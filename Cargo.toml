@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/metadb-core",
+    "crates/metadb-storage",
+    "crates/metadb-tx",
+    "crates/metadb-cluster",
+    "crates/metadb-proxy",
+    "crates/metadb-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/rustfs/MetaDB"
+authors = ["The RustFS Authors"]

@@ -1,0 +1,15 @@
+[package]
+name = "metadb-server"
+description = "Unified MetaDB engine supporting seamless evolution from Single-Node All-in-One to Trillion-Scale Multi-Cell Distributed Clusters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+metadb-core = { path = "../metadb-core" }
+metadb-storage = { path = "../metadb-storage" }
+metadb-tx = { path = "../metadb-tx" }
+metadb-cluster = { path = "../metadb-cluster" }
+metadb-proxy = { path = "../metadb-proxy" }

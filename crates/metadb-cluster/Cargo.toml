@@ -1,0 +1,12 @@
+[package]
+name = "metadb-cluster"
+description = "Tree-topology-induced sharding, jumbo shard isolation, Raft ConfChange, and Two-Tier Control Plane for MetaDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+metadb-core = { path = "../metadb-core" }
+metadb-storage = { path = "../metadb-storage" }

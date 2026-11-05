@@ -1,0 +1,11 @@
+[package]
+name = "metadb-storage"
+description = "Lifecycle-aware storage engine for MetaDB: Raft durability log, In-Memory MVCC, and Locality-Aware Compaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+metadb-core = { path = "../metadb-core" }

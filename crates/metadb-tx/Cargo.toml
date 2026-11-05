@@ -1,0 +1,12 @@
+[package]
+name = "metadb-tx"
+description = "Single-shard pushdown executor, conflict-free async attribute aggregation, and decoupled auxiliary sink for MetaDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+metadb-core = { path = "../metadb-core" }
+metadb-storage = { path = "../metadb-storage" }

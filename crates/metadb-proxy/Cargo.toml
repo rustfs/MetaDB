@@ -1,0 +1,11 @@
+[package]
+name = "metadb-proxy"
+description = "Lightweight SQL template parser and stateless router for MetaDB (~20 fixed metadata patterns)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+metadb-core = { path = "../metadb-core" }
