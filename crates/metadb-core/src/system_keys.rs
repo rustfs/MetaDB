@@ -320,8 +320,11 @@ impl SpilledAuxOutboxKey {
         out
     }
 
-    pub fn prefix_start(after_raft_index: u64) -> [u8; 11] {
-        Self::new(after_raft_index.saturating_add(1), 0).encode()
+    pub fn prefix_start(after_raft_index: u64) -> Vec<u8> {
+        match after_raft_index.checked_add(1) {
+            Some(next_idx) => Self::new(next_idx, 0).encode().to_vec(),
+            None => vec![SYSTEM_PREFIX_SPILLED_AUX_OUTBOX + 1],
+        }
     }
 
     pub const fn prefix_end() -> [u8; 1] {
@@ -397,6 +400,9 @@ pub fn affinity_key_for_raw_entry(raw_key: &[u8], raw_value: &[u8]) -> Result<Op
         }
         SYSTEM_PREFIX_TXN_RECORD => {
             let _ = TxnRecordKey::decode(raw_key)?;
+            if raw_value.is_empty() {
+                return Ok(None);
+            }
             let rec = TxnStatusRecord::decode(raw_value)?;
             Ok(Some(rec.primary_key))
         }

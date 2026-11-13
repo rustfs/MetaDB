@@ -668,5 +668,20 @@ mod tests {
         let range = CompositeKeyRange::meta_pid_range(10, 20).unwrap();
         assert!(range.contains_key(&MetaKey::child(15, "x").encode()));
         assert!(!range.contains_key(&MetaKey::child(20, "x").encode()));
+        assert!(!range.overlaps(
+            &MetaKey::child(15, "x").encode(),
+            &MetaKey::child(15, "x").encode()
+        ));
+        assert!(CompositeKeyRange::meta_pid_range(u64::MAX, u64::MAX).is_err());
+
+        // `SpilledAuxOutboxKey::prefix_start(u64::MAX)` yields `[0x08]` (empty scan `[0x08, 0x08)`).
+        assert_eq!(
+            SpilledAuxOutboxKey::prefix_start(u64::MAX),
+            SpilledAuxOutboxKey::prefix_end().to_vec()
+        );
+
+        // Empty tombstone payload on `0x06 TxnRecord` returns `Ok(None)` safely.
+        let tk = TxnRecordKey { txn_id: 99 }.encode();
+        assert_eq!(affinity_key_for_raw_entry(&tk, &[]).unwrap(), None);
     }
 }

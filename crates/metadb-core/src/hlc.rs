@@ -22,11 +22,18 @@ pub struct HlcTimestamp(pub u64);
 
 impl HlcTimestamp {
     pub const ZERO: HlcTimestamp = HlcTimestamp(0);
+    /// Maximum 48-bit physical millisecond component (`(1 << 48) - 1`, ~8,925 years).
+    pub const MAX_PHYSICAL_MS: u64 = (1u64 << 48) - 1;
 
-    /// Constructs an HLC timestamp from physical milliseconds and a 16-bit logical counter.
+    /// Constructs an HLC timestamp from physical milliseconds (clamped to 48 bits) and a 16-bit logical counter.
     #[inline]
     pub const fn new(physical_ms: u64, logical: u16) -> Self {
-        HlcTimestamp((physical_ms << 16) | (logical as u64))
+        let clamped_phys = if physical_ms > Self::MAX_PHYSICAL_MS {
+            Self::MAX_PHYSICAL_MS
+        } else {
+            physical_ms
+        };
+        HlcTimestamp((clamped_phys << 16) | (logical as u64))
     }
 
     /// Physical wall-clock component in milliseconds.
@@ -164,15 +171,44 @@ impl HybridLogicalClock {
         remote: HlcTimestamp,
         wall_ms: u64,
     ) -> Result<HlcTimestamp> {
+        let max_allowed = wall_ms.saturating_add(self.max_drift_ms);
         let rem_phys = remote.physical_ms();
-        if rem_phys > wall_ms.saturating_add(self.max_drift_ms) {
+        if rem_phys > max_allowed {
             return Err(MetaDbError::ClockSkewExceeded {
                 remote_ms: rem_phys,
                 local_ms: wall_ms,
                 max_drift_ms: self.max_drift_ms,
             });
         }
-        Ok(self.update_with_wall_ms(remote, wall_ms))
+
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            let cur_ts = HlcTimestamp(current);
+            let max_ts = cur_ts.max(remote);
+            let wall_ts = HlcTimestamp::new(wall_ms, 0);
+
+            let next = if wall_ts > max_ts {
+                wall_ts
+            } else {
+                max_ts.next_strict()
+            };
+
+            if next.physical_ms() > max_allowed {
+                return Err(MetaDbError::ClockSkewExceeded {
+                    remote_ms: next.physical_ms(),
+                    local_ms: wall_ms,
+                    max_drift_ms: self.max_drift_ms,
+                });
+            }
+
+            if self
+                .state
+                .compare_exchange_weak(current, next.0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(next);
+            }
+        }
     }
 
     /// Updates the local HLC upon receiving a message with a remote `HlcTimestamp`
@@ -233,11 +269,26 @@ mod tests {
         assert_eq!(after_max, HlcTimestamp::new(2_001, 0));
         assert!(after_max > near_max);
 
-        // Verify drift beyond max_drift_ms is rejected.
+        // Verify drift beyond max_drift_ms is rejected, including when `remote.logical == u16::MAX`
+        // at the exact `wall_ms + max_drift_ms` boundary would push `next.physical_ms()` 1ms over!
         let skewed = HlcTimestamp::new(3_000, 0);
         let err = clock
             .update_checked_with_wall_ms(skewed, 2_200)
             .unwrap_err();
         assert!(matches!(err, MetaDbError::ClockSkewExceeded { .. }));
+
+        let boundary_overflow = HlcTimestamp::new(2_700, u16::MAX);
+        let err_boundary = clock
+            .update_checked_with_wall_ms(boundary_overflow, 2_200)
+            .unwrap_err();
+        assert!(matches!(
+            err_boundary,
+            MetaDbError::ClockSkewExceeded { .. }
+        ));
+
+        // Verify 48-bit physical_ms clamping in `HlcTimestamp::new`.
+        let clamped = HlcTimestamp::new(u64::MAX, 42);
+        assert_eq!(clamped.physical_ms(), HlcTimestamp::MAX_PHYSICAL_MS);
+        assert_eq!(clamped.logical(), 42);
     }
 }

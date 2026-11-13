@@ -134,6 +134,11 @@ impl CompositeKeyRange {
 
     /// Constructs a `MetaTable` `PID`-boundary range `[start_pid, end_pid)`.
     pub fn meta_pid_range(start_pid: InodeId, end_pid: InodeId) -> Result<Self> {
+        if start_pid >= end_pid {
+            return Err(MetaDbError::ShardRoutingError(
+                "invalid meta_pid_range: require start_pid < end_pid".to_string(),
+            ));
+        }
         let start = MetaKey::encode_pid_prefix_start(start_pid);
         let end = if end_pid == u64::MAX {
             vec![TABLE_PREFIX_QUOTA]
@@ -149,9 +154,11 @@ impl CompositeKeyRange {
         user_key >= self.start_key.as_slice() && user_key < self.end_key.as_slice()
     }
 
-    /// Returns `true` if `[query_start, query_end)` intersects `[start_key, end_key)`.
+    /// Returns `true` if non-empty `[query_start, query_end)` intersects `[start_key, end_key)`.
     #[inline]
     pub fn overlaps(&self, query_start: &[u8], query_end: &[u8]) -> bool {
-        query_start < self.end_key.as_slice() && query_end > self.start_key.as_slice()
+        query_start < query_end
+            && query_start < self.end_key.as_slice()
+            && query_end > self.start_key.as_slice()
     }
 }
