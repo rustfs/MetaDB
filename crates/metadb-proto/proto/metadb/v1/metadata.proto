@@ -1,0 +1,241 @@
+syntax = "proto3";
+
+package metadb.v1;
+
+import "metadb/v1/common.proto";
+
+message RequestRoutingHeader {
+  uint64 shard_id = 1;
+  ShardEpochProto expected_epoch = 2;
+  uint64 caller_hlc = 3;
+}
+
+message CreateFileRequest {
+  RequestRoutingHeader header = 1;
+  uint64 pid = 2;
+  string name = 3;
+  uint64 inode_id = 4;
+  uint64 fid = 5;
+  uint64 uid = 6;
+  uint32 mode = 7;
+  int64 size_bytes = 8;
+}
+
+message CreateFileResponse {
+  ErrorDetailProto error = 1;
+  MetaEntryProto entry = 2;
+  uint64 server_hlc = 3;
+}
+
+message MkdirRequest {
+  RequestRoutingHeader header = 1;
+  uint64 pid = 2;
+  string name = 3;
+  uint64 dir_id = 4;
+  uint64 uid = 5;
+  uint32 mode = 6;
+}
+
+message MkdirResponse {
+  ErrorDetailProto error = 1;
+  MetaEntryProto entry = 2;
+  uint64 server_hlc = 3;
+}
+
+message UnlinkRequest {
+  RequestRoutingHeader header = 1;
+  uint64 pid = 2;
+  string name = 3;
+}
+
+message UnlinkResponse {
+  ErrorDetailProto error = 1;
+  InodeAttrProto removed_attr = 2;
+  uint64 server_hlc = 3;
+}
+
+message RmdirRequest {
+  RequestRoutingHeader header = 1;
+  uint64 pid = 2;
+  string name = 3;
+}
+
+message RmdirResponse {
+  ErrorDetailProto error = 1;
+  InodeAttrProto removed_attr = 2;
+  uint64 server_hlc = 3;
+}
+
+message SetAttrRequest {
+  RequestRoutingHeader header = 1;
+  uint64 pid = 2;
+  string name = 3;
+  bool has_mode = 4;
+  uint32 mode = 5;
+  bool has_uid = 6;
+  uint64 uid = 7;
+  bool has_size_bytes = 8;
+  int64 size_bytes = 9;
+  bool has_fid = 10;
+  uint64 fid = 11;
+  bool has_modify_time_hlc = 12;
+  uint64 modify_time_hlc = 13;
+}
+
+message SetAttrResponse {
+  ErrorDetailProto error = 1;
+  MetaEntryProto entry = 2;
+  uint64 server_hlc = 3;
+}
+
+message LookupRequest {
+  RequestRoutingHeader header = 1;
+  uint64 pid = 2;
+  string name = 3;
+}
+
+message LookupResponse {
+  ErrorDetailProto error = 1;
+  bool found = 2;
+  MetaEntryProto entry = 3;
+  uint64 server_hlc = 4;
+}
+
+message DirStatRequest {
+  RequestRoutingHeader header = 1;
+  uint64 pid = 2;
+}
+
+message DirStatResponse {
+  ErrorDetailProto error = 1;
+  InodeAttrProto attr = 2;
+  uint64 server_hlc = 3;
+}
+
+message GetDirPartitionStatRequest {
+  RequestRoutingHeader header = 1;
+  uint64 pid = 2;
+  bool use_fixed_barrier_hlc = 3;
+  uint64 barrier_hlc = 4;
+}
+
+message GetDirPartitionStatResponse {
+  ErrorDetailProto error = 1;
+  bool is_anchor = 2;
+  InodeAttrProto partition_attr = 3;
+  uint64 max_applied_hlc = 4;
+}
+
+message ListDirRequest {
+  RequestRoutingHeader header = 1;
+  uint64 pid = 2;
+  string after_name = 3;
+  string name_prefix = 4;
+  uint32 limit = 5;
+}
+
+message ListDirResponse {
+  ErrorDetailProto error = 1;
+  repeated MetaEntryProto entries = 2;
+  string next_cursor = 3;
+  bool has_more = 4;
+  uint64 server_hlc = 5;
+}
+
+message SqlParamValue {
+  oneof kind {
+    uint64 u64_val = 1;
+    int64 i64_val = 2;
+    string str_val = 3;
+  }
+}
+
+message ExecuteSqlRequest {
+  string sql = 1;
+  repeated SqlParamValue params = 2;
+  uint64 caller_hlc = 3;
+}
+
+message ExecuteSqlResponse {
+  ErrorDetailProto error = 1;
+  repeated MetaEntryProto entries = 2;
+  InodeAttrProto single_attr = 3;
+  QuotaRecordProto single_quota = 4;
+  repeated QuotaRecordProto quotas = 5;
+  SecondaryIndexRecordProto single_index = 6;
+  repeated SecondaryIndexRecordProto indices = 7;
+  uint64 server_hlc = 8;
+}
+
+message GetQuotaRequest {
+  RequestRoutingHeader header = 1;
+  uint64 uid = 2;
+}
+
+message GetQuotaResponse {
+  ErrorDetailProto error = 1;
+  bool found = 2;
+  QuotaRecordProto record = 3;
+}
+
+message SetQuotaLimitRequest {
+  RequestRoutingHeader header = 1;
+  uint64 uid = 2;
+  uint64 quota_limit_bytes = 3;
+}
+
+message SetQuotaLimitResponse {
+  ErrorDetailProto error = 1;
+  QuotaRecordProto record = 2;
+}
+
+message ListQuotasRequest {
+  RequestRoutingHeader header = 1;
+  uint64 start_uid = 2;
+  uint32 limit = 3;
+}
+
+message ListQuotasResponse {
+  ErrorDetailProto error = 1;
+  repeated QuotaRecordProto records = 2;
+}
+
+message GetSecondaryIndexRequest {
+  RequestRoutingHeader header = 1;
+  uint64 fid = 2;
+}
+
+message GetSecondaryIndexResponse {
+  ErrorDetailProto error = 1;
+  bool found = 2;
+  SecondaryIndexRecordProto record = 3;
+}
+
+message ScanSecondaryIndexRequest {
+  RequestRoutingHeader header = 1;
+  uint64 after_fid = 2;
+  uint32 limit = 3;
+}
+
+message ScanSecondaryIndexResponse {
+  ErrorDetailProto error = 1;
+  repeated SecondaryIndexRecordProto records = 2;
+}
+
+service MetadataService {
+  rpc CreateFile(CreateFileRequest) returns (CreateFileResponse);
+  rpc Mkdir(MkdirRequest) returns (MkdirResponse);
+  rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
+  rpc Rmdir(RmdirRequest) returns (RmdirResponse);
+  rpc SetAttr(SetAttrRequest) returns (SetAttrResponse);
+  rpc Lookup(LookupRequest) returns (LookupResponse);
+  rpc DirStat(DirStatRequest) returns (DirStatResponse);
+  rpc GetDirPartitionStat(GetDirPartitionStatRequest) returns (GetDirPartitionStatResponse);
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  rpc ExecuteSql(ExecuteSqlRequest) returns (ExecuteSqlResponse);
+  rpc GetQuota(GetQuotaRequest) returns (GetQuotaResponse);
+  rpc SetQuotaLimit(SetQuotaLimitRequest) returns (SetQuotaLimitResponse);
+  rpc ListQuotas(ListQuotasRequest) returns (ListQuotasResponse);
+  rpc GetSecondaryIndex(GetSecondaryIndexRequest) returns (GetSecondaryIndexResponse);
+  rpc ScanSecondaryIndex(ScanSecondaryIndexRequest) returns (ScanSecondaryIndexResponse);
+}

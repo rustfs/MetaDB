@@ -1,0 +1,157 @@
+syntax = "proto3";
+
+package metadb.v1;
+
+import "metadb/v1/common.proto";
+
+message RegisterNodeRequest {
+  uint64 cell_id = 1;
+  uint64 node_id = 2;
+  string grpc_addr = 3;
+}
+
+message RegisterNodeResponse {
+  ErrorDetailProto error = 1;
+}
+
+message ShardHeartbeatStatsProto {
+  ShardDescriptorProto descriptor = 1;
+  uint64 approximate_bytes = 2;
+  uint64 qps = 3;
+  bool unsplittable_jumbo = 4;
+  uint64 dominant_pid = 5;
+  uint64 safe_purge_index = 6;
+}
+
+message StoreHeartbeatRequest {
+  uint64 cell_id = 1;
+  uint64 node_id = 2;
+  uint64 disk_free_bytes = 3;
+  repeated ShardHeartbeatStatsProto shards = 4;
+}
+
+message StoreHeartbeatResponse {
+  ErrorDetailProto error = 1;
+}
+
+message GetRoutesRequest {
+  uint64 cell_id = 1;
+}
+
+message GetRoutesResponse {
+  ErrorDetailProto error = 1;
+  repeated ShardDescriptorProto shards = 2;
+}
+
+message AllocateIdBlockRequest {
+  bytes request_uuid_be = 1;
+  // 1 = FileInode, 2 = DirInode, 3 = FileId, 4 = ShardId
+  uint32 id_kind = 2;
+  uint64 count = 3;
+  uint64 preferred_shard_id = 4;
+}
+
+message AllocateIdBlockResponse {
+  ErrorDetailProto error = 1;
+  uint64 start_id = 2;
+  uint64 count = 3;
+}
+
+message AllocSplitPlanRequest {
+  bytes request_uuid_be = 1;
+  uint64 cell_id = 2;
+  uint64 parent_shard_id = 3;
+  bytes split_key = 4;
+  uint64 target_version = 5;
+}
+
+message AllocSplitPlanResponse {
+  ErrorDetailProto error = 1;
+  uint64 child_shard_id = 2;
+}
+
+message ActivateSplitRequest {
+  uint64 cell_id = 1;
+  ShardDescriptorProto parent_descriptor = 2;
+  ShardDescriptorProto child_descriptor = 3;
+}
+
+message ActivateSplitResponse {
+  ErrorDetailProto error = 1;
+}
+
+message AcquireDirRenameLeaseRequest {
+  bytes request_uuid_be = 1;
+  uint64 moved_dir_id = 2;
+  uint64 ttl_ms = 3;
+}
+
+message AcquireDirRenameLeaseResponse {
+  ErrorDetailProto error = 1;
+  uint64 rename_fence_token = 2;
+  uint64 expire_hlc = 3;
+}
+
+message ReleaseDirRenameLeaseRequest {
+  uint64 rename_fence_token = 1;
+}
+
+message ReleaseDirRenameLeaseResponse {
+  ErrorDetailProto error = 1;
+}
+
+message TriggerShardSplitRequest {
+  uint64 shard_id = 1;
+}
+
+message TriggerShardSplitResponse {
+  ErrorDetailProto error = 1;
+  bool split_executed = 2;
+  uint64 child_shard_id = 3;
+}
+
+message EnableDualModeSplitRequest {
+  uint64 shard_id = 1;
+  uint64 dominant_pid = 2;
+  string split_name = 3;
+}
+
+message EnableDualModeSplitResponse {
+  ErrorDetailProto error = 1;
+}
+
+message ScaleShardReplicasRequest {
+  uint64 cell_id = 1;
+  uint32 target_voters = 2;
+}
+
+message ScaleShardReplicasResponse {
+  ErrorDetailProto error = 1;
+  uint32 upgraded_shards = 2;
+}
+
+message RegisterCellRequest {
+  uint64 cell_id = 1;
+  bytes start_key = 2;
+  bytes end_key = 3;
+  repeated string cell_manager_endpoints = 4;
+}
+
+message RegisterCellResponse {
+  ErrorDetailProto error = 1;
+}
+
+service ControlPlaneService {
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc StoreHeartbeat(StoreHeartbeatRequest) returns (StoreHeartbeatResponse);
+  rpc GetRoutes(GetRoutesRequest) returns (GetRoutesResponse);
+  rpc AllocateIdBlock(AllocateIdBlockRequest) returns (AllocateIdBlockResponse);
+  rpc AllocSplitPlan(AllocSplitPlanRequest) returns (AllocSplitPlanResponse);
+  rpc ActivateSplit(ActivateSplitRequest) returns (ActivateSplitResponse);
+  rpc AcquireDirRenameLease(AcquireDirRenameLeaseRequest) returns (AcquireDirRenameLeaseResponse);
+  rpc ReleaseDirRenameLease(ReleaseDirRenameLeaseRequest) returns (ReleaseDirRenameLeaseResponse);
+  rpc TriggerShardSplit(TriggerShardSplitRequest) returns (TriggerShardSplitResponse);
+  rpc EnableDualModeSplit(EnableDualModeSplitRequest) returns (EnableDualModeSplitResponse);
+  rpc ScaleShardReplicas(ScaleShardReplicasRequest) returns (ScaleShardReplicasResponse);
+  rpc RegisterCell(RegisterCellRequest) returns (RegisterCellResponse);
+}

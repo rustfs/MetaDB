@@ -113,13 +113,16 @@ pub trait PreFlushHook: Send + Sync {
 
     /// Invoked strictly AFTER the resulting L0 SSTable and MANIFEST are fdatasync'd
     /// and the new `Version` is published in `VersionSet`.
-    fn on_flush_durable(&self, durable_raft_index: u64, durable_max_hlc: HlcTimestamp);
+    /// Returns the new contiguous `aux_outbox_durable_index` frontier (which reaches `M`
+    /// only when all unresolved tasks `<= M` were spilled into `[0x07]`, never advancing
+    /// unconditionally past unspilled/unacked tasks `<= M`).
+    fn on_flush_durable(&self, durable_raft_index: u64, durable_max_hlc: HlcTimestamp) -> u64;
 }
 ```
 Because `on_flush_durable(M)` runs strictly after `VersionSet` publication and `MANIFEST` `fdatasync`:
 * Readers before `VersionSet` swap read old `_attr_` (`applied_index = M_prev`) + in-memory deltas `(M_prev, latest]`.
 * Readers after `VersionSet` swap read new `_attr_` (`applied_index = M`) + in-memory deltas `(M, latest]`.
-* Only inside `on_flush_durable(M)` are in-memory deltas `<= M` pruned and `state_flushed_index` / `aux_outbox_durable_index` advanced to `M`.
+* Only inside `on_flush_durable(M)` are in-memory deltas `<= M` pruned, `state_flushed_index` advanced to `M`, and `aux_outbox_durable_index` advanced strictly to the contiguous durable-coverage frontier returned by the outbox hook.
 
 ---
 

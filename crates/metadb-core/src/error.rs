@@ -1,12 +1,16 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
+use crate::epoch::{ShardEpoch, TxnId};
+
 /// Result alias for MetaDB operations.
 pub type Result<T> = std::result::Result<T, MetaDbError>;
 
 /// Canonical error variants across all MetaDB subsystems.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetaDbError {
-    /// Attempted to use the reserved `"_attr_"` name for a user entry.
+    /// Attempted to use the reserved `"_attr_"` name or illegal empty/null name for a user entry.
     ReservedEntryName(String),
     /// Target file or directory entry already exists.
     AlreadyExists { pid: u64, name: String },
@@ -17,18 +21,64 @@ pub enum MetaDbError {
     /// Attempted to remove a non-empty directory via `rmdir`.
     DirectoryNotEmpty { dir_id: u64, child_count: usize },
     /// Operation type mismatch (e.g., `rmdir` on a regular file or `unlink` on a directory).
-    InvalidEntryType { expected: &'static str, actual: &'static str },
+    InvalidEntryType { expected: String, actual: String },
     /// Snapshot read timestamp is older than the In-Memory MVCC retention window (`>5s`).
     TransactionTimeout {
         snapshot_hlc: u64,
         oldest_retained_hlc: u64,
     },
+    /// Incoming remote HLC drifted ahead of local physical wall clock beyond `max_clock_drift_ms`.
+    ClockSkewExceeded {
+        remote_ms: u64,
+        local_ms: u64,
+        max_drift_ms: u64,
+    },
+    /// CRC32C checksum validation failed on disk or wire frame.
+    ChecksumMismatch {
+        context: String,
+        expected: u32,
+        actual: u32,
+    },
+    /// Non-final MANIFEST record or SSTable metadata grammar is corrupted.
+    ManifestCorrupted(String),
     /// Key or value binary decoding failed.
     CodecError(String),
     /// Shard routing or boundary error.
     ShardRoutingError(String),
-    /// Shard cannot be split along `group_key = PID` because all keys share one `PID` (Jumbo Shard).
+    /// Caller's `expected_epoch` did not match the shard's current `(conf_ver, version)` or range.
+    EpochMismatch {
+        shard_id: u64,
+        expected: ShardEpoch,
+        actual: ShardEpoch,
+    },
+    /// Target node is not the current Raft leader for `shard_id`.
+    NotLeader {
+        shard_id: u64,
+        leader_hint: Option<u64>,
+    },
+    /// Shard cannot be split along `group_key = PID` because a single `PID` dominates it.
     UnsplittableJumboShard { shard_id: u64, pid: u64 },
+    /// Encountered a conflicting 2PC `WriteIntent` on a target key.
+    WriteIntentConflict {
+        conflicting_txn_id: TxnId,
+        primary_key: Vec<u8>,
+        expire_hlc: u64,
+    },
+    /// 2PC transaction was aborted due to conflict, timeout, or superseded lease.
+    TransactionAborted(String),
+    /// Attempted to move a directory into itself or one of its own descendants.
+    InvalidRenameCycle { dir_id: u64, dst_pid: u64 },
+    /// Out-of-order gap detected in per-origin-shard auxiliary `QuotaDelta` stream.
+    AuxOutOfOrderGap {
+        origin_shard_id: u64,
+        uid: u64,
+        expected_after: (u64, u16),
+        got_prev: (u64, u16),
+    },
+    /// Local filesystem or storage I/O failure.
+    StorageIoError(String),
+    /// Network or gRPC transport error.
+    RpcError(String),
     /// Consensus or replication state error.
     ConsensusError(String),
     /// Lightweight SQL template parse error.
@@ -39,7 +89,7 @@ impl fmt::Display for MetaDbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MetaDbError::ReservedEntryName(name) => {
-                write!(f, "entry name '{}' is reserved for directory attributes", name)
+                write!(f, "entry name '{}' is reserved or invalid", name)
             }
             MetaDbError::AlreadyExists { pid, name } => {
                 write!(f, "entry ({}, '{}') already exists", pid, name)
@@ -50,13 +100,11 @@ impl fmt::Display for MetaDbError {
             MetaDbError::DirectoryNotFound(id) => {
                 write!(f, "directory inode {} not found", id)
             }
-            MetaDbError::DirectoryNotEmpty { dir_id, child_count } => {
-                write!(
-                    f,
-                    "directory {} is not empty ({} live children remain)",
-                    dir_id, child_count
-                )
-            }
+            MetaDbError::DirectoryNotEmpty { dir_id, child_count } => write!(
+                f,
+                "directory {} is not empty ({} live children remain)",
+                dir_id, child_count
+            ),
             MetaDbError::InvalidEntryType { expected, actual } => {
                 write!(f, "invalid entry type: expected {}, got {}", expected, actual)
             }
@@ -68,16 +116,83 @@ impl fmt::Display for MetaDbError {
                 "transaction snapshot HLC {} expired (oldest retained in-memory MVCC HLC is {})",
                 snapshot_hlc, oldest_retained_hlc
             ),
+            MetaDbError::ClockSkewExceeded {
+                remote_ms,
+                local_ms,
+                max_drift_ms,
+            } => write!(
+                f,
+                "remote HLC physical_ms {} exceeds local_ms {} + max_drift_ms {}",
+                remote_ms, local_ms, max_drift_ms
+            ),
+            MetaDbError::ChecksumMismatch {
+                context,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "CRC32C mismatch in {}: expected 0x{:08x}, got 0x{:08x}",
+                context, expected, actual
+            ),
+            MetaDbError::ManifestCorrupted(msg) => write!(f, "manifest corrupted: {}", msg),
             MetaDbError::CodecError(msg) => write!(f, "codec error: {}", msg),
             MetaDbError::ShardRoutingError(msg) => write!(f, "shard routing error: {}", msg),
+            MetaDbError::EpochMismatch {
+                shard_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "epoch mismatch on shard {}: expected {:?}, actual {:?}",
+                shard_id, expected, actual
+            ),
+            MetaDbError::NotLeader {
+                shard_id,
+                leader_hint,
+            } => write!(
+                f,
+                "not leader for shard {} (leader_hint: {:?})",
+                shard_id, leader_hint
+            ),
             MetaDbError::UnsplittableJumboShard { shard_id, pid } => write!(
                 f,
                 "shard {} is an unsplittable jumbo shard dominated by single PID {}",
                 shard_id, pid
             ),
+            MetaDbError::WriteIntentConflict {
+                conflicting_txn_id, ..
+            } => write!(
+                f,
+                "conflicting 2PC write intent held by txn {}",
+                conflicting_txn_id
+            ),
+            MetaDbError::TransactionAborted(msg) => write!(f, "transaction aborted: {}", msg),
+            MetaDbError::InvalidRenameCycle { dir_id, dst_pid } => write!(
+                f,
+                "invalid directory rename cycle moving dir {} under {}",
+                dir_id, dst_pid
+            ),
+            MetaDbError::AuxOutOfOrderGap {
+                origin_shard_id,
+                uid,
+                expected_after,
+                got_prev,
+            } => write!(
+                f,
+                "out-of-order quota delta gap from shard {} for uid {}: expected after {:?}, got {:?}",
+                origin_shard_id, uid, expected_after, got_prev
+            ),
+            MetaDbError::StorageIoError(msg) => write!(f, "storage I/O error: {}", msg),
+            MetaDbError::RpcError(msg) => write!(f, "RPC error: {}", msg),
             MetaDbError::ConsensusError(msg) => write!(f, "consensus error: {}", msg),
             MetaDbError::SqlParseError(msg) => write!(f, "SQL template parse error: {}", msg),
         }
+    }
+}
+
+impl From<std::io::Error> for MetaDbError {
+    fn from(err: std::io::Error) -> Self {
+        MetaDbError::StorageIoError(err.to_string())
     }
 }
 

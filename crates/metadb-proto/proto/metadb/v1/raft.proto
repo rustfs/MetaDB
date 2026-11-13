@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package metadb.v1;
+
+message RaftRpcEnvelope {
+  uint64 shard_id = 1;
+  bytes bincode_payload = 2;
+}
+
+message RaftRpcReply {
+  bytes bincode_payload = 1;
+  string error_message = 2;
+}
+
+message SnapshotChunkRequest {
+  uint64 shard_id = 1;
+  bytes vote_bincode = 2;
+  bytes snapshot_meta_bincode = 3;
+  string relative_file_path = 4;
+  uint64 offset = 5;
+  bytes data = 6;
+  bool done = 7;
+}
+
+message SnapshotChunkResponse {
+  bytes bincode_payload = 1;
+  string error_message = 2;
+}
+
+service RaftTransportService {
+  rpc AppendEntries(RaftRpcEnvelope) returns (RaftRpcReply);
+  rpc Vote(RaftRpcEnvelope) returns (RaftRpcReply);
+  rpc InstallSnapshot(stream SnapshotChunkRequest) returns (SnapshotChunkResponse);
+}

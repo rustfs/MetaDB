@@ -9,6 +9,6 @@ pub mod attr_aggregator;
 pub mod aux_sink;
 pub mod pushdown;
 
-pub use attr_aggregator::{AttrDeltaItem, AsyncAttrAggregator};
+pub use attr_aggregator::{AsyncAttrAggregator, AttrDeltaItem};
 pub use aux_sink::{AsyncAuxiliarySink, AuxUpdateTask};
 pub use pushdown::{PushdownExecutor, TwoPhaseCommitCoordinator};

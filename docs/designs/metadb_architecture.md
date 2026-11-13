@@ -47,7 +47,7 @@ Furthermore, adopters need an engine that can run in **Single-Node All-in-One Mo
 ### 3.1 Seven Disjoint Binary Keyspaces (`metadb-core`)
 1. `MetaTable` (`0x01`): Keyed by `MetaKey { pid: InodeId, name: String }` encoded in big-endian byte order (`[0x01][pid: 8B BE][name_utf8]`).
    * Reserved child name `"_attr_"` stores the directory's own `InodeAttr` (`88B` fixed binary payload with `parent_pid`, `applied_raft_index`, and `CRC32C`) colocated under `pid` (`group_key = pid`).
-2. `QuotaTable` (`0x02`): Keyed by `QuotaKey { uid: UserId }` (`[0x02][uid: 8B BE]`), storing `QuotaRecord` with `applied_index_by_shard: BTreeMap<ShardId, u64>`.
+2. `QuotaTable` (`0x02`): Keyed by `QuotaKey { uid: UserId }` (`[0x02][uid: 8B BE]`), storing `QuotaRecord` with `applied_by_shard: BTreeMap<ShardId, (u64, u16)>` (`(origin_raft_index, task_ordinal)`) and `prev_uid_cursor: (u64, u16)`.
 3. `SecondaryIndexTable` (`0x03`): Keyed by `SecondaryIndexKey { fid: FileId }` (`[0x03][fid: 8B BE]`), storing `SecondaryIndexRecord` with `(last_applied_hlc, tombstone_hlc, is_deleted)`.
 4. Shard-Local Replicated System Prefixes (`0x04..0x07`):
    * `0x04 DirShardDelta`: Per-sub-shard partial directory stats & existence lease for `DualModeFineGrained` jumbo directories.

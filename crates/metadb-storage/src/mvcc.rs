@@ -127,10 +127,10 @@ impl MemMvccStore {
         self.check_retention_window(&guard, read_hlc)?;
 
         let mut out = BTreeMap::new();
-        for (k, chain) in guard
-            .versions
-            .range::<[u8], _>((std::ops::Bound::Included(start_key), std::ops::Bound::Excluded(end_key)))
-        {
+        for (k, chain) in guard.versions.range::<[u8], _>((
+            std::ops::Bound::Included(start_key),
+            std::ops::Bound::Excluded(end_key),
+        )) {
             for version in chain.iter().rev() {
                 if version.hlc <= read_hlc {
                     out.insert(k.clone(), version.value.clone());

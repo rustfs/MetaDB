@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package metadb.v1;
+
+import "metadb/v1/common.proto";
+import "metadb/v1/metadata.proto";
+
+message RenameRequest {
+  uint64 src_pid = 1;
+  string src_name = 2;
+  uint64 dst_pid = 3;
+  string dst_name = 4;
+  bool overwrite = 5;
+  uint64 caller_hlc = 6;
+}
+
+message RenameResponse {
+  ErrorDetailProto error = 1;
+  MetaEntryProto entry = 2;
+  uint64 commit_hlc = 3;
+}
+
+message Prepare2pcRequest {
+  RequestRoutingHeader header = 1;
+  bytes txn_id_be = 2;
+  bool is_primary = 3;
+  bytes primary_key = 4;
+  repeated bytes all_participant_keys = 5;
+  uint64 start_hlc = 6;
+  uint64 expire_hlc = 7;
+  bool has_rename_fence_token = 8;
+  uint64 rename_fence_token = 9;
+  repeated bytes encoded_intent_keys = 10;
+  repeated bytes encoded_intent_records = 11;
+}
+
+message Prepare2pcResponse {
+  ErrorDetailProto error = 1;
+  uint64 prepared_hlc = 2;
+}
+
+message CommitPrimary2pcRequest {
+  RequestRoutingHeader header = 1;
+  bytes txn_id_be = 2;
+  uint64 commit_hlc = 3;
+  bool has_rename_fence_token = 4;
+  uint64 rename_fence_token = 5;
+}
+
+message CommitPrimary2pcResponse {
+  ErrorDetailProto error = 1;
+  uint64 commit_hlc = 2;
+}
+
+message CommitSecondary2pcRequest {
+  RequestRoutingHeader header = 1;
+  bytes txn_id_be = 2;
+  uint64 commit_hlc = 3;
+  repeated bytes target_user_keys = 4;
+}
+
+message CommitSecondary2pcResponse {
+  ErrorDetailProto error = 1;
+  bool already_applied = 2;
+}
+
+message Abort2pcRequest {
+  RequestRoutingHeader header = 1;
+  bytes txn_id_be = 2;
+  repeated bytes target_user_keys = 3;
+}
+
+message Abort2pcResponse {
+  ErrorDetailProto error = 1;
+}
+
+message CheckTxnStatusRequest {
+  RequestRoutingHeader header = 1;
+  bytes txn_id_be = 2;
+  bytes primary_key = 3;
+  uint64 caller_hlc = 4;
+}
+
+message CheckTxnStatusResponse {
+  ErrorDetailProto error = 1;
+  // 0 = NotFound/Aborted, 1 = Pending, 2 = Committed
+  uint32 txn_state = 2;
+  uint64 commit_hlc = 3;
+}
+
+message ApplyAuxBatchRequest {
+  RequestRoutingHeader header = 1;
+  uint64 origin_shard_id = 2;
+  repeated bytes encoded_outbox_entries = 3;
+}
+
+message ApplyAuxBatchResponse {
+  ErrorDetailProto error = 1;
+  uint32 applied_count = 2;
+}
+
+service TransactionService {
+  rpc Rename(RenameRequest) returns (RenameResponse);
+  rpc Prepare2pc(Prepare2pcRequest) returns (Prepare2pcResponse);
+  rpc CommitPrimary2pc(CommitPrimary2pcRequest) returns (CommitPrimary2pcResponse);
+  rpc CommitSecondary2pc(CommitSecondary2pcRequest) returns (CommitSecondary2pcResponse);
+  rpc Abort2pc(Abort2pcRequest) returns (Abort2pcResponse);
+  rpc CheckTxnStatus(CheckTxnStatusRequest) returns (CheckTxnStatusResponse);
+  rpc ApplyAuxBatch(ApplyAuxBatchRequest) returns (ApplyAuxBatchResponse);
+}

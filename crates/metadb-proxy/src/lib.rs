@@ -139,7 +139,8 @@ impl SqlTemplateParser {
         if let Some(rest) = trimmed.strip_prefix("UPDATE MetaTable SET pid = ") {
             if let Some((set_part, where_part)) = rest.split_once(" WHERE pid = ") {
                 if let Some((dst_pid_str, dst_name_part)) = set_part.split_once(", name = ") {
-                    if let Some((src_pid_str, src_name_part)) = where_part.split_once(" AND name = ")
+                    if let Some((src_pid_str, src_name_part)) =
+                        where_part.split_once(" AND name = ")
                     {
                         return Ok(MetadataSqlCommand::Rename {
                             src_pid: Self::parse_u64(src_pid_str)?,

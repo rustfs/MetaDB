@@ -97,9 +97,14 @@ impl MetaDbEngine {
             .global_manager
             .route_pid(ROOT_INODE_ID)
             .expect("root shard must exist");
-        engine
-            .pushdown
-            .init_directory_attr(&root_storage, ROOT_INODE_ID, 0, 0o755, hlc);
+        engine.pushdown.init_directory_attr(
+            &root_storage,
+            ROOT_INODE_ID,
+            ROOT_INODE_ID,
+            0,
+            0o755,
+            hlc,
+        );
 
         engine
     }

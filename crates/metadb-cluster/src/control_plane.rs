@@ -82,6 +82,7 @@ pub struct CellLocalManager {
 }
 
 impl CellLocalManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cell_id: CellId,
         initial_node: NodeId,
@@ -196,11 +197,9 @@ impl CellLocalManager {
     ) -> Result<Option<ShardId>> {
         let (desc, engine) = {
             let guard = self.inner.read().unwrap();
-            let desc = guard
-                .shards
-                .get(&shard_id)
-                .cloned()
-                .ok_or_else(|| MetaDbError::ShardRoutingError(format!("unknown shard {}", shard_id)))?;
+            let desc = guard.shards.get(&shard_id).cloned().ok_or_else(|| {
+                MetaDbError::ShardRoutingError(format!("unknown shard {}", shard_id))
+            })?;
             let engine = guard.engines.get(&shard_id).unwrap().clone();
             (desc, engine)
         };
@@ -253,7 +252,10 @@ impl CellLocalManager {
             Err(MetaDbError::UnsplittableJumboShard { pid, .. }) => {
                 // Jumbo-shard-aware scheduling and isolation (§4.1):
                 let mut guard = self.inner.write().unwrap();
-                let dedicated_node = *guard.available_nodes.last().unwrap_or(&desc.membership.leader);
+                let dedicated_node = *guard
+                    .available_nodes
+                    .last()
+                    .unwrap_or(&desc.membership.leader);
                 if let Some(target_desc) = guard.shards.get_mut(&shard_id) {
                     target_desc.health_state = ShardHealthState::JumboIsolated {
                         dedicated_node,
@@ -280,11 +282,23 @@ impl CellLocalManager {
     }
 
     pub fn list_shards(&self) -> Vec<ShardDescriptor> {
-        self.inner.read().unwrap().shards.values().cloned().collect()
+        self.inner
+            .read()
+            .unwrap()
+            .shards
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn all_engines(&self) -> Vec<Arc<LifecycleStorageEngine>> {
-        self.inner.read().unwrap().engines.values().cloned().collect()
+        self.inner
+            .read()
+            .unwrap()
+            .engines
+            .values()
+            .cloned()
+            .collect()
     }
 }
 
@@ -317,12 +331,7 @@ impl GlobalManager {
     }
 
     /// Registers a `CellLocalManager` responsible for `[start_pid, end_pid)`.
-    pub fn register_cell(
-        &self,
-        start_pid: InodeId,
-        end_pid: InodeId,
-        cell: Arc<CellLocalManager>,
-    ) {
+    pub fn register_cell(&self, start_pid: InodeId, end_pid: InodeId, cell: Arc<CellLocalManager>) {
         let mut guard = self.cells.write().unwrap();
         guard.push(GlobalRangeMapping {
             start_pid,
@@ -338,7 +347,11 @@ impl GlobalManager {
     pub fn route_pid(
         &self,
         pid: InodeId,
-    ) -> Result<(Arc<CellLocalManager>, ShardDescriptor, Arc<LifecycleStorageEngine>)> {
+    ) -> Result<(
+        Arc<CellLocalManager>,
+        ShardDescriptor,
+        Arc<LifecycleStorageEngine>,
+    )> {
         let guard = self.cells.read().unwrap();
         for mapping in guard.iter() {
             if pid >= mapping.start_pid && pid < mapping.end_pid {

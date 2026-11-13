@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package metadb.v1;
+
+message HlcTimestampProto {
+  uint64 raw = 1;
+}
+
+message ShardEpochProto {
+  uint64 conf_ver = 1;
+  uint64 version = 2;
+}
+
+message ReplicaPeerProto {
+  uint64 node_id = 1;
+  string grpc_addr = 2;
+  bool is_voter = 3;
+}
+
+message ShardDescriptorProto {
+  uint64 cell_id = 1;
+  uint64 shard_id = 2;
+  bytes start_key = 3;
+  bytes end_key = 4;
+  ShardEpochProto epoch = 5;
+  uint64 leader_node_id = 6;
+  repeated ReplicaPeerProto peers = 7;
+  bool dual_mode_fine_grained = 8;
+  bool jumbo_isolated = 9;
+  uint64 dominant_pid = 10;
+}
+
+message InodeAttrProto {
+  uint64 inode_id = 1;
+  uint64 parent_pid = 2;
+  uint32 entry_type = 3;
+  uint64 uid = 4;
+  uint32 mode = 5;
+  uint32 link_count = 6;
+  int64 num_children = 7;
+  int64 size_bytes = 8;
+  uint64 create_time_hlc = 9;
+  uint64 modify_time_hlc = 10;
+  bool has_fid = 11;
+  uint64 fid = 12;
+  uint64 applied_raft_index = 13;
+}
+
+message MetaEntryProto {
+  uint64 pid = 1;
+  string name = 2;
+  InodeAttrProto attr = 3;
+}
+
+message ShardCursorEntryProto {
+  uint64 origin_shard_id = 1;
+  uint64 raft_index = 2;
+  uint32 task_ordinal = 3;
+}
+
+message QuotaRecordProto {
+  uint64 uid = 1;
+  int64 used_bytes = 2;
+  int64 used_inodes = 3;
+  uint64 quota_limit_bytes = 4;
+  uint64 last_applied_hlc = 5;
+  repeated ShardCursorEntryProto applied_by_shard = 6;
+}
+
+message SecondaryIndexRecordProto {
+  uint64 fid = 1;
+  uint64 pid = 2;
+  string name = 3;
+  uint64 create_time_hlc = 4;
+  uint64 last_applied_hlc = 5;
+  uint64 last_origin_shard_id = 6;
+  uint64 last_origin_raft_index = 7;
+  uint32 last_task_ordinal = 8;
+  uint64 tombstone_hlc = 9;
+  bool is_deleted = 10;
+}
+
+message ErrorDetailProto {
+  string error_kind = 1;
+  string message = 2;
+  uint64 shard_id = 3;
+  ShardEpochProto expected_epoch = 4;
+  ShardEpochProto actual_epoch = 5;
+  ShardDescriptorProto updated_descriptor = 6;
+  ShardDescriptorProto split_child_hint = 7;
+  bool has_leader_hint = 8;
+  uint64 leader_hint = 9;
+  bytes serialized_core_error = 10;
+}

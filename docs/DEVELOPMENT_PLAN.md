@@ -95,7 +95,7 @@ flowchart TD
   * `crates/metadb-proto/src/{lib.rs, convert.rs}`
 * **Key Invariants**:
   * Disjoint binary key prefixes: `0x01` (`MetaTable`), `0x02` (`QuotaTable`), `0x03` (`SecondaryIndexTable`), `0x04` (`DirShardDelta` for `DualModeFineGrained` sub-shards), `0x05` (`WriteIntent` for 2PC locks), `0x06` (`TxnRecord` for Primary-Anchored 2PC decisions), `0x07` (`SpilledAuxOutbox` for bounded Raft log retention).
-  * Deterministic binary codecs with explicit format version byte and CRC32C validation for `InodeAttr`, `QuotaRecord` (including `applied_index_by_shard: BTreeMap<ShardId, u64>`), `SecondaryIndexRecord` (including `tombstone_hlc`), `WriteIntent`, `TxnRecord`, and `AuxUpdateTask`.
+  * Deterministic binary codecs with explicit format version byte and CRC32C validation for `InodeAttr`, `QuotaRecord` (including `applied_by_shard: BTreeMap<ShardId, (u64, u16)>` with `prev_uid_cursor`), `SecondaryIndexRecord` (including `tombstone_ver`), `WriteIntent`, `TxnRecord`, and `AuxOutboxEntry`.
   * Bounded HLC clock-skew check (`max_clock_drift_ms`, default `500ms`) & 16-bit logical overflow safety: `HybridLogicalClock::update_checked(remote)` rejects timestamps drifting beyond `max_clock_drift_ms` ahead of local physical wall clock with `MetaDbError::ClockSkewExceeded`; if the 16-bit logical counter reaches `u16::MAX`, `HLC` increments the 48-bit physical component by `+1ms` (yielding briefly if approaching `max_clock_drift_ms`) and **never wraps `u16` to `0` at the same physical millisecond**.
   * `CompositeKeyBound` supporting both `PID`-boundary intervals `[ (start_pid, ""), (end_pid, "") )` and `DualModeFineGrained` `(PID, name)` intervals.
 * **Verification Commands**:

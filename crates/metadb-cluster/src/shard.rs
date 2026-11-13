@@ -20,7 +20,10 @@ pub enum ShardHealthState {
     Normal,
     /// Unsplittable single-PID Jumbo Shard isolated onto a dedicated BE node with peer
     /// replicas of other shards evicted.
-    JumboIsolated { dedicated_node: NodeId, dominant_pid: InodeId },
+    JumboIsolated {
+        dedicated_node: NodeId,
+        dominant_pid: InodeId,
+    },
 }
 
 /// Role of a BE node inside a shard's Raft replication group.
@@ -55,7 +58,9 @@ impl RaftMembership {
 
     /// Step 1 of online scale-out: adds `node_id` as a non-voting `Learner` replica.
     pub fn add_learner(&mut self, node_id: NodeId) {
-        self.members.entry(node_id).or_insert(RaftMemberRole::Learner);
+        self.members
+            .entry(node_id)
+            .or_insert(RaftMemberRole::Learner);
         self.conf_epoch += 1;
     }
 
@@ -150,7 +155,11 @@ impl PolicyShardSplitter {
         }
 
         if bytes_by_pid.len() <= 1 {
-            let dominant_pid = bytes_by_pid.keys().copied().next().unwrap_or(shard.start_pid);
+            let dominant_pid = bytes_by_pid
+                .keys()
+                .copied()
+                .next()
+                .unwrap_or(shard.start_pid);
             return Err(MetaDbError::UnsplittableJumboShard {
                 shard_id: shard.shard_id,
                 pid: dominant_pid,

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/metadb-core",
+    "crates/metadb-proto",
     "crates/metadb-storage",
     "crates/metadb-tx",
     "crates/metadb-cluster",
@@ -15,3 +16,21 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/rustfs/MetaDB"
 authors = ["The RustFS Authors"]
+
+[workspace.dependencies]
+bytes = "1"
+crc32c = "0.6"
+prost = "0.14.6"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.14.9"
+tonic-prost = "0.14.9"
+tonic-prost-build = "0.14.9"
+openraft = { version = "0.10.0", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"

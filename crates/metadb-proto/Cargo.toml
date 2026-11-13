@@ -1,0 +1,18 @@
+[package]
+name = "metadb-proto"
+description = "Protobuf v1 wire schemas and tonic/prost gRPC contracts for MetaDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+metadb-core = { path = "../metadb-core" }
+bincode = { workspace = true }
+prost = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }

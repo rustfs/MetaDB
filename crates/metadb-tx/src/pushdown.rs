@@ -45,6 +45,7 @@ impl PushdownExecutor {
         &self,
         engine: &LifecycleStorageEngine,
         dir_id: InodeId,
+        parent_pid: InodeId,
         uid: UserId,
         mode: u32,
         hlc: HlcTimestamp,
@@ -52,6 +53,7 @@ impl PushdownExecutor {
         let attr_key = MetaKey::dir_attr(dir_id).encode();
         let attr = InodeAttr {
             inode_id: dir_id,
+            parent_pid,
             entry_type: EntryType::DirectoryAttr,
             uid,
             mode,
@@ -104,6 +106,7 @@ impl PushdownExecutor {
 
         let attr = InodeAttr {
             inode_id: new_inode_id,
+            parent_pid: pid,
             entry_type: EntryType::File,
             uid,
             mode,
@@ -166,6 +169,7 @@ impl PushdownExecutor {
 
         let dir_entry_attr = InodeAttr {
             inode_id: new_dir_id,
+            parent_pid: pid,
             entry_type: EntryType::Directory,
             uid,
             mode,
@@ -179,7 +183,7 @@ impl PushdownExecutor {
         };
 
         parent_engine.put(child_key_bytes, dir_entry_attr.encode(), hlc);
-        self.init_directory_attr(new_dir_engine, new_dir_id, uid, mode, hlc);
+        self.init_directory_attr(new_dir_engine, new_dir_id, pid, uid, mode, hlc);
 
         self.attr_aggregator
             .record_delta(parent_engine, pid, 1, 0, hlc);
@@ -214,8 +218,8 @@ impl PushdownExecutor {
         let attr = InodeAttr::decode(&raw)?;
         if attr.entry_type != EntryType::File {
             return Err(MetaDbError::InvalidEntryType {
-                expected: "File",
-                actual: "Directory",
+                expected: "File".to_string(),
+                actual: "Directory".to_string(),
             });
         }
 
@@ -256,8 +260,8 @@ impl PushdownExecutor {
         let dir_entry_attr = InodeAttr::decode(&raw)?;
         if dir_entry_attr.entry_type != EntryType::Directory {
             return Err(MetaDbError::InvalidEntryType {
-                expected: "Directory",
-                actual: "File",
+                expected: "Directory".to_string(),
+                actual: "File".to_string(),
             });
         }
 
@@ -366,6 +370,7 @@ impl TwoPhaseCommitCoordinator {
 
     /// Atomically moves `(src_pid, src_name)` to `(dst_pid, dst_name)` across shards,
     /// updating parent attribute deltas and the `SecondaryIndexTable` (`FID -> (dst_pid, dst_name)`).
+    #[allow(clippy::too_many_arguments)]
     pub fn rename(
         &self,
         src_engine: &LifecycleStorageEngine,

@@ -19,4 +19,6 @@ pub mod raft_log;
 pub use compaction::{CompactionStats, LocalityCompactor};
 pub use engine::{LifecycleStorageEngine, PersistentEntry, StorageMetrics};
 pub use mvcc::{MemMvccStore, MvccValue, MvccVersion};
-pub use raft_log::{LogSequenceNumber, RaftLog, RaftLogEntry, RaftLogPayload, TruncationWatermarks};
+pub use raft_log::{
+    LogSequenceNumber, RaftLog, RaftLogEntry, RaftLogPayload, TruncationWatermarks,
+};

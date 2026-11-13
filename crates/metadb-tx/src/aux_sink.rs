@@ -235,35 +235,37 @@ impl AsyncAuxiliarySink {
                     .quota_table
                     .entry(uid)
                     .or_insert_with(|| QuotaRecord::new(uid, u64::MAX));
-                let prev_lsn = record
-                    .applied_lsn_by_shard
+                let prev_cursor = record
+                    .applied_by_shard
                     .get(&origin_shard_id)
                     .copied()
-                    .unwrap_or(0);
-                if lsn <= prev_lsn {
+                    .unwrap_or((0, 0));
+                if (lsn, 0u16) <= prev_cursor {
                     return false; // Duplicate replay from Raft log recovery suppressed!
                 }
                 record.used_bytes = (record.used_bytes + delta_bytes).max(0);
                 record.used_inodes = (record.used_inodes + delta_inodes).max(0);
                 record.last_applied_hlc = record.last_applied_hlc.max(hlc);
-                record.applied_lsn_by_shard.insert(origin_shard_id, lsn);
+                record.applied_by_shard.insert(origin_shard_id, (lsn, 0));
                 true
             }
             AuxUpdateTask::IndexUpsert {
+                origin_shard_id,
+                lsn,
                 hlc,
                 fid,
                 pid,
                 name,
                 create_time,
-                ..
             } => {
+                let incoming_ver = (hlc, origin_shard_id, lsn, 0u16);
                 if let Some(&del_hlc) = guard.deleted_fid_hlc.get(&fid) {
                     if hlc <= del_hlc {
                         return false;
                     }
                 }
                 if let Some(existing) = guard.secondary_index_table.get(&fid) {
-                    if hlc <= existing.last_applied_hlc {
+                    if incoming_ver <= existing.last_ver.max(existing.tombstone_ver) {
                         return false;
                     }
                 }
@@ -274,19 +276,27 @@ impl AsyncAuxiliarySink {
                         pid,
                         name,
                         create_time,
-                        last_applied_hlc: hlc,
+                        last_ver: incoming_ver,
+                        tombstone_ver: (HlcTimestamp::ZERO, 0, 0, 0),
+                        is_deleted: false,
                     },
                 );
                 true
             }
-            AuxUpdateTask::IndexDelete { hlc, fid, .. } => {
+            AuxUpdateTask::IndexDelete {
+                origin_shard_id,
+                lsn,
+                hlc,
+                fid,
+            } => {
+                let incoming_ver = (hlc, origin_shard_id, lsn, 0u16);
                 if let Some(&del_hlc) = guard.deleted_fid_hlc.get(&fid) {
                     if hlc <= del_hlc {
                         return false;
                     }
                 }
                 if let Some(existing) = guard.secondary_index_table.get(&fid) {
-                    if hlc < existing.last_applied_hlc {
+                    if incoming_ver <= existing.last_ver && hlc < existing.last_applied_hlc() {
                         return false;
                     }
                 }
