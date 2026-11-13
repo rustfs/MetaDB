@@ -371,11 +371,9 @@ impl StorageBackend for LsmStorageBackend {
         // never moves newer keys beneath an untouched intermediate `L1` SSTable!
         loop {
             let mut added_any = false;
-            for lvl_idx in 0..=target_level {
-                let existing_ids: HashSet<u64> = participating[lvl_idx]
-                    .iter()
-                    .map(|r| r.meta().file_id)
-                    .collect();
+            for (lvl_idx, part_lvl) in participating.iter_mut().enumerate().take(target_level + 1) {
+                let existing_ids: HashSet<u64> =
+                    part_lvl.iter().map(|r| r.meta().file_id).collect();
                 for sst in &base_version.levels[lvl_idx] {
                     if !existing_ids.contains(&sst.meta().file_id)
                         && sst.meta().max_key >= union_min
@@ -383,7 +381,7 @@ impl StorageBackend for LsmStorageBackend {
                     {
                         union_min = union_min.min(sst.meta().min_key.clone());
                         union_max = union_max.max(sst.meta().max_key.clone());
-                        participating[lvl_idx].push(sst.clone());
+                        part_lvl.push(sst.clone());
                         added_any = true;
                     }
                 }
