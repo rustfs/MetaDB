@@ -93,12 +93,14 @@ mod route_conv {
     }
 }
 
-fn decode_uuid(bytes: &[u8]) -> u128 {
-    if bytes.len() == 16 {
-        u128::from_be_bytes(bytes.try_into().unwrap())
-    } else {
-        0
-    }
+fn decode_req_txn_id(bytes: &[u8]) -> Result<u128, Status> {
+    metadb_proto::convert::decode_u128_be(bytes)
+        .map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
+fn decode_req_optional_uuid(bytes: &[u8]) -> Result<u128, Status> {
+    metadb_proto::convert::decode_optional_u128_be(bytes)
+        .map_err(|e| Status::invalid_argument(e.to_string()))
 }
 
 #[derive(Clone)]
@@ -691,7 +693,7 @@ impl TransactionService for MetaDbGrpcService {
             return Err(Status::invalid_argument("missing routing header"));
         };
         let ep: ShardEpoch = hdr.expected_epoch.unwrap_or_default().into();
-        let txn_id = decode_uuid(&req.txn_id_be);
+        let txn_id = decode_req_txn_id(&req.txn_id_be)?;
 
         let mut intents = Vec::with_capacity(req.encoded_intent_keys.len());
         for (ik, ir) in req
@@ -761,7 +763,7 @@ impl TransactionService for MetaDbGrpcService {
             }));
         };
         let cmd = TxRaftCmd::CommitPrimary2pc {
-            txn_id: decode_uuid(&req.txn_id_be),
+            txn_id: decode_req_txn_id(&req.txn_id_be)?,
             commit_hlc: HlcTimestamp(req.commit_hlc),
             rename_fence_token: req.has_rename_fence_token.then_some(req.rename_fence_token),
         };
@@ -800,7 +802,7 @@ impl TransactionService for MetaDbGrpcService {
             }));
         };
         let cmd = TxRaftCmd::CommitSecondary2pc {
-            txn_id: decode_uuid(&req.txn_id_be),
+            txn_id: decode_req_txn_id(&req.txn_id_be)?,
             commit_hlc: HlcTimestamp(req.commit_hlc),
             target_user_keys: req.target_user_keys,
         };
@@ -849,7 +851,7 @@ impl TransactionService for MetaDbGrpcService {
             }));
         };
         let cmd = TxRaftCmd::Abort2pc {
-            txn_id: decode_uuid(&req.txn_id_be),
+            txn_id: decode_req_txn_id(&req.txn_id_be)?,
             target_user_keys: req.target_user_keys,
         };
         let payload = bincode::serialize(&cmd).map_err(|e| Status::internal(e.to_string()))?;
@@ -877,7 +879,7 @@ impl TransactionService for MetaDbGrpcService {
             }
         };
         let cmd = TxRaftCmd::CheckAndAbortExpiredTxn {
-            txn_id: decode_uuid(&req.txn_id_be),
+            txn_id: decode_req_txn_id(&req.txn_id_be)?,
             caller_hlc: HlcTimestamp(req.caller_hlc),
         };
         let payload = bincode::serialize(&cmd).map_err(|e| Status::internal(e.to_string()))?;
@@ -1026,7 +1028,7 @@ impl ControlPlaneService for MetaDbGrpcService {
             _ => return Err(Status::invalid_argument("unknown id_kind")),
         };
         match self.global_manager.id_allocator().allocate_block(
-            decode_uuid(&req.request_uuid_be),
+            decode_req_optional_uuid(&req.request_uuid_be)?,
             kind,
             req.count,
         ) {
@@ -1056,7 +1058,7 @@ impl ControlPlaneService for MetaDbGrpcService {
             }));
         };
         match cell.alloc_split_plan(
-            decode_uuid(&req.request_uuid_be),
+            decode_req_optional_uuid(&req.request_uuid_be)?,
             req.parent_shard_id,
             req.split_key,
             req.target_version,

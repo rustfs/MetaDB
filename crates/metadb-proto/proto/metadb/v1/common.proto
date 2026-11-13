@@ -78,6 +78,9 @@ message SecondaryIndexRecordProto {
   uint32 last_task_ordinal = 8;
   uint64 tombstone_hlc = 9;
   bool is_deleted = 10;
+  uint64 tombstone_origin_shard_id = 11;
+  uint64 tombstone_origin_raft_index = 12;
+  uint32 tombstone_task_ordinal = 13;
 }
 
 message ErrorDetailProto {

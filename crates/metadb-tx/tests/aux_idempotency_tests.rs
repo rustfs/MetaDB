@@ -303,6 +303,53 @@ async fn test_aux_outbox_spill_contiguous_frontiers_gap_rejection_and_cleanup() 
         "stale pre-unlink IndexUpsert must not resurrect unlinked FID"
     );
 
+    // 6. Out-of-order `IndexDelete` arriving BEFORE `IndexUpsert` at identical HLC (`task_ordinal` tie-breaker):
+    //    `tombstone_ver = (same_hlc, 1, 50, 1) > incoming_ver = (same_hlc, 1, 50, 0)` must suppress resurrection!
+    let same_hlc = clock.now();
+    idx_grp
+        .propose(
+            idx_grp.current_epoch(),
+            clock.now(),
+            bincode::serialize(&TxRaftCmd::ApplyAuxBatch {
+                entries: vec![AuxOutboxEntry {
+                    origin_shard_id: 1,
+                    origin_raft_index: 50,
+                    task_ordinal: 1,
+                    hlc: same_hlc,
+                    payload: AuxTaskPayload::IndexDelete { fid: 9999 },
+                }],
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    idx_grp
+        .propose(
+            idx_grp.current_epoch(),
+            clock.now(),
+            bincode::serialize(&TxRaftCmd::ApplyAuxBatch {
+                entries: vec![AuxOutboxEntry {
+                    origin_shard_id: 1,
+                    origin_raft_index: 50,
+                    task_ordinal: 0,
+                    hlc: same_hlc,
+                    payload: AuxTaskPayload::IndexUpsert {
+                        fid: 9999,
+                        pid: ROOT_INODE_ID,
+                        name: "reordered.bin".to_string(),
+                        create_time: same_hlc,
+                    },
+                }],
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        tx.get_secondary_index(9999).await.unwrap().is_none(),
+        "out-of-order IndexDelete persisted before IndexUpsert must suppress lower-tuple resurrection"
+    );
+
     meta_grp.shutdown().await.unwrap();
     quota_grp.shutdown().await.unwrap();
     idx_grp.shutdown().await.unwrap();

@@ -955,7 +955,7 @@ impl TxStateMachineHandler {
                                     name: String::new(),
                                     create_time: HlcTimestamp::ZERO,
                                     last_ver: (HlcTimestamp::ZERO, 0, 0, 0),
-                                    tombstone_ver: incoming_ver,
+                                    tombstone_ver: (HlcTimestamp::ZERO, 0, 0, 0),
                                     is_deleted: true,
                                 },
                             };
