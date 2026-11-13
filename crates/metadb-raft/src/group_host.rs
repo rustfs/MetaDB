@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use openraft::async_runtime::watch::WatchReceiver;
 use openraft::errors::{ClientWriteError, RaftError};
 use openraft::{BasicNode, Config};
 use serde::{Deserialize, Serialize};
@@ -136,16 +137,53 @@ impl ShardRaftGroup {
         }))
     }
 
-    /// Bootstraps initial cluster membership (e.g., `1-Voter` in Stage 1 or `3-Voter` on split child).
+    /// Bootstraps initial cluster membership (e.g., `1-Voter` in Stage 1 or `3-Voter` on split child)
+    /// and deterministically awaits initial leader election and membership application for single-voter groups.
     pub async fn initialize_if_needed(&self, members: BTreeMap<NodeId, String>) -> Result<()> {
+        let should_wait_leader = members.len() == 1 && members.contains_key(&self.node_id);
         let nodes: BTreeMap<NodeId, BasicNode> = members
             .into_iter()
             .map(|(id, addr)| (id, BasicNode::new(addr)))
             .collect();
         match self.raft.initialize(nodes).await {
-            Ok(()) => Ok(()),
-            Err(RaftError::APIError(openraft::errors::InitializeError::NotAllowed(_))) => Ok(()),
-            Err(e) => Err(MetaDbError::ConsensusError(e.to_string())),
+            Ok(()) => {}
+            Err(RaftError::APIError(openraft::errors::InitializeError::NotAllowed(_))) => {}
+            Err(e) => return Err(MetaDbError::ConsensusError(e.to_string())),
+        }
+        if should_wait_leader {
+            self.wait_for_leader(Duration::from_secs(5)).await?;
+        }
+        Ok(())
+    }
+
+    /// Waits up to `timeout` until OpenRaft elects a leader and applies the current membership log entry.
+    pub async fn wait_for_leader(&self, timeout: Duration) -> Result<NodeId> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut rx = self.raft.metrics();
+        loop {
+            {
+                let m = rx.borrow_watched();
+                if let Some(leader) = m.current_leader {
+                    if m.last_applied.is_some() {
+                        return Ok(leader);
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(MetaDbError::ConsensusError(format!(
+                    "timed out waiting for leader election on shard {}",
+                    self.shard_id
+                )));
+            }
+            if tokio::time::timeout_at(deadline, rx.changed())
+                .await
+                .is_err()
+            {
+                return Err(MetaDbError::ConsensusError(format!(
+                    "timed out waiting for leader metrics change on shard {}",
+                    self.shard_id
+                )));
+            }
         }
     }
 

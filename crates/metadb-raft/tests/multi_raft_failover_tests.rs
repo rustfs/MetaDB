@@ -83,9 +83,7 @@ async fn test_online_1_to_3_voter_snapshot_promotion_and_leader_failover() {
         .initialize_if_needed(BTreeMap::from([(1u64, addr1.clone())]))
         .await
         .unwrap();
-
-    // Wait briefly for single-voter leadership.
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    node1.wait_for_leader(Duration::from_secs(5)).await.unwrap();
     let ep1 = node1.current_epoch();
     for i in 0..25u64 {
         let cmd = BasicKvCommand::Put {
@@ -124,6 +122,7 @@ async fn test_online_1_to_3_voter_snapshot_promotion_and_leader_failover() {
     )
     .await
     .unwrap();
+    node1.wait_for_leader(Duration::from_secs(5)).await.unwrap();
 
     // Write 1 more entry committed across the 3-Voter quorum!
     let ep_3voter = node1.current_epoch();
