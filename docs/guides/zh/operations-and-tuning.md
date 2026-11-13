@@ -4,7 +4,7 @@
 
 ---
 
-## 1. `metadb-ctl` 运维命令行工具 `[目标: Phase 6]`
+## 1. `metadb-ctl` 运维命令行工具 `[已实现]`
 
 ```bash
 # 查看各 Cell、BE 节点健康状态、分片分布与 Raft 三水位延迟

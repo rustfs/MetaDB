@@ -4,7 +4,7 @@
 
 ---
 
-## 1. `metadb-ctl` 管理 CLI `[対象: Phase 6]`
+## 1. `metadb-ctl` 管理 CLI `[実装済]`
 
 ```bash
 # クラスター全体の Cell・BE ノード状態・3 ウォーターマーク遅延を確認

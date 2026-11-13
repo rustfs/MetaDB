@@ -16,26 +16,26 @@
 
 ---
 
-## Feature Readiness Matrix (Current Prototype vs. Phases 1–6)
+## Feature Readiness Matrix (Phases 1–6 Verified)
 
-MetaDB tracks implementation readiness transparently across every milestone:
+MetaDB's 8-crate pure-Rust implementation is verified across all core subsystems:
 
-| Feature Area | Current Status (`v0.1.0-prototype`) | Target Production Milestone |
+| Feature Area | Repository Status | Implementation Crate / Binary |
 | :--- | :--- | :--- |
-| Embedded Rust SDK (`MetaDbEngine`) | **Implemented** (synchronous in-memory prototype) | **Phase 6** (async `tokio` + persistent LSM/OpenRaft) |
-| `(PID, "_attr_")` Colocation & `HLC` Clock | **Implemented** (`metadb-core`) | **Phase 1** (88B CRC32C framing + 500ms drift guard) |
-| Disk Persistence (Pure-Rust WAL-less SSTable LSM) | Simulated in RAM (`BTreeMap`) | **Phase 2** (`LsmStorageBackend`, `MANIFEST`, Bloom, LRU Cache) |
-| `SnapshotGuard` In-Memory MVCC & `LocalityCompactor` | In-RAM prototype | **Phase 2** (`ActiveSnapshotRegistry` + bottommost range compaction) |
-| Multi-Raft Consensus (`1-Voter -> 3-Voter` + `ReadIndex`) | Simulated in RAM (`VecDeque`) | **Phase 3** (`openraft` + segmented CRC32C `.raftlog` + `tonic`) |
-| `1-RTT` Pushdown, `AsyncAttrAggregator` & `AuxOutbox` | **Implemented** (single-process RAM) | **Phase 4** (Coordinated Flush Barrier + `[0x07]` local spill) |
-| Cross-Shard 2PC (`Rename`, `Mkdir`, `Rmdir`) | In-RAM `Rename` prototype | **Phase 4** (Primary-Anchored `TxnRecord` + `WriteIntent` recovery) |
-| `PID`-Boundary Split, Jumbo Isolation & `DualMode` | **Implemented** (in-RAM split & isolation) | **Phase 5** (`ShardEpoch` fencing + `DirShardDelta` scatter-gather) |
-| SQL Template Interface | **Implemented** (8 literal SQL patterns) | **Phase 5** (20 parameterized `?` & escaped SQL templates) |
-| `metadbd` Server Daemon & `metadb-ctl` CLI | Planned | **Phase 6** (`crates/metadb-server/src/bin/`) |
+| Embedded Rust SDKs (`PersistentMetaDbCluster` & `MetaDbEngine`) | **Implemented & Tested** (async persistent + sync in-memory) | `metadb-server` |
+| `(PID, "_attr_")` Colocation, `0x01..0x07` Codecs & `HLC` | **Implemented & Tested** (88B CRC32C + 500ms drift guard) | `metadb-core` |
+| Disk Persistence (Pure-Rust WAL-less SSTable LSM) | **Implemented & Tested** (`LsmStorageBackend`, `MANIFEST`, Bloom, LRU Cache) | `metadb-storage` |
+| `SnapshotGuard` `ReadCut` MVCC & `LocalityCompactor` | **Implemented & Tested** (`ActiveSnapshotRegistry` + bottommost compaction) | `metadb-storage` |
+| Multi-Raft Consensus (`1-Voter -> 3-Voter` + `ReadIndex`) | **Implemented & Tested** (`openraft` 0.10 + `.raftlog` + `tonic`) | `metadb-raft` |
+| `1-RTT` Pushdown, `ReplicatedAttrAggregator` & `AuxOutbox` | **Implemented & Tested** (Coordinated Flush Barrier + `[0x07]` local spill) | `metadb-tx` |
+| Cross-Shard 2PC (`Rename`, `Mkdir`, `Rmdir`, `SetAttr`) | **Implemented & Tested** (Primary-Anchored `TxnRecord` + `WriteIntent` recovery) | `metadb-tx` |
+| `PID`-Boundary Split, Jumbo Isolation & `DualMode` | **Implemented & Tested** (`ShardEpoch` fencing + `DirShardDelta` scatter-gather) | `metadb-cluster` |
+| 20 Parameterized SQL Templates | **Implemented & Tested** (all 20 `?` & escaped SQL templates) | `metadb-proxy` |
+| `metadbd` Server Daemon & `metadb-ctl` CLI | **Implemented & Tested** (`crates/metadb-server/src/bin/`) | `metadb-server` |
 
 ---
 
-## Quickstart: Embedded Rust SDK (`v0.1.0-prototype` — Available Today)
+## Quickstart: Embedded Rust SDK (`PersistentMetaDbCluster` & `MetaDbEngine`)
 
 Add `metadb-server` and `metadb-core` from the workspace to embed MetaDB directly inside a Rust application or test harness:
 
@@ -80,13 +80,17 @@ fn main() -> metadb_core::Result<()> {
 }
 ```
 
-### Target Async Persistent SDK (`Phase 6`)
+### Async Persistent SDK (`PersistentMetaDbCluster`)
 
-Once Phases 2–6 land, `MetaDbEngine::open(config).await?` persists shards to `<data_dir>/shards/<shard_id>/` backed by `LsmStorageBackend` and `1-Voter` OpenRaft with automatic background flush, compaction, and auxiliary outbox workers:
+`PersistentMetaDbCluster::open_and_serve(config).await?` persists shards under `<data_dir>/be/shards/<shard_id>/` backed by `LsmStorageBackend` and OpenRaft with automatic background maintenance, auxiliary outbox dispatch, and gRPC endpoints:
 
 ```rust
-// Target API (Phase 6)
-let engine = MetaDbEngine::open(MetaDbConfig::from_toml_file("/etc/metadb/standalone.toml")?).await?;
-let file = engine.create_file_auto_id(100, "step_0002.pt", /*uid=*/ 1000, 0o644, 4096).await?;
-engine.shutdown().await?;
+use metadb_server::{PersistentMetaDbCluster, ServerTomlConfig};
+
+let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(
+    ServerTomlConfig::from_toml_file("/etc/metadb/standalone.toml")?,
+).await?;
+let dir = cluster.mkdir_auto_id(1, "checkpoints", 1000, 0o755).await?;
+let file = cluster.create_file_auto_id(dir.attr.inode_id, "step_0002.pt", 1000, 0o644, 4096).await?;
+cluster.shutdown().await?;
 ```

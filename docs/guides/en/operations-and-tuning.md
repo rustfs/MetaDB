@@ -4,7 +4,7 @@
 
 ---
 
-## 1. `metadb-ctl` Administration CLI `[Target: Phase 6]`
+## 1. `metadb-ctl` Administration CLI `[Implemented]`
 
 `metadb-ctl` connects to `ControlPlaneService` and `MetadataService` over gRPC to inspect cluster topology, manage shards, execute SQL templates, and run synthetic benchmarks:
 

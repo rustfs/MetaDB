@@ -6,7 +6,7 @@ MetaDB nutzt über alle Ausbaustufen hinweg **exakt dieselbe WAL-freie LSM-Speic
 
 ---
 
-## Stufe 1: Eigenständiger Einzelknoten (`metadbd --role all-in-one`) `[Ziel: Phase 6]`
+## Stufe 1: Eigenständiger Einzelknoten (`metadbd --role all-in-one`) `[Implementiert]`
 
 Im Einzelknotenmodus laufen `GlobalManager`, `CellLocalManager`, `MetaCache`, `Proxy` und das **`1-Voter`-OpenRaft**-Speicher-Backend in einem einzigen Prozess. Auf ein separates KV-WAL wird verzichtet, da das CRC32C-gesicherte `.raftlog` bereits sequenzielle Absturzsicherheit garantiert.
 
@@ -40,13 +40,13 @@ metadbd --config /etc/metadb/standalone.toml
 
 ---
 
-## Stufe 2: Dynamisches Shard-Splitting an `PID`-Grenzen `[Prototyp implementiert | Persistenz & Epoch: Phase 5]`
+## Stufe 2: Dynamisches Shard-Splitting an `PID`-Grenzen `[Implementiert]`
 
 Überschreitet ein Shard `shard_split_threshold_bytes`, teilt `PolicyShardSplitter` ihn strikt entlang einer `group_key = PID`-Grenze (`[0x01][pid: 8B BE]`), sodass `(PID, "_attr_")` und sämtliche Kind-Einträge gemeinsam auf demselben Shard verbleiben.
 
 ---
 
-## Stufe 3: Unterbrechungsfreie Skalierung auf `3-Voter` Multi-Raft & Multi-Cell `[Ziel: Phasen 3–6]`
+## Stufe 3: Unterbrechungsfreie Skalierung auf `3-Voter` Multi-Raft & Multi-Cell `[Implementiert]`
 
 ### 3.1 Online-Hochstufung von `1-Voter` auf `3-Voter` HA
 

@@ -4,11 +4,11 @@
 
 MetaDB runs the **exact same WAL-less LSM storage engine and OpenRaft state machine** across all three operational stages, allowing deployments to start on a single machine and expand online to a multi-Cell cluster without offline migration.
 
-> **Milestone Note**: In-process multi-shard splitting, Jumbo isolation, and multi-Cell routing prototypes are implemented today in `metadb-cluster` / `metadb-server`; the standalone `metadbd` binary, disk persistence, and `tonic` gRPC network transport land across **Phases 2–6**.
+> **Implementation Status**: Persistent WAL-less SSTable LSM, `openraft` Multi-Raft (`1-Voter -> 3-Voter`), Epoch-fenced `PID` & `DualModeFineGrained` shard splitting, Jumbo isolation, `metadbd`, and `metadb-ctl` are implemented and verified across the 8-crate workspace.
 
 ---
 
-## Stage 1: Standalone Single-Node Deployment (`metadbd --role all-in-one`) `[Target: Phase 6]`
+## Stage 1: Standalone Single-Node Deployment (`metadbd --role all-in-one`) `[Implemented]`
 
 In Stage 1, `GlobalManager`, `CellLocalManager`, `MetaCache`, `Proxy`, and the `BE` storage engine run inside a single process backed by **`1-Voter` OpenRaft**. Local KV WAL files remain disabled because the segmented CRC32C `.raftlog` provides full crash durability with a single sequential `fdatasync`.
 
@@ -46,7 +46,7 @@ metadbd --config /etc/metadb/standalone.toml
 
 ---
 
-## Stage 2: Single-Node Automatic `PID`-Boundary Shard Splitting `[Prototype Implemented | Disk & Epoch Fencing: Phase 5]`
+## Stage 2: Single-Node Automatic `PID`-Boundary Shard Splitting `[Implemented]`
 
 As metadata grows past `shard_split_threshold_bytes`, `CellLocalManager` and `PolicyShardSplitter` automatically split `MetaTable` shards along `group_key = PID` boundaries (`[0x01][pid: 8B BE]`):
 * `(PID, "_attr_")` and all direct children `(PID, child_name)` stay colocated on the same shard.
@@ -54,7 +54,7 @@ As metadata grows past `shard_split_threshold_bytes`, `CellLocalManager` and `Po
 
 ---
 
-## Stage 3: Online Scale-Out to `3-Voter` Multi-Raft & Multi-Cell Clusters `[Target: Phases 3–6]`
+## Stage 3: Online Scale-Out to `3-Voter` Multi-Raft & Multi-Cell Clusters `[Implemented]`
 
 ### Step 3.1: Zero-Downtime Upgrade from `1-Voter` to `3-Voter` HA
 

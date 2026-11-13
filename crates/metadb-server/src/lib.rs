@@ -6,19 +6,42 @@
 //! - **Stage 3 (Distributed Multi-Cell Cluster)**: Zero-downtime Raft `ConfChange` (`1-Voter -> 3-Voter`),
 //!   Jumbo Shard dedicated-node isolation, and multi-Cell federation under `GlobalManager`.
 
-use std::sync::Arc;
+pub mod config;
+pub mod grpc_services;
+pub mod metrics;
 
-use metadb_cluster::{CellId, CellLocalManager, GlobalManager, MetaCache, ShardDescriptor};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::Server;
+
+use metadb_cluster::{
+    CellId, CellLocalManager, CompositeMetaCache, DurableCellManager, DurableGlobalManager,
+    DurableIdAllocator, GlobalManager, LocalIdBuffer, MetaCache, ShardDescriptor,
+};
 use metadb_core::{
-    FileId, HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId, MetaEntry, NodeId, QuotaRecord,
-    Result, SecondaryIndexRecord, UserId, ROOT_INODE_ID,
+    CompositeKeyRange, FileId, HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId, MetaEntry,
+    NodeId, QuotaRecord, Result, SecondaryIndexRecord, UserId, ROOT_INODE_ID,
 };
-use metadb_proxy::{MetadataSqlCommand, SqlTemplateParser};
+use metadb_proto::control_plane_service_server::ControlPlaneServiceServer;
+use metadb_proto::metadata_service_server::MetadataServiceServer;
+use metadb_proto::raft_transport_service_server::RaftTransportServiceServer;
+use metadb_proto::transaction_service_server::TransactionServiceServer;
+use metadb_proxy::{MetadataSqlCommand, SqlTemplateParser, StatelessProxyRouter};
+use metadb_raft::{MultiRaftTransportServer, ShardGroupHost};
 use metadb_storage::mvcc::DEFAULT_MVCC_RETENTION_MS;
-use metadb_storage::LifecycleStorageEngine;
+use metadb_storage::{LifecycleStorageEngine, ShardedBlockCache};
 use metadb_tx::{
-    AsyncAttrAggregator, AsyncAuxiliarySink, PushdownExecutor, TwoPhaseCommitCoordinator,
+    AsyncAttrAggregator, AsyncAuxiliarySink, AuxDispatcher, DistributedTxRouter, PushdownExecutor,
+    TwoPhaseCommitCoordinator, TxnRecoveryWorker,
 };
+
+pub use config::{ServerRole, ServerTomlConfig};
+pub use grpc_services::MetaDbGrpcService;
+pub use metrics::{collect_cluster_metrics, render_prometheus_metrics, ClusterMetricsSnapshot};
 
 /// Result returned from executing a lightweight metadata SQL statement through `MetaDbEngine`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,5 +367,254 @@ impl MetaDbEngine {
             }
         }
         out
+    }
+}
+
+/// Production asynchronous, disk-persistent MetaDB server & embedded SDK (`PersistentMetaDbCluster`).
+///
+/// Orchestrates:
+/// - `DurableGlobalManager` + `DurableCellManager` + `CompositeMetaCache` + `DurableIdAllocator`
+/// - `ShardGroupHost` (`openraft` Multi-Raft + WAL-less `LsmStorageBackend`)
+/// - `DistributedTxRouter` + `StatelessProxyRouter`
+/// - Background `AuxDispatcher` & `TxnRecoveryWorker` loops
+/// - Multiplexed `tonic` gRPC server (`MetadataService`, `TransactionService`, `ControlPlaneService`, `RaftTransportService`)
+pub struct PersistentMetaDbCluster {
+    config: ServerTomlConfig,
+    clock: Arc<HybridLogicalClock>,
+    id_buffer: Arc<LocalIdBuffer>,
+    host: Arc<ShardGroupHost>,
+    cell_manager: Arc<DurableCellManager>,
+    global_manager: Arc<DurableGlobalManager>,
+    tx_router: Arc<DistributedTxRouter>,
+    proxy_router: Arc<StatelessProxyRouter>,
+    shutdown_tx: watch::Sender<bool>,
+    task_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl PersistentMetaDbCluster {
+    /// Opens or bootstraps a persistent MetaDB instance from `config` and starts its gRPC listener
+    /// (binding to `config.node.grpc_listen_addr`, e.g., `"127.0.0.1:0"` for OS-assigned ephemeral ports).
+    pub async fn open_and_serve(config: ServerTomlConfig) -> Result<(Arc<Self>, String)> {
+        let listener = TcpListener::bind(&config.node.grpc_listen_addr).await?;
+        let bound_addr = listener.local_addr()?.to_string();
+
+        let clock = Arc::new(HybridLogicalClock::with_max_drift_ms(
+            config.clock.max_clock_drift_ms,
+        ));
+        let block_cache = Arc::new(ShardedBlockCache::new(config.storage.block_cache_bytes));
+        let id_allocator = Arc::new(DurableIdAllocator::open(
+            config.node.data_dir.join("global_allocator"),
+        )?);
+        let id_buffer = Arc::new(LocalIdBuffer::new(
+            id_allocator.clone(),
+            config.node.node_id,
+        ));
+        let meta_cache = Arc::new(CompositeMetaCache::new());
+
+        let host = Arc::new(ShardGroupHost::open(
+            config.node.node_id,
+            config.node.data_dir.join("be"),
+            block_cache,
+            clock.clone(),
+        )?);
+
+        // Start RaftTransportService BEFORE initializing Multi-Raft groups so multi-node RPCs resolve immediately!
+        let raft_router = host.router().clone();
+        let cell_manager = DurableCellManager::open_or_bootstrap(
+            config.node.cell_id,
+            config
+                .node
+                .data_dir
+                .join(format!("cell_{}", config.node.cell_id)),
+            host.clone(),
+            bound_addr.clone(),
+            config.sharding.bootstrap_table_shards,
+            config.sharding.shard_split_threshold_bytes,
+            config.to_lsm_config(),
+            config.raft_options.clone(),
+            id_allocator.clone(),
+            meta_cache.clone(),
+        )
+        .await?;
+
+        let global_manager = Arc::new(DurableGlobalManager::new(
+            clock.clone(),
+            id_allocator,
+            meta_cache,
+        ));
+        global_manager.register_cell(CompositeKeyRange::all_user_tables(), cell_manager.clone());
+
+        let tx_router = Arc::new(DistributedTxRouter::new(
+            config.node.node_id,
+            clock.clone(),
+            global_manager.clone(),
+        ));
+        let proxy_router = Arc::new(StatelessProxyRouter::new(tx_router.clone()));
+
+        // Ensure root directory `/` (`ROOT_INODE_ID = 1`) exists idempotently on bootstrap!
+        if tx_router.dirstat(ROOT_INODE_ID).await.is_err() {
+            let _ = tx_router
+                .init_dir_attr(ROOT_INODE_ID, ROOT_INODE_ID, 0, 0o755)
+                .await;
+        }
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let grpc_svc = MetaDbGrpcService::new(
+            global_manager.clone(),
+            tx_router.clone(),
+            proxy_router.clone(),
+        );
+
+        let grpc_handle = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(MetadataServiceServer::new(grpc_svc.clone()))
+                .add_service(TransactionServiceServer::new(grpc_svc.clone()))
+                .add_service(ControlPlaneServiceServer::new(grpc_svc))
+                .add_service(RaftTransportServiceServer::new(
+                    MultiRaftTransportServer::new(raft_router),
+                ))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.changed().await;
+                })
+                .await;
+        });
+
+        let cluster = Arc::new(Self {
+            config,
+            clock,
+            id_buffer,
+            host,
+            cell_manager,
+            global_manager,
+            tx_router,
+            proxy_router,
+            shutdown_tx,
+            task_handles: tokio::sync::Mutex::new(vec![grpc_handle]),
+        });
+
+        // Background maintenance task (`AuxDispatcher` + `TxnRecoveryWorker` every 250ms).
+        let bg_cluster = Arc::downgrade(&cluster);
+        let mut bg_rx = cluster.shutdown_tx.subscribe();
+        let bg_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = bg_rx.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                        let Some(c) = bg_cluster.upgrade() else { break; };
+                        let _ = c.run_maintenance_tick().await;
+                    }
+                }
+            }
+        });
+        cluster.task_handles.lock().await.push(bg_handle);
+
+        Ok((cluster, bound_addr))
+    }
+
+    pub fn config(&self) -> &ServerTomlConfig {
+        &self.config
+    }
+
+    pub fn tx_router(&self) -> &Arc<DistributedTxRouter> {
+        &self.tx_router
+    }
+
+    pub fn proxy_router(&self) -> &Arc<StatelessProxyRouter> {
+        &self.proxy_router
+    }
+
+    pub fn cell_manager(&self) -> &Arc<DurableCellManager> {
+        &self.cell_manager
+    }
+
+    pub fn global_manager(&self) -> &Arc<DurableGlobalManager> {
+        &self.global_manager
+    }
+
+    pub fn id_buffer(&self) -> &Arc<LocalIdBuffer> {
+        &self.id_buffer
+    }
+
+    /// Creates a file under `pid` automatically allocating bit-63 `InodeId` and backing `FileId`.
+    pub async fn create_file_auto_id(
+        &self,
+        pid: InodeId,
+        name: &str,
+        uid: UserId,
+        mode: u32,
+        size_bytes: i64,
+    ) -> Result<MetaEntry> {
+        let inode_id = self.id_buffer.next_file_inode_id()?;
+        let fid = self.id_buffer.next_file_id()?;
+        self.tx_router
+            .create_file(pid, name, inode_id, fid, uid, mode, size_bytes)
+            .await
+    }
+
+    /// Creates a subdirectory under `pid` automatically allocating a directory `PID` (bit 63 = `0`).
+    pub async fn mkdir_auto_id(
+        &self,
+        pid: InodeId,
+        name: &str,
+        uid: UserId,
+        mode: u32,
+    ) -> Result<MetaEntry> {
+        let dir_id = self.id_buffer.next_dir_inode_id()?;
+        self.tx_router.mkdir(pid, name, dir_id, uid, mode).await
+    }
+
+    /// Runs one deterministic pass of `AuxDispatcher`, `TxnRecoveryWorker`, and split checks.
+    pub async fn run_maintenance_tick(&self) -> Result<()> {
+        for cell in self.global_manager.all_cells() {
+            for (_, grp, handler) in cell.local_shard_handles() {
+                let _ = AuxDispatcher::drain_shard_outbox(
+                    &grp,
+                    &handler,
+                    self.global_manager.as_ref(),
+                    &self.clock,
+                )
+                .await;
+                let _ = TxnRecoveryWorker::run_recovery_pass_on_shard(
+                    &grp,
+                    &handler,
+                    self.global_manager.as_ref(),
+                    &self.clock,
+                )
+                .await;
+                let _ = cell
+                    .maybe_split_or_isolate_shard(grp.shard_id(), false)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flushes all local shard MemTables to SSTables and drains auxiliary outboxes.
+    pub async fn flush_all(&self) -> Result<()> {
+        self.run_maintenance_tick().await?;
+        for cell in self.global_manager.all_cells() {
+            for (_, grp, _) in cell.local_shard_handles() {
+                grp.state_machine().flush_to_lsm()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn metrics_snapshot(&self) -> ClusterMetricsSnapshot {
+        collect_cluster_metrics(&self.global_manager)
+    }
+
+    /// Gracefully stops gRPC/background loops, flushes all shard state to disk, and stops OpenRaft groups.
+    pub async fn shutdown(&self) -> Result<()> {
+        let _ = self.shutdown_tx.send(true);
+        let handles: Vec<_> = {
+            let mut guard = self.task_handles.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        for h in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+        }
+        self.flush_all().await?;
+        self.host.shutdown_all().await
     }
 }

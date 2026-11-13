@@ -1,7 +1,7 @@
 //! Pluggable `StorageBackend` trait with pure-Rust WAL-less `LsmStorageBackend` and `InMemoryBackend`.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -100,6 +100,7 @@ struct LsmState {
 pub struct LsmStorageBackend {
     shard_id: ShardId,
     lsm_dir: PathBuf,
+    _lock_file: File,
     block_cache: Arc<ShardedBlockCache>,
     bloom_bits_per_key: usize,
     l0_compaction_trigger: usize,
@@ -116,6 +117,20 @@ impl LsmStorageBackend {
         bloom_bits_per_key: usize,
     ) -> Result<Self> {
         let lsm_dir = lsm_dir.as_ref().to_path_buf();
+        fs::create_dir_all(&lsm_dir)?;
+        let lock_path = lsm_dir.join("LOCK");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        lock_file.try_lock().map_err(|e| {
+            MetaDbError::StorageIoError(format!(
+                "failed to acquire exclusive lock on {:?}: {}",
+                lock_path, e
+            ))
+        })?;
         let (manifest, recovered) = ManifestLog::open_or_create(&lsm_dir)?;
 
         let mut readers = Vec::with_capacity(recovered.live_files.len());
@@ -130,6 +145,7 @@ impl LsmStorageBackend {
         Ok(Self {
             shard_id,
             lsm_dir,
+            _lock_file: lock_file,
             block_cache,
             bloom_bits_per_key: bloom_bits_per_key.max(4),
             l0_compaction_trigger: DEFAULT_L0_COMPACTION_TRIGGER,
@@ -347,19 +363,33 @@ impl StorageBackend for LsmStorageBackend {
                 });
             }
         }
-        let (union_min, union_max) = (union_min.unwrap(), union_max.unwrap());
+        let (mut union_min, mut union_max) = (union_min.unwrap(), union_max.unwrap());
         let target_level = deepest_level.max(1);
 
-        let existing_target_ids: HashSet<u64> = participating[target_level]
-            .iter()
-            .map(|r| r.meta().file_id)
-            .collect();
-        for sst in &base_version.levels[target_level] {
-            if !existing_target_ids.contains(&sst.meta().file_id)
-                && sst.meta().max_key >= union_min
-                && sst.meta().min_key <= union_max
-            {
-                participating[target_level].push(sst.clone());
+        // Iteratively expand participating SSTables across ALL levels `0..=target_level` overlapping
+        // `[union_min, union_max]` until fixed point so rewriting wide `L0` files into `target_level >= 2`
+        // never moves newer keys beneath an untouched intermediate `L1` SSTable!
+        loop {
+            let mut added_any = false;
+            for lvl_idx in 0..=target_level {
+                let existing_ids: HashSet<u64> = participating[lvl_idx]
+                    .iter()
+                    .map(|r| r.meta().file_id)
+                    .collect();
+                for sst in &base_version.levels[lvl_idx] {
+                    if !existing_ids.contains(&sst.meta().file_id)
+                        && sst.meta().max_key >= union_min
+                        && sst.meta().min_key <= union_max
+                    {
+                        union_min = union_min.min(sst.meta().min_key.clone());
+                        union_max = union_max.max(sst.meta().max_key.clone());
+                        participating[lvl_idx].push(sst.clone());
+                        added_any = true;
+                    }
+                }
+            }
+            if !added_any {
+                break;
             }
         }
         participating[0].sort_by(|a, b| {

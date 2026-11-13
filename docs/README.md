@@ -6,7 +6,7 @@ Welcome to the official documentation hub for **MetaDB** (`rustfs/MetaDB`), a 10
 
 ## Multilingual User & Operator Guides
 
-Select your preferred language below. Every guide suite documents both **currently available capabilities (`v0.1.0-prototype`)** and **target production capabilities (`Phases 1–6`)**, with explicit milestone badges kept synchronized as each phase lands.
+Select your preferred language below. Every guide suite documents the **verified Phases 1–6 pure-Rust implementation** across all 8 workspace crates (`metadb-core`, `metadb-proto`, `metadb-storage`, `metadb-raft`, `metadb-tx`, `metadb-cluster`, `metadb-proxy`, `metadb-server`).
 
 | Language | Overview & Quickstart | Deployment & Scale-Out | Client APIs, gRPC & 20 SQL Templates | Operations, `metadb-ctl` & Tuning |
 | :--- | :--- | :--- | :--- | :--- |

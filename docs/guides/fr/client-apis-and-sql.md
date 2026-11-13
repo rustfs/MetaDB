@@ -6,7 +6,7 @@
 
 ## 1. Surfaces d'Accès Client
 
-1. **SDK Rust embarqué (`metadb-server`)** : Appels directs en mémoire sans sérialisation (API synchrone disponible dans `v0.1.0-prototype`, API asynchrone en **Phase 6**).
+1. **SDK Rust embarqué (`metadb-server`)** : Appels directs en mémoire sans sérialisation (`PersistentMetaDbCluster` API asynchrone persistante et `MetaDbEngine` API synchrone).
 2. **Services gRPC `tonic` (`metadb.v1` — Contrats Phase 1 / Serveur Phase 6)** :
    * `MetadataService` : `CreateFile`, `Mkdir`, `Unlink`, `Rmdir`, `SetAttr`, `Lookup`, `DirStat`, `ListDir`, `ExecuteSql`, `GetQuota`, `SetQuotaLimit`, `ListQuotas`, `GetSecondaryIndex`, `ScanSecondaryIndex`.
    * `TransactionService` : `Rename` (`1-RTT` local ou `2PC` inter-shards automatique) ainsi que `Prepare2pc`, `CommitPrimary2pc`, `CommitSecondary2pc`, `Abort2pc`, `CheckTxnStatus`, `ApplyAuxBatch`.

@@ -4,7 +4,7 @@
 
 ---
 
-## 1. Utilitaire d'Administration `metadb-ctl` `[Cible : Phase 6]`
+## 1. Utilitaire d'Administration `metadb-ctl` `[Implémenté]`
 
 ```bash
 # État global des cellules, nœuds BE et filigranes Raft

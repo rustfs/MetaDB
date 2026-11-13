@@ -6,7 +6,7 @@
 
 ## 1. Client-Schnittstellen im Überblick
 
-1. **Eingebettetes Rust-SDK (`metadb-server`)**: Direkte In-Process-Aufrufe ohne Serialisierung (`v0.1.0-prototype` synchron verfügbar; asynchrone API in **Phase 6**).
+1. **Eingebettetes Rust-SDK (`metadb-server`)**: Direkte In-Process-Aufrufe ohne Serialisierung (`PersistentMetaDbCluster` asynchrone persistente API und `MetaDbEngine` synchrone API).
 2. **Typisierte `tonic` gRPC-Dienste (`metadb.v1` — Verträge Phase 1 / Server Phase 6)**:
    * `MetadataService`: `CreateFile`, `Mkdir`, `Unlink`, `Rmdir`, `SetAttr`, `Lookup`, `DirStat`, `ListDir`, `ExecuteSql`, `GetQuota`, `SetQuotaLimit`, `ListQuotas`, `GetSecondaryIndex`, `ScanSecondaryIndex`.
    * `TransactionService`: `Rename` (automatisch `1-RTT` lokal oder primärverankertes `2PC` über Shards hinweg) sowie `Prepare2pc`, `CommitPrimary2pc`, `CommitSecondary2pc`, `Abort2pc`, `CheckTxnStatus`, `ApplyAuxBatch`.

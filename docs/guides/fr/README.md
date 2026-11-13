@@ -16,24 +16,24 @@
 
 ---
 
-## Matrice de Maturité (Prototype actuel vs. Phases 1–6)
+## Matrice de Maturité (Phases 1–6 Implémentées & Vérifiées)
 
-| Domaine Fonctionnel | État Actuel (`v0.1.0-prototype`) | Jalon de Production Cible |
+| Domaine Fonctionnel | État du Dépôt | Crate / Binaire |
 | :--- | :--- | :--- |
-| SDK Rust embarqué (`MetaDbEngine`) | **Implémenté** (prototype synchrone en RAM) | **Phase 6** (`tokio` asynchrone + LSM / OpenRaft persistant) |
-| Colocalisation `(PID, "_attr_")` & horloge `HLC` | **Implémenté** (`metadb-core`) | **Phase 1** (encodage 88 octets CRC32C + garde de dérive 500 ms) |
-| Stockage persistant (LSM SSTable pur Rust sans WAL) | Simulé en mémoire (`BTreeMap`) | **Phase 2** (`LsmStorageBackend`, `MANIFEST`, Bloom, cache LRU) |
-| MVCC en mémoire (`SnapshotGuard`) & `LocalityCompactor` | Prototype en RAM | **Phase 2** (`ActiveSnapshotRegistry` + compaction ciblée) |
-| Consensus Multi-Raft (`1-Voter -> 3-Voter` + `ReadIndex`) | Simulé en mémoire (`VecDeque`) | **Phase 3** (`openraft` + segments `.raftlog` CRC32C + `tonic`) |
-| Pushdown `1-RTT`, `AsyncAttrAggregator` & `AuxOutbox` | **Implémenté** (processus unique RAM) | **Phase 4** (barrière de flush coordonnée + débordement `[0x07]`) |
-| Transactions 2PC inter-shards (`Rename`, `Mkdir`, `Rmdir`) | Prototype `Rename` en RAM | **Phase 4** (`TxnRecord` ancré sur le shard primaire + `WriteIntent`) |
-| Découpage sur frontière `PID`, isolation Jumbo & `DualMode` | **Implémenté** (découpage & isolation RAM) | **Phase 5** (clôture `ShardEpoch` + agrégation `DirShardDelta`) |
-| Compilateur léger de modèles SQL | **Implémenté** (8 modèles SQL littéraux) | **Phase 5** (20 modèles SQL paramétrés `?` avec échappement) |
-| Démon serveur `metadbd` & CLI `metadb-ctl` | Planifié | **Phase 6** (`crates/metadb-server/src/bin/`) |
+| SDKs Rust embarqués (`PersistentMetaDbCluster` & `MetaDbEngine`) | **Implémenté & Testé** (persistant asynchrone + RAM synchrone) | `metadb-server` |
+| Colocalisation `(PID, "_attr_")`, codecs `0x01..0x07` & `HLC` | **Implémenté & Testé** (88 octets CRC32C + garde de dérive 500 ms) | `metadb-core` |
+| Stockage persistant (LSM SSTable pur Rust sans WAL) | **Implémenté & Testé** (`LsmStorageBackend`, `MANIFEST`, Bloom, cache LRU) | `metadb-storage` |
+| MVCC en mémoire (`SnapshotGuard` `ReadCut`) & `LocalityCompactor` | **Implémenté & Testé** (`ActiveSnapshotRegistry` + compaction ciblée) | `metadb-storage` |
+| Consensus Multi-Raft (`1-Voter -> 3-Voter` + `ReadIndex`) | **Implémenté & Testé** (`openraft` 0.10 + `.raftlog` CRC32C + `tonic`) | `metadb-raft` |
+| Pushdown `1-RTT`, `ReplicatedAttrAggregator` & `AuxOutbox` | **Implémenté & Testé** (barrière coordonnée + débordement `[0x07]`) | `metadb-tx` |
+| Transactions 2PC inter-shards (`Rename`, `Mkdir`, `Rmdir`, `SetAttr`) | **Implémenté & Testé** (`TxnRecord` primaire + `WriteIntent`) | `metadb-tx` |
+| Découpage sur frontière `PID`, isolation Jumbo & `DualMode` | **Implémenté & Testé** (clôture `ShardEpoch` + `DirShardDelta`) | `metadb-cluster` |
+| Compilateur léger de 20 modèles SQL | **Implémenté & Testé** (20 modèles SQL paramétrés `?` avec échappement) | `metadb-proxy` |
+| Démon serveur `metadbd` & CLI `metadb-ctl` | **Implémenté & Testé** (`crates/metadb-server/src/bin/`) | `metadb-server` |
 
 ---
 
-## Démarrage rapide : SDK Rust embarqué (`v0.1.0-prototype` disponible)
+## Démarrage rapide : SDK Rust embarqué (`PersistentMetaDbCluster` & `MetaDbEngine`)
 
 ```toml
 [dependencies]
@@ -65,4 +65,19 @@ fn main() -> metadb_core::Result<()> {
     engine.run_background_maintenance()?;
     Ok(())
 }
+```
+
+### SDK Asynchrone Persistant & gRPC (`PersistentMetaDbCluster`)
+
+`PersistentMetaDbCluster::open_and_serve(config).await?` démarre le moteur persistant basé sur `LsmStorageBackend` et OpenRaft avec maintenance asynchrone et écoute gRPC :
+
+```rust
+use metadb_server::{PersistentMetaDbCluster, ServerTomlConfig};
+
+let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(
+    ServerTomlConfig::from_toml_file("/etc/metadb/standalone.toml")?,
+).await?;
+let dir = cluster.mkdir_auto_id(1, "checkpoints", 1000, 0o755).await?;
+let file = cluster.create_file_auto_id(dir.attr.inode_id, "step_0002.pt", 1000, 0o644, 4096).await?;
+cluster.shutdown().await?;
 ```

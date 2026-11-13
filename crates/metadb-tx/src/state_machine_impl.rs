@@ -1073,6 +1073,19 @@ impl TxStateMachineHandler {
                                     });
                                 }
                             }
+                            let delta_key = DirShardDeltaKey { pid: dir_id }.encode();
+                            if let Some(raw_sub) = Self::read_latest_in_apply(engine, &delta_key)? {
+                                let mut sub = DirShardDeltaRecord::decode(&raw_sub)?;
+                                if sub.deleting_fence {
+                                    return Err(MetaDbError::WriteIntentConflict {
+                                        conflicting_txn_id: 0,
+                                        primary_key: primary_key.clone(),
+                                        expire_hlc: expire_hlc.0,
+                                    });
+                                }
+                                sub.deleting_fence = true;
+                                encoded_writes.push((delta_key.to_vec(), sub.encode()));
+                            }
                             let rec = WriteIntentRecord {
                                 txn_id,
                                 primary_shard_hint: self.shard_id,
@@ -1425,7 +1438,10 @@ impl TxStateMachineHandler {
                 attr_deltas,
                 aux_specs,
             } => {
-                engine.apply_committed_delete(user_key.to_vec(), commit_hlc, raft_index);
+                let canonical_attr_key = MetaKey::dir_attr(dir_id).encode();
+                if user_key == canonical_attr_key.as_slice() {
+                    engine.apply_committed_delete(canonical_attr_key, commit_hlc, raft_index);
+                }
                 let dk = DirShardDeltaKey { pid: dir_id }.encode().to_vec();
                 engine.apply_committed_delete(dk, commit_hlc, raft_index);
                 engine.apply_committed_delete(ik, commit_hlc, raft_index);
@@ -1461,6 +1477,22 @@ impl TxStateMachineHandler {
                     };
                     engine.apply_committed_put(ik, updated.encode(), hlc, raft_index);
                 }
+            }
+            IntentOp::DeletingDir { dir_id, .. } if rec.txn_id == txn_id => {
+                let delta_key = DirShardDeltaKey { pid: dir_id }.encode();
+                if let Some(raw_sub) = Self::read_latest_in_apply(engine, &delta_key)? {
+                    let mut sub = DirShardDeltaRecord::decode(&raw_sub)?;
+                    if sub.deleting_fence {
+                        sub.deleting_fence = false;
+                        engine.apply_committed_put(
+                            delta_key.to_vec(),
+                            sub.encode(),
+                            hlc,
+                            raft_index,
+                        );
+                    }
+                }
+                engine.apply_committed_delete(ik, hlc, raft_index);
             }
             _ if rec.txn_id == txn_id => {
                 engine.apply_committed_delete(ik, hlc, raft_index);

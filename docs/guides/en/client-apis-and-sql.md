@@ -3,7 +3,7 @@
 * **Back to Guide Index**: [English Overview](./README.md) | [Hub](../../README.md)
 
 MetaDB exposes three client access surfaces tailored to different integration needs:
-1. **Embedded Rust SDK (`metadb-server`)** — Zero-serialization direct calls for co-located Rust services (`v0.1.0-prototype` synchronous API available today; async API in **Phase 6**).
+1. **Embedded Rust SDK (`metadb-server`)** — Zero-serialization direct calls for co-located Rust services (`PersistentMetaDbCluster` async persistent API and `MetaDbEngine` synchronous API).
 2. **Typed `tonic` gRPC APIs (`metadb-proto`)** — High-throughput multiplexed RPCs for networked RustFS data nodes and proxies (**Phase 1** contracts, **Phase 6** server endpoints).
 3. **20 Lightweight SQL Templates (`metadb-proxy`)** — Sub-5µs pattern compilation without general-purpose SQL optimizer overhead (Templates 1–5, 7–9 available in literal form today; full 20 parameterized/escaped templates in **Phase 5**).
 

@@ -277,15 +277,15 @@ Detailed Zero-Decision subsystem blueprints are maintained under [`docs/designs/
 
 ## 12. Implementation Status Matrix (Paper vs. Repository)
 
-| Capability / Subsystem | Baidu Paper (`arXiv:2610.32247v1`) | Current Repo (`v0.1.0-prototype`) | Target Repo Milestone |
+| Capability / Subsystem | Baidu Paper (`arXiv:2610.32247v1`) | Current Repository Status (Phases 0–6 Verified) | Crate / Binary |
 | :--- | :--- | :--- | :--- |
-| `(PID, "_attr_")` Colocation & `HLC` | Production (C++) | In-memory prototype (`metadb-core`) | **Phase 1** (CRC32C framing, `0x01..0x07`, drift guard) |
-| Protobuf / `tonic` gRPC Wire Contracts | Production RPC | Not yet present | **Phase 1** (`metadb-proto`) |
-| WAL-less Disk LSM (SSTable, Manifest, Bloom, Cache) | Production RocksDB (WAL off) | Simulated in-RAM `BTreeMap` | **Phase 2** (Pure-Rust `LsmStorageBackend`) |
-| `SnapshotGuard` In-Memory MVCC & `LocalityCompactor` | Production (`5s` window) | Wall-clock RAM prototype (no `SnapshotGuard` / SSTables) | **Phase 2** (`ActiveSnapshotRegistry` + bottommost compaction) |
-| Multi-Raft Consensus (`1-Voter -> 3-Voter` + `ReadIndex`) | Production Baidu `braft` | In-RAM `VecDeque` log + membership struct | **Phase 3** (`metadb-raft` via `openraft` + segmented log) |
-| `1-RTT` Pushdown, Coordinated `AttrAgg` & `AuxOutbox` Spill | Production | Single-process RAM prototype | **Phase 4** (Deterministic `RaftStateMachine` + `[0x07]` spill) |
-| Crash-Recoverable 2PC (`Rename`, Cross-Shard `Mkdir`/`Rmdir`) | Production 2PC | Non-durable in-RAM `Rename` only | **Phase 4** (Primary-Anchored `TxnRecord` + `WriteIntent`) |
-| Epoch-Fenced `PID` Split, Jumbo Isolation & `DualMode` | Production | Single-process RAM prototype (no `DualMode` routing) | **Phase 5** (`ShardEpoch` + `DirShardDelta` scatter-gather) |
-| Two-Tier Control Plane (`GlobalManager` + `CellLocalManager`) | Production (575+ nodes/cluster) | In-process Rust structs | **Phase 5–6** (gRPC control plane + `IdRangeAllocator`) |
-| 20 Metadata SQL Templates + `metadbd` & `metadb-ctl` | Production (~20 SQL patterns) | 8 literal SQL patterns; library-only | **Phase 5–6** (20 parameterized SQL templates + binaries) |
+| `(PID, "_attr_")` Colocation, `0x01..0x07` Codecs & `HLC` | Production (C++) | **Implemented & Tested** (88B CRC32C `InodeAttr`, 500ms drift & `u16` overflow guards) | `metadb-core` |
+| Protobuf v1 / `tonic` gRPC Wire Contracts | Production RPC | **Implemented & Tested** (`MetadataService`, `TransactionService`, `RaftTransportService`, `ControlPlaneService`) | `metadb-proto` |
+| Pure-Rust WAL-less Disk LSM (SSTable, Manifest, Bloom, Cache) | Production RocksDB (WAL off) | **Implemented & Tested** (`LsmStorageBackend`, 64B footer, `flush_generation`, 16-shard LRU `BlockCache`) | `metadb-storage` |
+| `SnapshotGuard` `ReadCut` MVCC & `LocalityCompactor` | Production (`5s` window) | **Implemented & Tested** (`ActiveSnapshotRegistry` Safe-Flush Gate + bottommost range compaction) | `metadb-storage` |
+| Multi-Raft Consensus (`1-Voter -> 3-Voter` + `ReadIndex`) | Production Baidu `braft` | **Implemented & Tested** (`openraft` 0.10 + segmented CRC32C `.raftlog` + 3-watermark purge + SSTable snapshots) | `metadb-raft` |
+| `1-RTT` Pushdown, Coordinated `AttrAgg` & `AuxOutbox` Spill | Production | **Implemented & Tested** (`TxStateMachineHandler`, `ViewAtRaftIndex`, `[0x07]` `task_ordinal` spill & `AckAuxTasks`) | `metadb-tx` |
+| Crash-Recoverable 2PC (`Rename`, Cross-Shard `Mkdir`/`Rmdir`) | Production 2PC | **Implemented & Tested** (Primary-Anchored `TxnRecord` + `WriteIntent`, POSIX overwrite, `DirRenameLease`) | `metadb-tx` |
+| Epoch-Fenced `PID` Split, Jumbo Isolation & `DualMode` | Production | **Implemented & Tested** (3-stage `ExecuteSplit`, `JumboIsolationPlanner`, `DualModeFineGrained` scatter-gather) | `metadb-cluster` |
+| Two-Tier Control Plane (`GlobalManager` + `CellLocalManager`) | Production (575+ nodes/cluster) | **Implemented & Tested** (`DurableGlobalManager`, `DurableCellManager`, `CompositeMetaCache`, `DurableIdAllocator`) | `metadb-cluster` |
+| 20 Parameterized SQL Templates + `metadbd` & `metadb-ctl` | Production (~20 SQL patterns) | **Implemented & Tested** (`SqlTemplateParser` 20 templates + `PersistentMetaDbCluster` + `metadbd` + `metadb-ctl`) | `metadb-proxy` / `metadb-server` |

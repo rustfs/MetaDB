@@ -16,26 +16,26 @@
 
 ---
 
-## 功能实现进度矩阵（当前原型 vs. Phase 1–6 目标）
+## 功能实现状态矩阵（Phase 1–6 已全部实现并验证）
 
-为保持架构文档与代码状态一致，以下明确标注各项能力在当前仓库原型（`v0.1.0-prototype`）中的可用状态及后续实现阶段：
+以下为当前仓库 8 个纯 Rust Crate 的已实现与测试验证状态：
 
-| 功能模块 | 当前仓库状态 (`v0.1.0-prototype`) | 目标生产实现里程碑 |
+| 功能模块 | 当前仓库状态 | 所属 Crate / 二进制 |
 | :--- | :--- | :--- |
-| 嵌入式 Rust SDK (`MetaDbEngine`) | **已实现**（同步内存原型） | **Phase 6**（异步 `tokio` + 持久化 LSM / OpenRaft） |
-| `(PID, "_attr_")` 同分片聚簇与 `HLC` 时钟 | **已实现** (`metadb-core`) | **Phase 1**（88B CRC32C 编码 + 500ms 时钟偏斜保护） |
-| 磁盘持久化（纯 Rust 无 WAL SSTable LSM） | 内存 `BTreeMap` 模拟 | **Phase 2** (`LsmStorageBackend`、`MANIFEST`、Bloom、LRU 缓存) |
-| `SnapshotGuard` 内存 MVCC 与局部性感知压缩 | 内存原型 | **Phase 2** (`ActiveSnapshotRegistry` + 最底层安全范围压缩) |
-| Multi-Raft 共识 (`1-Voter -> 3-Voter` + `ReadIndex`) | 内存 `VecDeque` 模拟 | **Phase 3** (`openraft` + 分段 CRC32C `.raftlog` + `tonic`) |
-| `1-RTT` 下推执行、`AsyncAttrAggregator` 与 `AuxOutbox` | **已实现**（单进程内存版） | **Phase 4**（协同刷盘屏障 + `[0x07]` 本地溢出落盘） |
-| 跨分片 2PC 事务 (`Rename`、`Mkdir`、`Rmdir`) | 内存 `Rename` 原型 | **Phase 4**（主锁锚定 `TxnRecord` + `WriteIntent` 崩溃恢复） |
-| `PID` 边界分片分裂、Jumbo 隔离与双模分裂 (`DualMode`) | **已实现**（内存分裂与隔离） | **Phase 5** (`ShardEpoch` 围栏 + `DirShardDelta` 扇出聚合) |
-| 轻量级 SQL 模板编译执行 | **已实现**（8 条字面量 SQL 模板） | **Phase 5**（全部 20 条参数化 `?` 与转义 SQL 模板） |
-| `metadbd` 服务端守护进程与 `metadb-ctl` 运维工具 | 规划中 | **Phase 6** (`crates/metadb-server/src/bin/`) |
+| 嵌入式 Rust SDK (`PersistentMetaDbCluster` & `MetaDbEngine`) | **已实现并验证**（异步持久化版 + 同步内存版） | `metadb-server` |
+| `(PID, "_attr_")` 同分片聚簇、`0x01..0x07` 编码与 `HLC` | **已实现并验证**（88B CRC32C 编码 + 500ms 时钟偏斜保护） | `metadb-core` |
+| 磁盘持久化（纯 Rust 无 WAL SSTable LSM） | **已实现并验证** (`LsmStorageBackend`、`MANIFEST`、Bloom、LRU 缓存) | `metadb-storage` |
+| `SnapshotGuard` `ReadCut` 内存 MVCC 与局部性压缩 | **已实现并验证** (`ActiveSnapshotRegistry` + 最底层安全范围压缩) | `metadb-storage` |
+| Multi-Raft 共识 (`1-Voter -> 3-Voter` + `ReadIndex`) | **已实现并验证** (`openraft` 0.10 + 分段 `.raftlog` + `tonic`) | `metadb-raft` |
+| `1-RTT` 下推、`ReplicatedAttrAggregator` 与 `AuxOutbox` | **已实现并验证**（协同刷盘屏障 + `[0x07]` 本地溢出落盘与清理） | `metadb-tx` |
+| 跨分片 2PC 事务 (`Rename`、`Mkdir`、`Rmdir`、`SetAttr`) | **已实现并验证**（主锁锚定 `TxnRecord` + `WriteIntent` 崩溃恢复） | `metadb-tx` |
+| `PID` 边界分片分裂、Jumbo 隔离与双模分裂 (`DualMode`) | **已实现并验证** (`ShardEpoch` 围栏 + `DirShardDelta` 扇出聚合) | `metadb-cluster` |
+| 轻量级 SQL 模板编译执行 | **已实现并验证**（全部 20 条参数化 `?` 与转义 SQL 模板） | `metadb-proxy` |
+| `metadbd` 服务端守护进程与 `metadb-ctl` 运维工具 | **已实现并验证** (`crates/metadb-server/src/bin/`) | `metadb-server` |
 
 ---
 
-## 快速开始：嵌入式 Rust SDK（`v0.1.0-prototype` 当前可用）
+## 快速开始：嵌入式 Rust SDK（`PersistentMetaDbCluster` 与 `MetaDbEngine`）
 
 在 Cargo 工程中引入工作区内的 `metadb-core` 与 `metadb-server`，即可在进程内直接嵌入运行 MetaDB：
 
@@ -80,13 +80,17 @@ fn main() -> metadb_core::Result<()> {
 }
 ```
 
-### 目标异步持久化 SDK（`Phase 6`）
+### 异步持久化 SDK（`PersistentMetaDbCluster`）
 
-在 Phase 2–6 完成后，`MetaDbEngine::open(config).await?` 将基于 `LsmStorageBackend` 与 `1-Voter` OpenRaft 实现磁盘级崩溃安全持久化与自动后台维护：
+`PersistentMetaDbCluster::open_and_serve(config).await?` 基于 `LsmStorageBackend` 与 OpenRaft 实现磁盘级崩溃安全持久化、自动后台维护与 gRPC 服务监听：
 
 ```rust
-// 目标接口（Phase 6）
-let engine = MetaDbEngine::open(MetaDbConfig::from_toml_file("/etc/metadb/standalone.toml")?).await?;
-let file = engine.create_file_auto_id(100, "step_0002.pt", /*uid=*/ 1000, 0o644, 4096).await?;
-engine.shutdown().await?;
+use metadb_server::{PersistentMetaDbCluster, ServerTomlConfig};
+
+let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(
+    ServerTomlConfig::from_toml_file("/etc/metadb/standalone.toml")?,
+).await?;
+let dir = cluster.mkdir_auto_id(1, "checkpoints", 1000, 0o755).await?;
+let file = cluster.create_file_auto_id(dir.attr.inode_id, "step_0002.pt", 1000, 0o644, 4096).await?;
+cluster.shutdown().await?;
 ```

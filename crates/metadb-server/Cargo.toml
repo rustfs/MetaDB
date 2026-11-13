@@ -1,15 +1,38 @@
 [package]
 name = "metadb-server"
-description = "Unified MetaDB engine supporting seamless evolution from Single-Node All-in-One to Trillion-Scale Multi-Cell Distributed Clusters"
+description = "Unified MetaDB engine, metadbd daemon, and metadb-ctl CLI supporting Single-Node All-in-One to Multi-Cell Distributed Clusters"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+default-run = "metadbd"
+
+[[bin]]
+name = "metadbd"
+path = "src/bin/metadbd.rs"
+
+[[bin]]
+name = "metadb-ctl"
+path = "src/bin/metadb-ctl.rs"
 
 [dependencies]
 metadb-core = { path = "../metadb-core" }
+metadb-proto = { path = "../metadb-proto" }
 metadb-storage = { path = "../metadb-storage" }
+metadb-raft = { path = "../metadb-raft" }
 metadb-tx = { path = "../metadb-tx" }
 metadb-cluster = { path = "../metadb-cluster" }
 metadb-proxy = { path = "../metadb-proxy" }
+bincode = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+toml = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

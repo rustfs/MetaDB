@@ -57,23 +57,22 @@ MetaDB runs the **exact same `StorageBackend` and `openraft` state machine** fro
 
 | Crate | Status | Responsibility |
 | :--- | :--- | :--- |
-| `crates/metadb-core` | Prototype (`v0.1.0`) -> Phase 1 | `0x01..0x07` binary codecs, `(PID, "_attr_")` keys, `ShardEpoch`, CRC32C, `HLC` (+ drift guard). |
-| `crates/metadb-proto` | Planned (Phase 1) | Protobuf v1 schemas & `tonic`/`prost` gRPC contracts (`MetadataService`, `TransactionService`, `RaftTransportService`, `ControlPlaneService`). |
-| `crates/metadb-storage` | Prototype (`v0.1.0`) -> Phase 2 | `StorageBackend` trait, pure-Rust WAL-less SSTable LSM, `MANIFEST`, `BlockCache`, Bloom filter, `SnapshotGuard` MVCC, `LocalityCompactor`. |
-| `crates/metadb-raft` | Planned (Phase 3) | `openraft` Multi-Raft, segmented CRC32C log store, 3-watermark purge gate, batched `ReadIndex`, `1->3` Voter `ConfChange`. |
-| `crates/metadb-tx` | Prototype (`v0.1.0`) -> Phase 4 | Deterministic `RaftStateMachine`, `1-RTT` `PushdownExecutor`, `AsyncAttrAggregator`, FIFO `AuxOutbox` + `[0x07]` spill, crash-recoverable 2PC. |
-| `crates/metadb-cluster` | Prototype (`v0.1.0`) -> Phase 5 | `PID` & `DualModeFineGrained` splitter, `ShardEpoch` fencing, Jumbo isolation, `GlobalManager`, `CellLocalManager`, `MetaCache`, `IdRangeAllocator`. |
-| `crates/metadb-proxy` | Prototype (`v0.1.0`) -> Phase 5 | Tokenizing compiler for all 20 parameterized metadata SQL templates + Epoch-aware router. |
-| `crates/metadb-server` | Prototype (`v0.1.0`) -> Phase 6 | Embedded `MetaDbEngine` SDK + `metadbd` daemon + `metadb-ctl` operator CLI. |
+| [`crates/metadb-core`](./crates/metadb-core) | Implemented (Phase 1) | `0x01..0x07` CRC32C binary codecs, `(PID, "_attr_")` keys, `ShardEpoch`, `CompositeKeyRange`, `HLC` (+ drift/overflow guards). |
+| [`crates/metadb-proto`](./crates/metadb-proto) | Implemented (Phase 1) | Protobuf v1 schemas & `tonic`/`prost` gRPC contracts (`MetadataService`, `TransactionService`, `RaftTransportService`, `ControlPlaneService`). |
+| [`crates/metadb-storage`](./crates/metadb-storage) | Implemented (Phase 2) | `StorageBackend` trait, pure-Rust WAL-less SSTable LSM, `MANIFEST`, 16-shard LRU `BlockCache`, Bloom filter, `SnapshotGuard` `ReadCut` MVCC, `LocalityCompactor`. |
+| [`crates/metadb-raft`](./crates/metadb-raft) | Implemented (Phase 3) | `openraft` 0.10 Multi-Raft, segmented CRC32C `.raftlog`, 3-watermark purge gate, batched `ReadIndex`, SSTable snapshots, `1->3` Voter `ConfChange`. |
+| [`crates/metadb-tx`](./crates/metadb-tx) | Implemented (Phase 4) | Deterministic `TxStateMachineHandler`, `1-RTT` pushdown, `ReplicatedAttrAggregator`, contiguous `ShardAuxOutbox` + `[0x07]` spill, crash-recoverable 2PC. |
+| [`crates/metadb-cluster`](./crates/metadb-cluster) | Implemented (Phase 5) | 3-stage `ExecuteSplit` (`PID` & `DualModeFineGrained`), `ShardEpoch` fencing, Jumbo isolation, `DurableGlobalManager`, `DurableCellManager`, `CompositeMetaCache`, `DurableIdAllocator`. |
+| [`crates/metadb-proxy`](./crates/metadb-proxy) | Implemented (Phase 5) | Tokenizing `SqlLexer` & compiler for all 20 parameterized metadata SQL templates + `StatelessProxyRouter`. |
+| [`crates/metadb-server`](./crates/metadb-server) | Implemented (Phase 6) | `PersistentMetaDbCluster` & `MetaDbEngine` SDKs + `metadbd` daemon + `metadb-ctl` operator CLI + Prometheus metrics. |
 
 ---
 
 ## Current Implementation Status
 
-* **Completed**:
-  * **Phase 0**: Complete English Architecture & Zero-Decision EGM Subsystem Specifications, Adversarial Goldfish Design Review (`docs/designs/review_report.md`), Phased Rust Development Plan (`docs/DEVELOPMENT_PLAN.md`), and Multilingual Usage Guides (`en`, `ja`, `fr`, `zh`, `de`).
-  * **Baseline Prototype (`v0.1.0-prototype`)**: 6-crate synchronous in-memory verification baseline passing `cargo test --workspace`.
-* **Next Up (Phases 1–6)**: Step-by-step pure-Rust implementation of `metadb-core`/`metadb-proto` (Phase 1), WAL-less disk LSM + `SnapshotGuard` MVCC (Phase 2), `openraft` Multi-Raft (Phase 3), replicated transactions & 2PC recovery (Phase 4), distributed sharding/control plane & 20 SQL templates (Phase 5), and `metadbd` + `metadb-ctl` binaries (Phase 6).
+* **Phases 0–6 Completed & Verified**:
+  * **Phase 0**: Master `Architecture.md`, EGM subsystem specs, zero-context Goldfish review & resolutions (`B1`–`B18`, `N1`–`N5`), `DEVELOPMENT_PLAN.md`, and 5-language usage guides (`en`, `ja`, `fr`, `zh`, `de`).
+  * **Phases 1–6**: Full 8-crate 100% pure-Rust implementation (`zero C/C++ FFI`) passing `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` (including fault-injection suites for SSTable/MANIFEST crash recovery, `SnapshotGuard` `ReadCut` isolation, `LocalityCompactor`, `1-Voter -> 3-Voter` Multi-Raft snapshot promotion & leader failover, `[0x07]` outbox spill/cleanup, 2PC crash recovery, 3-way `DualModeFineGrained` scatter-gather, all 20 SQL templates, and end-to-end gRPC cluster evolution).
 
 ---
 

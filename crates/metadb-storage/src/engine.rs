@@ -182,13 +182,13 @@ impl LifecycleStorageEngine {
         min_read_index: LogSequenceNumber,
     ) -> Result<SnapshotGuard> {
         self.mvcc
-            .acquire_linearizable_snapshot(min_read_index, self.backend.current_version())
+            .acquire_linearizable_snapshot(min_read_index, self.backend.as_ref())
     }
 
     /// Acquires a fixed-HLC `SnapshotGuard` at `barrier_hlc`.
     pub fn acquire_fixed_snapshot(&self, barrier_hlc: HlcTimestamp) -> Result<SnapshotGuard> {
         self.mvcc
-            .acquire_fixed_snapshot(barrier_hlc, self.backend.current_version())
+            .acquire_fixed_snapshot(barrier_hlc, self.backend.as_ref())
     }
 
     /// Point lookup using a pinned `SnapshotGuard` and bounded step-lease check.

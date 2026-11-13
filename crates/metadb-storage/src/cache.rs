@@ -45,6 +45,9 @@ impl LruShard {
 
     fn insert(&mut self, key: BlockCacheKey, block: Arc<DataBlock>) {
         let block_bytes = block.byte_size().max(64);
+        if block_bytes > self.capacity_bytes {
+            return;
+        }
         if let Some(old) = self.entries.remove(&key) {
             self.used_bytes = self.used_bytes.saturating_sub(old.byte_size().max(64));
             self.order.retain(|k| k != &key);

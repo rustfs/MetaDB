@@ -6,7 +6,7 @@
 
 ## 1. クライアント接続インターフェース
 
-1. **組込み Rust SDK (`metadb-server`)**：同一プロセス内でのゼロシリアライズ呼び出し（現行 `v0.1.0-prototype` で同期 API 利用可能、**Phase 6** で非同期 API 提供）。
+1. **組込み Rust SDK (`metadb-server`)**：同一プロセス内でのゼロシリアライズ呼び出し（`PersistentMetaDbCluster` 非同期永続化 API および `MetaDbEngine` 同期 API）。
 2. **`tonic` gRPC サービス (`metadb.v1` — Phase 1 定義 / Phase 6 サーバー実装)**：
    * `MetadataService`：`CreateFile`, `Mkdir`, `Unlink`, `Rmdir`, `SetAttr`, `Lookup`, `DirStat`, `ListDir`, `ExecuteSql`, `GetQuota`, `SetQuotaLimit`, `ListQuotas`, `GetSecondaryIndex`, `ScanSecondaryIndex`。
    * `TransactionService`：`Rename`（単一シャード `1-RTT` / クロスシャード `2PC` 自動切替）および内部 2PC / `ApplyAuxBatch` RPC。

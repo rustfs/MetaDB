@@ -6,7 +6,7 @@ MetaDB exécute **exactement le même moteur LSM sans WAL et la même machine à
 
 ---
 
-## Étape 1 : Déploiement Mononœud Autonome (`metadbd --role all-in-one`) `[Cible : Phase 6]`
+## Étape 1 : Déploiement Mononœud Autonome (`metadbd --role all-in-one`) `[Implémenté]`
 
 Tous les rôles (`GlobalManager`, `CellLocalManager`, `MetaCache`, `Proxy` et stockage `BE` en **OpenRaft `1-Voter`**) tournent dans un seul binaire. Le WAL local du moteur KV est désactivé : seul le journal segmenté `.raftlog` (protégé par CRC32C) assure la durabilité séquentielle.
 
@@ -40,13 +40,13 @@ metadbd --config /etc/metadb/standalone.toml
 
 ---
 
-## Étape 2 : Découpage Dynamique sur Frontière `PID` `[Prototype implémenté | Persistance & Epoch : Phase 5]`
+## Étape 2 : Découpage Dynamique sur Frontière `PID` `[Implémenté]`
 
 Lorsqu'un shard dépasse `shard_split_threshold_bytes`, `PolicyShardSplitter` choisit une frontière stricte `group_key = PID` (`[0x01][pid: 8B BE]`) afin que `(PID, "_attr_")` et tous ses enfants restent sur le même shard.
 
 ---
 
-## Étape 3 : Extension sans Interruption vers Multi-Raft `3-Voter` & Multi-Cell `[Cible : Phases 3–6]`
+## Étape 3 : Extension sans Interruption vers Multi-Raft `3-Voter` & Multi-Cell `[Implémenté]`
 
 ### 3.1 Promotion Haute Disponibilité `1-Voter -> Learner -> 3-Voter`
 

@@ -8,7 +8,7 @@ MetaDB 在单机模式与千节点分布式集群中使用**完全相同的无 W
 
 ---
 
-## 阶段一：独立单节点部署 (`metadbd --role all-in-one`) `[目标: Phase 6]`
+## 阶段一：独立单节点部署 (`metadbd --role all-in-one`) `[已实现]`
 
 在单机一体化模式下，`GlobalManager`、`CellLocalManager`、`MetaCache`、`Proxy` 与 `BE` 存储引擎运行于同一进程，底层采用 **`1-Voter` OpenRaft**。由于分段 CRC32C `.raftlog` 已经提供顺序写崩溃持久化保障，底层 LSM 引擎彻底关闭本地 KV WAL，避免双重写日志开销。
 
@@ -46,7 +46,7 @@ metadbd --config /etc/metadb/standalone.toml
 
 ---
 
-## 阶段二：单节点动态 `PID` 边界分片分裂 `[原型已实现 | 磁盘与 Epoch 围栏: Phase 5]`
+## 阶段二：单节点动态 `PID` 边界分片分裂 `[已实现]`
 
 当分片容量超过 `shard_split_threshold_bytes` 时，`PolicyShardSplitter` 会扫描 SSTable 块索引中点并严格沿着 `group_key = PID`（`[0x01][pid: 8B BE]`）边界执行原子分裂：
 * 同一目录的属性记录 `(PID, "_attr_")` 与所有直接子项 `(PID, child_name)` 始终保持在同一分片内。
@@ -54,7 +54,7 @@ metadbd --config /etc/metadb/standalone.toml
 
 ---
 
-## 阶段三：在线扩展至 `3-Voter` Multi-Raft 与多单元集群 `[目标: Phase 3–6]`
+## 阶段三：在线扩展至 `3-Voter` Multi-Raft 与多单元集群 `[已实现]`
 
 ### 3.1 零停机高可用升级（`1-Voter -> Learner -> 3-Voter`）
 

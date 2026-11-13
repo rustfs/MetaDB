@@ -294,6 +294,7 @@ pub struct MemMvccStore {
     retention_ms: u64,
     registry: Arc<ActiveSnapshotRegistry>,
     inner: RwLock<MemMvccInner>,
+    flush_mutex: std::sync::Mutex<()>,
 }
 
 impl MemMvccStore {
@@ -321,6 +322,7 @@ impl MemMvccStore {
                 total_mvcc_writes: 0,
                 total_pruned_versions: 0,
             }),
+            flush_mutex: std::sync::Mutex::new(()),
         }
     }
 
@@ -365,9 +367,10 @@ impl MemMvccStore {
     pub fn acquire_linearizable_snapshot(
         &self,
         min_read_index: LogSequenceNumber,
-        pinned_version: Arc<Version>,
+        backend: &dyn StorageBackend,
     ) -> Result<SnapshotGuard> {
         let guard = self.inner.read().unwrap();
+        let pinned_version = backend.current_version();
         let cut = ReadCut {
             max_raft_index: guard.latest_lsn.max(min_read_index),
             max_hlc: guard.latest_hlc,
@@ -389,9 +392,10 @@ impl MemMvccStore {
     pub fn acquire_fixed_snapshot(
         &self,
         barrier_hlc: HlcTimestamp,
-        pinned_version: Arc<Version>,
+        backend: &dyn StorageBackend,
     ) -> Result<SnapshotGuard> {
         let guard = self.inner.read().unwrap();
+        let pinned_version = backend.current_version();
         self.check_retention_window(&guard, barrier_hlc)?;
         if barrier_hlc < guard.disk_flushed_max_hlc {
             return Err(MetaDbError::TransactionTimeout {
@@ -593,6 +597,8 @@ impl MemMvccStore {
         let mut guard = self.inner.write().unwrap();
         let sealed_index = checkpoint.flushed_raft_index.max(guard.latest_lsn);
         let sealed_hlc = checkpoint.flushed_max_hlc.max(guard.latest_hlc);
+        guard.latest_lsn = sealed_index;
+        guard.latest_hlc = sealed_hlc;
         checkpoint.flushed_raft_index = sealed_index;
         checkpoint.flushed_max_hlc = sealed_hlc;
 
@@ -654,12 +660,13 @@ impl MemMvccStore {
         backend: &dyn StorageBackend,
         hook: Option<&dyn PreFlushHook>,
     ) -> Result<(Vec<FlushedKeyState>, LogSequenceNumber, LogSequenceNumber)> {
-        let active_bounds = self.registry.expire_stale_and_min_bounds();
+        let _flush_guard = self.flush_mutex.lock().unwrap();
         let mut all_flushed = Vec::new();
         let mut max_state_flushed_lsn = self.inner.read().unwrap().last_flushed_lsn;
         let mut aux_durable_frontier = 0u64;
 
         loop {
+            let active_bounds = self.registry.expire_stale_and_min_bounds();
             let candidate = {
                 let guard = self.inner.read().unwrap();
                 let Some(front) = guard.imm_queue.front() else {
@@ -718,6 +725,8 @@ impl MemMvccStore {
                 }
                 guard.disk_flushed_max_hlc = guard.disk_flushed_max_hlc.max(candidate.max_hlc);
                 guard.last_flushed_lsn = guard.last_flushed_lsn.max(candidate.max_raft_index);
+                guard.latest_hlc = guard.latest_hlc.max(guard.disk_flushed_max_hlc);
+                guard.latest_lsn = guard.latest_lsn.max(guard.last_flushed_lsn);
                 guard.total_pruned_versions += pruned_total;
                 while let Some(&(_, lsn)) = guard.hlc_to_lsn.front() {
                     if lsn <= guard.last_flushed_lsn {

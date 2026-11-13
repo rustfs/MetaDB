@@ -6,7 +6,7 @@ MetaDB はシングルノード構成から 1,000 台超の分散クラスター
 
 ---
 
-## Stage 1：スタンドアロン・シングルノード構成 (`metadbd --role all-in-one`) `[対象: Phase 6]`
+## Stage 1：スタンドアロン・シングルノード構成 (`metadbd --role all-in-one`) `[実装済]`
 
 単一プロセス内で `GlobalManager`、`CellLocalManager`、`MetaCache`、`Proxy`、および **`1-Voter` OpenRaft** バックエンドを実行します。ローカル KV の WAL は無効化され、CRC32C チェックサム付き `.raftlog` セグメントへの順次追記のみで耐久性を保証します。
 
@@ -40,13 +40,13 @@ metadbd --config /etc/metadb/standalone.toml
 
 ---
 
-## Stage 2：単一ホスト上の自動 `PID` 境界シャード分割 `[プロトタイプ実装済 | 永続化・Epoch: Phase 5]`
+## Stage 2：単一ホスト上の自動 `PID` 境界シャード分割 `[実装済]`
 
 シャードサイズが `shard_split_threshold_bytes` を超えると、`PolicyShardSplitter` が `group_key = PID`（`[0x01][pid: 8B BE]`）境界でシャードを分割し、親ディレクトリ属性 `(PID, "_attr_")` と全子エントリを同一シャードに維持します。
 
 ---
 
-## Stage 3：`3-Voter` Multi-Raft および Multi-Cell 分散クラスターへの無停止拡張 `[対象: Phase 3–6]`
+## Stage 3：`3-Voter` Multi-Raft および Multi-Cell 分散クラスターへの無停止拡張 `[実装済]`
 
 ### 3.1 `1-Voter` から `3-Voter` への無停止レプリカ昇格
 

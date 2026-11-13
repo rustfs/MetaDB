@@ -16,24 +16,24 @@
 
 ---
 
-## 機能実装ステータスマトリクス（現行プロトタイプ vs. Phase 1–6）
+## 機能実装ステータスマトリクス（Phase 1–6 実装・検証完了）
 
-| 機能領域 | 現行リポジトリ (`v0.1.0-prototype`) | 本番実装マイルストーン |
+| 機能領域 | リポジトリ実装状態 | 実装 Crate / バイナリ |
 | :--- | :--- | :--- |
-| 組込み Rust SDK (`MetaDbEngine`) | **実装済**（同期インメモリ・プロトタイプ） | **Phase 6**（非同期 `tokio` + 永続化 LSM / OpenRaft） |
-| `(PID, "_attr_")` 共配置キー & `HLC` 時計 | **実装済** (`metadb-core`) | **Phase 1**（88B CRC32C エンコード + 500ms ドリフト保護） |
-| ディスク永続化（純 Rust WAL レス SSTable LSM） | RAM 上の `BTreeMap` シミュレーション | **Phase 2** (`LsmStorageBackend`、`MANIFEST`、Bloom、LRU キャッシュ) |
-| `SnapshotGuard` メモリ内 MVCC & `LocalityCompactor` | RAM プロトタイプ | **Phase 2** (`ActiveSnapshotRegistry` + 最下層安全範囲コンパクション) |
-| Multi-Raft 合意 (`1-Voter -> 3-Voter` + `ReadIndex`) | RAM `VecDeque` シミュレーション | **Phase 3** (`openraft` + セグメント `.raftlog` + `tonic`) |
-| `1-RTT` プッシュダウン・`AsyncAttrAggregator`・`AuxOutbox` | **実装済**（単一プロセス RAM） | **Phase 4**（協調フラッシュバリア + `[0x07]` ローカル退避） |
-| クロスシャード 2PC (`Rename`, `Mkdir`, `Rmdir`) | RAM `Rename` プロトタイプ | **Phase 4**（プライマリ固定 `TxnRecord` + `WriteIntent` 障害復旧） |
-| `PID` 境界分割・Jumbo 分離・`DualMode` 分割 | **実装済**（RAM 分割・分離） | **Phase 5** (`ShardEpoch` フェンシング + `DirShardDelta` 並列集約) |
-| 軽量 SQL テンプレート実行 | **実装済**（8 パターンのリテラル SQL） | **Phase 5**（全 20 パターンの `?` バインド・エスケープ対応） |
-| `metadbd` サーバーデーモン & `metadb-ctl` CLI | 計画中 | **Phase 6** (`crates/metadb-server/src/bin/`) |
+| 組込み Rust SDK (`PersistentMetaDbCluster` & `MetaDbEngine`) | **実装・検証済**（非同期永続化 + 同期インメモリ） | `metadb-server` |
+| `(PID, "_attr_")` 共配置キー・`0x01..0x07` & `HLC` 時計 | **実装・検証済**（88B CRC32C + 500ms ドリフト保護） | `metadb-core` |
+| ディスク永続化（純 Rust WAL レス SSTable LSM） | **実装・検証済** (`LsmStorageBackend`、`MANIFEST`、Bloom、LRU キャッシュ) | `metadb-storage` |
+| `SnapshotGuard` `ReadCut` メモリ内 MVCC & `LocalityCompactor` | **実装・検証済** (`ActiveSnapshotRegistry` + 最下層安全範囲コンパクション) | `metadb-storage` |
+| Multi-Raft 合意 (`1-Voter -> 3-Voter` + `ReadIndex`) | **実装・検証済** (`openraft` 0.10 + セグメント `.raftlog` + `tonic`) | `metadb-raft` |
+| `1-RTT` プッシュダウン・`ReplicatedAttrAggregator`・`AuxOutbox` | **実装・検証済**（協調フラッシュバリア + `[0x07]` ローカル退避） | `metadb-tx` |
+| クロスシャード 2PC (`Rename`, `Mkdir`, `Rmdir`, `SetAttr`) | **実装・検証済**（プライマリ固定 `TxnRecord` + `WriteIntent` 障害復旧） | `metadb-tx` |
+| `PID` 境界分割・Jumbo 分離・`DualMode` 分割 | **実装・検証済** (`ShardEpoch` フェンシング + `DirShardDelta` 並列集約) | `metadb-cluster` |
+| 軽量 SQL テンプレート実行 | **実装・検証済**（全 20 パターンの `?` バインド・エスケープ対応） | `metadb-proxy` |
+| `metadbd` サーバーデーモン & `metadb-ctl` CLI | **実装・検証済** (`crates/metadb-server/src/bin/`) | `metadb-server` |
 
 ---
 
-## クイックスタート：組込み Rust SDK（`v0.1.0-prototype` 利用可能）
+## クイックスタート：組込み Rust SDK（`PersistentMetaDbCluster` & `MetaDbEngine`）
 
 ```toml
 [dependencies]
@@ -65,4 +65,19 @@ fn main() -> metadb_core::Result<()> {
     engine.run_background_maintenance()?;
     Ok(())
 }
+```
+
+### 非同期永続化・gRPC クラスター SDK（`PersistentMetaDbCluster`）
+
+`PersistentMetaDbCluster::open_and_serve(config).await?` は `LsmStorageBackend` と OpenRaft に基づく永続化、バックグラウンド維持処理、および gRPC サーバーを起動します：
+
+```rust
+use metadb_server::{PersistentMetaDbCluster, ServerTomlConfig};
+
+let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(
+    ServerTomlConfig::from_toml_file("/etc/metadb/standalone.toml")?,
+).await?;
+let dir = cluster.mkdir_auto_id(1, "checkpoints", 1000, 0o755).await?;
+let file = cluster.create_file_auto_id(dir.attr.inode_id, "step_0002.pt", 1000, 0o644, 4096).await?;
+cluster.shutdown().await?;
 ```

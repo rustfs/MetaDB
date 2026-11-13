@@ -35,8 +35,8 @@ This skill loads the architectural history, foundational literature, subsystem c
 
 ## Implementation Status Policy
 
-* **Current Baseline**: Phase 0 Approved Specification Suite + `v0.1.0-prototype` (initial 6-crate synchronous in-memory prototype).
-* **Phases 1–6 Execution**: Always consult `docs/DEVELOPMENT_PLAN.md` and keep implementation status badges synchronized across `Architecture.md`, `README.md`, and `docs/guides/{en,ja,fr,zh,de}/` as each phase completes.
+* **Current Baseline**: Phases 0–6 Completed & Verified across all 8 pure-Rust crates (`cargo fmt`, `cargo clippy -D warnings`, and `cargo test --workspace` passing).
+* **Ongoing Maintenance**: Keep `Architecture.md`, `README.md`, `docs/designs/*.md`, and `docs/guides/{en,ja,fr,zh,de}/` synchronized with any future architectural extensions.
 
 ## Non-Negotiable Architectural Invariants
 

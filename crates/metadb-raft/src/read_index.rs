@@ -93,6 +93,16 @@ impl ReadIndexBatcher {
     ) -> Result<(ReadToken, SnapshotGuard)> {
         let token = self.linearizable_token(expected_epoch).await?;
         let snap = engine.acquire_linearizable_snapshot(token.read_index)?;
+        // Re-verify epoch after acquiring `SnapshotGuard` to close the window between
+        // `linearizable_token()` and snapshot guard registration.
+        let post_guard_epoch = self.current_frontier().epoch;
+        if post_guard_epoch != expected_epoch {
+            return Err(MetaDbError::EpochMismatch {
+                shard_id: self.shard_id,
+                expected: expected_epoch,
+                actual: post_guard_epoch,
+            });
+        }
         Ok((token, snap))
     }
 
@@ -106,39 +116,40 @@ impl ReadIndexBatcher {
         };
 
         if is_driver {
-            // If multiple callers arrive within 200µs, batch them into one quorum check;
-            // in single-caller / 1-Voter mode, yield once so concurrent tasks on the executor can join.
-            tokio::task::yield_now().await;
-            if self.pending_waiters.lock().await.len() > 1 {
-                tokio::time::sleep(MICRO_BATCH_WINDOW).await;
-            }
+            // Spawn the batch driver on an independent task so cancelling a single caller's
+            // request future never strands peer waiters in `pending_waiters`.
+            let pending_waiters = self.pending_waiters.clone();
+            let raft = self.raft.clone();
+            let shard_id = self.shard_id;
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                if pending_waiters.lock().await.len() > 1 {
+                    tokio::time::sleep(MICRO_BATCH_WINDOW).await;
+                }
 
-            let waiters = {
-                let mut guard = self.pending_waiters.lock().await;
-                std::mem::take(&mut *guard)
-            };
+                let waiters = {
+                    let mut guard = pending_waiters.lock().await;
+                    std::mem::take(&mut *guard)
+                };
 
-            let res = self.execute_ensure_linearizable().await;
-            for w in waiters {
-                let _ = w.send(res.clone());
-            }
+                let res = match raft.ensure_linearizable(ReadPolicy::ReadIndex).await {
+                    Ok(read_log_id) => Ok(read_log_id.index()),
+                    Err(RaftError::APIError(LinearizableReadError::ForwardToLeader(fwd))) => {
+                        Err(MetaDbError::NotLeader {
+                            shard_id,
+                            leader_hint: fwd.leader_id,
+                        })
+                    }
+                    Err(other) => Err(MetaDbError::ConsensusError(other.to_string())),
+                };
+                for w in waiters {
+                    let _ = w.send(res.clone());
+                }
+            });
         }
 
         rx.await
             .map_err(|_| MetaDbError::ConsensusError("ReadIndex driver cancelled".to_string()))?
-    }
-
-    async fn execute_ensure_linearizable(&self) -> Result<u64> {
-        match self.raft.ensure_linearizable(ReadPolicy::ReadIndex).await {
-            Ok(read_log_id) => Ok(read_log_id.index()),
-            Err(RaftError::APIError(LinearizableReadError::ForwardToLeader(fwd))) => {
-                Err(MetaDbError::NotLeader {
-                    shard_id: self.shard_id,
-                    leader_hint: fwd.leader_id,
-                })
-            }
-            Err(other) => Err(MetaDbError::ConsensusError(other.to_string())),
-        }
     }
 
     async fn wait_applied_at_least(&self, target_index: u64) -> Result<AppliedFrontier> {

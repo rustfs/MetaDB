@@ -16,24 +16,24 @@
 
 ---
 
-## Funktions- und Reifegradmatrix (Aktueller Prototyp vs. Phasen 1–6)
+## Funktions- und Reifegradmatrix (Phasen 1–6 Implementiert & Verifiziert)
 
-| Funktionsbereich | Aktueller Stand (`v0.1.0-prototype`) | Ziel-Meilenstein (Produktion) |
+| Funktionsbereich | Repository-Status | Crate / Binärdatei |
 | :--- | :--- | :--- |
-| Eingebettetes Rust-SDK (`MetaDbEngine`) | **Implementiert** (synchroner RAM-Prototyp) | **Phase 6** (asynchrones `tokio` + persistentes LSM/OpenRaft) |
-| `(PID, "_attr_")`-Kolokation & `HLC`-Uhr | **Implementiert** (`metadb-core`) | **Phase 1** (88-Byte-CRC32C-Format + 500-ms-Driftschutz) |
-| Persistenter Speicher (WAL-freies Rust-SSTable-LSM) | Im RAM simuliert (`BTreeMap`) | **Phase 2** (`LsmStorageBackend`, `MANIFEST`, Bloom, LRU-Cache) |
-| In-Memory-MVCC (`SnapshotGuard`) & `LocalityCompactor` | RAM-Prototyp | **Phase 2** (`ActiveSnapshotRegistry` + Bottommost-Kompaktierung) |
-| Multi-Raft-Konsens (`1-Voter -> 3-Voter` + `ReadIndex`) | Im RAM simuliert (`VecDeque`) | **Phase 3** (`openraft` + `.raftlog`-Segmente + `tonic`) |
-| `1-RTT`-Pushdown, `AsyncAttrAggregator` & `AuxOutbox` | **Implementiert** (Einzelprozess-RAM) | **Phase 4** (koordinierte Flush-Barriere + lokaler `[0x07]`-Überlauf) |
-| Shard-übergreifendes 2PC (`Rename`, `Mkdir`, `Rmdir`) | RAM-Prototyp für `Rename` | **Phase 4** (primärverankertes `TxnRecord` + `WriteIntent`-Recovery) |
-| `PID`-Grenz-Split, Jumbo-Isolierung & `DualMode` | **Implementiert** (RAM-Split & Isolierung) | **Phase 5** (`ShardEpoch`-Fencing + `DirShardDelta`-Scatter-Gather) |
-| Leichtgewichtiger SQL-Vorlagen-Compiler | **Implementiert** (8 literale SQL-Muster) | **Phase 5** (alle 20 parametrisierten `?`-SQL-Vorlagen) |
-| Server-Daemon `metadbd` & `metadb-ctl` CLI | Geplant | **Phase 6** (`crates/metadb-server/src/bin/`) |
+| Eingebettete Rust-SDKs (`PersistentMetaDbCluster` & `MetaDbEngine`) | **Implementiert & Getestet** (asynchron persistent + synchron RAM) | `metadb-server` |
+| `(PID, "_attr_")`-Kolokation, `0x01..0x07` & `HLC`-Uhr | **Implementiert & Getestet** (88-Byte-CRC32C + 500-ms-Driftschutz) | `metadb-core` |
+| Persistenter Speicher (WAL-freies Rust-SSTable-LSM) | **Implementiert & Getestet** (`LsmStorageBackend`, `MANIFEST`, Bloom, LRU-Cache) | `metadb-storage` |
+| In-Memory-MVCC (`SnapshotGuard` `ReadCut`) & `LocalityCompactor` | **Implementiert & Getestet** (`ActiveSnapshotRegistry` + Bottommost-Kompaktierung) | `metadb-storage` |
+| Multi-Raft-Konsens (`1-Voter -> 3-Voter` + `ReadIndex`) | **Implementiert & Getestet** (`openraft` 0.10 + `.raftlog`-Segmente + `tonic`) | `metadb-raft` |
+| `1-RTT`-Pushdown, `ReplicatedAttrAggregator` & `AuxOutbox` | **Implementiert & Getestet** (koordinierte Flush-Barriere + `[0x07]`-Überlauf) | `metadb-tx` |
+| Shard-übergreifendes 2PC (`Rename`, `Mkdir`, `Rmdir`, `SetAttr`) | **Implementiert & Getestet** (primärverankertes `TxnRecord` + `WriteIntent`) | `metadb-tx` |
+| `PID`-Grenz-Split, Jumbo-Isolierung & `DualMode` | **Implementiert & Getestet** (`ShardEpoch`-Fencing + `DirShardDelta`) | `metadb-cluster` |
+| Leichtgewichtiger 20-SQL-Vorlagen-Compiler | **Implementiert & Getestet** (alle 20 parametrisierten `?`-SQL-Vorlagen) | `metadb-proxy` |
+| Server-Daemon `metadbd` & `metadb-ctl` CLI | **Implementiert & Getestet** (`crates/metadb-server/src/bin/`) | `metadb-server` |
 
 ---
 
-## Schnellstart: Eingebettetes Rust-SDK (`v0.1.0-prototype` sofort nutzbar)
+## Schnellstart: Eingebettetes Rust-SDK (`PersistentMetaDbCluster` & `MetaDbEngine`)
 
 ```toml
 [dependencies]
@@ -65,4 +65,19 @@ fn main() -> metadb_core::Result<()> {
     engine.run_background_maintenance()?;
     Ok(())
 }
+```
+
+### Asynchrones Persistentes & gRPC-Cluster-SDK (`PersistentMetaDbCluster`)
+
+`PersistentMetaDbCluster::open_and_serve(config).await?` startet den absturzsicheren Speicher auf Basis von `LsmStorageBackend` und OpenRaft inklusive Hintergrundwartung und gRPC-Endpunkt:
+
+```rust
+use metadb_server::{PersistentMetaDbCluster, ServerTomlConfig};
+
+let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(
+    ServerTomlConfig::from_toml_file("/etc/metadb/standalone.toml")?,
+).await?;
+let dir = cluster.mkdir_auto_id(1, "checkpoints", 1000, 0o755).await?;
+let file = cluster.create_file_auto_id(dir.attr.inode_id, "step_0002.pt", 1000, 0o644, 4096).await?;
+cluster.shutdown().await?;
 ```

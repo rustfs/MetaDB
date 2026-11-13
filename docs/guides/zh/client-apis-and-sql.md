@@ -3,7 +3,7 @@
 * **返回指南首页**: [简体中文概览](./README.md) | [文档中心](../../README.md)
 
 MetaDB 提供三类客户端接入方式：
-1. **嵌入式 Rust SDK (`metadb-server`)** — 同进程零序列化调用（当前 `v0.1.0-prototype` 提供同步版，**Phase 6** 提供 `tokio` 异步版）。
+1. **嵌入式 Rust SDK (`metadb-server`)** — 同进程零序列化调用（提供 `PersistentMetaDbCluster` 异步持久化版与 `MetaDbEngine` 同步内存版）。
 2. **强类型 `tonic` gRPC 接口 (`metadb-proto`)** — 面向分布式 RustFS 数据节点与代理的高吞吐多路复用 RPC（**Phase 1** 定义契约，**Phase 6** 交付服务端）。
 3. **20 条轻量级元数据 SQL 模板 (`metadb-proxy`)** — 省去通用 SQL 优化器开销，在 `<5µs` 内直接编译为存储执行计划（当前已支持 8 条字面量模式，**Phase 5** 支持全部 20 条 `?` 参数绑定与引号转义模式）。
 

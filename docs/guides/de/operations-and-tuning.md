@@ -4,7 +4,7 @@
 
 ---
 
-## 1. Administrations-CLI `metadb-ctl` `[Ziel: Phase 6]`
+## 1. Administrations-CLI `metadb-ctl` `[Implementiert]`
 
 ```bash
 # Cluster-, Cell-, BE-Knoten- und Raft-Watermark-Status prüfen
