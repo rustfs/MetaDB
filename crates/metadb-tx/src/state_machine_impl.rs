@@ -124,6 +124,10 @@ pub enum TxRaftCmd {
         txn_id: TxnId,
         caller_hlc: HlcTimestamp,
     },
+    FenceShardRangeForSplit {
+        new_range: CompositeKeyRange,
+        new_epoch: ShardEpoch,
+    },
     UpdateShardRangeOnSplit {
         new_range: CompositeKeyRange,
         new_epoch: ShardEpoch,
@@ -1335,6 +1339,19 @@ impl TxStateMachineHandler {
                 self.outbox
                     .record_entry_specs(raft_index, commit_hlc, vec![]);
                 Ok(TxRaftOutput::TxnStatus(Some(txn_rec.state)))
+            }
+            TxRaftCmd::FenceShardRangeForSplit {
+                new_range,
+                new_epoch,
+            } => {
+                {
+                    let mut m = self.meta.write().unwrap();
+                    m.range = new_range;
+                    m.epoch = new_epoch;
+                }
+                self.outbox
+                    .record_entry_specs(raft_index, commit_hlc, vec![]);
+                Ok(TxRaftOutput::Unit)
             }
             TxRaftCmd::UpdateShardRangeOnSplit {
                 new_range,

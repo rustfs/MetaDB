@@ -126,20 +126,23 @@ impl DistributedTxRouter {
         user_key: &[u8],
         cmd: &TxRaftCmd,
     ) -> Result<TxRaftOutput> {
-        for attempt in 0..8usize {
+        for attempt in 0..12usize {
             let (epoch, group, _) = self.directory.route_user_key(user_key)?;
             match Self::propose_cmd(&group, epoch, self.clock.now(), cmd).await {
                 Ok((_, out)) => return Ok(out),
-                Err(MetaDbError::EpochMismatch { .. } | MetaDbError::NotLeader { .. })
-                    if attempt < 7 =>
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                Err(
+                    MetaDbError::EpochMismatch { .. }
+                    | MetaDbError::NotLeader { .. }
+                    | MetaDbError::ShardRoutingError(_),
+                ) if attempt < 11 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(15 * (attempt as u64 + 1)))
+                        .await;
                 }
                 Err(MetaDbError::WriteIntentConflict {
                     conflicting_txn_id,
                     primary_key,
                     expire_hlc,
-                }) if attempt < 7 => {
+                }) if attempt < 11 => {
                     if self.clock.now().0 > expire_hlc {
                         let _ = TxnRecoveryWorker::resolve_single_txn(
                             self.directory.as_ref(),

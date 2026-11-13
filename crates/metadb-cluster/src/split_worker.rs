@@ -194,7 +194,33 @@ impl RaftShardSplitWorker {
             }
         }
 
-        // Trigger Coordinated Flush Barrier on `S_parent` so all in-memory `AttrDelta`s are folded!
+        let left_range =
+            CompositeKeyRange::new(parent_route.range.start_key.clone(), split_key.clone())?;
+        let right_range = CompositeKeyRange::new(split_key.clone(), old_end_key.clone())?;
+        let new_parent_epoch = ShardEpoch {
+            conf_ver: parent_group.current_epoch().conf_ver,
+            version: target_version,
+        };
+
+        // Atomically fence `S_parent` to `left_range` + `new_parent_epoch` BEFORE flushing & scanning
+        // so zero concurrent writes or `AttrDelta`s can land in `right_range` on `S_parent` during split!
+        if parent_group.current_epoch().version < target_version {
+            let fence_cmd = TxRaftCmd::FenceShardRangeForSplit {
+                new_range: left_range.clone(),
+                new_epoch: new_parent_epoch,
+            };
+            let fence_payload = bincode::serialize(&fence_cmd)
+                .map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+            parent_group
+                .propose(
+                    parent_group.current_epoch(),
+                    host.clock().now(),
+                    fence_payload,
+                )
+                .await?;
+        }
+
+        // Trigger Coordinated Flush Barrier on `S_parent` so 100% of pre-fence `AttrDelta`s are folded!
         parent_group.state_machine().flush_to_lsm()?;
 
         // Stage B.1: Record `PendingChildBoot` in `NODE_SHARD_REGISTRY` (`Resolution B15`).
@@ -211,10 +237,6 @@ impl RaftShardSplitWorker {
                 peers: peer_addrs.clone(),
             },
         )?;
-
-        let left_range =
-            CompositeKeyRange::new(parent_route.range.start_key.clone(), split_key.clone())?;
-        let right_range = CompositeKeyRange::new(split_key.clone(), old_end_key.clone())?;
 
         // Stage B.2: Partition all `0x01..0x06` entries by `affinity_key_for_raw_entry` (`0x07` stays on parent!).
         let (_, snap_full) = parent_group
@@ -454,11 +476,7 @@ impl RaftShardSplitWorker {
             RegistryShardState::Active { peers: peer_addrs },
         )?;
 
-        // Commit `UpdateShardRangeOnSplit` on `S_parent` (`epoch.version = target_version`).
-        let new_parent_epoch = ShardEpoch {
-            conf_ver: parent_group.current_epoch().conf_ver,
-            version: target_version,
-        };
+        // Commit `UpdateShardRangeOnSplit` cleanup on `S_parent` (`epoch.version = target_version`).
         let update_cmd = TxRaftCmd::UpdateShardRangeOnSplit {
             new_range: left_range.clone(),
             new_epoch: new_parent_epoch,
