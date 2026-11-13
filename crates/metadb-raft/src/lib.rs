@@ -18,5 +18,5 @@ pub use read_index::{ReadIndexBatcher, ReadToken};
 pub use state_machine::{BasicKvApplyHandler, ShardApplyHandler, ShardStateMachine};
 pub use types::{
     AppliedFrontier, BasicKvCommand, MetaDbRaftRequest, MetaDbRaftResponse, MetaDbTypeConfig,
-    ShardWatermarkTracker, SnapshotArchive,
+    ShardWatermarkTracker, SnapshotArchive, SnapshotFileEntry,
 };

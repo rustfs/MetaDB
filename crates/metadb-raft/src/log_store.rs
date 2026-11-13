@@ -29,11 +29,13 @@ struct PersistedHardState {
 }
 
 struct SegmentFile {
-    #[allow(dead_code)]
     first_index: u64,
     last_index: u64,
     path: PathBuf,
     byte_len: u64,
+    /// Maps each log index stored in this segment to its frame end byte offset (`>= 8`),
+    /// enabling crash-safe in-place `set_len` suffix truncation without rewriting committed prefixes.
+    entry_end_offsets: BTreeMap<u64, u64>,
 }
 
 struct LogStoreInner {
@@ -110,6 +112,7 @@ impl LogStoreInner {
             let mut offset = 8usize;
             let mut last_idx_in_seg = first_index;
             let mut truncate_tail: Option<usize> = None;
+            let mut entry_end_offsets: BTreeMap<u64, u64> = BTreeMap::new();
 
             while offset < raw.len() {
                 if offset + 8 > raw.len() {
@@ -129,7 +132,7 @@ impl LogStoreInner {
                     u32::from_le_bytes(raw[offset + 4..offset + 8].try_into().unwrap());
                 let frame_end = offset.saturating_add(8).saturating_add(frame_len);
 
-                if frame_end > raw.len() || frame_len < 8 {
+                if frame_end > raw.len() {
                     if is_last_segment {
                         truncate_tail = Some(offset);
                         break;
@@ -140,19 +143,23 @@ impl LogStoreInner {
                         ));
                     }
                 }
+                if frame_len < 8 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid raft frame_len {} < 8 in {:?}", frame_len, path),
+                    ));
+                }
 
                 let frame_body = &raw[offset + 8..frame_end];
                 let actual_crc = checksum_crc32c(frame_body);
                 if actual_crc != expected_crc {
-                    if is_last_segment {
-                        truncate_tail = Some(offset);
-                        break;
-                    } else {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("CRC32C mismatch in non-final raft segment {:?}", path),
-                        ));
-                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "CRC32C mismatch in complete raft frame at offset {} of {:?}",
+                            offset, path
+                        ),
+                    ));
                 }
 
                 let log_index = u64::from_le_bytes(frame_body[0..8].try_into().unwrap());
@@ -160,6 +167,7 @@ impl LogStoreInner {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
                 last_idx_in_seg = log_index;
+                entry_end_offsets.insert(log_index, frame_end as u64);
                 let keep_entry = match purged_idx_opt {
                     None => true,
                     Some(purged_idx) => log_index > purged_idx,
@@ -184,6 +192,7 @@ impl LogStoreInner {
                 last_index: last_idx_in_seg,
                 path,
                 byte_len: final_len,
+                entry_end_offsets,
             });
         }
 
@@ -255,6 +264,7 @@ impl LogStoreInner {
             last_index: first_index,
             path,
             byte_len: 8,
+            entry_end_offsets: BTreeMap::new(),
         });
         self.active_file = Some(append_f);
         Ok(())
@@ -293,6 +303,7 @@ impl LogStoreInner {
             if let Some(seg) = self.segments.last_mut() {
                 seg.last_index = log_idx;
                 seg.byte_len += frame.len() as u64;
+                seg.entry_end_offsets.insert(log_idx, seg.byte_len);
             }
             self.entries.insert(log_idx, entry);
         }
@@ -303,14 +314,72 @@ impl LogStoreInner {
         Ok(())
     }
 
-    fn rewrite_all_segments(&mut self) -> io::Result<()> {
+    /// Crash-safe suffix-only truncation: never unlinks or rewrites committed prefix segments!
+    /// Truncates the target segment containing `keep_upto` in-place via `set_len(valid_end_offset)` + `sync_data()`,
+    /// and unlinks only trailing segment files whose `first_index > keep_upto`.
+    fn truncate_suffix_after(
+        &mut self,
+        last_log_id: Option<LogIdOf<MetaDbTypeConfig>>,
+    ) -> io::Result<()> {
         self.active_file = None;
-        for seg in self.segments.drain(..) {
-            let _ = fs::remove_file(seg.path);
+
+        let Some(lid) = last_log_id else {
+            self.entries.clear();
+            let mut removed_any = false;
+            for seg in self.segments.drain(..) {
+                let _ = fs::remove_file(seg.path);
+                removed_any = true;
+            }
+            if removed_any {
+                sync_dir(&self.raft_dir).map_err(|e| io::Error::other(e.to_string()))?;
+            }
+            return Ok(());
+        };
+
+        let keep_upto = lid.index;
+        let _ = self.entries.split_off(&(keep_upto.saturating_add(1)));
+
+        let mut removed_trailing = false;
+        while let Some(last_seg) = self.segments.last() {
+            if last_seg.first_index > keep_upto {
+                let seg = self.segments.pop().unwrap();
+                let _ = fs::remove_file(&seg.path);
+                removed_trailing = true;
+            } else {
+                break;
+            }
         }
-        let existing: Vec<EntryOf<MetaDbTypeConfig>> = self.entries.values().cloned().collect();
-        self.entries.clear();
-        self.append_entries_sync(existing)
+        if removed_trailing {
+            sync_dir(&self.raft_dir).map_err(|e| io::Error::other(e.to_string()))?;
+        }
+
+        if let Some(tail_seg) = self.segments.last_mut() {
+            if tail_seg.last_index > keep_upto {
+                let valid_end_offset = tail_seg
+                    .entry_end_offsets
+                    .range(..=keep_upto)
+                    .next_back()
+                    .map(|(_, &end_off)| end_off)
+                    .unwrap_or(8);
+                let wf = OpenOptions::new().write(true).open(&tail_seg.path)?;
+                wf.set_len(valid_end_offset)?;
+                wf.sync_data()?;
+                drop(wf);
+
+                let _ = tail_seg
+                    .entry_end_offsets
+                    .split_off(&(keep_upto.saturating_add(1)));
+                tail_seg.byte_len = valid_end_offset;
+                tail_seg.last_index = tail_seg
+                    .entry_end_offsets
+                    .last_key_value()
+                    .map(|(&idx, _)| idx)
+                    .unwrap_or(tail_seg.first_index);
+            }
+            self.active_file = Some(OpenOptions::new().append(true).open(&tail_seg.path)?);
+        }
+
+        Ok(())
     }
 }
 
@@ -499,19 +568,23 @@ impl RaftLogStorage<MetaDbTypeConfig> for SegmentedRaftLogStore {
         last_log_id: Option<LogIdOf<MetaDbTypeConfig>>,
     ) -> Result<(), io::Error> {
         let mut guard = self.inner.lock().unwrap();
-        let keep_upto = last_log_id.map(|id| id.index).unwrap_or(0);
-        let committed_idx = guard.hard_state.committed.map(|id| id.index).unwrap_or(0);
-        if keep_upto < committed_idx {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "refusing to truncate committed raft log index {} below {}",
-                    keep_upto, committed_idx
-                ),
-            ));
+        if let Some(comm) = guard.hard_state.committed {
+            let keep_ok = match last_log_id {
+                Some(lid) => lid.index >= comm.index,
+                None => false,
+            };
+            if !keep_ok {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to truncate committed raft log index {:?} below {}",
+                        last_log_id.map(|id| id.index),
+                        comm.index
+                    ),
+                ));
+            }
         }
-        guard.entries.split_off(&(keep_upto + 1));
-        guard.rewrite_all_segments()
+        guard.truncate_suffix_after(last_log_id)
     }
 
     async fn purge(&mut self, log_id: LogIdOf<MetaDbTypeConfig>) -> Result<(), io::Error> {

@@ -164,3 +164,177 @@ async fn test_single_voter_walless_crash_recovery_and_three_watermark_pinning() 
         recovered.shutdown().await.unwrap();
     }
 }
+
+/// T-RAFT-1B: Verifies crash-safe suffix-only `truncate_after` (preserving untouched prefix segment files),
+/// strict `InvalidData` error on complete-frame CRC32C corruption in the final segment, and
+/// `install_snapshot` index + per-file `(expected_len, crc32c)` validation.
+#[tokio::test]
+async fn test_suffix_only_truncate_final_crc_rejection_and_snapshot_verification() {
+    use openraft::storage::{RaftLogReader, RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine};
+
+    let dir = tempdir().unwrap();
+    let wm = Arc::new(ShardWatermarkTracker::new(0, 0, 0));
+
+    // 1. Use a single-voter group (`max_segment_bytes = 512`) to populate multi-segment `.raftlog` frames.
+    let group_dir = dir.path().join("group_1");
+    let cache = Arc::new(ShardedBlockCache::new(2 * 1024 * 1024));
+    let clock = Arc::new(HybridLogicalClock::new());
+    let handler = Arc::new(BasicKvApplyHandler::new(ShardEpoch::initial(), wm.clone()));
+    let router = MultiRaftRouter::new();
+    let grp = ShardRaftGroup::start(
+        10,
+        1,
+        &group_dir,
+        cache.clone(),
+        LsmEngineConfig::default(),
+        RaftNodeOptions {
+            max_segment_bytes: 512,
+            ..Default::default()
+        },
+        handler.clone(),
+        wm.clone(),
+        clock,
+        &router,
+        ChannelPool::default(),
+    )
+    .await
+    .unwrap();
+    grp.initialize_if_needed(BTreeMap::from([(1u64, "127.0.0.1:0".to_string())]))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let ep = grp.current_epoch();
+    for i in 1..=15u64 {
+        let cmd = BasicKvCommand::Put {
+            key: MetaKey::child(1, format!("k_{:02}", i)).encode(),
+            value: vec![i as u8; 64],
+        };
+        grp.propose(ep, HlcTimestamp::ZERO, bincode::serialize(&cmd).unwrap())
+            .await
+            .unwrap();
+    }
+
+    // Build a valid snapshot from `grp` for snapshot-verification checks below!
+    let mut sm_clone = grp.state_machine().clone();
+    let mut builder = sm_clone.get_snapshot_builder().await;
+    let valid_snap = builder.build_snapshot().await.unwrap();
+    grp.shutdown().await.unwrap();
+
+    // Reopen `SegmentedRaftLogStore` on `group_dir/raft`, lower `committed` to index 5 so indices 6..=16 are uncommitted,
+    // record first segment bytes, and verify `truncate_after(index 8)` leaves segment 0 untouched while truncating suffix!
+    let grp_raft_dir = group_dir.join("raft");
+    let mut raw_store =
+        metadb_raft::SegmentedRaftLogStore::open_with_segment_size(&grp_raft_dir, 512, wm.clone())
+            .unwrap();
+    assert!(raw_store.segment_file_count() >= 2);
+    let seg0_path = grp_raft_dir.join("segment_00000000000000000000.raftlog");
+    let seg0_before = fs::read(&seg0_path).unwrap();
+
+    let entry3 = raw_store
+        .try_get_log_entries(3..=3)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let entry5 = raw_store
+        .try_get_log_entries(5..=5)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let entry8 = raw_store
+        .try_get_log_entries(8..=8)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    raw_store.save_committed(Some(entry5.log_id)).await.unwrap();
+
+    // Truncating below committed index 5 must be rejected!
+    assert!(raw_store.truncate_after(Some(entry3.log_id)).await.is_err());
+    assert!(raw_store.truncate_after(None).await.is_err());
+
+    // Suffix-only truncate_after(8) must keep 0..=8 and preserve `seg0_path` byte-for-byte!
+    raw_store.truncate_after(Some(entry8.log_id)).await.unwrap();
+    assert_eq!(fs::read(&seg0_path).unwrap(), seg0_before);
+    drop(raw_store);
+
+    let reopened_store =
+        metadb_raft::SegmentedRaftLogStore::open_with_segment_size(&grp_raft_dir, 512, wm.clone())
+            .unwrap();
+    let mut reader = reopened_store.clone();
+    let all_after = reader.try_get_log_entries(0..=100).await.unwrap();
+    assert_eq!(all_after.last().unwrap().log_id.index, 8);
+    drop(reader);
+    drop(reopened_store);
+
+    // 2. Corrupt 1 payload byte inside a COMPLETE frame of the final `.raftlog` segment -> must return `Err(InvalidData)`!
+    let mut seg_files: Vec<_> = fs::read_dir(&grp_raft_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s == "raftlog")
+                .unwrap_or(false)
+        })
+        .collect();
+    seg_files.sort();
+    let last_seg = seg_files.last().unwrap();
+    let mut seg_bytes = fs::read(last_seg).unwrap();
+    let flip_idx = seg_bytes.len() - 2;
+    seg_bytes[flip_idx] ^= 0xFF;
+    fs::write(last_seg, &seg_bytes).unwrap();
+
+    let corrupt_err = match metadb_raft::SegmentedRaftLogStore::open(&grp_raft_dir, wm.clone()) {
+        Ok(_) => panic!("expected InvalidData on complete-frame CRC32C mismatch in final segment"),
+        Err(e) => e,
+    };
+    assert_eq!(corrupt_err.kind(), std::io::ErrorKind::InvalidData);
+
+    // 3. Verify `ShardStateMachine::install_snapshot` rejects checkpoint index mismatch and tampered file CRC32C!
+    let target_sm_dir = dir.path().join("sm_install_target");
+    let mut target_sm = metadb_raft::ShardStateMachine::open(
+        99,
+        &target_sm_dir,
+        cache,
+        LsmEngineConfig::default(),
+        Arc::new(BasicKvApplyHandler::new(ShardEpoch::initial(), wm)),
+        Arc::new(ShardWatermarkTracker::default()),
+    )
+    .unwrap()
+    .0;
+
+    let mut bad_idx_snap = valid_snap.snapshot.clone();
+    bad_idx_snap.checkpoint.flushed_raft_index += 7;
+    assert_eq!(
+        target_sm
+            .install_snapshot(&valid_snap.meta, bad_idx_snap)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+
+    let mut bad_crc_snap = valid_snap.snapshot.clone();
+    bad_crc_snap.files[0].bytes[0] ^= 0xFF;
+    assert_eq!(
+        target_sm
+            .install_snapshot(&valid_snap.meta, bad_crc_snap)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+
+    // Valid snapshot installs cleanly, and re-installing at `<= current_idx` is a fast no-op!
+    target_sm
+        .install_snapshot(&valid_snap.meta, valid_snap.snapshot.clone())
+        .await
+        .unwrap();
+    target_sm
+        .install_snapshot(&valid_snap.meta, valid_snap.snapshot)
+        .await
+        .unwrap();
+}

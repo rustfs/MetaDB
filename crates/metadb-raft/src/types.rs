@@ -55,13 +55,22 @@ pub enum BasicKvCommand {
     Noop,
 }
 
+/// Verified per-file payload inside a `SnapshotArchive` with explicit `(expected_len, crc32c)` metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotFileEntry {
+    pub name: String,
+    pub expected_len: u64,
+    pub crc32c: u32,
+    pub bytes: Vec<u8>,
+}
+
 /// Portable snapshot bundle containing verified hard-linked `.sst` and `MANIFEST` files
 /// pinned strictly at `checkpoint.flushed_raft_index` (`Resolution B6` / `G-S5`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotArchive {
     pub checkpoint: DurableShardCheckpoint,
-    /// `(relative_file_name, file_bytes)` inside the shard `lsm/` directory.
-    pub files: Vec<(String, Vec<u8>)>,
+    /// Verified files inside the shard `lsm/` directory.
+    pub files: Vec<SnapshotFileEntry>,
 }
 
 openraft::declare_raft_types!(

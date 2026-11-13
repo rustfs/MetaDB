@@ -17,7 +17,8 @@ use tokio::sync::watch;
 use tokio_stream::StreamExt;
 
 use metadb_core::{
-    append_crc32c_le, verify_crc32c_le, HlcTimestamp, MetaDbError, Result, ShardEpoch, ShardId,
+    append_crc32c_le, checksum_crc32c, verify_crc32c_le, HlcTimestamp, MetaDbError, Result,
+    ShardEpoch, ShardId,
 };
 use metadb_storage::sstable::sync_dir;
 use metadb_storage::{
@@ -27,7 +28,7 @@ use metadb_storage::{
 
 use crate::types::{
     AppliedFrontier, BasicKvCommand, MetaDbRaftRequest, MetaDbRaftResponse, MetaDbTypeConfig,
-    ShardWatermarkTracker, SnapshotArchive,
+    ShardWatermarkTracker, SnapshotArchive, SnapshotFileEntry,
 };
 
 /// Pluggable application command handler executed deterministically inside `RaftStateMachine::apply`.
@@ -132,7 +133,7 @@ impl ShardApplyHandler for BasicKvApplyHandler {
 struct PersistedSnapshotMeta {
     meta: SnapshotMetaOf<MetaDbTypeConfig>,
     checkpoint: DurableShardCheckpoint,
-    file_names: Vec<String>,
+    file_specs: Vec<(String, u64, u32)>,
 }
 
 struct StateMachineShared {
@@ -244,20 +245,28 @@ impl StateMachineShared {
                     .unwrap_or_else(|_| self.last_membership.read().unwrap().clone())
             };
 
-        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-        let mut file_names: Vec<String> = Vec::new();
+        let mut files: Vec<SnapshotFileEntry> = Vec::new();
         for d in fs::read_dir(&ckpt_lsm_dir)? {
             let d = d?;
             if d.file_type()?.is_file() {
                 let fname = d.file_name().to_string_lossy().to_string();
                 let mut buf = Vec::new();
                 File::open(d.path())?.read_to_end(&mut buf)?;
-                file_names.push(fname.clone());
-                files.push((fname, buf));
+                let expected_len = buf.len() as u64;
+                let crc32c = checksum_crc32c(&buf);
+                files.push(SnapshotFileEntry {
+                    name: fname,
+                    expected_len,
+                    crc32c,
+                    bytes: buf,
+                });
             }
         }
-        files.sort_by(|a, b| a.0.cmp(&b.0));
-        file_names.sort();
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        let file_specs: Vec<(String, u64, u32)> = files
+            .iter()
+            .map(|f| (f.name.clone(), f.expected_len, f.crc32c))
+            .collect();
 
         let meta: SnapshotMetaOf<MetaDbTypeConfig> = SnapshotMeta {
             last_log_id,
@@ -267,7 +276,7 @@ impl StateMachineShared {
         let persisted_meta = PersistedSnapshotMeta {
             meta: meta.clone(),
             checkpoint: checkpoint.clone(),
-            file_names,
+            file_specs,
         };
         let mut meta_bytes = bincode::serialize(&persisted_meta)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -283,7 +292,8 @@ impl StateMachineShared {
         }
 
         fs::rename(&tmp_dir, &final_dir)?;
-        // Remove older `snap_*` directories.
+        sync_dir(&snaps_root).map_err(|e| io::Error::other(e.to_string()))?;
+        // Remove older `snap_*` directories only AFTER `final_dir` is durably fsync'd in `snaps_root`.
         for d in fs::read_dir(&snaps_root)? {
             let d = d?;
             if d.path() != final_dir {
@@ -336,11 +346,22 @@ impl StateMachineShared {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         let lsm_dir = snap_dir.join("lsm");
-        let mut files = Vec::with_capacity(pmeta.file_names.len());
-        for fname in &pmeta.file_names {
+        let mut files = Vec::with_capacity(pmeta.file_specs.len());
+        for (fname, expected_len, expected_crc) in &pmeta.file_specs {
             let mut buf = Vec::new();
             File::open(lsm_dir.join(fname))?.read_to_end(&mut buf)?;
-            files.push((fname.clone(), buf));
+            if buf.len() as u64 != *expected_len || checksum_crc32c(&buf) != *expected_crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("snapshot file {} failed length/CRC32C check", fname),
+                ));
+            }
+            files.push(SnapshotFileEntry {
+                name: fname.clone(),
+                expected_len: *expected_len,
+                crc32c: *expected_crc,
+                bytes: buf,
+            });
         }
 
         Ok(Some(Snapshot {
@@ -608,18 +629,52 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
         snapshot: Self::SnapshotData,
     ) -> std::result::Result<(), io::Error> {
         let snap_idx = meta.last_log_id.map(|id| id.index).unwrap_or(0);
-        let current_idx = self
-            .shared
-            .last_applied_log_id
-            .read()
-            .unwrap()
-            .map(|id| id.index)
-            .unwrap_or(0);
+        if let Some(cur) = *self.shared.last_applied_log_id.read().unwrap() {
+            if snap_idx <= cur.index {
+                return Ok(());
+            }
+        }
+        if snapshot.checkpoint.flushed_raft_index != snap_idx {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "snapshot index mismatch: meta={} != checkpoint.flushed_raft_index={}",
+                    snap_idx, snapshot.checkpoint.flushed_raft_index
+                ),
+            ));
+        }
 
-        // Do not overwrite a newer applied state (`Resolution B6`), except when OpenRaft restores
-        // its own initial snapshot at startup (`snap_idx == current_idx`).
-        if snap_idx < current_idx {
-            return Ok(());
+        // Verify per-file `(expected_len, crc32c)` BEFORE staging or touching live `lsm/`.
+        let mut file_specs = Vec::with_capacity(snapshot.files.len());
+        for entry in &snapshot.files {
+            if entry.name.is_empty() || entry.name.contains('/') || entry.name.contains("..") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid snapshot relative file name: {:?}", entry.name),
+                ));
+            }
+            if entry.bytes.len() as u64 != entry.expected_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "snapshot file {} length mismatch: expected {}, got {}",
+                        entry.name,
+                        entry.expected_len,
+                        entry.bytes.len()
+                    ),
+                ));
+            }
+            let actual_crc = checksum_crc32c(&entry.bytes);
+            if actual_crc != entry.crc32c {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "snapshot file {} CRC32C mismatch: expected 0x{:08x}, got 0x{:08x}",
+                        entry.name, entry.crc32c, actual_crc
+                    ),
+                ));
+            }
+            file_specs.push((entry.name.clone(), entry.expected_len, entry.crc32c));
         }
 
         let staging_dir = self
@@ -631,17 +686,15 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
         }
         fs::create_dir_all(&staging_dir)?;
 
-        let mut file_names = Vec::with_capacity(snapshot.files.len());
-        for (fname, bytes) in &snapshot.files {
-            let fpath = staging_dir.join(fname);
+        for entry in &snapshot.files {
+            let fpath = staging_dir.join(&entry.name);
             let mut f = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .open(&fpath)?;
-            f.write_all(bytes)?;
+            f.write_all(&entry.bytes)?;
             f.sync_data()?;
-            file_names.push(fname.clone());
         }
         sync_dir(&staging_dir).map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -713,7 +766,7 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
         let pmeta = PersistedSnapshotMeta {
             meta: meta.clone(),
             checkpoint: snapshot.checkpoint.clone(),
-            file_names,
+            file_specs,
         };
         let mut meta_bytes = bincode::serialize(&pmeta)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -728,6 +781,7 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
             mf.sync_data()?;
         }
         fs::rename(&saved_tmp, &saved_snap_dir)?;
+        sync_dir(&snaps_root).map_err(|e| io::Error::other(e.to_string()))?;
         for d in fs::read_dir(&snaps_root)? {
             let d = d?;
             if d.path() != saved_snap_dir {
