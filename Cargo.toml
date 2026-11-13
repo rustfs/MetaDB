@@ -4,6 +4,7 @@ members = [
     "crates/metadb-core",
     "crates/metadb-proto",
     "crates/metadb-storage",
+    "crates/metadb-raft",
     "crates/metadb-tx",
     "crates/metadb-cluster",
     "crates/metadb-proxy",
@@ -24,7 +25,7 @@ prost = "0.14.6"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14.9"
 tonic-prost = "0.14.9"
 tonic-prost-build = "0.14.9"

@@ -1,0 +1,25 @@
+[package]
+name = "metadb-raft"
+description = "OpenRaft Multi-Raft consensus, segmented CRC32C log store, 3-watermark purge gate, and tonic gRPC transport for MetaDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+metadb-core = { path = "../metadb-core" }
+metadb-proto = { path = "../metadb-proto" }
+metadb-storage = { path = "../metadb-storage" }
+bincode = { workspace = true }
+bytes = { workspace = true }
+crc32c = { workspace = true }
+openraft = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
