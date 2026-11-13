@@ -1,23 +1,39 @@
+//! In-Memory MVCC (`MemMvccStore`) with `SnapshotGuard` `ReadCut` isolation,
+//! `ActiveSnapshotRegistry` Safe-Flush Gate, and `PreFlushHook` Coordinated Flush Barrier.
+
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::RwLock;
+use std::ops::Bound;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use metadb_core::{HlcTimestamp, MetaDbError, Result};
 
+use crate::backend::{PersistentEntry, StorageBackend};
+use crate::manifest::DurableShardCheckpoint;
 use crate::raft_log::LogSequenceNumber;
+use crate::version_set::Version;
 
 /// Default transaction timeout and in-memory MVCC retention window (`5,000 ms`, §6.1).
 pub const DEFAULT_MVCC_RETENTION_MS: u64 = 5_000;
+
+/// Total immutable read cut `(max_raft_index, max_hlc)` pinned by a `SnapshotGuard` (`Resolution B1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadCut {
+    pub max_raft_index: LogSequenceNumber,
+    pub max_hlc: HlcTimestamp,
+}
 
 /// Value state of an in-memory MVCC version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MvccValue {
     /// Live byte value.
     Value(Vec<u8>),
-    /// Logical MVCC tombstone (kept strictly in memory; never persisted as an MVCC version).
+    /// Logical MVCC tombstone (kept strictly in memory; collapsed to a single physical LSM tombstone on flush).
     Tombstone,
 }
 
-/// A single timestamped version in memory.
+/// A single timestamped and Raft-indexed version in memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MvccVersion {
     pub hlc: HlcTimestamp,
@@ -25,98 +41,503 @@ pub struct MvccVersion {
     pub value: MvccValue,
 }
 
-/// Output produced when flushing `MemMvccStore` to the persistent LSM store.
+/// Sealed immutable MemTable queued for collapse-flush once `min_active_snapshot_hlc >= max_hlc`.
+#[derive(Debug, Clone)]
+pub struct ImmMemTable {
+    pub seal_id: u64,
+    pub max_raft_index: LogSequenceNumber,
+    pub max_hlc: HlcTimestamp,
+    pub checkpoint: DurableShardCheckpoint,
+    pub entries: BTreeMap<Vec<u8>, Vec<MvccVersion>>,
+}
+
+impl ImmMemTable {
+    pub fn get_at_cut(&self, key: &[u8], cut: ReadCut) -> Option<MvccValue> {
+        let chain = self.entries.get(key)?;
+        for v in chain.iter().rev() {
+            if v.lsn <= cut.max_raft_index && v.hlc <= cut.max_hlc {
+                return Some(v.value.clone());
+            }
+        }
+        None
+    }
+}
+
+/// Read-only view spanning `SealingMemTable (<= M) -> queued ImmMemTables (<= M) -> VersionSet`
+/// passed into `PreFlushHook::on_seal_memtable(M)` (`Resolution B5` / `G-S3`).
+pub struct ViewAtRaftIndex<'a> {
+    sealed_index: LogSequenceNumber,
+    sealing_entries: &'a BTreeMap<Vec<u8>, VecDeque<MvccVersion>>,
+    imm_queue: &'a VecDeque<Arc<ImmMemTable>>,
+    backend: &'a dyn StorageBackend,
+    version: Arc<Version>,
+}
+
+impl<'a> ViewAtRaftIndex<'a> {
+    /// Reads the latest value of `key` committed at `raft_index <= M` across memory and disk.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(chain) = self.sealing_entries.get(key) {
+            for v in chain.iter().rev() {
+                if v.lsn <= self.sealed_index {
+                    return Ok(match &v.value {
+                        MvccValue::Value(b) => Some(b.clone()),
+                        MvccValue::Tombstone => None,
+                    });
+                }
+            }
+        }
+        for imm in self.imm_queue.iter().rev() {
+            if let Some(chain) = imm.entries.get(key) {
+                for v in chain.iter().rev() {
+                    if v.lsn <= self.sealed_index {
+                        return Ok(match &v.value {
+                            MvccValue::Value(b) => Some(b.clone()),
+                            MvccValue::Tombstone => None,
+                        });
+                    }
+                }
+            }
+        }
+        match self.backend.get_in_version(&self.version, key)? {
+            Some(PersistentEntry::Value(b)) => Ok(Some(b)),
+            Some(PersistentEntry::PhysicalTombstone) | None => Ok(None),
+        }
+    }
+}
+
+/// Hook for atomic Coordinated Flush Barriers (`AsyncAttrAggregator` folding + `AuxOutbox` `[0x07]` spill).
+pub trait PreFlushHook: Send + Sync {
+    fn on_seal_memtable(
+        &self,
+        sealed_raft_index: LogSequenceNumber,
+        sealed_max_hlc: HlcTimestamp,
+        view_at_m: &ViewAtRaftIndex<'_>,
+    ) -> Result<Vec<(Vec<u8>, HlcTimestamp, MvccValue)>>;
+
+    /// Invoked strictly after the L0 SSTable and `MANIFEST` are `fdatasync`'d and published.
+    /// Returns the contiguous `aux_outbox_durable_index` coverage frontier.
+    fn on_flush_durable(
+        &self,
+        durable_raft_index: LogSequenceNumber,
+        durable_max_hlc: HlcTimestamp,
+    ) -> LogSequenceNumber;
+}
+
+/// Collapsed key output emitted when flushing an `ImmMemTable` to an `L0` SSTable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushedKeyState {
     pub key: Vec<u8>,
     pub lsn: LogSequenceNumber,
-    /// `Some(bytes)` writes a `Put` to the persistent KV store;
-    /// `None` writes a single physical LSM tombstone (eliminating the MVCC+LSM double tombstone).
     pub latest_value: Option<Vec<u8>>,
-    /// Number of stale in-memory MVCC versions/tombstones pruned without hitting disk.
     pub pruned_versions: usize,
 }
 
+pub struct SnapshotSlot {
+    pub id: u64,
+    pub cut: ReadCut,
+    pub pinned_flushed_lsn: LogSequenceNumber,
+    pub created_at: Instant,
+    pub expired: AtomicBool,
+    /// Step-level read/write lock held ONLY during bounded `get` / `scan_page` steps (`<100µs`),
+    /// allowing forced expiration at `5,000ms` without indefinite blocking.
+    pub step_lock: RwLock<()>,
+}
+
+/// Registry of active point-in-time `SnapshotGuard`s gating unversioned L0 SSTable collapse-flushes.
+pub struct ActiveSnapshotRegistry {
+    next_id: AtomicU64,
+    retention: Duration,
+    slots: Mutex<BTreeMap<u64, Arc<SnapshotSlot>>>,
+}
+
+impl ActiveSnapshotRegistry {
+    pub fn new(retention_ms: u64) -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            retention: Duration::from_millis(retention_ms.max(1)),
+            slots: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn register(
+        &self,
+        cut: ReadCut,
+        pinned_flushed_lsn: LogSequenceNumber,
+    ) -> Arc<SnapshotSlot> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let slot = Arc::new(SnapshotSlot {
+            id,
+            cut,
+            pinned_flushed_lsn,
+            created_at: Instant::now(),
+            expired: AtomicBool::new(false),
+            step_lock: RwLock::new(()),
+        });
+        self.slots.lock().unwrap().insert(id, slot.clone());
+        slot
+    }
+
+    pub fn unregister(&self, id: u64) {
+        self.slots.lock().unwrap().remove(&id);
+    }
+
+    /// Marks any guard older than `retention` as `expired = true` under its `step_lock.write()`,
+    /// removes expired slots, and returns `(min_active_hlc, min_pinned_flushed_lsn)`.
+    pub fn expire_stale_and_min_bounds(&self) -> Option<(HlcTimestamp, LogSequenceNumber)> {
+        let mut guard = self.slots.lock().unwrap();
+        let mut expired_ids = Vec::new();
+        let mut min_hlc: Option<HlcTimestamp> = None;
+        let mut min_flushed: Option<LogSequenceNumber> = None;
+
+        for (&id, slot) in guard.iter() {
+            if slot.expired.load(Ordering::Acquire) || slot.created_at.elapsed() > self.retention {
+                let _step_w = slot.step_lock.write().unwrap();
+                slot.expired.store(true, Ordering::Release);
+                expired_ids.push(id);
+            } else {
+                min_hlc = Some(match min_hlc {
+                    Some(cur) => cur.min(slot.cut.max_hlc),
+                    None => slot.cut.max_hlc,
+                });
+                min_flushed = Some(match min_flushed {
+                    Some(cur) => cur.min(slot.pinned_flushed_lsn),
+                    None => slot.pinned_flushed_lsn,
+                });
+            }
+        }
+        for id in expired_ids {
+            guard.remove(&id);
+        }
+        min_hlc.zip(min_flushed)
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.slots.lock().unwrap().len()
+    }
+}
+
+/// RAII snapshot handle pinning `(ReadCut, Arc<Version>, Vec<Arc<ImmMemTable>>)` (`Resolution B1`).
+pub struct SnapshotGuard {
+    slot: Arc<SnapshotSlot>,
+    retention: Duration,
+    oldest_retained_hlc: HlcTimestamp,
+    pinned_version: Arc<Version>,
+    pinned_imms: Vec<Arc<ImmMemTable>>,
+    registry: Arc<ActiveSnapshotRegistry>,
+}
+
+impl SnapshotGuard {
+    #[inline]
+    pub fn cut(&self) -> ReadCut {
+        self.slot.cut
+    }
+
+    #[inline]
+    pub fn read_hlc(&self) -> HlcTimestamp {
+        self.slot.cut.max_hlc
+    }
+
+    #[inline]
+    pub fn pinned_version(&self) -> &Arc<Version> {
+        &self.pinned_version
+    }
+
+    #[inline]
+    pub fn pinned_imms(&self) -> &[Arc<ImmMemTable>] {
+        &self.pinned_imms
+    }
+
+    /// Acquires the short-lived per-step read lease and verifies the snapshot has not timed out.
+    pub fn with_step_lease<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _r = self.slot.step_lock.read().unwrap();
+        if self.slot.expired.load(Ordering::Acquire)
+            || self.slot.created_at.elapsed() > self.retention
+        {
+            self.slot.expired.store(true, Ordering::Release);
+            return Err(MetaDbError::TransactionTimeout {
+                snapshot_hlc: self.slot.cut.max_hlc.as_u64(),
+                oldest_retained_hlc: self.oldest_retained_hlc.as_u64(),
+            });
+        }
+        f()
+    }
+
+    /// Explicitly marks this guard expired for deterministic timeout testing.
+    pub fn force_expire_for_test(&self) {
+        let _w = self.slot.step_lock.write().unwrap();
+        self.slot.expired.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        self.registry.unregister(self.slot.id);
+    }
+}
+
 struct MemMvccInner {
-    versions: BTreeMap<Vec<u8>, VecDeque<MvccVersion>>,
+    active_versions: BTreeMap<Vec<u8>, VecDeque<MvccVersion>>,
+    hlc_to_lsn: VecDeque<(HlcTimestamp, LogSequenceNumber)>,
+    imm_queue: VecDeque<Arc<ImmMemTable>>,
+    next_seal_id: u64,
     latest_hlc: HlcTimestamp,
+    latest_lsn: LogSequenceNumber,
+    disk_flushed_max_hlc: HlcTimestamp,
     last_flushed_lsn: LogSequenceNumber,
     total_mvcc_writes: u64,
     total_pruned_versions: u64,
 }
 
-/// In-Memory MVCC layer (§6.1 of `arXiv:2610.32247v1`).
-///
-/// Keeps multiple committed versions and MVCC tombstones strictly in memory for the short
-/// metadata transaction lifetime (`5s`). When flushing to persistent storage, stale versions
-/// and MVCC tombstones are pruned in memory so only the latest committed state (or a single
-/// physical LSM tombstone) is written to disk.
+/// In-Memory MVCC store coordinating active version chains, `ImmMemTable` queue,
+/// and `ActiveSnapshotRegistry`.
 pub struct MemMvccStore {
     retention_ms: u64,
+    registry: Arc<ActiveSnapshotRegistry>,
     inner: RwLock<MemMvccInner>,
 }
 
 impl MemMvccStore {
     pub fn new(retention_ms: u64) -> Self {
+        Self::with_recovered_watermarks(retention_ms, 0, HlcTimestamp::ZERO)
+    }
+
+    pub fn with_recovered_watermarks(
+        retention_ms: u64,
+        flushed_lsn: LogSequenceNumber,
+        flushed_max_hlc: HlcTimestamp,
+    ) -> Self {
         Self {
             retention_ms,
+            registry: Arc::new(ActiveSnapshotRegistry::new(retention_ms)),
             inner: RwLock::new(MemMvccInner {
-                versions: BTreeMap::new(),
-                latest_hlc: HlcTimestamp::ZERO,
-                last_flushed_lsn: 0,
+                active_versions: BTreeMap::new(),
+                hlc_to_lsn: VecDeque::new(),
+                imm_queue: VecDeque::new(),
+                next_seal_id: 1,
+                latest_hlc: flushed_max_hlc,
+                latest_lsn: flushed_lsn,
+                disk_flushed_max_hlc: flushed_max_hlc,
+                last_flushed_lsn: flushed_lsn,
                 total_mvcc_writes: 0,
                 total_pruned_versions: 0,
             }),
         }
     }
 
-    /// Inserts a new committed version into the in-memory MVCC chain.
+    pub fn snapshot_registry(&self) -> &Arc<ActiveSnapshotRegistry> {
+        &self.registry
+    }
+
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>, hlc: HlcTimestamp, lsn: LogSequenceNumber) {
         let mut guard = self.inner.write().unwrap();
         guard.latest_hlc = guard.latest_hlc.max(hlc);
+        guard.latest_lsn = guard.latest_lsn.max(lsn);
         guard.total_mvcc_writes += 1;
-        let chain = guard.versions.entry(key).or_default();
-        chain.push_back(MvccVersion {
-            hlc,
-            lsn,
-            value: MvccValue::Value(value),
-        });
+        guard.hlc_to_lsn.push_back((hlc, lsn));
+        guard
+            .active_versions
+            .entry(key)
+            .or_default()
+            .push_back(MvccVersion {
+                hlc,
+                lsn,
+                value: MvccValue::Value(value),
+            });
     }
 
-    /// Inserts a logical MVCC tombstone into the in-memory MVCC chain.
     pub fn delete(&self, key: Vec<u8>, hlc: HlcTimestamp, lsn: LogSequenceNumber) {
         let mut guard = self.inner.write().unwrap();
         guard.latest_hlc = guard.latest_hlc.max(hlc);
+        guard.latest_lsn = guard.latest_lsn.max(lsn);
         guard.total_mvcc_writes += 1;
-        let chain = guard.versions.entry(key).or_default();
-        chain.push_back(MvccVersion {
-            hlc,
-            lsn,
-            value: MvccValue::Tombstone,
-        });
+        guard.hlc_to_lsn.push_back((hlc, lsn));
+        guard
+            .active_versions
+            .entry(key)
+            .or_default()
+            .push_back(MvccVersion {
+                hlc,
+                lsn,
+                value: MvccValue::Tombstone,
+            });
     }
 
-    /// Reads the version of `key` visible at `read_hlc` from memory, if present.
-    ///
-    /// Returns:
-    /// - `Ok(Some(MvccValue))` if a visible version is present in memory.
-    /// - `Ok(None)` if the key has no in-memory version at or before `read_hlc` (caller should fall back to persistent store).
-    /// - `Err(MetaDbError::TransactionTimeout)` if `read_hlc` is older than the retention window.
+    pub fn acquire_linearizable_snapshot(
+        &self,
+        min_read_index: LogSequenceNumber,
+        pinned_version: Arc<Version>,
+    ) -> Result<SnapshotGuard> {
+        let guard = self.inner.read().unwrap();
+        let cut = ReadCut {
+            max_raft_index: guard.latest_lsn.max(min_read_index),
+            max_hlc: guard.latest_hlc,
+        };
+        let pinned_imms: Vec<Arc<ImmMemTable>> = guard.imm_queue.iter().cloned().collect();
+        let slot = self
+            .registry
+            .register(cut, pinned_version.checkpoint.flushed_raft_index);
+        Ok(SnapshotGuard {
+            slot,
+            retention: Duration::from_millis(self.retention_ms),
+            oldest_retained_hlc: guard.disk_flushed_max_hlc,
+            pinned_version,
+            pinned_imms,
+            registry: self.registry.clone(),
+        })
+    }
+
+    pub fn acquire_fixed_snapshot(
+        &self,
+        barrier_hlc: HlcTimestamp,
+        pinned_version: Arc<Version>,
+    ) -> Result<SnapshotGuard> {
+        let guard = self.inner.read().unwrap();
+        self.check_retention_window(&guard, barrier_hlc)?;
+        if barrier_hlc < guard.disk_flushed_max_hlc {
+            return Err(MetaDbError::TransactionTimeout {
+                snapshot_hlc: barrier_hlc.as_u64(),
+                oldest_retained_hlc: guard.disk_flushed_max_hlc.as_u64(),
+            });
+        }
+
+        let mut max_raft_index = guard.last_flushed_lsn;
+        for &(h, lsn) in &guard.hlc_to_lsn {
+            if h <= barrier_hlc && lsn > max_raft_index {
+                max_raft_index = lsn;
+            }
+        }
+        let cut = ReadCut {
+            max_raft_index,
+            max_hlc: barrier_hlc,
+        };
+        let pinned_imms: Vec<Arc<ImmMemTable>> = guard.imm_queue.iter().cloned().collect();
+        let slot = self
+            .registry
+            .register(cut, pinned_version.checkpoint.flushed_raft_index);
+        Ok(SnapshotGuard {
+            slot,
+            retention: Duration::from_millis(self.retention_ms),
+            oldest_retained_hlc: guard.disk_flushed_max_hlc,
+            pinned_version,
+            pinned_imms,
+            registry: self.registry.clone(),
+        })
+    }
+
+    pub fn get_with_guard(&self, key: &[u8], snap: &SnapshotGuard) -> Option<MvccValue> {
+        let cut = snap.cut();
+        {
+            let guard = self.inner.read().unwrap();
+            if let Some(chain) = guard.active_versions.get(key) {
+                for v in chain.iter().rev() {
+                    if v.lsn <= cut.max_raft_index && v.hlc <= cut.max_hlc {
+                        return Some(v.value.clone());
+                    }
+                }
+            }
+            for imm in guard.imm_queue.iter().rev() {
+                if let Some(val) = imm.get_at_cut(key, cut) {
+                    return Some(val);
+                }
+            }
+        }
+        for imm in snap.pinned_imms().iter().rev() {
+            if let Some(val) = imm.get_at_cut(key, cut) {
+                return Some(val);
+            }
+        }
+        None
+    }
+
+    pub fn range_with_guard(
+        &self,
+        start_key: &[u8],
+        end_key: &[u8],
+        snap: &SnapshotGuard,
+    ) -> BTreeMap<Vec<u8>, MvccValue> {
+        let cut = snap.cut();
+        let mut out: BTreeMap<Vec<u8>, MvccValue> = BTreeMap::new();
+
+        {
+            let guard = self.inner.read().unwrap();
+            for (k, chain) in guard
+                .active_versions
+                .range::<[u8], _>((Bound::Included(start_key), Bound::Excluded(end_key)))
+            {
+                for v in chain.iter().rev() {
+                    if v.lsn <= cut.max_raft_index && v.hlc <= cut.max_hlc {
+                        out.insert(k.clone(), v.value.clone());
+                        break;
+                    }
+                }
+            }
+            for imm in guard.imm_queue.iter().rev() {
+                for (k, chain) in imm
+                    .entries
+                    .range::<[u8], _>((Bound::Included(start_key), Bound::Excluded(end_key)))
+                {
+                    if out.contains_key(k) {
+                        continue;
+                    }
+                    for v in chain.iter().rev() {
+                        if v.lsn <= cut.max_raft_index && v.hlc <= cut.max_hlc {
+                            out.insert(k.clone(), v.value.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        for imm in snap.pinned_imms().iter().rev() {
+            for (k, chain) in imm
+                .entries
+                .range::<[u8], _>((Bound::Included(start_key), Bound::Excluded(end_key)))
+            {
+                if out.contains_key(k) {
+                    continue;
+                }
+                for v in chain.iter().rev() {
+                    if v.lsn <= cut.max_raft_index && v.hlc <= cut.max_hlc {
+                        out.insert(k.clone(), v.value.clone());
+                        break;
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
     pub fn get_at(&self, key: &[u8], read_hlc: HlcTimestamp) -> Result<Option<MvccValue>> {
         let guard = self.inner.read().unwrap();
         self.check_retention_window(&guard, read_hlc)?;
+        if read_hlc < guard.disk_flushed_max_hlc {
+            return Err(MetaDbError::TransactionTimeout {
+                snapshot_hlc: read_hlc.as_u64(),
+                oldest_retained_hlc: guard.disk_flushed_max_hlc.as_u64(),
+            });
+        }
 
-        if let Some(chain) = guard.versions.get(key) {
-            for version in chain.iter().rev() {
-                if version.hlc <= read_hlc {
-                    return Ok(Some(version.value.clone()));
+        if let Some(chain) = guard.active_versions.get(key) {
+            for v in chain.iter().rev() {
+                if v.hlc <= read_hlc {
+                    return Ok(Some(v.value.clone()));
+                }
+            }
+        }
+        for imm in guard.imm_queue.iter().rev() {
+            if let Some(chain) = imm.entries.get(key) {
+                for v in chain.iter().rev() {
+                    if v.hlc <= read_hlc {
+                        return Ok(Some(v.value.clone()));
+                    }
                 }
             }
         }
         Ok(None)
     }
 
-    /// Collects all in-memory keys in `[start_key, end_key)` and their visible `MvccValue` at `read_hlc`.
     pub fn range_at(
         &self,
         start_key: &[u8],
@@ -125,95 +546,234 @@ impl MemMvccStore {
     ) -> Result<BTreeMap<Vec<u8>, MvccValue>> {
         let guard = self.inner.read().unwrap();
         self.check_retention_window(&guard, read_hlc)?;
+        if read_hlc < guard.disk_flushed_max_hlc {
+            return Err(MetaDbError::TransactionTimeout {
+                snapshot_hlc: read_hlc.as_u64(),
+                oldest_retained_hlc: guard.disk_flushed_max_hlc.as_u64(),
+            });
+        }
 
         let mut out = BTreeMap::new();
-        for (k, chain) in guard.versions.range::<[u8], _>((
-            std::ops::Bound::Included(start_key),
-            std::ops::Bound::Excluded(end_key),
-        )) {
-            for version in chain.iter().rev() {
-                if version.hlc <= read_hlc {
-                    out.insert(k.clone(), version.value.clone());
+        for (k, chain) in guard
+            .active_versions
+            .range::<[u8], _>((Bound::Included(start_key), Bound::Excluded(end_key)))
+        {
+            for v in chain.iter().rev() {
+                if v.hlc <= read_hlc {
+                    out.insert(k.clone(), v.value.clone());
                     break;
+                }
+            }
+        }
+        for imm in guard.imm_queue.iter().rev() {
+            for (k, chain) in imm
+                .entries
+                .range::<[u8], _>((Bound::Included(start_key), Bound::Excluded(end_key)))
+            {
+                if out.contains_key(k) {
+                    continue;
+                }
+                for v in chain.iter().rev() {
+                    if v.hlc <= read_hlc {
+                        out.insert(k.clone(), v.value.clone());
+                        break;
+                    }
                 }
             }
         }
         Ok(out)
     }
 
-    /// Flushes dirty keys up to `current_hlc` to the persistent store while retaining
-    /// in-memory versions younger than the `retention_ms` window so active snapshots
-    /// within the 5-second window continue to see consistent point-in-time state.
-    ///
-    /// Crucially, only the latest committed state per key is emitted for disk persistence,
-    /// pruning intermediate versions and MVCC tombstones in memory (§6.1).
-    pub fn prepare_flush(&self) -> (Vec<FlushedKeyState>, LogSequenceNumber) {
+    pub fn seal_active_memtable(
+        &self,
+        backend: &dyn StorageBackend,
+        mut checkpoint: DurableShardCheckpoint,
+        hook: Option<&dyn PreFlushHook>,
+    ) -> Result<Option<Arc<ImmMemTable>>> {
         let mut guard = self.inner.write().unwrap();
-        let cutoff_phys_ms = guard
-            .latest_hlc
-            .physical_ms()
-            .saturating_sub(self.retention_ms);
-        let cutoff_hlc = HlcTimestamp::new(cutoff_phys_ms, 0);
+        let sealed_index = checkpoint.flushed_raft_index.max(guard.latest_lsn);
+        let sealed_hlc = checkpoint.flushed_max_hlc.max(guard.latest_hlc);
+        checkpoint.flushed_raft_index = sealed_index;
+        checkpoint.flushed_max_hlc = sealed_hlc;
 
-        let mut flushed = Vec::new();
-        let mut max_flushed_lsn = guard.last_flushed_lsn;
+        let injected = if let Some(h) = hook {
+            let view = ViewAtRaftIndex {
+                sealed_index,
+                sealing_entries: &guard.active_versions,
+                imm_queue: &guard.imm_queue,
+                backend,
+                version: backend.current_version(),
+            };
+            h.on_seal_memtable(sealed_index, sealed_hlc, &view)?
+        } else {
+            Vec::new()
+        };
 
-        let keys: Vec<Vec<u8>> = guard.versions.keys().cloned().collect();
-        for key in keys {
-            let mut pruned_for_key = 0usize;
-            let mut emit_state: Option<FlushedKeyState> = None;
-            let mut remove_entry = false;
+        for (k, hlc, val) in injected {
+            guard.latest_hlc = guard.latest_hlc.max(hlc);
+            guard.total_mvcc_writes += 1;
+            guard
+                .active_versions
+                .entry(k)
+                .or_default()
+                .push_back(MvccVersion {
+                    hlc,
+                    lsn: sealed_index,
+                    value: val,
+                });
+        }
 
-            if let Some(chain) = guard.versions.get_mut(&key) {
-                if let Some(latest) = chain.back().cloned() {
-                    if latest.lsn > max_flushed_lsn {
-                        max_flushed_lsn = latest.lsn;
+        if guard.active_versions.is_empty() && sealed_index == guard.last_flushed_lsn {
+            return Ok(None);
+        }
+
+        let seal_id = guard.next_seal_id;
+        guard.next_seal_id += 1;
+        let active_taken = std::mem::take(&mut guard.active_versions);
+        let entries: BTreeMap<Vec<u8>, Vec<MvccVersion>> = active_taken
+            .into_iter()
+            .map(|(k, dq)| (k, dq.into_iter().collect()))
+            .collect();
+
+        let imm = Arc::new(ImmMemTable {
+            seal_id,
+            max_raft_index: sealed_index,
+            max_hlc: guard.latest_hlc.max(sealed_hlc),
+            checkpoint: DurableShardCheckpoint {
+                flushed_max_hlc: guard.latest_hlc.max(sealed_hlc),
+                ..checkpoint
+            },
+            entries,
+        });
+        guard.imm_queue.push_back(imm.clone());
+        Ok(Some(imm))
+    }
+
+    pub fn flush_eligible_imms(
+        &self,
+        backend: &dyn StorageBackend,
+        hook: Option<&dyn PreFlushHook>,
+    ) -> Result<(Vec<FlushedKeyState>, LogSequenceNumber, LogSequenceNumber)> {
+        let active_bounds = self.registry.expire_stale_and_min_bounds();
+        let mut all_flushed = Vec::new();
+        let mut max_state_flushed_lsn = self.inner.read().unwrap().last_flushed_lsn;
+        let mut aux_durable_frontier = 0u64;
+
+        loop {
+            let candidate = {
+                let guard = self.inner.read().unwrap();
+                let Some(front) = guard.imm_queue.front() else {
+                    break;
+                };
+                if let Some((min_hlc, min_pinned_flushed_lsn)) = active_bounds {
+                    if min_hlc < front.max_hlc || min_pinned_flushed_lsn < front.max_raft_index {
+                        break;
                     }
-                    // Count all older versions and the MVCC tombstone itself as pruned from disk writes.
-                    pruned_for_key = chain.len().saturating_sub(1);
-                    let latest_value = match &latest.value {
-                        MvccValue::Value(v) => Some(v.clone()),
-                        MvccValue::Tombstone => {
-                            pruned_for_key += 1; // MVCC tombstone pruned; only single physical LSM tombstone emitted
-                            None
-                        }
-                    };
-                    emit_state = Some(FlushedKeyState {
-                        key: key.clone(),
-                        lsn: latest.lsn,
-                        latest_value,
-                        pruned_versions: pruned_for_key,
-                    });
                 }
+                front.clone()
+            };
 
-                // Prune versions older than the 5-second active transaction window,
-                // keeping at most one baseline version <= cutoff_hlc if needed by active snapshots.
-                while chain.len() > 1 {
-                    if chain[0].hlc < cutoff_hlc && chain[1].hlc <= cutoff_hlc {
-                        chain.pop_front();
+            let mut batch_to_persist: Vec<(Vec<u8>, PersistentEntry)> =
+                Vec::with_capacity(candidate.entries.len());
+            let mut batch_flushed_states: Vec<FlushedKeyState> =
+                Vec::with_capacity(candidate.entries.len());
+            let mut pruned_total = 0u64;
+
+            for (k, chain) in &candidate.entries {
+                let Some(latest) = chain.last() else {
+                    continue;
+                };
+                let mut pruned_for_key = chain.len().saturating_sub(1);
+                let latest_value = match &latest.value {
+                    MvccValue::Value(v) => {
+                        batch_to_persist.push((k.clone(), PersistentEntry::Value(v.clone())));
+                        Some(v.clone())
+                    }
+                    MvccValue::Tombstone => {
+                        pruned_for_key += 1;
+                        batch_to_persist.push((k.clone(), PersistentEntry::PhysicalTombstone));
+                        None
+                    }
+                };
+                pruned_total += pruned_for_key as u64;
+                batch_flushed_states.push(FlushedKeyState {
+                    key: k.clone(),
+                    lsn: latest.lsn,
+                    latest_value,
+                    pruned_versions: pruned_for_key,
+                });
+            }
+
+            backend.flush_l0_batch(&batch_to_persist, candidate.checkpoint.clone())?;
+
+            {
+                let mut guard = self.inner.write().unwrap();
+                if guard
+                    .imm_queue
+                    .front()
+                    .map(|f| f.seal_id == candidate.seal_id)
+                    .unwrap_or(false)
+                {
+                    guard.imm_queue.pop_front();
+                }
+                guard.disk_flushed_max_hlc = guard.disk_flushed_max_hlc.max(candidate.max_hlc);
+                guard.last_flushed_lsn = guard.last_flushed_lsn.max(candidate.max_raft_index);
+                guard.total_pruned_versions += pruned_total;
+                while let Some(&(_, lsn)) = guard.hlc_to_lsn.front() {
+                    if lsn <= guard.last_flushed_lsn {
+                        guard.hlc_to_lsn.pop_front();
                     } else {
                         break;
                     }
                 }
-                if chain.len() == 1 && chain[0].hlc <= cutoff_hlc {
-                    // Once flushed to persistent KV and older than the 5s snapshot window,
-                    // the in-memory chain can be dropped completely.
-                    chain.pop_front();
-                }
-                remove_entry = chain.is_empty();
+                max_state_flushed_lsn = guard.last_flushed_lsn;
             }
 
-            if remove_entry {
-                guard.versions.remove(&key);
+            if let Some(h) = hook {
+                aux_durable_frontier =
+                    h.on_flush_durable(candidate.max_raft_index, candidate.max_hlc);
             }
-            if let Some(state) = emit_state {
-                guard.total_pruned_versions += pruned_for_key as u64;
-                flushed.push(state);
-            }
+
+            all_flushed.extend(batch_flushed_states);
         }
 
-        guard.last_flushed_lsn = max_flushed_lsn;
-        (flushed, max_flushed_lsn)
+        Ok((all_flushed, max_state_flushed_lsn, aux_durable_frontier))
+    }
+
+    pub fn imm_queue_len(&self) -> usize {
+        self.inner.read().unwrap().imm_queue.len()
+    }
+
+    pub fn latest_watermarks(
+        &self,
+    ) -> (
+        LogSequenceNumber,
+        HlcTimestamp,
+        LogSequenceNumber,
+        HlcTimestamp,
+    ) {
+        let g = self.inner.read().unwrap();
+        (
+            g.latest_lsn,
+            g.latest_hlc,
+            g.last_flushed_lsn,
+            g.disk_flushed_max_hlc,
+        )
+    }
+
+    pub fn reset_after_snapshot_install(
+        &self,
+        snapshot_lsn: LogSequenceNumber,
+        snapshot_hlc: HlcTimestamp,
+    ) {
+        let mut g = self.inner.write().unwrap();
+        g.active_versions.clear();
+        g.hlc_to_lsn.clear();
+        g.imm_queue.clear();
+        g.latest_lsn = snapshot_lsn;
+        g.latest_hlc = snapshot_hlc;
+        g.last_flushed_lsn = snapshot_lsn;
+        g.disk_flushed_max_hlc = snapshot_hlc;
     }
 
     pub fn stats(&self) -> (u64, u64) {

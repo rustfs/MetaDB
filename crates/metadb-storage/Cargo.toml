@@ -9,3 +9,10 @@ authors.workspace = true
 
 [dependencies]
 metadb-core = { path = "../metadb-core" }
+bytes = { workspace = true }
+crc32c = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

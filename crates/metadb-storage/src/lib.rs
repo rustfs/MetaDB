@@ -11,14 +11,29 @@
 //! 4. [`engine`]: Unified `LifecycleStorageEngine` combining RaftLog, In-Memory MVCC,
 //!    persistent sorted KV storage, and Locality-Aware Compaction.
 
+pub mod backend;
+pub mod block;
+pub mod bloom;
+pub mod cache;
 pub mod compaction;
 pub mod engine;
+pub mod manifest;
 pub mod mvcc;
 pub mod raft_log;
+pub mod sstable;
+pub mod version_set;
 
+pub use backend::{InMemoryBackend, LsmStorageBackend, PersistentEntry, StorageBackend};
+pub use cache::ShardedBlockCache;
 pub use compaction::{CompactionStats, LocalityCompactor};
-pub use engine::{LifecycleStorageEngine, PersistentEntry, StorageMetrics};
-pub use mvcc::{MemMvccStore, MvccValue, MvccVersion};
+pub use engine::{LifecycleStorageEngine, LsmEngineConfig, StorageMetrics};
+pub use manifest::{DurableShardCheckpoint, ManifestLog, VersionEdit};
+pub use mvcc::{
+    ActiveSnapshotRegistry, ImmMemTable, MemMvccStore, MvccValue, MvccVersion, PreFlushHook,
+    ReadCut, SnapshotGuard, ViewAtRaftIndex, DEFAULT_MVCC_RETENTION_MS,
+};
 pub use raft_log::{
     LogSequenceNumber, RaftLog, RaftLogEntry, RaftLogPayload, TruncationWatermarks,
 };
+pub use sstable::{SstFileMeta, SstableBuilder, SstableReader, SSTABLE_FOOTER_LEN};
+pub use version_set::Version;

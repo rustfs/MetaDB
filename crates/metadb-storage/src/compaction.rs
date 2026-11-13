@@ -11,28 +11,40 @@ pub struct CompactionStats {
 /// Range bucket key (uses the 9-byte `[table_prefix][PID/prefix: 8B]` prefix to track spatial locality).
 pub type RangeBucketPrefix = [u8; 9];
 
+#[derive(Debug, Clone, Copy, Default)]
+struct BucketDensity {
+    tombstones: usize,
+    live_writes: usize,
+}
+
 struct LocalityTrackerInner {
-    tombstones_by_bucket: BTreeMap<RangeBucketPrefix, usize>,
+    buckets: BTreeMap<RangeBucketPrefix, BucketDensity>,
     stats: CompactionStats,
 }
 
-/// Locality-Aware Compaction controller (§6.2 of `arXiv:2610.32247v1`).
+/// Locality-Aware Compaction controller (§6.2 of `arXiv:2610.32247v1` & `storage_lsm_mvcc.md` §8.2).
 ///
-/// Tracks consecutive bulk deletions (e.g., object TTL expirations or directory purges)
-/// by spatial prefix bucket. When the number of physical LSM tombstones in a bucket
-/// reaches `density_threshold`, MetaDB proactively compacts only that narrow key range
-/// `[prefix, prefix + 1)` rather than waiting for passive full-shard compaction.
+/// Tracks consecutive bulk deletions by 9-byte spatial prefix bucket (`[table_prefix][group_key: 8B]`).
+/// Triggers targeted bottommost range compaction over `[prefix, prefix + 1)` when both:
+/// 1. `tombstones >= density_threshold`, AND
+/// 2. `tombstones / (tombstones + live_writes) >= min_tombstone_ratio` (default `0.50`).
 pub struct LocalityCompactor {
     density_threshold: usize,
+    min_ratio_permille: usize,
     inner: RwLock<LocalityTrackerInner>,
 }
 
 impl LocalityCompactor {
     pub fn new(density_threshold: usize) -> Self {
+        Self::with_ratio(density_threshold, 500)
+    }
+
+    pub fn with_ratio(density_threshold: usize, min_ratio_permille: usize) -> Self {
         Self {
             density_threshold: density_threshold.max(1),
+            min_ratio_permille: min_ratio_permille.clamp(1, 1000),
             inner: RwLock::new(LocalityTrackerInner {
-                tombstones_by_bucket: BTreeMap::new(),
+                buckets: BTreeMap::new(),
                 stats: CompactionStats::default(),
             }),
         }
@@ -53,15 +65,29 @@ impl LocalityCompactor {
         }
     }
 
+    /// Records a live value flushed for `key`.
+    pub fn record_live_write(&self, key: &[u8]) {
+        let Some(bucket) = Self::bucket_for_key(key) else {
+            return;
+        };
+        let mut guard = self.inner.write().unwrap();
+        guard.buckets.entry(bucket).or_default().live_writes += 1;
+    }
+
     /// Records a physical LSM tombstone written during a flush.
-    /// Returns `Some((start_key, end_key))` if the bucket's tombstone density reached the threshold
-    /// and a localized range compaction should be triggered immediately.
+    /// Decrements estimated live keys in that spatial bucket so tombstone ratio reflects
+    /// `tombstones / (tombstones + remaining_live_keys)`.
+    /// Returns `Some((start_key, end_key))` when both density count and ratio thresholds are met.
     pub fn record_tombstone(&self, key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         let bucket = Self::bucket_for_key(key)?;
         let mut guard = self.inner.write().unwrap();
-        let count = guard.tombstones_by_bucket.entry(bucket).or_insert(0);
-        *count += 1;
-        if *count >= self.density_threshold {
+        let entry = guard.buckets.entry(bucket).or_default();
+        entry.live_writes = entry.live_writes.saturating_sub(1);
+        entry.tombstones += 1;
+        let total = entry.tombstones + entry.live_writes;
+        if entry.tombstones >= self.density_threshold
+            && entry.tombstones * 1000 >= total * self.min_ratio_permille
+        {
             Some(Self::bucket_bounds(&bucket))
         } else {
             None
@@ -72,7 +98,7 @@ impl LocalityCompactor {
     pub fn on_range_compacted(&self, start_key: &[u8], purged_count: usize) {
         let mut guard = self.inner.write().unwrap();
         if let Some(bucket) = Self::bucket_for_key(start_key) {
-            guard.tombstones_by_bucket.remove(&bucket);
+            guard.buckets.remove(&bucket);
         }
         guard.stats.localized_compactions_triggered += 1;
         guard.stats.tombstones_purged += purged_count as u64;
@@ -85,7 +111,6 @@ impl LocalityCompactor {
     fn bucket_bounds(bucket: &RangeBucketPrefix) -> (Vec<u8>, Vec<u8>) {
         let start = bucket.to_vec();
         let mut end = bucket.to_vec();
-        // Increment the 9-byte big-endian prefix by 1 to form the exclusive upper bound.
         for i in (0..9).rev() {
             if end[i] < 0xFF {
                 end[i] += 1;
