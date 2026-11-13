@@ -60,6 +60,15 @@ pub trait StorageBackend: Send + Sync {
         end_key: &[u8],
     ) -> Result<(BTreeMap<Vec<u8>, PersistentEntry>, u64)>;
 
+    /// Bounded page scan returning up to `limit` smallest merged keys in `[start_key, end_key)` against `pinned_version`.
+    fn scan_in_version_page(
+        &self,
+        version: &Version,
+        start_key: &[u8],
+        end_key: &[u8],
+        limit: usize,
+    ) -> Result<(BTreeMap<Vec<u8>, PersistentEntry>, u64)>;
+
     /// Atomically flushes sorted collapsed `(key, PersistentEntry)` items as a new `L0` SSTable
     /// and updates `MANIFEST` with `checkpoint`.
     fn flush_l0_batch(
@@ -217,6 +226,21 @@ impl StorageBackend for LsmStorageBackend {
         end_key: &[u8],
     ) -> Result<(BTreeMap<Vec<u8>, PersistentEntry>, u64)> {
         let (raw, tombs) = version.scan_range_merged(start_key, end_key)?;
+        let converted = raw
+            .into_iter()
+            .map(|(k, v)| (k, PersistentEntry::from(v)))
+            .collect();
+        Ok((converted, tombs))
+    }
+
+    fn scan_in_version_page(
+        &self,
+        version: &Version,
+        start_key: &[u8],
+        end_key: &[u8],
+        limit: usize,
+    ) -> Result<(BTreeMap<Vec<u8>, PersistentEntry>, u64)> {
+        let (raw, tombs) = version.scan_range_page_merged(start_key, end_key, limit)?;
         let converted = raw
             .into_iter()
             .map(|(k, v)| (k, PersistentEntry::from(v)))
@@ -664,6 +688,32 @@ impl StorageBackend for InMemoryBackend {
         for (k, v) in guard
             .entries
             .range::<[u8], _>((Bound::Included(start_key), Bound::Excluded(end_key)))
+        {
+            if matches!(v, PersistentEntry::PhysicalTombstone) {
+                tombs += 1;
+            }
+            out.insert(k.clone(), v.clone());
+        }
+        Ok((out, tombs))
+    }
+
+    fn scan_in_version_page(
+        &self,
+        _version: &Version,
+        start_key: &[u8],
+        end_key: &[u8],
+        limit: usize,
+    ) -> Result<(BTreeMap<Vec<u8>, PersistentEntry>, u64)> {
+        if limit == 0 || start_key >= end_key {
+            return Ok((BTreeMap::new(), 0));
+        }
+        let guard = self.inner.read().unwrap();
+        let mut out = BTreeMap::new();
+        let mut tombs = 0u64;
+        for (k, v) in guard
+            .entries
+            .range::<[u8], _>((Bound::Included(start_key), Bound::Excluded(end_key)))
+            .take(limit)
         {
             if matches!(v, PersistentEntry::PhysicalTombstone) {
                 tombs += 1;

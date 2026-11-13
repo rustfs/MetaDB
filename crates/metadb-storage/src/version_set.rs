@@ -74,6 +74,54 @@ impl Version {
         Ok(None)
     }
 
+    /// Scans up to `limit` smallest merged distinct keys in `[start_key, end_key)` across `L0..L3`
+    /// in $O(limit)$ block reads per SSTable.
+    pub fn scan_range_page_merged(
+        &self,
+        start_key: &[u8],
+        end_key: &[u8],
+        limit: usize,
+    ) -> Result<(BTreeMap<Vec<u8>, BlockEntryValue>, u64)> {
+        if limit == 0 || start_key >= end_key {
+            return Ok((BTreeMap::new(), 0));
+        }
+        let mut merged: BTreeMap<Vec<u8>, BlockEntryValue> = BTreeMap::new();
+        let mut tombstones_seen = 0u64;
+
+        for sst in &self.levels[0] {
+            for (k, v) in sst.scan_range_limit(start_key, end_key, limit)? {
+                if matches!(v, BlockEntryValue::PhysicalTombstone) {
+                    tombstones_seen += 1;
+                }
+                merged.entry(k).or_insert(v);
+            }
+        }
+        for lvl in &self.levels[1..] {
+            let first_idx = lvl.partition_point(|sst| sst.meta().max_key.as_slice() < start_key);
+            for sst in &lvl[first_idx..] {
+                if sst.meta().min_key.as_slice() >= end_key {
+                    break;
+                }
+                let remaining = limit;
+                for (k, v) in sst.scan_range_limit(start_key, end_key, remaining)? {
+                    if matches!(v, BlockEntryValue::PhysicalTombstone) {
+                        tombstones_seen += 1;
+                    }
+                    merged.entry(k).or_insert(v);
+                }
+                if sst.meta().max_key.as_slice() >= end_key && merged.len() >= limit {
+                    // Any subsequent non-overlapping SSTable in this level has min_key > max_key >= end_key.
+                    break;
+                }
+            }
+        }
+
+        while merged.len() > limit {
+            merged.pop_last();
+        }
+        Ok((merged, tombstones_seen))
+    }
+
     /// Scans `[start_key, end_key)` across `L0..L3` enforcing deterministic source precedence:
     /// `L0 (descending flush_generation) > L1 > L2 > L3`.
     /// Also returns the count of `PhysicalTombstone`s encountered during the scan.

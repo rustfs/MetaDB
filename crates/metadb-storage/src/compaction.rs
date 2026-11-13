@@ -94,11 +94,41 @@ impl LocalityCompactor {
         }
     }
 
-    /// Marks a bucket as compacted and records how many physical tombstones were purged.
-    pub fn on_range_compacted(&self, start_key: &[u8], purged_count: usize) {
+    /// Captures the pre-compaction `(tombstones, live_writes)` snapshot for `start_key`'s bucket.
+    pub fn snapshot_bucket_counts(&self, start_key: &[u8]) -> (usize, usize) {
+        let Some(bucket) = Self::bucket_for_key(start_key) else {
+            return (0, 0);
+        };
+        let guard = self.inner.read().unwrap();
+        guard
+            .buckets
+            .get(&bucket)
+            .map(|b| (b.tombstones, b.live_writes))
+            .unwrap_or((0, 0))
+    }
+
+    /// Subtracts the pre-compaction `(compacted_tombstones, compacted_live)` counts strictly after
+    /// `backend.compact_range` succeeds (`Ok`), preserving any concurrent writes/tombstones recorded
+    /// during compaction as well as preserving full density if compaction errored.
+    pub fn on_range_compacted(
+        &self,
+        start_key: &[u8],
+        compacted_tombstones: usize,
+        compacted_live: usize,
+        purged_count: usize,
+    ) {
         let mut guard = self.inner.write().unwrap();
         if let Some(bucket) = Self::bucket_for_key(start_key) {
-            guard.buckets.remove(&bucket);
+            let should_remove = if let Some(entry) = guard.buckets.get_mut(&bucket) {
+                entry.tombstones = entry.tombstones.saturating_sub(compacted_tombstones);
+                entry.live_writes = entry.live_writes.saturating_sub(compacted_live);
+                entry.tombstones == 0 && entry.live_writes == 0
+            } else {
+                false
+            };
+            if should_remove {
+                guard.buckets.remove(&bucket);
+            }
         }
         guard.stats.localized_compactions_triggered += 1;
         guard.stats.tombstones_purged += purged_count as u64;

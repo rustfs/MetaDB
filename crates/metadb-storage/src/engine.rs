@@ -193,58 +193,112 @@ impl LifecycleStorageEngine {
 
     /// Point lookup using a pinned `SnapshotGuard` and bounded step-lease check.
     pub fn get_with_snapshot(&self, key: &[u8], snap: &SnapshotGuard) -> Result<Option<Vec<u8>>> {
-        snap.with_step_lease(|| {
-            if let Some(mvcc_val) = self.mvcc.get_with_guard(key, snap) {
+        let cut = snap.cut();
+        snap.with_step_lease(|pinned| {
+            if let Some(mvcc_val) = self.mvcc.get_with_pinned(key, cut, pinned) {
                 return Ok(match mvcc_val {
                     MvccValue::Value(v) => Some(v),
                     MvccValue::Tombstone => None,
                 });
             }
-            match self.backend.get_in_version(snap.pinned_version(), key)? {
+            match self.backend.get_in_version(&pinned.version, key)? {
                 Some(PersistentEntry::Value(v)) => Ok(Some(v)),
                 Some(PersistentEntry::PhysicalTombstone) | None => Ok(None),
             }
         })
     }
 
-    /// Range scan over `[start_key, end_key)` using a pinned `SnapshotGuard` (`Resolution B1`).
+    /// Range scan over `[start_key, end_key)` using a pinned `SnapshotGuard` with bounded 256-key
+    /// per-step read leases (`Resolution B1` — guarantees `<100µs` preemption on 5s forced expiration).
     pub fn scan_with_snapshot(
         &self,
         start_key: &[u8],
         end_key: &[u8],
         snap: &SnapshotGuard,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        snap.with_step_lease(|| {
-            let mut merged = self.mvcc.range_with_guard(start_key, end_key, snap);
-            let (disk_entries, disk_tombs) =
-                self.backend
-                    .scan_in_version(snap.pinned_version(), start_key, end_key)?;
+        const SCAN_STEP_PAGE_KEYS: usize = 256;
+        if start_key >= end_key {
+            return snap.with_step_lease(|_| Ok(Vec::new()));
+        }
 
-            let mut unshadowed_tombs = 0u64;
-            for (k, entry) in disk_entries {
-                if merged.contains_key(&k) {
-                    continue;
-                }
-                match entry {
-                    PersistentEntry::Value(v) => {
-                        merged.insert(k, MvccValue::Value(v));
-                    }
-                    PersistentEntry::PhysicalTombstone => {
-                        unshadowed_tombs += 1;
-                    }
-                }
-            }
-            let _ = disk_tombs;
-            self.backend.record_scanned_tombstones(unshadowed_tombs);
+        let cut = snap.cut();
+        let mut cursor = start_key.to_vec();
+        let mut out = Vec::new();
 
-            let mut out = Vec::new();
-            for (k, v) in merged {
-                if let MvccValue::Value(bytes) = v {
-                    out.push((k, bytes));
-                }
+        loop {
+            if cursor.as_slice() >= end_key {
+                break;
             }
-            Ok(out)
-        })
+            let (page_live, next_cursor) = snap.with_step_lease(|pinned| {
+                let mut merged = self.mvcc.range_page_with_pinned(
+                    &cursor,
+                    end_key,
+                    cut,
+                    pinned,
+                    SCAN_STEP_PAGE_KEYS,
+                );
+                let (disk_entries, _) = self.backend.scan_in_version_page(
+                    &pinned.version,
+                    &cursor,
+                    end_key,
+                    SCAN_STEP_PAGE_KEYS,
+                )?;
+
+                let mut disk_tomb_keys = std::collections::HashSet::new();
+                for (k, entry) in disk_entries {
+                    if merged.contains_key(&k) {
+                        continue;
+                    }
+                    match entry {
+                        PersistentEntry::Value(v) => {
+                            merged.insert(k, MvccValue::Value(v));
+                        }
+                        PersistentEntry::PhysicalTombstone => {
+                            disk_tomb_keys.insert(k.clone());
+                            merged.insert(k, MvccValue::Tombstone);
+                        }
+                    }
+                }
+
+                let raw_count = merged.len();
+                while merged.len() > SCAN_STEP_PAGE_KEYS {
+                    merged.pop_last();
+                }
+
+                let next_cur = if raw_count >= SCAN_STEP_PAGE_KEYS {
+                    merged.last_key_value().map(|(last_k, _)| {
+                        let mut nxt = last_k.clone();
+                        nxt.push(0x00);
+                        nxt
+                    })
+                } else {
+                    None
+                };
+
+                let mut unshadowed_tombs = 0u64;
+                let mut live_page = Vec::new();
+                for (k, v) in merged {
+                    match v {
+                        MvccValue::Value(bytes) => live_page.push((k, bytes)),
+                        MvccValue::Tombstone => {
+                            if disk_tomb_keys.contains(&k) {
+                                unshadowed_tombs += 1;
+                            }
+                        }
+                    }
+                }
+                self.backend.record_scanned_tombstones(unshadowed_tombs);
+                Ok((live_page, next_cur))
+            })?;
+
+            out.extend(page_live);
+            match next_cursor {
+                Some(nxt) => cursor = nxt,
+                None => break,
+            }
+        }
+
+        Ok(out)
     }
 
     /// Point lookup at `read_hlc` consulting `MemMvccStore` first and falling back to persistent storage.
@@ -335,7 +389,7 @@ impl LifecycleStorageEngine {
         }
 
         for (start, end) in ranges_to_compact {
-            let _ = self.compact_range(&start, &end);
+            self.try_compact_range(&start, &end)?;
         }
 
         self.raft_log.advance_storage_flushed_lsn(state_flushed_lsn);
@@ -356,11 +410,19 @@ impl LifecycleStorageEngine {
         flushed
     }
 
+    /// Performs localized bottommost range compaction over `[start_key, end_key)`, updating
+    /// `LocalityCompactor` bucket counts strictly when `backend.compact_range` succeeds (`Ok`).
+    pub fn try_compact_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<usize> {
+        let (snap_tombs, snap_live) = self.compactor.snapshot_bucket_counts(start_key);
+        let purged = self.backend.compact_range(start_key, end_key)?;
+        self.compactor
+            .on_range_compacted(start_key, snap_tombs, snap_live, purged);
+        Ok(purged)
+    }
+
     /// Performs localized bottommost range compaction over `[start_key, end_key)`.
     pub fn compact_range(&self, start_key: &[u8], end_key: &[u8]) -> usize {
-        let purged = self.backend.compact_range(start_key, end_key).unwrap_or(0);
-        self.compactor.on_range_compacted(start_key, purged);
-        purged
+        self.try_compact_range(start_key, end_key).unwrap_or(0)
     }
 
     /// Creates a hard-linked SSTable + standalone `MANIFEST` checkpoint at `dest_dir`.

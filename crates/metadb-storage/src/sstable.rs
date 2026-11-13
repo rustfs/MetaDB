@@ -357,6 +357,37 @@ impl SstableReader {
         block.get(key)
     }
 
+    /// Scans up to `limit` `(key, BlockEntryValue)` entries in `[start_key, end_key)`.
+    pub fn scan_range_limit(
+        &self,
+        start_key: &[u8],
+        end_key: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, BlockEntryValue)>> {
+        if limit == 0
+            || end_key <= self.meta.min_key.as_slice()
+            || start_key > self.meta.max_key.as_slice()
+        {
+            return Ok(Vec::new());
+        }
+        let first_idx = self
+            .index
+            .partition_point(|ie| ie.last_key.as_slice() < start_key);
+        let mut out = Vec::new();
+        for ie in &self.index[first_idx..] {
+            let block = self.load_data_block(ie)?;
+            block.scan_range(start_key, end_key, &mut out)?;
+            if out.len() >= limit {
+                out.truncate(limit);
+                break;
+            }
+            if ie.last_key.as_slice() >= end_key {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Scans all `(key, BlockEntryValue)` entries in `[start_key, end_key)`.
     pub fn scan_range(
         &self,

@@ -132,15 +132,35 @@ pub struct FlushedKeyState {
     pub pruned_versions: usize,
 }
 
+/// Shared active MemTable generation (`Arc<ActiveMemTable>`), pinned inside `PinnedSnapshotData`
+/// and cleared on 5s forced expiration (`Resolution B1`).
+pub type ActiveMemTable = RwLock<BTreeMap<Vec<u8>, VecDeque<MvccVersion>>>;
+
+/// Point-in-time pinned `(ActiveMemTable, ImmMemTables, Version)` held inside `SnapshotSlot.state`
+/// so forced 5s expiration drops all `Arc`s immediately even if a stalled caller retains `SnapshotGuard`.
+pub struct PinnedSnapshotData {
+    pub active: Arc<ActiveMemTable>,
+    pub imms: Vec<Arc<ImmMemTable>>,
+    pub version: Arc<Version>,
+}
+
 pub struct SnapshotSlot {
     pub id: u64,
     pub cut: ReadCut,
     pub pinned_flushed_lsn: LogSequenceNumber,
     pub created_at: Instant,
     pub expired: AtomicBool,
-    /// Step-level read/write lock held ONLY during bounded `get` / `scan_page` steps (`<100µs`),
-    /// allowing forced expiration at `5,000ms` without indefinite blocking.
-    pub step_lock: RwLock<()>,
+    /// Step-level read/write lock protecting `Option<PinnedSnapshotData>`, held ONLY during bounded
+    /// `get` / 256-key `scan_page` steps (`<100µs`) so forced expiration at `5,000ms` clears `None`
+    /// and reclaims RAM/SSTables without indefinite blocking.
+    pub state: RwLock<Option<PinnedSnapshotData>>,
+}
+
+impl SnapshotSlot {
+    /// Returns `true` if `PinnedSnapshotData` is still resident (becomes `false` immediately on forced expiration or drop).
+    pub fn has_pinned_data(&self) -> bool {
+        self.state.read().unwrap().is_some()
+    }
 }
 
 /// Registry of active point-in-time `SnapshotGuard`s gating unversioned L0 SSTable collapse-flushes.
@@ -163,6 +183,7 @@ impl ActiveSnapshotRegistry {
         &self,
         cut: ReadCut,
         pinned_flushed_lsn: LogSequenceNumber,
+        pinned: PinnedSnapshotData,
     ) -> Arc<SnapshotSlot> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let slot = Arc::new(SnapshotSlot {
@@ -171,18 +192,22 @@ impl ActiveSnapshotRegistry {
             pinned_flushed_lsn,
             created_at: Instant::now(),
             expired: AtomicBool::new(false),
-            step_lock: RwLock::new(()),
+            state: RwLock::new(Some(pinned)),
         });
         self.slots.lock().unwrap().insert(id, slot.clone());
         slot
     }
 
     pub fn unregister(&self, id: u64) {
-        self.slots.lock().unwrap().remove(&id);
+        let removed = self.slots.lock().unwrap().remove(&id);
+        if let Some(slot) = removed {
+            *slot.state.write().unwrap() = None;
+        }
     }
 
-    /// Marks any guard older than `retention` as `expired = true` under its `step_lock.write()`,
-    /// removes expired slots, and returns `(min_active_hlc, min_pinned_flushed_lsn)`.
+    /// Marks any guard older than `retention` as `expired = true` under `slot.state.write()`,
+    /// clears `Option<PinnedSnapshotData>` to free RAM/SSTables immediately, removes expired slots,
+    /// and returns `(min_active_hlc, min_pinned_flushed_lsn)`.
     pub fn expire_stale_and_min_bounds(&self) -> Option<(HlcTimestamp, LogSequenceNumber)> {
         let mut guard = self.slots.lock().unwrap();
         let mut expired_ids = Vec::new();
@@ -191,8 +216,9 @@ impl ActiveSnapshotRegistry {
 
         for (&id, slot) in guard.iter() {
             if slot.expired.load(Ordering::Acquire) || slot.created_at.elapsed() > self.retention {
-                let _step_w = slot.step_lock.write().unwrap();
+                let mut state_w = slot.state.write().unwrap();
                 slot.expired.store(true, Ordering::Release);
+                *state_w = None;
                 expired_ids.push(id);
             } else {
                 min_hlc = Some(match min_hlc {
@@ -216,13 +242,11 @@ impl ActiveSnapshotRegistry {
     }
 }
 
-/// RAII snapshot handle pinning `(ReadCut, Arc<Version>, Vec<Arc<ImmMemTable>>)` (`Resolution B1`).
+/// RAII snapshot handle pinning `(ReadCut, PinnedSnapshotData)` (`Resolution B1`).
 pub struct SnapshotGuard {
     slot: Arc<SnapshotSlot>,
     retention: Duration,
     oldest_retained_hlc: HlcTimestamp,
-    pinned_version: Arc<Version>,
-    pinned_imms: Vec<Arc<ImmMemTable>>,
     registry: Arc<ActiveSnapshotRegistry>,
 }
 
@@ -238,34 +262,40 @@ impl SnapshotGuard {
     }
 
     #[inline]
-    pub fn pinned_version(&self) -> &Arc<Version> {
-        &self.pinned_version
+    pub fn has_pinned_data(&self) -> bool {
+        self.slot.has_pinned_data()
     }
 
-    #[inline]
-    pub fn pinned_imms(&self) -> &[Arc<ImmMemTable>] {
-        &self.pinned_imms
-    }
-
-    /// Acquires the short-lived per-step read lease and verifies the snapshot has not timed out.
-    pub fn with_step_lease<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        let _r = self.slot.step_lock.read().unwrap();
-        if self.slot.expired.load(Ordering::Acquire)
-            || self.slot.created_at.elapsed() > self.retention
+    /// Acquires the short-lived per-step read lease, verifies the snapshot has not timed out,
+    /// and passes `&PinnedSnapshotData` to `f`.
+    pub fn with_step_lease<T>(
+        &self,
+        f: impl FnOnce(&PinnedSnapshotData) -> Result<T>,
+    ) -> Result<T> {
         {
-            self.slot.expired.store(true, Ordering::Release);
-            return Err(MetaDbError::TransactionTimeout {
-                snapshot_hlc: self.slot.cut.max_hlc.as_u64(),
-                oldest_retained_hlc: self.oldest_retained_hlc.as_u64(),
-            });
+            let r = self.slot.state.read().unwrap();
+            if !self.slot.expired.load(Ordering::Acquire)
+                && self.slot.created_at.elapsed() <= self.retention
+            {
+                if let Some(pinned) = r.as_ref() {
+                    return f(pinned);
+                }
+            }
         }
-        f()
+        let mut w = self.slot.state.write().unwrap();
+        self.slot.expired.store(true, Ordering::Release);
+        *w = None;
+        Err(MetaDbError::TransactionTimeout {
+            snapshot_hlc: self.slot.cut.max_hlc.as_u64(),
+            oldest_retained_hlc: self.oldest_retained_hlc.as_u64(),
+        })
     }
 
-    /// Explicitly marks this guard expired for deterministic timeout testing.
+    /// Explicitly marks this guard expired and releases its `PinnedSnapshotData` immediately.
     pub fn force_expire_for_test(&self) {
-        let _w = self.slot.step_lock.write().unwrap();
+        let mut w = self.slot.state.write().unwrap();
         self.slot.expired.store(true, Ordering::Release);
+        *w = None;
     }
 }
 
@@ -276,7 +306,7 @@ impl Drop for SnapshotGuard {
 }
 
 struct MemMvccInner {
-    active_versions: BTreeMap<Vec<u8>, VecDeque<MvccVersion>>,
+    active_versions: Arc<ActiveMemTable>,
     hlc_to_lsn: VecDeque<(HlcTimestamp, LogSequenceNumber)>,
     imm_queue: VecDeque<Arc<ImmMemTable>>,
     next_seal_id: u64,
@@ -311,7 +341,7 @@ impl MemMvccStore {
             retention_ms,
             registry: Arc::new(ActiveSnapshotRegistry::new(retention_ms)),
             inner: RwLock::new(MemMvccInner {
-                active_versions: BTreeMap::new(),
+                active_versions: Arc::new(RwLock::new(BTreeMap::new())),
                 hlc_to_lsn: VecDeque::new(),
                 imm_queue: VecDeque::new(),
                 next_seal_id: 1,
@@ -338,6 +368,8 @@ impl MemMvccStore {
         guard.hlc_to_lsn.push_back((hlc, lsn));
         guard
             .active_versions
+            .write()
+            .unwrap()
             .entry(key)
             .or_default()
             .push_back(MvccVersion {
@@ -355,6 +387,8 @@ impl MemMvccStore {
         guard.hlc_to_lsn.push_back((hlc, lsn));
         guard
             .active_versions
+            .write()
+            .unwrap()
             .entry(key)
             .or_default()
             .push_back(MvccVersion {
@@ -371,20 +405,21 @@ impl MemMvccStore {
     ) -> Result<SnapshotGuard> {
         let guard = self.inner.read().unwrap();
         let pinned_version = backend.current_version();
+        let pinned_flushed_lsn = pinned_version.checkpoint.flushed_raft_index;
         let cut = ReadCut {
             max_raft_index: guard.latest_lsn.max(min_read_index),
             max_hlc: guard.latest_hlc,
         };
-        let pinned_imms: Vec<Arc<ImmMemTable>> = guard.imm_queue.iter().cloned().collect();
-        let slot = self
-            .registry
-            .register(cut, pinned_version.checkpoint.flushed_raft_index);
+        let pinned = PinnedSnapshotData {
+            active: guard.active_versions.clone(),
+            imms: guard.imm_queue.iter().cloned().collect(),
+            version: pinned_version,
+        };
+        let slot = self.registry.register(cut, pinned_flushed_lsn, pinned);
         Ok(SnapshotGuard {
             slot,
             retention: Duration::from_millis(self.retention_ms),
             oldest_retained_hlc: guard.disk_flushed_max_hlc,
-            pinned_version,
-            pinned_imms,
             registry: self.registry.clone(),
         })
     }
@@ -396,6 +431,7 @@ impl MemMvccStore {
     ) -> Result<SnapshotGuard> {
         let guard = self.inner.read().unwrap();
         let pinned_version = backend.current_version();
+        let pinned_flushed_lsn = pinned_version.checkpoint.flushed_raft_index;
         self.check_retention_window(&guard, barrier_hlc)?;
         if barrier_hlc < guard.disk_flushed_max_hlc {
             return Err(MetaDbError::TransactionTimeout {
@@ -414,25 +450,30 @@ impl MemMvccStore {
             max_raft_index,
             max_hlc: barrier_hlc,
         };
-        let pinned_imms: Vec<Arc<ImmMemTable>> = guard.imm_queue.iter().cloned().collect();
-        let slot = self
-            .registry
-            .register(cut, pinned_version.checkpoint.flushed_raft_index);
+        let pinned = PinnedSnapshotData {
+            active: guard.active_versions.clone(),
+            imms: guard.imm_queue.iter().cloned().collect(),
+            version: pinned_version,
+        };
+        let slot = self.registry.register(cut, pinned_flushed_lsn, pinned);
         Ok(SnapshotGuard {
             slot,
             retention: Duration::from_millis(self.retention_ms),
             oldest_retained_hlc: guard.disk_flushed_max_hlc,
-            pinned_version,
-            pinned_imms,
             registry: self.registry.clone(),
         })
     }
 
-    pub fn get_with_guard(&self, key: &[u8], snap: &SnapshotGuard) -> Option<MvccValue> {
-        let cut = snap.cut();
+    pub fn get_with_pinned(
+        &self,
+        key: &[u8],
+        cut: ReadCut,
+        pinned: &PinnedSnapshotData,
+    ) -> Option<MvccValue> {
         {
             let guard = self.inner.read().unwrap();
-            if let Some(chain) = guard.active_versions.get(key) {
+            let active_map = guard.active_versions.read().unwrap();
+            if let Some(chain) = active_map.get(key) {
                 for v in chain.iter().rev() {
                     if v.lsn <= cut.max_raft_index && v.hlc <= cut.max_hlc {
                         return Some(v.value.clone());
@@ -445,7 +486,17 @@ impl MemMvccStore {
                 }
             }
         }
-        for imm in snap.pinned_imms().iter().rev() {
+        {
+            let pinned_active = pinned.active.read().unwrap();
+            if let Some(chain) = pinned_active.get(key) {
+                for v in chain.iter().rev() {
+                    if v.lsn <= cut.max_raft_index && v.hlc <= cut.max_hlc {
+                        return Some(v.value.clone());
+                    }
+                }
+            }
+        }
+        for imm in pinned.imms.iter().rev() {
             if let Some(val) = imm.get_at_cut(key, cut) {
                 return Some(val);
             }
@@ -453,47 +504,43 @@ impl MemMvccStore {
         None
     }
 
-    pub fn range_with_guard(
+    pub fn range_page_with_pinned(
         &self,
         start_key: &[u8],
         end_key: &[u8],
-        snap: &SnapshotGuard,
+        cut: ReadCut,
+        pinned: &PinnedSnapshotData,
+        limit: usize,
     ) -> BTreeMap<Vec<u8>, MvccValue> {
-        let cut = snap.cut();
+        if limit == 0 || start_key >= end_key {
+            return BTreeMap::new();
+        }
         let mut out: BTreeMap<Vec<u8>, MvccValue> = BTreeMap::new();
 
-        {
-            let guard = self.inner.read().unwrap();
-            for (k, chain) in guard
-                .active_versions
-                .range::<[u8], _>((Bound::Included(start_key), Bound::Excluded(end_key)))
+        let collect_dq_map = |map: &BTreeMap<Vec<u8>, VecDeque<MvccVersion>>,
+                              out: &mut BTreeMap<Vec<u8>, MvccValue>| {
+            let mut taken = 0usize;
+            for (k, chain) in
+                map.range::<[u8], _>((Bound::Included(start_key), Bound::Excluded(end_key)))
             {
+                if out.contains_key(k) {
+                    continue;
+                }
                 for v in chain.iter().rev() {
                     if v.lsn <= cut.max_raft_index && v.hlc <= cut.max_hlc {
                         out.insert(k.clone(), v.value.clone());
+                        taken += 1;
                         break;
                     }
                 }
-            }
-            for imm in guard.imm_queue.iter().rev() {
-                for (k, chain) in imm
-                    .entries
-                    .range::<[u8], _>((Bound::Included(start_key), Bound::Excluded(end_key)))
-                {
-                    if out.contains_key(k) {
-                        continue;
-                    }
-                    for v in chain.iter().rev() {
-                        if v.lsn <= cut.max_raft_index && v.hlc <= cut.max_hlc {
-                            out.insert(k.clone(), v.value.clone());
-                            break;
-                        }
-                    }
+                if taken >= limit {
+                    break;
                 }
             }
-        }
+        };
 
-        for imm in snap.pinned_imms().iter().rev() {
+        let collect_imm = |imm: &ImmMemTable, out: &mut BTreeMap<Vec<u8>, MvccValue>| {
+            let mut taken = 0usize;
             for (k, chain) in imm
                 .entries
                 .range::<[u8], _>((Bound::Included(start_key), Bound::Excluded(end_key)))
@@ -504,12 +551,35 @@ impl MemMvccStore {
                 for v in chain.iter().rev() {
                     if v.lsn <= cut.max_raft_index && v.hlc <= cut.max_hlc {
                         out.insert(k.clone(), v.value.clone());
+                        taken += 1;
                         break;
                     }
                 }
+                if taken >= limit {
+                    break;
+                }
+            }
+        };
+
+        {
+            let guard = self.inner.read().unwrap();
+            let active_map = guard.active_versions.read().unwrap();
+            collect_dq_map(&active_map, &mut out);
+            for imm in guard.imm_queue.iter().rev() {
+                collect_imm(imm, &mut out);
             }
         }
+        {
+            let pinned_active = pinned.active.read().unwrap();
+            collect_dq_map(&pinned_active, &mut out);
+        }
+        for imm in pinned.imms.iter().rev() {
+            collect_imm(imm, &mut out);
+        }
 
+        while out.len() > limit {
+            out.pop_last();
+        }
         out
     }
 
@@ -523,7 +593,8 @@ impl MemMvccStore {
             });
         }
 
-        if let Some(chain) = guard.active_versions.get(key) {
+        let active_map = guard.active_versions.read().unwrap();
+        if let Some(chain) = active_map.get(key) {
             for v in chain.iter().rev() {
                 if v.hlc <= read_hlc {
                     return Ok(Some(v.value.clone()));
@@ -558,9 +629,9 @@ impl MemMvccStore {
         }
 
         let mut out = BTreeMap::new();
-        for (k, chain) in guard
-            .active_versions
-            .range::<[u8], _>((Bound::Included(start_key), Bound::Excluded(end_key)))
+        let active_map = guard.active_versions.read().unwrap();
+        for (k, chain) in
+            active_map.range::<[u8], _>((Bound::Included(start_key), Bound::Excluded(end_key)))
         {
             for v in chain.iter().rev() {
                 if v.hlc <= read_hlc {
@@ -603,9 +674,10 @@ impl MemMvccStore {
         checkpoint.flushed_max_hlc = sealed_hlc;
 
         let injected = if let Some(h) = hook {
+            let active_map = guard.active_versions.read().unwrap();
             let view = ViewAtRaftIndex {
                 sealed_index,
-                sealing_entries: &guard.active_versions,
+                sealing_entries: &active_map,
                 imm_queue: &guard.imm_queue,
                 backend,
                 version: backend.current_version(),
@@ -615,30 +687,37 @@ impl MemMvccStore {
             Vec::new()
         };
 
-        for (k, hlc, val) in injected {
-            guard.latest_hlc = guard.latest_hlc.max(hlc);
-            guard.total_mvcc_writes += 1;
-            guard
-                .active_versions
-                .entry(k)
-                .or_default()
-                .push_back(MvccVersion {
+        {
+            let active_arc = guard.active_versions.clone();
+            let mut active_map = active_arc.write().unwrap();
+            for (k, hlc, val) in injected {
+                guard.latest_hlc = guard.latest_hlc.max(hlc);
+                guard.total_mvcc_writes += 1;
+                active_map.entry(k).or_default().push_back(MvccVersion {
                     hlc,
                     lsn: sealed_index,
                     value: val,
                 });
+            }
         }
 
-        if guard.active_versions.is_empty() && sealed_index == guard.last_flushed_lsn {
+        if guard.active_versions.read().unwrap().is_empty()
+            && sealed_index == guard.last_flushed_lsn
+        {
             return Ok(None);
         }
 
         let seal_id = guard.next_seal_id;
         guard.next_seal_id += 1;
-        let active_taken = std::mem::take(&mut guard.active_versions);
-        let entries: BTreeMap<Vec<u8>, Vec<MvccVersion>> = active_taken
-            .into_iter()
-            .map(|(k, dq)| (k, dq.into_iter().collect()))
+        let old_active = std::mem::replace(
+            &mut guard.active_versions,
+            Arc::new(RwLock::new(BTreeMap::new())),
+        );
+        let entries: BTreeMap<Vec<u8>, Vec<MvccVersion>> = old_active
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, dq)| (k.clone(), dq.iter().cloned().collect()))
             .collect();
 
         let imm = Arc::new(ImmMemTable {
@@ -776,7 +855,7 @@ impl MemMvccStore {
         snapshot_hlc: HlcTimestamp,
     ) {
         let mut g = self.inner.write().unwrap();
-        g.active_versions.clear();
+        g.active_versions = Arc::new(RwLock::new(BTreeMap::new()));
         g.hlc_to_lsn.clear();
         g.imm_queue.clear();
         g.latest_lsn = snapshot_lsn;

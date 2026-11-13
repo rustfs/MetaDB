@@ -135,10 +135,54 @@ fn test_snapshot_guard_read_cut_safe_flush_gate_and_view_at_raft_index() {
     let metrics = engine.metrics();
     assert!(metrics.pruned_mvcc_versions >= 3);
 
-    // Verify forced expiration immediately returns `TransactionTimeout`.
+    // Verify forced expiration immediately drops `PinnedSnapshotData` (`has_pinned_data() == false`)
+    // even while the stalled caller holds `g2`, and returns `TransactionTimeout`.
+    assert!(g2.has_pinned_data());
     g2.force_expire_for_test();
+    assert!(!g2.has_pinned_data());
     assert!(matches!(
         engine.get_with_snapshot(&ka, &g2).unwrap_err(),
         MetaDbError::TransactionTimeout { .. }
     ));
+
+    // Verify bounded 256-key per-page `scan_with_snapshot` across 600 keys (> 2 * 256 = 3 pages)
+    // spanning both flushed SSTables (0..300) and active MemTable (300..600).
+    let mut lsn = 10u64;
+    for i in 0..300u32 {
+        lsn += 1;
+        let k = MetaKey::child(88, format!("item_{:04}.dat", i)).encode();
+        engine.apply_committed_put(k, vec![0x11; 16], HlcTimestamp::new(2_000, i as u16), lsn);
+    }
+    engine
+        .seal_and_flush_with_hook(
+            DurableShardCheckpoint {
+                flushed_raft_index: lsn,
+                flushed_max_hlc: HlcTimestamp::new(2_000, 300),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+    for i in 300..600u32 {
+        lsn += 1;
+        let k = MetaKey::child(88, format!("item_{:04}.dat", i)).encode();
+        engine.apply_committed_put(k, vec![0x22; 16], HlcTimestamp::new(2_001, i as u16), lsn);
+    }
+    let g_paged = engine.acquire_linearizable_snapshot(lsn).unwrap();
+    let scanned_600 = engine
+        .scan_with_snapshot(
+            &MetaKey::encode_pid_prefix_start(88),
+            &MetaKey::encode_pid_prefix_end(88),
+            &g_paged,
+        )
+        .unwrap();
+    assert_eq!(scanned_600.len(), 600);
+    assert_eq!(
+        scanned_600.first().unwrap().0,
+        MetaKey::child(88, "item_0000.dat").encode()
+    );
+    assert_eq!(
+        scanned_600.last().unwrap().0,
+        MetaKey::child(88, "item_0599.dat").encode()
+    );
 }

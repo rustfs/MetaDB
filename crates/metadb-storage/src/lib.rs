@@ -29,8 +29,9 @@ pub use compaction::{CompactionStats, LocalityCompactor};
 pub use engine::{LifecycleStorageEngine, LsmEngineConfig, StorageMetrics};
 pub use manifest::{DurableShardCheckpoint, ManifestLog, VersionEdit};
 pub use mvcc::{
-    ActiveSnapshotRegistry, ImmMemTable, MemMvccStore, MvccValue, MvccVersion, PreFlushHook,
-    ReadCut, SnapshotGuard, ViewAtRaftIndex, DEFAULT_MVCC_RETENTION_MS,
+    ActiveMemTable, ActiveSnapshotRegistry, ImmMemTable, MemMvccStore, MvccValue, MvccVersion,
+    PinnedSnapshotData, PreFlushHook, ReadCut, SnapshotGuard, ViewAtRaftIndex,
+    DEFAULT_MVCC_RETENTION_MS,
 };
 pub use raft_log::{
     LogSequenceNumber, RaftLog, RaftLogEntry, RaftLogPayload, TruncationWatermarks,
