@@ -72,6 +72,13 @@ impl Default for MetaDbConfig {
     }
 }
 
+impl MetaDbConfig {
+    /// Parses a persistent `ServerTomlConfig` from disk for `MetaDbEngine::open(...).await`.
+    pub fn from_toml_file(path: impl AsRef<std::path::Path>) -> Result<ServerTomlConfig> {
+        ServerTomlConfig::from_toml_file(path)
+    }
+}
+
 /// Top-level MetaDB engine coordinating the Proxy, MetaCache, Two-Tier Control Plane,
 /// Single-Shard Pushdown Executor, 2PC Coordinator, Off-Critical-Path Queues, and
 /// Lifecycle-Aware Storage Engines.
@@ -83,6 +90,13 @@ pub struct MetaDbEngine {
 }
 
 impl MetaDbEngine {
+    /// Opens or bootstraps an asynchronous, persistent WAL-less LSM + OpenRaft MetaDB instance
+    /// from `ServerTomlConfig` (convenience wrapper over `PersistentMetaDbCluster::open_and_serve`).
+    pub async fn open(config: ServerTomlConfig) -> Result<Arc<PersistentMetaDbCluster>> {
+        let (cluster, _addr) = PersistentMetaDbCluster::open_and_serve(config).await?;
+        Ok(cluster)
+    }
+
     /// Initializes a Stage 1 Single-Node All-in-One MetaDB instance with a root shard
     /// and pre-initialized root directory `(ROOT_INODE_ID = 1, "_attr_")`.
     pub fn new_single_node(config: MetaDbConfig) -> Self {

@@ -80,17 +80,17 @@ fn main() -> metadb_core::Result<()> {
 }
 ```
 
-### Async Persistent SDK (`PersistentMetaDbCluster`)
+### Async Persistent SDK (`MetaDbEngine::open` / `PersistentMetaDbCluster`)
 
-`PersistentMetaDbCluster::open_and_serve(config).await?` persists shards under `<data_dir>/be/shards/<shard_id>/` backed by `LsmStorageBackend` and OpenRaft with automatic background maintenance, auxiliary outbox dispatch, and gRPC endpoints:
+`MetaDbEngine::open(config).await?` (and `PersistentMetaDbCluster::open_and_serve(config).await?` when also retrieving the bound gRPC address) persists shards under `<data_dir>/be/shards/<shard_id>/` backed by `LsmStorageBackend` and OpenRaft with automatic background maintenance, auxiliary outbox dispatch, and gRPC endpoints:
 
 ```rust
-use metadb_server::{PersistentMetaDbCluster, ServerTomlConfig};
+use metadb_server::{MetaDbConfig, MetaDbEngine};
 
-let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(
-    ServerTomlConfig::from_toml_file("/etc/metadb/standalone.toml")?,
+let engine = MetaDbEngine::open(
+    MetaDbConfig::from_toml_file("/etc/metadb/standalone.toml")?,
 ).await?;
-let dir = cluster.mkdir_auto_id(1, "checkpoints", 1000, 0o755).await?;
-let file = cluster.create_file_auto_id(dir.attr.inode_id, "step_0002.pt", 1000, 0o644, 4096).await?;
-cluster.shutdown().await?;
+let dir = engine.mkdir_auto_id(1, "checkpoints", 1000, 0o755).await?;
+let file = engine.create_file_auto_id(dir.attr.inode_id, "step_0002.pt", 1000, 0o644, 4096).await?;
+engine.shutdown().await?;
 ```

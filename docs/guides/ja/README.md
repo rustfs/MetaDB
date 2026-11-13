@@ -67,17 +67,17 @@ fn main() -> metadb_core::Result<()> {
 }
 ```
 
-### 非同期永続化・gRPC クラスター SDK（`PersistentMetaDbCluster`）
+### 非同期永続化・gRPC クラスター SDK（`MetaDbEngine::open` / `PersistentMetaDbCluster`）
 
-`PersistentMetaDbCluster::open_and_serve(config).await?` は `LsmStorageBackend` と OpenRaft に基づく永続化、バックグラウンド維持処理、および gRPC サーバーを起動します：
+`MetaDbEngine::open(config).await?`（バインド済み gRPC アドレスも取得する場合は `PersistentMetaDbCluster::open_and_serve(config).await?`）は `LsmStorageBackend` と OpenRaft に基づく永続化、バックグラウンド維持処理、および gRPC サーバーを起動します：
 
 ```rust
-use metadb_server::{PersistentMetaDbCluster, ServerTomlConfig};
+use metadb_server::{MetaDbConfig, MetaDbEngine};
 
-let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(
-    ServerTomlConfig::from_toml_file("/etc/metadb/standalone.toml")?,
+let engine = MetaDbEngine::open(
+    MetaDbConfig::from_toml_file("/etc/metadb/standalone.toml")?,
 ).await?;
-let dir = cluster.mkdir_auto_id(1, "checkpoints", 1000, 0o755).await?;
-let file = cluster.create_file_auto_id(dir.attr.inode_id, "step_0002.pt", 1000, 0o644, 4096).await?;
-cluster.shutdown().await?;
+let dir = engine.mkdir_auto_id(1, "checkpoints", 1000, 0o755).await?;
+let file = engine.create_file_auto_id(dir.attr.inode_id, "step_0002.pt", 1000, 0o644, 4096).await?;
+engine.shutdown().await?;
 ```

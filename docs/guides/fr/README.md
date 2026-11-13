@@ -67,17 +67,17 @@ fn main() -> metadb_core::Result<()> {
 }
 ```
 
-### SDK Asynchrone Persistant & gRPC (`PersistentMetaDbCluster`)
+### SDK Asynchrone Persistant & gRPC (`MetaDbEngine::open` / `PersistentMetaDbCluster`)
 
-`PersistentMetaDbCluster::open_and_serve(config).await?` démarre le moteur persistant basé sur `LsmStorageBackend` et OpenRaft avec maintenance asynchrone et écoute gRPC :
+`MetaDbEngine::open(config).await?` (ou `PersistentMetaDbCluster::open_and_serve(config).await?` pour obtenir également l'adresse gRPC liée) démarre le moteur persistant basé sur `LsmStorageBackend` et OpenRaft avec maintenance asynchrone et écoute gRPC :
 
 ```rust
-use metadb_server::{PersistentMetaDbCluster, ServerTomlConfig};
+use metadb_server::{MetaDbConfig, MetaDbEngine};
 
-let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(
-    ServerTomlConfig::from_toml_file("/etc/metadb/standalone.toml")?,
+let engine = MetaDbEngine::open(
+    MetaDbConfig::from_toml_file("/etc/metadb/standalone.toml")?,
 ).await?;
-let dir = cluster.mkdir_auto_id(1, "checkpoints", 1000, 0o755).await?;
-let file = cluster.create_file_auto_id(dir.attr.inode_id, "step_0002.pt", 1000, 0o644, 4096).await?;
-cluster.shutdown().await?;
+let dir = engine.mkdir_auto_id(1, "checkpoints", 1000, 0o755).await?;
+let file = engine.create_file_auto_id(dir.attr.inode_id, "step_0002.pt", 1000, 0o644, 4096).await?;
+engine.shutdown().await?;
 ```

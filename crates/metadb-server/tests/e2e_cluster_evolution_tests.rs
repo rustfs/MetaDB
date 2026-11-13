@@ -9,7 +9,10 @@ use metadb_proto::{
     DirStatRequest, ExecuteSqlRequest, GetQuotaRequest, GetRoutesRequest, GetSecondaryIndexRequest,
     ListDirRequest, RenameRequest, SqlParamValue, TriggerShardSplitRequest,
 };
-use metadb_server::{render_prometheus_metrics, PersistentMetaDbCluster, ServerTomlConfig};
+use metadb_server::{
+    render_prometheus_metrics, MetaDbConfig, MetaDbEngine, PersistentMetaDbCluster,
+    ServerTomlConfig,
+};
 use tempfile::tempdir;
 
 /// End-to-End Phase 6 Verification Suite (`e2e_cluster_evolution_tests.rs`):
@@ -246,5 +249,18 @@ shard_split_threshold_bytes = 2048
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         cluster.shutdown().await.unwrap();
+    }
+
+    // --- Phase C: Verify `MetaDbEngine::open(MetaDbConfig::from_toml_file(...)?).await?` SDK entry point ---
+    {
+        let toml_path = dir.path().join("standalone.toml");
+        std::fs::write(&toml_path, &toml_text).unwrap();
+        let engine = MetaDbEngine::open(MetaDbConfig::from_toml_file(&toml_path).unwrap())
+            .await
+            .unwrap();
+        let stat_b = engine.tx_router().dirstat(dir_b_id).await.unwrap();
+        assert_eq!(stat_b.num_children, 13);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        engine.shutdown().await.unwrap();
     }
 }

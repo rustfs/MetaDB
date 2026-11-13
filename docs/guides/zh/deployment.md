@@ -4,7 +4,7 @@
 
 MetaDB 在单机模式与千节点分布式集群中使用**完全相同的无 WAL LSM 存储引擎与 OpenRaft 状态机**，支持从单机平滑在线演进至百亿—十万亿级元数据集群，无需停机迁移数据格式。
 
-> **里程碑说明**：进程内多分片分裂、Jumbo 分片隔离与两层路由模型已在当前原型中验证；独立守护进程 `metadbd`、磁盘持久化与 `tonic` gRPC 网络传输将在 **Phase 2–6** 分步落地。
+> **实现状态说明**：无 WAL SSTable 持久化 LSM 引擎、`openraft` Multi-Raft（`1-Voter -> 3-Voter` 在线扩容）、带 `ShardEpoch` 围栏的 `PID` 边界与 `DualModeFineGrained` 分片分裂、Jumbo 分片隔离、守护进程 `metadbd` 以及运维工具 `metadb-ctl` 均已在当前 8-Crate 工作区中完整实现并通过测试验证。
 
 ---
 
