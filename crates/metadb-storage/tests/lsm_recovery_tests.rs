@@ -22,6 +22,11 @@ fn test_lsm_sstable_bloom_tombstone_shadowing_and_crc32c() {
     };
 
     let engine = LifecycleStorageEngine::open_lsm(1, &lsm_dir, cache.clone(), cfg.clone()).unwrap();
+    // Verify exclusive `lsm/LOCK` prevents concurrent opening of the same directory!
+    assert!(matches!(
+        LifecycleStorageEngine::open_lsm(1, &lsm_dir, cache.clone(), cfg.clone()),
+        Err(MetaDbError::StorageIoError(_))
+    ));
     let k1 = MetaKey::child(10, "alpha.txt").encode();
     let k2 = MetaKey::child(10, "beta.txt").encode();
 

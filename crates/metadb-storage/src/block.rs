@@ -55,8 +55,8 @@ impl DataBlockBuilder {
         &self.last_key
     }
 
-    /// Appends a sorted `(key, value)` entry to the block.
-    pub fn add(&mut self, key: &[u8], value: &BlockEntryValue) {
+    /// Appends a sorted `(key, value)` entry to the block, rejecting keys whose unshared suffix exceeds `u16::MAX`.
+    pub fn add(&mut self, key: &[u8], value: &BlockEntryValue) -> Result<()> {
         debug_assert!(
             self.entries_count == 0 || key > self.last_key.as_slice(),
             "DataBlock keys must be strictly ascending"
@@ -74,8 +74,14 @@ impl DataBlockBuilder {
         }
 
         let unshared = key.len() - shared;
+        let unshared_u16 = u16::try_from(unshared).map_err(|_| {
+            MetaDbError::CodecError(format!(
+                "DataBlock unshared key suffix length {} exceeds u16::MAX",
+                unshared
+            ))
+        })?;
         self.buf.extend_from_slice(&(shared as u16).to_le_bytes());
-        self.buf.extend_from_slice(&(unshared as u16).to_le_bytes());
+        self.buf.extend_from_slice(&unshared_u16.to_le_bytes());
         match value {
             BlockEntryValue::Value(v) => {
                 self.buf.push(ENTRY_TAG_VALUE);
@@ -94,6 +100,7 @@ impl DataBlockBuilder {
         self.last_key.extend_from_slice(key);
         self.counter += 1;
         self.entries_count += 1;
+        Ok(())
     }
 
     /// Finalizes the block with `[restart_offsets: u32 LE * R][num_restarts: u32 LE][crc32c: u32 LE]`.

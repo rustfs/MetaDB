@@ -122,7 +122,7 @@ impl SstableBuilder {
             if matches!(v, BlockEntryValue::PhysicalTombstone) {
                 num_tombstones += 1;
             }
-            block_builder.add(k, v);
+            block_builder.add(k, v)?;
             if block_builder.estimated_size() >= DEFAULT_BLOCK_SIZE_BYTES {
                 let last_key = block_builder.last_key().to_vec();
                 let raw_block = std::mem::take(&mut block_builder).finish();
