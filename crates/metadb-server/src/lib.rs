@@ -270,15 +270,37 @@ impl MetaDbEngine {
                 Ok(SqlQueryResult::OptionalEntry(self.lookup(pid, &name)?))
             }
             MetadataSqlCommand::DirStat { pid } => Ok(SqlQueryResult::Attr(self.dirstat(pid)?)),
-            MetadataSqlCommand::ListDir { pid } => Ok(SqlQueryResult::Entries(self.listdir(pid)?)),
+            MetadataSqlCommand::ListDir {
+                pid,
+                after_name,
+                name_prefix,
+                limit,
+            } => {
+                let mut rows = self.listdir(pid)?;
+                if let Some(after) = after_name {
+                    rows.retain(|e| e.key.name > after);
+                }
+                if let Some(pfx) = name_prefix {
+                    rows.retain(|e| e.key.name.starts_with(&pfx));
+                }
+                if limit > 0 && rows.len() > limit {
+                    rows.truncate(limit);
+                }
+                Ok(SqlQueryResult::Entries(rows))
+            }
             MetadataSqlCommand::Rename {
                 src_pid,
                 src_name,
                 dst_pid,
                 dst_name,
+                ..
             } => Ok(SqlQueryResult::Entry(
                 self.rename(src_pid, &src_name, dst_pid, &dst_name)?,
             )),
+            other => Err(metadb_core::MetaDbError::SqlParseError(format!(
+                "use async ClusterEngine / StatelessProxyRouter for template {:?}",
+                other
+            ))),
         }
     }
 

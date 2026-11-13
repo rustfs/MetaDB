@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use metadb_core::{HlcTimestamp, InodeId, MetaDbError, MetaKey, NodeId, Result, ShardId};
 use metadb_storage::LifecycleStorageEngine;
 
 /// Sharding mode for a shard (§4.1 Workload-Adjustable Dual-Mode Sharding).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShardSplitMode {
     /// Default mode: splits strictly at `group_key = PID` boundaries so a directory's
     /// `_attr_` and all direct children remain on a single shard.
@@ -15,7 +17,7 @@ pub enum ShardSplitMode {
 }
 
 /// Scheduling and isolation state of a shard (§4.1 Jumbo-Shard-Aware Scheduling).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShardHealthState {
     Normal,
     /// Unsplittable single-PID Jumbo Shard isolated onto a dedicated BE node with peer

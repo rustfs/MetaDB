@@ -9,3 +9,13 @@ authors.workspace = true
 
 [dependencies]
 metadb-core = { path = "../metadb-core" }
+metadb-proto = { path = "../metadb-proto" }
+metadb-cluster = { path = "../metadb-cluster" }
+metadb-tx = { path = "../metadb-tx" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+
+[dev-dependencies]
+metadb-raft = { path = "../metadb-raft" }
+metadb-storage = { path = "../metadb-storage" }
+tempfile = { workspace = true }
