@@ -869,8 +869,16 @@ dependencies = [
 name = "metadb-tx"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "metadb-core",
+ "metadb-proto",
+ "metadb-raft",
  "metadb-storage",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

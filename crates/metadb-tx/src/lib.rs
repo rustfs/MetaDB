@@ -6,9 +6,19 @@
 //! - [`pushdown`]: Single-Shard Transaction Logic Pushdown (`1-RTT` RMW) and Cross-Shard 2PC `Rename`.
 
 pub mod attr_aggregator;
+pub mod aux_outbox;
 pub mod aux_sink;
 pub mod pushdown;
+pub mod recovery_worker;
+pub mod state_machine_impl;
+pub mod two_pc;
 
 pub use attr_aggregator::{AsyncAttrAggregator, AttrDeltaItem};
+pub use aux_outbox::{ReplicatedAttrAggregator, ShardAuxOutbox, DEFAULT_OUTBOX_SPILL_THRESHOLD};
 pub use aux_sink::{AsyncAuxiliarySink, AuxUpdateTask};
 pub use pushdown::{PushdownExecutor, TwoPhaseCommitCoordinator};
+pub use recovery_worker::{AuxDispatcher, TxnRecoveryWorker};
+pub use state_machine_impl::{SetAttrPatch, TxRaftCmd, TxRaftOutput, TxStateMachineHandler};
+pub use two_pc::{
+    DirRenameLease, DistributedTxRouter, RoutedShardHandle, ShardDirectory, TwoPcCrashStage,
+};
