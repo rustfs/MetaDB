@@ -33,8 +33,8 @@ During Phase 1 ideation, the concept was challenged across six adversarial lense
 
 ---
 
-## 3. Approved Scope for Phase 2 (`/egm-draft`)
+## 3. Approved Scope for Subsystem Specifications & Phased Implementation
 
-1. Author a comprehensive root `Architecture.md` and EGM specification `docs/designs/metadb_architecture.md` with explicit mathematical capacity modeling for **100 Billion to 10+ Trillion records**.
-2. Subject the specification to zero-context Goldfish subagent reviews (`/egm-review`) and document resolutions in `docs/designs/review_report.md`.
-3. Implement the modular 6-crate Rust workspace (`metadb-core`, `metadb-storage`, `metadb-tx`, `metadb-cluster`, `metadb-proxy`, `metadb-server`) and verify all invariants via automated test suites.
+1. Author a comprehensive master `Architecture.md`, umbrella `docs/designs/metadb_architecture.md`, and three Zero-Decision modular subsystem specifications (`storage_lsm_mvcc.md`, `consensus_and_transactions.md`, `sharding_and_control_plane.md`) with explicit capacity modeling for **100 Billion to 10+ Trillion records**.
+2. Subject the entire specification suite to an isolated zero-context Goldfish subagent review (`rubber-duck` reading strictly the written markdown specifications) and record all findings and resolutions accurately in `docs/designs/review_report.md`.
+3. Deliver the phased engineering plan (`docs/DEVELOPMENT_PLAN.md`) and 5-language usage documentation (`en`, `ja`, `fr`, `zh`, `de`) in Phase 0, followed by step-by-step implementation of the **8-crate 100% pure-Rust workspace** (`metadb-core`, `metadb-proto`, `metadb-storage`, `metadb-raft`, `metadb-tx`, `metadb-cluster`, `metadb-proxy`, `metadb-server`) across Phases 1–6.

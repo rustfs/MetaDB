@@ -1,8 +1,13 @@
 # EGM Specification: MetaDB Distributed Metadata Engine
 
-* **Status**: Approved
+* **Status**: Phase 0 Approved Umbrella Specification
 * **Methodology**: [Google Elephant-Goldfish Model (EGM)](https://github.com/google/elephant-goldfish-model)
 * **Primary Reference**: Biao Cao et al., *"MetaDB: Putting File-System Structure Back into Distributed Databases"*, [arXiv:2610.32247v1](https://arxiv.org/html/2610.32247v1) (Baidu & Peking University, 2026)
+* **Modular Subsystem Contracts**:
+  * [`storage_lsm_mvcc.md`](./storage_lsm_mvcc.md) — Pure-Rust WAL-less LSM, `SnapshotGuard` MVCC & `LocalityCompactor` (`metadb-storage`)
+  * [`consensus_and_transactions.md`](./consensus_and_transactions.md) — `openraft` Multi-Raft, 3-Watermark Log, `ReadIndex`, `PushdownExecutor`, `AsyncAttrAggregator`, `AuxOutbox` & 2PC (`metadb-raft`, `metadb-tx`)
+  * [`sharding_and_control_plane.md`](./sharding_and_control_plane.md) — `ShardEpoch` Topology Sharding, Jumbo `DualModeFineGrained`, Two-Tier Control Plane, 20 SQL Templates & Protobuf v1 (`metadb-proto`, `metadb-cluster`, `metadb-proxy`)
+  * [`../DEVELOPMENT_PLAN.md`](../DEVELOPMENT_PLAN.md) — Phased Pure-Rust Implementation Plan (Phases 1–6)
 * **Semantic Boundaries**:
   * `FeatureRange`: Sections 1 – 6
   * `DetailedRange`: Sections 7 – 9
@@ -39,135 +44,97 @@ Furthermore, adopters need an engine that can run in **Single-Node All-in-One Mo
 
 ## 3. Proposed Architecture (`FeatureRange`)
 
-### 3.1 Three Core Tables (`metadb-core`)
-1. `MetaTable`: Keyed by `MetaKey { pid: InodeId, name: String }` encoded in lexicographical big-endian byte order (`[table_prefix=0x01][pid: 8B BE][name_bytes]`).
-   * Special child name `"_attr_"` stores the directory's own attributes (`InodeAttr`) colocated under `pid`.
-   * Sharding `group_key` is `pid`.
-2. `QuotaTable`: Keyed by `QuotaKey { uid: UserId }` (`[table_prefix=0x02][uid: 8B BE]`), storing `QuotaRecord { uid, used_bytes, used_inodes, limit_bytes, last_applied_hlc }`.
-3. `SecondaryIndexTable`: Keyed by `SecondaryIndexKey { fid: FileId }` (`[table_prefix=0x03][fid: 8B BE]`), storing `SecondaryIndexRecord { fid, pid, name, create_time, last_applied_hlc }`.
+### 3.1 Seven Disjoint Binary Keyspaces (`metadb-core`)
+1. `MetaTable` (`0x01`): Keyed by `MetaKey { pid: InodeId, name: String }` encoded in big-endian byte order (`[0x01][pid: 8B BE][name_utf8]`).
+   * Reserved child name `"_attr_"` stores the directory's own `InodeAttr` (`88B` fixed binary payload with `parent_pid`, `applied_raft_index`, and `CRC32C`) colocated under `pid` (`group_key = pid`).
+2. `QuotaTable` (`0x02`): Keyed by `QuotaKey { uid: UserId }` (`[0x02][uid: 8B BE]`), storing `QuotaRecord` with `applied_index_by_shard: BTreeMap<ShardId, u64>`.
+3. `SecondaryIndexTable` (`0x03`): Keyed by `SecondaryIndexKey { fid: FileId }` (`[0x03][fid: 8B BE]`), storing `SecondaryIndexRecord` with `(last_applied_hlc, tombstone_hlc, is_deleted)`.
+4. Shard-Local Replicated System Prefixes (`0x04..0x07`):
+   * `0x04 DirShardDelta`: Per-sub-shard partial directory stats & existence lease for `DualModeFineGrained` jumbo directories.
+   * `0x05 WriteIntent`: Durable Raft-replicated 2PC participant locks (`Put`, `Delete`, `DeletingDir`, `DirExistsFence`).
+   * `0x06 TxnRecord`: Primary-Anchored 2PC commit/abort source of truth (`ttl_ms = 3,000ms`).
+   * `0x07 SpilledAuxOutbox`: Local persistent overflow queue preventing remote shard partitions from blocking Raft log truncation.
 
-### 3.2 Hybrid Logical Clock (`HLC`)
-* Every node runs an independent `HybridLogicalClock` packing a 48-bit physical millisecond wall clock and a 16-bit logical counter into a monotonic `HlcTimestamp(u64)`.
-* Eliminates central Timestamp Oracle (TSO) bottlenecks.
+### 3.2 Hybrid Logical Clock (`HLC`) with Drift & Overflow Guard
+* Every node runs a decentralized `HybridLogicalClock` packing a 48-bit physical millisecond wall clock and a 16-bit logical counter into `HlcTimestamp(u64)`, enforcing `max_clock_drift_ms` (`500ms`) on incoming RPC timestamps and advancing the 48-bit physical component (never wrapping `u16` to `0`) if logical ticks reach `u16::MAX`.
 
-### 3.3 Storage Layer (`metadb-storage`)
-* **WAL-less Persistent KV + Raft Log**: All mutations are first appended to `RaftLog` (which assigns a monotonically increasing `LogSequenceNumber (LSN)`). The underlying persistent KV engine (`PersistentKvStore`) disables its own WAL.
-* **Safe Raft Log Truncation Watermark**:
-  $$\text{safe\_truncate\_lsn} = \min(\text{storage\_flushed\_lsn},\ \text{attr\_aggregated\_lsn},\ \text{aux\_sink\_acked\_lsn})$$
-* **In-Memory MVCC (`MemMvccStore`)**: Stores version chains `VecDeque<MvccVersion>` per key in memory. Snapshots older than `retention_window_ms` (`5,000ms`) are rejected with `MetaDbError::TransactionTimeout`. On `flush_to_persistent()`, only the newest version per key is written (`Put` for live value, single physical `Delete` tombstone for `MvccTombstone`), and all older versions/MVCC tombstones are discarded.
-* **Locality-Aware Compaction (`LocalityCompactor`)**: Tracks deletion counts per key prefix bucket (`pid` or key-range slice). When `tombstones_in_bucket >= density_threshold`, `compact_range(start_key, end_key)` purges physical tombstones solely within that bucket.
+### 3.3 Pure-Rust WAL-less LSM & `SnapshotGuard` MVCC (`metadb-storage` & `metadb-raft`)
+* **WAL-less `LsmStorageBackend` + Segmented `openraft` Log**: Local KV WAL files are disabled; pre-flush durability relies on `metadb-raft`'s CRC32C-framed `.raftlog` segments and durable `HARD_STATE.last_committed`.
+* **Safe Raft Log Purge Gate**:
+  $$\text{safe\_purge\_index} = \min\big(\text{state\_flushed\_index},\ \text{aux\_outbox\_durable\_index},\ \text{last\_snapshot\_index}\big)$$
+* **`SnapshotGuard` & `ReadCut` In-Memory MVCC (`MemMvccStore`)**: Active readers pin an immutable `ReadCut { max_raft_index, max_hlc }` + `Arc<Version>` + `Vec<Arc<ImmMemTable>>` (`<= 5,000ms` timeout). Sealed `ImmMemTable`s collapse-flush unversioned latest values or single physical tombstones to `flush_generation`-ordered 4 KiB CRC32C SSTables **strictly when** `min_active_snapshot_hlc >= imm.max_hlc`.
+* **Bottommost-Safe Locality-Aware Compaction (`LocalityCompactor`)**: Tracks tombstone count and ratio per 9-byte `[table_prefix][group_key: 8B]` bucket, rewrites all keys of overlapping input SSTables, and drops physical tombstones strictly when proven bottommost.
 
-### 3.4 Transaction & Off-Critical-Path Layer (`metadb-tx`)
-* **Single-Shard Pushdown (`PushdownExecutor`)**: Executes `CreateFile`, `Mkdir`, `Unlink`, `Rmdir`, `DirStat`, `Lookup`, and `ListDir` atomically on a single shard.
-* **2PC Cross-Shard Coordinator**: Executes atomic cross-directory `Rename` when `src_pid` and `dst_pid` reside on different shards.
-* **Async Attribute Aggregator (`AsyncAttrAggregator`)**: Accumulates `AttrDelta { pid, delta_children, delta_bytes, latest_modify_time, lsn }` in memory without locking `(pid, "_attr_")`. Persisted `InodeAttr` tracks `applied_lsn`; `reconcile_attr(pid, persisted_attr)` folds only deltas with `delta.lsn > persisted_attr.applied_lsn` to prevent undercounting or double-counting during concurrent flushes. `rmdir` verifies emptiness via an authoritative live-child scan (excluding the reserved `"_attr_"` entry, which is rejected for user-created files).
-* **Async Auxiliary Sink (`AsyncAuxiliarySink`)**: Queues `AuxUpdateTask` entries (`QuotaUpdate` and `SecondaryIndexUpdate`), batches them by target, and applies them idempotently using per-origin-shard LSN watermarks (`applied_lsn_by_shard`) for additive `QuotaTable` deltas and monotonic `HlcTimestamp` checks for `SecondaryIndexTable` mutations.
+### 3.4 Deterministic Replicated Transactions & Off-Critical-Path Queues (`metadb-tx`)
+* **Single-Shard Pushdown (`PushdownExecutor`)**: Executes `CreateFile`, `Unlink`, `SetAttr`, `Lookup`, `DirStat`, `ListDir`, and shard-colocated `Mkdir`/`Rmdir` in `1 RTT` (fenced by `ShardEpoch` and batched `ReadIndex`).
+* **Crash-Recoverable Primary-Anchored 2PC (`TwoPhaseCommitCoordinator`)**: Executes cross-shard `Rename` (exclusive and POSIX overwrite), cross-shard `Mkdir`, and cross-shard `Rmdir` with cycle detection (`DirRenameGuard` + `parent_pid` walk) and `TxnRecoveryWorker` roll-forward/abort.
+* **`AsyncAttrAggregator` + Coordinated Flush Barrier**: Folds deltas `<= M` directly into `(PID, "_attr_")` inside the sealing `ImmMemTable` batch before `attr_flushed_index` advances, while `reconcile_attr` folds strictly `delta.raft_index > persisted.applied_raft_index && delta.hlc <= read_hlc`.
+* **Exact-Once FIFO `AuxOutbox`**: Dispatches `QuotaTable` and `SecondaryIndexTable` batches in strict ascending `origin_raft_index` order per `(origin_shard_id, target_shard_id)`, spilling overdue tasks to `[0x07]` on L0 flush.
 
-### 3.5 Topology-Induced Sharding & Two-Tier Control Plane (`metadb-cluster`)
-* **Shard Splitting on `group_key = PID`**: Splits shards only between distinct `PID` values unless the shard is explicitly placed in `ShardSplitMode::DualModeFineGrained`.
-* **Jumbo Shard Detection & Isolation**: Shards holding a single massive `PID` above `jumbo_shard_threshold_bytes` are marked `JumboIsolated` and scheduled onto dedicated BE nodes.
-* **Two-Tier Control Plane**: `GlobalManager` maps coarse key ranges to `CellId`; each `CellLocalManager` manages per-shard Raft groups, `PID`-boundary splits, and replica membership (`SingleNode` 1-Voter $\rightarrow$ `ThreeWayReplica` 3-Voter via `ConfChange`).
+### 3.5 Topology Sharding, Two-Tier Control Plane & Wire Contracts (`metadb-proto`, `metadb-cluster`, `metadb-proxy`, `metadb-server`)
+* **Unified `[0x01, 0x04)` Sharding**: `PolicyShardSplitter` splits `MetaTable` shards on `group_key = PID` boundaries via `RaftCmd::ExecuteSplit`, isolates single-`PID` Jumbo Shards (`JumboIsolated`), and supports `DualModeFineGrained` `(PID, name)` splits (`1-RTT` writes + `1-hop` parallel scatter-gather `dirstat`).
+* **Two-Tier Control Plane**: `GlobalManager` + per-Cell `CellLocalManager` + `MetaCache` + bitspace-partitioned `IdRangeAllocator` (File bit-63 = `1`, Directory bit-63 = `0` with shard-locality leases).
+* **Interfaces**: 20 parameterized/escaped SQL templates in `metadb-proxy`, `tonic` gRPC services in `metadb-proto`, embedded `MetaDbEngine` SDK, `metadbd` daemon, and `metadb-ctl` CLI in `metadb-server`.
 
 ---
 
 ## 4. Alternatives Considered (`FeatureRange`)
 
 1. **General-Purpose Distributed SQL (TiDB / CockroachDB)**: Rejected due to 100% multi-shard transaction ratio when secondary/quota indexes are updated in-band, 36.2x lower throughput under single-directory concurrent writes, and multi-second `listdir` latency spikes under bulk deletions (`arXiv:2610.32247v1`, §7 & Appendix A).
-2. **Decoupled External Directory Index Service**: Rejected because maintaining directory trees outside the transactional database requires cross-system 2PC and duplicate replication/recovery machinery (`arXiv:2610.32247v1`, §8).
-3. **Separate Non-Raft Storage Path for Single-Node Mode**: Rejected because dual durability paths (RocksDB WAL vs. Raft Log) break state-machine symmetry for `In-Memory MVCC` flush watermarks and asynchronous queue recovery during online cluster expansion.
+2. **External C/C++ Storage Engines (`librocksdb-sys`)**: Rejected to maintain a 100% memory-safe pure-Rust stack with native `SnapshotGuard`-gated MemTable collapse and 9-byte prefix tombstone-density compaction hooks.
+3. **Decoupled External Directory Index Service**: Rejected because maintaining directory trees outside the transactional database requires cross-system 2PC and duplicate replication/recovery machinery (`arXiv:2610.32247v1`, §8).
+4. **Separate Non-Raft Storage Path for Single-Node Mode**: Rejected because dual durability paths break state-machine symmetry for `MemMvccStore` watermarks and asynchronous queue recovery during online `1-Voter -> 3-Voter` cluster expansion.
 
 ---
 
 ## 5. Risks & Mitigations (`FeatureRange`)
 
-1. **Risk: Single-Directory Skew Exceeding Single-Node Disk/CPU (Jumbo Shard)**:
-   * *Mitigation*: Two-level defense: (a) `CellLocalManager` automatically isolates jumbo shards onto dedicated BE nodes (`JumboIsolated`); (b) operator/policy switch to `DualModeFineGrained` allows splitting a single `PID` across shards by `(PID, name)` sub-ranges, automatically routing operations on that `PID` through the 2PC path.
-2. **Risk: Unbounded Raft Log Growth if Remote Auxiliary Shard is Unreachable**:
-   * *Mitigation*: When `AsyncAuxiliarySink` retry lag exceeds `max_pending_aux_tasks`, pending tasks are spilled into a local persistent retry queue within the shard, advancing `aux_sink_acked_lsn` so Raft log truncation proceeds unimpeded.
-3. **Risk: Stale Parent Directory Attributes on Immediate Read**:
-   * *Mitigation*: `DirStat` and `GetAttr` always invoke `AsyncAttrAggregator::reconcile_attr()`, folding in-memory pending deltas into the persisted `_attr_` record before returning to the caller.
+1. **Single-Directory Skew (Jumbo Shard)**: Mitigated by (a) `CellLocalManager` `JumboIsolated` dedicated-node placement, and (b) `DualModeFineGrained` `(PID, name)` splitting using shard-local `[0x04] DirShardDelta` records so `create`/`unlink` remain `1-RTT` lock-free while `dirstat` uses `1-hop` scatter-gather.
+2. **Unbounded Raft Log Growth During Remote Sink Partitions**: Mitigated by spilling overdue `AuxOutbox` entries into `[0x07] SpilledAuxOutbox` inside the local L0 SSTable flush, advancing `aux_outbox_durable_index` immediately.
+3. **Future-Read Anomaly & Stale Parent Attributes**: Mitigated by `ActiveSnapshotRegistry` gating unversioned L0 flushes until `min_active_snapshot_hlc >= imm.max_hlc` and `AsyncAttrAggregator` folding deltas via the Coordinated Flush Barrier + Read-Path Reconciliation.
 
 ---
 
 ## 6. Capacity & Scale Verification (`FeatureRange`)
 
-* **100B Records (`10^11`)**: `~18 TB` logical (`~54 TB` 3-replica), `~4,500` shards (`4 GiB` each), served by a single Cell of `16–24` BE nodes.
+* **Single-Node Starter (`10^8` records)**: `~18 GB` (`1-Voter`), `5–16` shards, `< 2 GiB` RAM on 1 `metadbd` node.
+* **100B Records (`10^11`)**: `~18 TB` logical (`~54 TB` 3-replica), `~4,500` shards (`4 GiB` each), served by 1 Cell (`~20` BE nodes).
 * **1T–10T Records (`10^12 – 10^13`)**: `180 TB – 1.8 PB` logical (`540 TB – 5.4 PB` 3-replica), `45,000 – 450,000` shards partitioned across `4–20` Cells under `GlobalManager`.
 
 ---
 
-## 7. Target Scope & File Boundary (`DetailedRange`)
+## 7. Target Workspace Scope & File Boundaries (`DetailedRange`)
 
- In compliance with the EGM Implementation Readiness Standard, Phase 5 implementation is strictly scoped to the following repository-relative files:
-
-* `Cargo.toml`
-* `README.md`
-* `Architecture.md`
-* `_agents/skills/metadb_elephant/SKILL.md`
-* `docs/designs/SITEMAP.md`
-* `docs/designs/concepts_brief.md`
-* `docs/designs/metadb_architecture.md`
-* `docs/designs/review_report.md`
-* `crates/metadb-core/Cargo.toml`
-* `crates/metadb-core/src/lib.rs`
-* `crates/metadb-core/src/hlc.rs`
-* `crates/metadb-core/src/schema.rs`
-* `crates/metadb-core/src/error.rs`
-* `crates/metadb-storage/Cargo.toml`
-* `crates/metadb-storage/src/lib.rs`
-* `crates/metadb-storage/src/raft_log.rs`
-* `crates/metadb-storage/src/mvcc.rs`
-* `crates/metadb-storage/src/compaction.rs`
-* `crates/metadb-storage/src/engine.rs`
-* `crates/metadb-tx/Cargo.toml`
-* `crates/metadb-tx/src/lib.rs`
-* `crates/metadb-tx/src/attr_aggregator.rs`
-* `crates/metadb-tx/src/aux_sink.rs`
-* `crates/metadb-tx/src/pushdown.rs`
-* `crates/metadb-cluster/Cargo.toml`
-* `crates/metadb-cluster/src/lib.rs`
-* `crates/metadb-cluster/src/shard.rs`
-* `crates/metadb-cluster/src/control_plane.rs`
-* `crates/metadb-proxy/Cargo.toml`
-* `crates/metadb-proxy/src/lib.rs`
-* `crates/metadb-server/Cargo.toml`
-* `crates/metadb-server/src/lib.rs`
-* `crates/metadb-server/tests/integration_tests.rs`
+Phases 1–6 target the 8-crate Cargo workspace defined in [`../DEVELOPMENT_PLAN.md`](../DEVELOPMENT_PLAN.md):
+* `crates/metadb-core`: `src/{lib.rs, error.rs, hlc.rs, schema.rs, epoch.rs, system_keys.rs, checksum.rs}`
+* `crates/metadb-proto`: `proto/metadb/v1/{common,metadata,transaction,raft,control_plane}.proto`, `src/{lib.rs, convert.rs}`
+* `crates/metadb-storage`: `src/{lib.rs, backend.rs, block.rs, bloom.rs, cache.rs, sstable.rs, manifest.rs, version_set.rs, mvcc.rs, compaction.rs, engine.rs}` (specified in [`storage_lsm_mvcc.md`](./storage_lsm_mvcc.md))
+* `crates/metadb-raft`: `src/{lib.rs, types.rs, log_store.rs, state_machine.rs, network.rs, read_index.rs, group_host.rs, conf_change.rs}` (specified in [`consensus_and_transactions.md`](./consensus_and_transactions.md))
+* `crates/metadb-tx`: `src/{lib.rs, state_machine_impl.rs, pushdown.rs, attr_aggregator.rs, aux_outbox.rs, two_pc.rs, recovery_worker.rs}` (specified in [`consensus_and_transactions.md`](./consensus_and_transactions.md))
+* `crates/metadb-cluster`: `src/{lib.rs, shard.rs, split_worker.rs, jumbo.rs, id_allocator.rs, meta_cache.rs, cell_manager.rs, global_manager.rs}` (specified in [`sharding_and_control_plane.md`](./sharding_and_control_plane.md))
+* `crates/metadb-proxy`: `src/{lib.rs, sql_lexer.rs, sql_templates.rs, router.rs}` (specified in [`sharding_and_control_plane.md`](./sharding_and_control_plane.md))
+* `crates/metadb-server`: `src/{lib.rs, config.rs, grpc_services.rs, metrics.rs}`, `src/bin/{metadbd.rs, metadb-ctl.rs}`
 
 ---
 
-## 8. Actionable Implementation Steps (`DetailedRange`)
+## 8. Phased Implementation Sequence (`DetailedRange`)
 
-### Phase 5.1: `metadb-core`
-1. Implement `HlcTimestamp` and thread-safe `HybridLogicalClock` (`now()`, `update(remote)`).
-2. Implement big-endian lexicographical key encoding for `MetaKey (pid, name)` with `ATTR_ENTRY_NAME = "_attr_"`, `QuotaKey (uid)`, and `SecondaryIndexKey (fid)`.
-3. Guarantee that `MetaKey::group_key()` returns `pid.to_be_bytes()` so all entries sharing a parent directory share an identical 8-byte prefix after the table byte.
-
-### Phase 5.2: `metadb-storage`
-1. Implement `RaftLog` supporting append, checkpoint tracking (`storage_flushed_lsn`, `attr_aggregated_lsn`, `aux_sink_acked_lsn`), safe truncation (`min` of the three watermarks), and crash recovery replay.
-2. Implement `MemMvccStore` with in-memory version chains (`MvccValue::Value(Vec<u8>)` and `MvccValue::Tombstone`), enforcing `tx_timeout_ms` (`5,000ms`) and pruning MVCC tombstones during `flush_to_persistent()` so only a single physical LSM tombstone is written per deleted key.
-3. Implement `LocalityCompactor` tracking range tombstone density per prefix bucket and triggering `compact_range()` on hot deletion ranges.
-4. Combine them in `LifecycleStorageEngine`.
-
-### Phase 5.3: `metadb-tx`
-1. Implement `AsyncAttrAggregator` with lock-free/fine-grained per-PID delta folding (`delta_children`, `delta_bytes`, `max(modify_time)`), `reconcile_attr()` for linearizable reads, and `flush_to_engine()` for batched background persistence.
-2. Implement `AsyncAuxiliarySink` with destination batching, HLC-based idempotency (`last_applied_hlc`), and local overflow spill so `aux_sink_acked_lsn` never blocks Raft log truncation indefinitely.
-3. Implement `PushdownExecutor` for `1-RTT` single-shard directory operations (`mkdir`, `create_file`, `unlink`, `rmdir`, `dirstat`, `lookup`, `listdir`) and a `TwoPhaseCommitCoordinator` for cross-directory `rename`.
-
-### Phase 5.4: `metadb-cluster`, `metadb-proxy`, and `metadb-server`
-1. Implement `ShardMetadata` and `PolicyShardSplitter` that splits shards strictly on `group_key = PID` boundaries, detects unsplittable Jumbo Shards (`JumboIsolated`), and supports `DualModeFineGrained` fallback.
-2. Implement Raft membership transitions (`ConfChange::AddLearner`, `ConfChange::PromoteVoter`, `ConfChange::RemoveNode`) enabling zero-downtime evolution from `1-Voter` Single-Node mode to `3-Voter` Distributed mode.
-3. Implement `CellLocalManager`, `GlobalManager`, and `MetaCache` for two-tier control plane routing across millions of shards.
-4. Implement `SqlTemplateParser` in `metadb-proxy` supporting the canonical metadata SQL templates (`INSERT INTO MetaTable ...`, `SELECT * FROM MetaTable WHERE pid = ? ...`, `DELETE FROM MetaTable ...`, etc.).
-5. Assemble `MetaDbClusterEngine` in `metadb-server` supporting single-node initialization, automatic `PID`-boundary shard splitting, and online scale-out to multi-node/multi-cell clusters.
+Full step-by-step execution rules, invariants, and verification commands are specified in [`../DEVELOPMENT_PLAN.md`](../DEVELOPMENT_PLAN.md):
+1. **Phase 1 (`metadb-core` & `metadb-proto`)**: `0x01..0x07` CRC32C binary codecs, HLC drift guard, `ShardEpoch`, and Protobuf v1 / `tonic` gRPC contracts.
+2. **Phase 2 (`metadb-storage`)**: Pure-Rust WAL-less SSTable LSM, `MANIFEST` recovery, 16-shard LRU `BlockCache`, Bloom filters, `SnapshotGuard` MVCC, and bottommost-safe `LocalityCompactor`.
+3. **Phase 3 (`metadb-raft`)**: `openraft` Multi-Raft, segmented CRC32C `.raftlog` store, 3-watermark purge gate, batched `ReadIndex`, and online `1-Voter -> 3-Voter` `ConfChange`.
+4. **Phase 4 (`metadb-tx`)**: Deterministic `RaftStateMachine`, `PushdownExecutor`, Coordinated Flush Barrier `AsyncAttrAggregator`, FIFO `AuxOutbox` + `[0x07]` spill, and Primary-Anchored 2PC + `TxnRecoveryWorker`.
+5. **Phase 5 (`metadb-cluster` & `metadb-proxy`)**: Epoch-fenced `ExecuteSplit`, Jumbo isolation & `DualModeFineGrained` scatter-gather, Two-Tier Control Plane, `IdRangeAllocator`, and 20 parameterized SQL templates.
+6. **Phase 6 (`metadb-server`)**: Unified `MetaDbEngine` SDK, `metadbd` multi-role server, `metadb-ctl` CLI, and end-to-end Stage 1 -> Stage 2 -> Stage 3 evolution suite.
 
 ---
 
-## 9. Test Plan (`DetailedRange`)
+## 9. System-Wide Acceptance Test Matrix (`DetailedRange`)
 
-1. **T1 (`group_key = PID` Colocation & Split Test)**: Insert entries across multiple directories until shard size exceeds threshold; verify that shard split points occur strictly between distinct `PID`s and never separate `(PID, "_attr_")` from `(PID, child_name)`.
-2. **T2 (Jumbo Shard Isolation & Dual-Mode Fallback Test)**: Populate a single directory beyond the split threshold; verify `CellLocalManager` marks it `JumboIsolated` and assigns a dedicated node, and verify `DualModeFineGrained` fallback when explicitly enabled.
-3. **T3 (Hotspot Directory Async Attribute Aggregation & Read Reconciliation Test)**: Concurrently create 1,000 files in the same directory; verify zero parent-lock serialization, verify immediate `dirstat` returns exact `num_children = 1000` and latest `modify_time` before background flush, and verify persisted state after flush.
-4. **T4 (Decoupled Async Quota & Secondary Index Idempotency Test)**: Execute file creations and replay duplicate `AuxUpdateTask` batches with identical or older HLC timestamps (simulating Raft leader failover); verify `QuotaTable` and `SecondaryIndexTable` apply each update exactly once.
-5. **T5 (In-Memory MVCC Double-Tombstone Elimination & Locality Compaction Test)**: Perform bulk creation and consecutive TTL deletions; verify `MemMvccStore` prunes MVCC tombstones on flush (reducing persistent writes) and `LocalityCompactor` purges only the hot deletion range, leaving zero tombstones traversed during `listdir`.
-6. **T6 (Single-Node to Distributed Online Evolution Test)**: Start `MetaDbClusterEngine` in Stage 1 (`1 Node, 1-Voter Raft`), grow into Stage 2 (`Multi-Shard Split`), and evolve online into Stage 3 (`3-Voter Multi-Raft` across multiple nodes and multiple Cells) while verifying data integrity and SQL template execution.
+Subsystem fault-injection tests (`T-LSM-*`, `T-MVCC-*`, `T-COMP-*`, `T-RAFT-*`, `T-TX-*`, `T-2PC-*`, `T-SHARD-*`, `T-ID-*`, `T-SQL-*`) are defined in the three modular specifications and culminate in the end-to-end cluster evolution suite (`e2e_cluster_evolution_tests.rs`) verifying:
+1. Persistent `1-Voter` crash recovery across torn `.raftlog` and `MANIFEST` tails.
+2. Live `group_key = PID` shard splitting under concurrent load with zero mid-directory splits and transparent `EpochMismatch` retry.
+3. Jumbo Shard dedicated-node isolation and `DualModeFineGrained` `(PID, name)` scatter-gather `dirstat` + paginated `listdir` + 2PC `rmdir`.
+4. Hotspot single-directory concurrent writes with linearizable Read-Path Reconciliation across L0 Coordinated Flush Barriers.
+5. Exact-once `QuotaTable` and `SecondaryIndexTable` convergence across network partitions (`[0x07]` local spill) and leader failovers.
+6. Crash-recoverable cross-shard 2PC `rename` (exclusive + overwrite + cycle rejection) and online `1-Voter -> Learner -> 3-Voter` Multi-Cell expansion.

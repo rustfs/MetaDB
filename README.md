@@ -1,13 +1,17 @@
 # MetaDB
 
-**MetaDB** is a high-performance, file-system structure-aware distributed transactional metadata database engine written in Rust for [RustFS](https://github.com/rustfs).
+**MetaDB** is a high-performance, 100% pure-Rust, file-system structure-aware distributed transactional metadata database engine built for [RustFS](https://github.com/rustfs).
+
+* **User & Operator Guides**: [Documentation Hub](./docs/README.md) — [English](./docs/guides/en/README.md) | [日本語](./docs/guides/ja/README.md) | [Français](./docs/guides/fr/README.md) | [简体中文](./docs/guides/zh/README.md) | [Deutsch](./docs/guides/de/README.md)
+* **Architecture & Engineering**: [`Architecture.md`](./Architecture.md) | [`docs/DEVELOPMENT_PLAN.md`](./docs/DEVELOPMENT_PLAN.md) | [`docs/designs/SITEMAP.md`](./docs/designs/SITEMAP.md) | [`docs/designs/review_report.md`](./docs/designs/review_report.md)
 
 > **Academic & Architectural Attribution**:
-> The architecture of `rustfs/MetaDB` is directly inspired by and adapted from Baidu's trillion-scale production metadata center paper:
+> The architecture of `rustfs/MetaDB` is inspired by and adapted from Baidu's trillion-scale production metadata center paper:
 > **Biao Cao, Kang Chen, Zhihui Yin, Qiushi Chen, Jielong Jian, Jiwei Xiong, Xinxing Wang, Yan Xing, Liguo Duan, Ran Zheng, Xianjun Meng, and Zhenyu Hou**, *"MetaDB: Putting File-System Structure Back into Distributed Databases"*, [arXiv:2610.32247v1](https://arxiv.org/html/2610.32247v1) (Baidu & Peking University, 2026).
+> *(Note: Trillion-record production figures cited from `arXiv:2610.32247v1` reflect Baidu's production deployment; see [Current Implementation Status](#current-implementation-status) below for `rustfs/MetaDB` repository milestones.)*
 >
 > **Spec-Driven Development Methodology**:
-> Designed, stress-tested, and verified using Google's [Elephant-Goldfish Model (EGM)](https://github.com/google/elephant-goldfish-model). See [`Architecture.md`](./Architecture.md) and [`docs/designs/SITEMAP.md`](./docs/designs/SITEMAP.md) for the complete specification and zero-context Goldfish review reports.
+> Designed, stress-tested, and verified using Google's [Elephant-Goldfish Model (EGM)](https://github.com/google/elephant-goldfish-model).
 
 ---
 
@@ -15,8 +19,8 @@
 
 General-purpose distributed databases (such as TiDB, CockroachDB, and FoundationDB) treat file-system and object-storage metadata as generic flat key-value or relational rows. At exabyte scale, this "black-box" approach creates three severe bottlenecks:
 
-1. **Data Model Mismatch**: Flat hash or size-based sharding fractures entries of the same directory across multiple shards, turning `>96%` of localized single-directory operations (`create`, `mkdir`, `unlink`, `listdir`) into multi-shard Two-Phase Commit (2PC) transactions and requiring multiple coordinator-to-storage network round-trips.
-2. **Transaction Model Mismatch**: Synchronously locking the shared parent-directory attribute record (`num_children`, `modify_time`) collapses concurrent single-directory write throughput by `10x–36x`, while synchronous updates to `QuotaTable` and `SecondaryIndexTable` force unnecessary cross-shard 2PC on every write.
+1. **Data Model Mismatch**: Flat hash or byte-midpoint sharding fractures entries of the same directory across multiple shards, turning `>96%` of localized single-directory operations (`create`, `mkdir`, `unlink`, `listdir`) into multi-shard Two-Phase Commit (2PC) transactions and incurring extra network round-trips.
+2. **Transaction Model Mismatch**: Synchronously locking the shared parent-directory attribute record (`num_children`, `size_bytes`, `modify_time`) collapses concurrent single-directory write throughput by `10x–36x`, while synchronous updates to `QuotaTable` and `SecondaryIndexTable` force unnecessary cross-shard 2PC on every write.
 3. **Storage Implementation Mismatch**: Persisting multi-version concurrency control (MVCC) tombstones to disk for transient (`<10ms`) metadata transactions creates a **double-tombstone penalty** (MVCC tombstones + LSM-tree tombstones). Under consecutive bulk TTL deletions, accumulated tombstones degrade `listdir` range-scan latency from `<100ms` to `~6 seconds`.
 
 ---
@@ -24,40 +28,52 @@ General-purpose distributed databases (such as TiDB, CockroachDB, and Foundation
 ## Three Core Architectural Pillars
 
 ### 1. Tree-Topology-Induced Sharding and Execution (`metadb-cluster` & `metadb-tx`)
-* **Colocated Schema (`(PID, "_attr_")`)**: `MetaTable` is keyed by `(PID, name)` with `group_key = PID`. A directory's own attributes are stored in a reserved child entry `(PID, "_attr_")` physically adjacent to all of its direct children `(PID, child_name)`.
-* **Policy/Size-Based Sharding**: Shards split strictly along `group_key = PID` boundaries so entries of the same directory remain in a single shard, paired with **Jumbo-Shard Isolation Scheduling** and **Dual-Mode Sharding Fallback** for extreme single-directory workloads.
-* **Single-Shard Transaction Logic Pushdown**: Executes single-directory Read-Modify-Write (`create`, `mkdir`, `unlink`, `rmdir`, `dirstat`, `listdir`) directly on the shard leader in `1 RTT`, reserving 2PC strictly for cross-directory `rename` (`<3%` of operations).
+* **Colocated Schema (`(PID, "_attr_")`)**: `MetaTable` is keyed by `(PID, name)` with `group_key = PID`. A directory's own attributes are stored in a reserved child entry `(PID, "_attr_")` physically adjacent to its direct children `(PID, child_name)`.
+* **Epoch-Fenced `PID`-Boundary Sharding & Jumbo Defense**: Shards split strictly along `group_key = PID` boundaries under `ShardEpoch` fencing, paired with **Jumbo-Shard Dedicated-Node Isolation** and **`DualModeFineGrained` `(PID, name)` Splitting** (using shard-local `DirShardDelta` records for `1-RTT` writes and `1-hop` scatter-gather `dirstat`).
+* **Single-Shard Pushdown + Crash-Recoverable 2PC**: Executes single-directory Read-Modify-Write (`create`, `unlink`, `setattr`, `lookup`, `dirstat`, `listdir`, and colocated `mkdir`/`rmdir`) in `1 RTT` on the shard leader, reserving Primary-Anchored 2PC (`WriteIntent` + `TxnRecord`) for cross-shard `rename` (`<3%` of workload) and cross-shard `mkdir`/`rmdir`.
 
 ### 2. Semantic-Aware Off-Critical-Path Processing (`metadb-tx`)
-* **Conflict-Free Asynchronous Attribute Aggregation**: Removes parent directory attribute locks from the write critical path. Child mutations append deltas (`delta_children`, `delta_bytes`, `modify_time`) to the Raft log and an in-memory aggregator, while **Read-Path Reconciliation** atomically merges persisted `_attr_` state with un-flushed deltas (`delta.lsn > persisted.applied_lsn`) so `dirstat` is always linearizable.
-* **Decoupled Asynchronous Auxiliary Updates**: Updates `QuotaTable` and `SecondaryIndexTable` (`FID -> (PID, name)`) out-of-band via batched asynchronous queues backed by Raft log persistence and per-shard LSN / HLC idempotency.
+* **Conflict-Free Asynchronous Attribute Aggregation**: Removes parent directory attribute locks from the foreground write path. Child mutations append deterministic deltas to `AsyncAttrAggregator`, folded into `(PID, "_attr_")` at the L0 SSTable **Coordinated Flush Barrier** while **Read-Path Reconciliation** guarantees linearizable `dirstat` reads.
+* **Exact-Once Asynchronous `AuxOutbox`**: Propagates `QuotaTable` and `SecondaryIndexTable` (`FID -> (PID, name)`) updates in strict FIFO per-shard LSN batches with `[0x07]` local overflow spill so Raft log compaction is never blocked by remote partitions.
 
-### 3. Lifecycle-Aware Storage Engine (`metadb-storage`)
-* **In-Memory MVCC (`MemMvccStore`)**: Retains multi-version states and MVCC tombstones strictly in memory for the `5-second` transaction window. On flush, stale versions and MVCC tombstones are pruned in memory, writing only the latest value or a single physical LSM tombstone (cutting persistent KV writes by `~60%`).
-* **Locality-Aware Compaction (`LocalityCompactor`)**: Tracks tombstone density per spatial prefix bucket and triggers targeted range compaction on hot bulk-deletion ranges to keep `listdir` latency flat.
-
----
-
-## Single-Node to Trillion-Scale Evolution
-
-MetaDB runs the **exact same storage engine and Raft state machine** from a single-binary embedded node to a 1,000+ node cluster:
-
-* **Stage 1: Single-Node All-in-One (`1-Voter` Raft)**: Zero network coordination; uses the Raft log as the sole durability log (with underlying KV WAL disabled).
-* **Stage 2: Dynamic Multi-Shard Split**: Automatically splits shards along `group_key = PID` boundaries as directory metadata grows.
-* **Stage 3: Multi-Cell Distributed Cluster (`100B – 10T+` Records)**: Zero-downtime Raft `ConfChange` (`1-Voter -> Learner -> 3-Voter`), decentralized **Hybrid Logical Clocks (HLC)**, stateless **MetaCache**, and a **Two-Tier Control Plane (`GlobalManager` + `CellLocalManager`)** partitioning millions of shards across independent Cells.
+### 3. Lifecycle-Aware Pure-Rust Storage Engine (`metadb-storage` & `metadb-raft`)
+* **WAL-less LSM + 3-Watermark OpenRaft**: Disables local KV WAL files in favor of segmented CRC32C Raft logs (`openraft`), clamping log purge to `min(state_flushed_index, aux_outbox_durable_index, last_snapshot_index)`.
+* **`SnapshotGuard` In-Memory MVCC**: Retains multi-version chains in memory for the `5s` transaction window, gating unversioned L0 SSTable collapse-flushes on `ActiveSnapshotRegistry` (`min_active_snapshot_hlc >= imm.max_hlc`) to eliminate persisted MVCC tombstones (`~60%` fewer KV writes) with zero future-read anomalies.
+* **Bottommost-Safe Locality-Aware Compaction**: Tracks tombstone density per 9-byte prefix bucket and compacts hot deletion ranges down to the deepest overlapping SSTable level to keep `listdir` latency flat.
 
 ---
 
-## Workspace Crates
+## Single-Node to Multi-Cell Evolution
 
-| Crate | Responsibility |
-| :--- | :--- |
-| [`crates/metadb-core`](./crates/metadb-core) | `MetaTable`, `QuotaTable`, `SecondaryIndexTable` binary codecs, `(PID, "_attr_")` colocation keys, and decentralized `HybridLogicalClock` (`HLC`). |
-| [`crates/metadb-storage`](./crates/metadb-storage) | WAL-less `RaftLog` with three-watermark truncation safety, `MemMvccStore` (In-Memory MVCC), and `LocalityCompactor` (Locality-Aware Compaction). |
-| [`crates/metadb-tx`](./crates/metadb-tx) | `PushdownExecutor` (`1-RTT` RMW), `TwoPhaseCommitCoordinator` (cross-shard `rename`), `AsyncAttrAggregator`, and `AsyncAuxiliarySink`. |
-| [`crates/metadb-cluster`](./crates/metadb-cluster) | `PolicyShardSplitter` (`group_key = PID`), Jumbo Shard isolation, Raft `ConfChange` (`1-Voter -> 3-Voter`), `GlobalManager`, `CellLocalManager`, and `MetaCache`. |
-| [`crates/metadb-proxy`](./crates/metadb-proxy) | `SqlTemplateParser` compiling fixed metadata SQL patterns directly into storage execution commands. |
-| [`crates/metadb-server`](./crates/metadb-server) | Unified `MetaDbEngine` orchestrating single-node and distributed multi-Cell deployments. |
+MetaDB runs the **exact same `StorageBackend` and `openraft` state machine** from an embedded single-binary node to a multi-Cell cluster:
+
+* **Stage 1 — Single-Node All-in-One (`1-Voter` OpenRaft)**: Zero network coordination; sequential Raft log persistence + embedded Rust SDK or `metadbd --role all-in-one`.
+* **Stage 2 — Dynamic Multi-Shard Split**: Automatically splits shards along `group_key = PID` boundaries on a single host.
+* **Stage 3 — Multi-Cell Distributed Cluster (`3-Voter` Multi-Raft)**: Online `AddLearner` -> SSTable snapshot catch-up -> joint-consensus `Voter` promotion, decentralized `HLC` clocks, stateless `MetaCache`, and a **Two-Tier Control Plane (`GlobalManager` + `CellLocalManager`)**.
+
+---
+
+## 8-Crate Pure-Rust Workspace Architecture
+
+| Crate | Status | Responsibility |
+| :--- | :--- | :--- |
+| `crates/metadb-core` | Prototype (`v0.1.0`) -> Phase 1 | `0x01..0x07` binary codecs, `(PID, "_attr_")` keys, `ShardEpoch`, CRC32C, `HLC` (+ drift guard). |
+| `crates/metadb-proto` | Planned (Phase 1) | Protobuf v1 schemas & `tonic`/`prost` gRPC contracts (`MetadataService`, `TransactionService`, `RaftTransportService`, `ControlPlaneService`). |
+| `crates/metadb-storage` | Prototype (`v0.1.0`) -> Phase 2 | `StorageBackend` trait, pure-Rust WAL-less SSTable LSM, `MANIFEST`, `BlockCache`, Bloom filter, `SnapshotGuard` MVCC, `LocalityCompactor`. |
+| `crates/metadb-raft` | Planned (Phase 3) | `openraft` Multi-Raft, segmented CRC32C log store, 3-watermark purge gate, batched `ReadIndex`, `1->3` Voter `ConfChange`. |
+| `crates/metadb-tx` | Prototype (`v0.1.0`) -> Phase 4 | Deterministic `RaftStateMachine`, `1-RTT` `PushdownExecutor`, `AsyncAttrAggregator`, FIFO `AuxOutbox` + `[0x07]` spill, crash-recoverable 2PC. |
+| `crates/metadb-cluster` | Prototype (`v0.1.0`) -> Phase 5 | `PID` & `DualModeFineGrained` splitter, `ShardEpoch` fencing, Jumbo isolation, `GlobalManager`, `CellLocalManager`, `MetaCache`, `IdRangeAllocator`. |
+| `crates/metadb-proxy` | Prototype (`v0.1.0`) -> Phase 5 | Tokenizing compiler for all 20 parameterized metadata SQL templates + Epoch-aware router. |
+| `crates/metadb-server` | Prototype (`v0.1.0`) -> Phase 6 | Embedded `MetaDbEngine` SDK + `metadbd` daemon + `metadb-ctl` operator CLI. |
+
+---
+
+## Current Implementation Status
+
+* **Completed**:
+  * **Phase 0**: Complete English Architecture & Zero-Decision EGM Subsystem Specifications, Adversarial Goldfish Design Review (`docs/designs/review_report.md`), Phased Rust Development Plan (`docs/DEVELOPMENT_PLAN.md`), and Multilingual Usage Guides (`en`, `ja`, `fr`, `zh`, `de`).
+  * **Baseline Prototype (`v0.1.0-prototype`)**: 6-crate synchronous in-memory verification baseline passing `cargo test --workspace`.
+* **Next Up (Phases 1–6)**: Step-by-step pure-Rust implementation of `metadb-core`/`metadb-proto` (Phase 1), WAL-less disk LSM + `SnapshotGuard` MVCC (Phase 2), `openraft` Multi-Raft (Phase 3), replicated transactions & 2PC recovery (Phase 4), distributed sharding/control plane & 20 SQL templates (Phase 5), and `metadbd` + `metadb-ctl` binaries (Phase 6).
 
 ---
 
