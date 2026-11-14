@@ -181,7 +181,7 @@ async fn recover_after_split_crash(point: SplitCrashPoint) {
             msg.contains("injected split crash"),
             "crash point {point:?} produced unexpected error: {msg}"
         );
-        host.shutdown_all().await.unwrap();
+        host.shutdown_all_no_flush().await.unwrap();
     }
 
     let alloc = Arc::new(DurableIdAllocator::open(&alloc_dir).unwrap());

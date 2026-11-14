@@ -157,6 +157,7 @@ impl RaftShardSplitWorker {
         dual_mode_pid: Option<InodeId>,
         lsm_config: LsmEngineConfig,
         raft_opts: RaftNodeOptions,
+        target_version: u64,
         crash_at: Option<SplitCrashPoint>,
     ) -> Result<(
         CompositeShardRoute,
@@ -165,7 +166,8 @@ impl RaftShardSplitWorker {
         Arc<TxStateMachineHandler>,
     )> {
         let old_end_key = parent_route.range.end_key.clone();
-        let target_version = parent_route.epoch.version + 1;
+        // Never publish an epoch older than the one already applied. A stale plan must
+        // not rewind `version` and then re-fence a range that a newer split already owns.
 
         // Stage A: Scan `concat([0x05], split_key) .. concat([0x05], old_end_key)` (`Resolution B14`)
         // and verify no active `deleting_fence` (`Resolution B17`) before splitting!
@@ -212,7 +214,7 @@ impl RaftShardSplitWorker {
         let right_range = CompositeKeyRange::new(split_key.clone(), old_end_key.clone())?;
         let new_parent_epoch = ShardEpoch {
             conf_ver: parent_group.current_epoch().conf_ver,
-            version: target_version,
+            version: target_version.max(parent_group.current_epoch().version),
         };
 
         // Atomically fence `S_parent` to `left_range` + `new_parent_epoch` BEFORE flushing & scanning

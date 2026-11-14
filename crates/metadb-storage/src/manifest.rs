@@ -353,9 +353,9 @@ impl ManifestLog {
             let payload = &raw[offset + 8..record_end];
             let actual_crc = checksum_crc32c(payload);
             if actual_crc != expected_crc {
-                // A bad CRC on the final record of this MANIFEST is treated as a torn
-                // tail write. A bad CRC with more bytes after it is real corruption.
-                if record_end == raw.len() {
+                // A bad CRC on the final record is a torn tail only when a valid record
+                // already precedes it. Truncating the sole baseline would drop every SST.
+                if record_end == raw.len() && offset > 0 {
                     truncate_to = Some(offset);
                     break;
                 }

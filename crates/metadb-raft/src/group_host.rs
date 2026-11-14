@@ -443,12 +443,28 @@ impl ShardGroupHost {
     }
 
     pub async fn shutdown_all(&self) -> Result<()> {
-        let groups = self.all_groups();
-        for g in groups {
-            let _ = g.state_machine().flush_to_lsm();
+        self.shutdown_groups(true).await
+    }
+
+    /// Stops Raft groups without flushing the memtable, so a crash-injection test can
+    /// reopen the raft tail that had not yet reached an LSM checkpoint.
+    pub async fn shutdown_all_no_flush(&self) -> Result<()> {
+        self.shutdown_groups(false).await
+    }
+
+    async fn shutdown_groups(&self, flush: bool) -> Result<()> {
+        let groups: Vec<Arc<ShardRaftGroup>> = {
+            let mut guard = self.groups.write().unwrap();
+            guard.drain().map(|(_, g)| g).collect()
+        };
+        for g in &groups {
+            if flush {
+                let _ = g.state_machine().flush_to_lsm();
+            }
             let _ = g.shutdown().await;
             self.router.remove_group(g.shard_id());
         }
+        drop(groups);
         Ok(())
     }
 
@@ -460,7 +476,7 @@ impl ShardGroupHost {
         let mut raw = Vec::new();
         File::open(&path)?.read_to_end(&mut raw)?;
         let body = verify_crc32c_le(&raw, "NODE_SHARD_REGISTRY")?;
-        bincode::deserialize(body).map_err(|e| MetaDbError::CodecError(e.to_string()))
+        decode_registry(body)
     }
 
     fn persist_registry(
@@ -485,4 +501,44 @@ impl ShardGroupHost {
         sync_dir(data_dir)?;
         Ok(())
     }
+}
+
+/// `PendingChildBoot` originally stored only the parent id and peer map.
+#[derive(Debug, Deserialize)]
+enum LegacyRegistryShardState {
+    PendingChildBoot {
+        parent_shard_id: ShardId,
+        peers: BTreeMap<NodeId, String>,
+    },
+    Active {
+        peers: BTreeMap<NodeId, String>,
+    },
+}
+
+fn decode_registry(body: &[u8]) -> Result<BTreeMap<ShardId, RegistryShardState>> {
+    if let Ok(reg) = bincode::deserialize::<BTreeMap<ShardId, RegistryShardState>>(body) {
+        return Ok(reg);
+    }
+    let legacy: BTreeMap<ShardId, LegacyRegistryShardState> = bincode::deserialize(body)
+        .map_err(|e| MetaDbError::CodecError(format!("NODE_SHARD_REGISTRY: {e}")))?;
+    Ok(legacy
+        .into_iter()
+        .map(|(id, state)| {
+            let state = match state {
+                LegacyRegistryShardState::PendingChildBoot {
+                    parent_shard_id,
+                    peers,
+                } => RegistryShardState::PendingChildBoot {
+                    parent_shard_id,
+                    peers,
+                    split_key: Vec::new(),
+                    target_version: 0,
+                    parent_end_key: Vec::new(),
+                    dual_mode_pid: None,
+                },
+                LegacyRegistryShardState::Active { peers } => RegistryShardState::Active { peers },
+            };
+            (id, state)
+        })
+        .collect())
 }

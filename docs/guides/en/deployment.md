@@ -50,7 +50,7 @@ metadbd --config /etc/metadb/standalone.toml
 
 `MetadataService`, `TransactionService`, `ControlPlaneService`, and `RaftTransportService` do **not** terminate TLS. With an empty `[security].shared_secret` (the default) they also perform no application authentication. The default `grpc_listen_addr` is `127.0.0.1:7800`. Do not publish that socket on an untrusted network.
 
-Set a shared secret to require `authorization: Bearer <secret>` on metadata, transaction, and control-plane RPCs (Raft transport on the same port stays unauthenticated):
+Set a shared secret to require `authorization: Bearer <secret>` on metadata, transaction, and control-plane RPCs (Raft transport on the same port stays unauthenticated). `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --cell-manager` send that header:
 
 ```toml
 [security]

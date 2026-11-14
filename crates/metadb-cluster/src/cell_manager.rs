@@ -93,8 +93,7 @@ impl DurableCellManager {
             let mut raw = Vec::new();
             File::open(&state_path)?.read_to_end(&mut raw)?;
             let body = verify_crc32c_le(&raw, "CELL_MANAGER_STATE")?;
-            bincode::deserialize::<PersistedCellState>(body)
-                .map_err(|e| MetaDbError::CodecError(e.to_string()))?
+            decode_cell_state(body)?
         } else {
             let mut init = PersistedCellState::default();
             init.nodes.insert(host.node_id(), local_addr.clone());
@@ -344,8 +343,8 @@ impl DurableCellManager {
         child_route: CompositeShardRoute,
         child_handler: Option<Arc<TxStateMachineHandler>>,
     ) -> Result<()> {
-        let next = {
-            let guard = self.state.lock().unwrap();
+        {
+            let mut guard = self.state.lock().unwrap();
             let mut next = guard.clone();
             if let Some(plan) = next.split_plans.get_mut(&request_uuid) {
                 plan.state = SplitPlanState::Activated;
@@ -354,10 +353,6 @@ impl DurableCellManager {
                 .insert(parent_route.shard_id, parent_route.clone());
             next.routes
                 .insert(child_route.shard_id, child_route.clone());
-            next
-        };
-        {
-            let mut guard = self.state.lock().unwrap();
             self.persist_sync(&next)?;
             *guard = next;
         }
@@ -381,6 +376,8 @@ impl DurableCellManager {
         force: bool,
     ) -> Result<Option<ShardId>> {
         let _guard = self.split_lock.lock().await;
+        // Finish or drop any plan left by a crash before discovering a new boundary.
+        self.recover_incomplete_splits().await?;
         let route = {
             let st = self.state.lock().unwrap();
             st.routes.get(&shard_id).cloned().ok_or_else(|| {
@@ -441,10 +438,21 @@ impl DurableCellManager {
                 let child_shard_id = self.alloc_split_plan(
                     req_uuid,
                     shard_id,
-                    split_key.clone(),
+                    split_key,
                     live_route.epoch.version + 1,
                     dual_mode_pid,
                 )?;
+                // A retry of the same epoch reuses the persisted boundary, not a newly
+                // discovered one that was never copied into the child.
+                let (split_key, dual_mode_pid, target_version) = {
+                    let st = self.state.lock().unwrap();
+                    let plan = st.split_plans.get(&req_uuid).cloned().ok_or_else(|| {
+                        MetaDbError::ShardRoutingError(
+                            "split plan missing after durable alloc".to_string(),
+                        )
+                    })?;
+                    (plan.split_key, plan.dual_mode_pid, plan.target_version)
+                };
                 let crash_at = *self.crash_point.lock().unwrap();
                 let (new_parent, new_child, _child_grp, child_handler) =
                     RaftShardSplitWorker::execute_local_split(
@@ -457,6 +465,7 @@ impl DurableCellManager {
                         dual_mode_pid,
                         self.lsm_config.clone(),
                         self.raft_opts.clone(),
+                        target_version,
                         crash_at,
                     )
                     .await?;
@@ -571,8 +580,7 @@ impl DurableCellManager {
         let mut raw = Vec::new();
         File::open(&state_path)?.read_to_end(&mut raw)?;
         let body = verify_crc32c_le(&raw, "CELL_MANAGER_STATE")?;
-        bincode::deserialize::<PersistedCellState>(body)
-            .map_err(|e| MetaDbError::CodecError(e.to_string()))
+        decode_cell_state(body)
     }
 
     /// Resumes splits that fenced the parent (or deleted its right-half keys) without publishing
@@ -635,9 +643,20 @@ impl DurableCellManager {
         if self.host.get_group(plan.parent_shard_id).is_none() {
             return Ok(());
         }
-        let mut parent_route = parent_route;
-        if parent_route.epoch.version + 1 != plan.target_version {
-            parent_route.epoch.version = plan.target_version.saturating_sub(1);
+        let interior = plan.split_key.as_slice() > parent_route.range.start_key.as_slice()
+            && plan.split_key.as_slice() < parent_route.range.end_key.as_slice();
+        if !interior {
+            self.drop_split_plan(request_uuid)?;
+            return Ok(());
+        }
+        let current = self
+            .host
+            .get_group(plan.parent_shard_id)
+            .map(|g| g.current_epoch().version)
+            .unwrap_or(0);
+        if current > plan.target_version {
+            self.drop_split_plan(request_uuid)?;
+            return Ok(());
         }
         self.finish_split(
             request_uuid,
@@ -645,6 +664,7 @@ impl DurableCellManager {
             plan.child_shard_id,
             plan.split_key.clone(),
             plan.dual_mode_pid,
+            plan.target_version,
         )
         .await
     }
@@ -673,7 +693,7 @@ impl DurableCellManager {
             if self.state.lock().unwrap().routes.contains_key(&child_id) {
                 continue;
             }
-            let Some(mut parent_route) = ({
+            let Some(parent_route) = ({
                 let st = self.state.lock().unwrap();
                 st.routes.get(&parent_shard_id).cloned()
             }) else {
@@ -682,12 +702,32 @@ impl DurableCellManager {
             if self.host.get_group(parent_shard_id).is_none() {
                 continue;
             }
-            if parent_route.epoch.version + 1 != target_version && target_version > 0 {
-                parent_route.epoch.version = target_version.saturating_sub(1);
+            if split_key.is_empty() || target_version == 0 {
+                continue;
+            }
+            if split_key.as_slice() <= parent_route.range.start_key.as_slice()
+                || split_key.as_slice() >= parent_route.range.end_key.as_slice()
+            {
+                continue;
+            }
+            let current = self
+                .host
+                .get_group(parent_shard_id)
+                .map(|g| g.current_epoch().version)
+                .unwrap_or(0);
+            if current > target_version {
+                continue;
             }
             let req_uuid = (child_id as u128) << 64 | target_version as u128;
-            self.finish_split(req_uuid, &parent_route, child_id, split_key, dual_mode_pid)
-                .await?;
+            self.finish_split(
+                req_uuid,
+                &parent_route,
+                child_id,
+                split_key,
+                dual_mode_pid,
+                target_version,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -771,12 +811,18 @@ impl DurableCellManager {
                 continue;
             }
             let req_uuid = (child_id as u128) << 64;
+            let target_version = self
+                .host
+                .get_group(parent_route.shard_id)
+                .map(|g| g.current_epoch().version)
+                .unwrap_or(parent_route.epoch.version);
             self.finish_split(
                 req_uuid,
                 &parent_route,
                 child_id,
                 fenced.end_key.clone(),
                 parent_route.dual_mode_pid,
+                target_version,
             )
             .await?;
             orphans.retain(|id| *id != child_id);
@@ -851,6 +897,7 @@ impl DurableCellManager {
         child_shard_id: ShardId,
         split_key: Vec<u8>,
         dual_mode_pid: Option<InodeId>,
+        target_version: u64,
     ) -> Result<()> {
         let (_epoch, group, handler) = self.lookup_local_handle(parent_route.shard_id)?;
         let live_route = parent_route.clone();
@@ -865,10 +912,23 @@ impl DurableCellManager {
                 dual_mode_pid,
                 self.lsm_config.clone(),
                 self.raft_opts.clone(),
+                target_version,
                 None,
             )
             .await?;
         self.activate_split(request_uuid, new_parent, new_child, Some(child_handler))
+    }
+
+    fn drop_split_plan(&self, request_uuid: u128) -> Result<()> {
+        let mut guard = self.state.lock().unwrap();
+        if !guard.split_plans.contains_key(&request_uuid) {
+            return Ok(());
+        }
+        let mut next = guard.clone();
+        next.split_plans.remove(&request_uuid);
+        self.persist_sync(&next)?;
+        *guard = next;
+        Ok(())
     }
 
     fn mark_plan_activated(&self, request_uuid: u128) -> Result<()> {
@@ -916,4 +976,51 @@ impl DurableCellManager {
         sync_dir(dir)?;
         Ok(())
     }
+}
+
+/// `SplitPlanRecord` gained `dual_mode_pid` after the first on-disk layout.
+/// Old `CELL_MANAGER_STATE` files still decode; missing mode is `None`.
+#[derive(Debug, Deserialize)]
+struct LegacySplitPlanRecord {
+    parent_shard_id: ShardId,
+    child_shard_id: ShardId,
+    split_key: Vec<u8>,
+    target_version: u64,
+    state: SplitPlanState,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyPersistedCellState {
+    nodes: BTreeMap<NodeId, String>,
+    routes: BTreeMap<ShardId, CompositeShardRoute>,
+    split_plans: BTreeMap<u128, LegacySplitPlanRecord>,
+}
+
+fn decode_cell_state(body: &[u8]) -> Result<PersistedCellState> {
+    if let Ok(state) = bincode::deserialize::<PersistedCellState>(body) {
+        return Ok(state);
+    }
+    let legacy: LegacyPersistedCellState = bincode::deserialize(body)
+        .map_err(|e| MetaDbError::CodecError(format!("CELL_MANAGER_STATE: {e}")))?;
+    Ok(PersistedCellState {
+        nodes: legacy.nodes,
+        routes: legacy.routes,
+        split_plans: legacy
+            .split_plans
+            .into_iter()
+            .map(|(uuid, plan)| {
+                (
+                    uuid,
+                    SplitPlanRecord {
+                        parent_shard_id: plan.parent_shard_id,
+                        child_shard_id: plan.child_shard_id,
+                        split_key: plan.split_key,
+                        target_version: plan.target_version,
+                        state: plan.state,
+                        dual_mode_pid: None,
+                    },
+                )
+            })
+            .collect(),
+    })
 }

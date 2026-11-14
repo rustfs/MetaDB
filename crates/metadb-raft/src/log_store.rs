@@ -28,14 +28,6 @@ struct PersistedHardState {
     last_purged_log_id: Option<LogIdOf<MetaDbTypeConfig>>,
 }
 
-struct SegmentSnap {
-    first_index: u64,
-    last_index: u64,
-    path: PathBuf,
-    byte_len: u64,
-    entry_end_offsets: BTreeMap<u64, u64>,
-}
-
 struct SegmentFile {
     first_index: u64,
     last_index: u64,
@@ -293,26 +285,18 @@ impl LogStoreInner {
             return Ok(());
         }
 
-        let snap = self.snapshot_segments();
+        let prior_segments = self.segments.len();
+        let (tail_byte_len, tail_last_index) = self
+            .segments
+            .last()
+            .map(|s| (s.byte_len, s.last_index))
+            .unwrap_or((0, 0));
         let new_indexes: Vec<u64> = batch.iter().map(|e| e.log_id().index).collect();
         if let Err(err) = self.append_entries_mutating(batch) {
-            self.rollback_append(&snap, &new_indexes);
+            self.rollback_append(prior_segments, tail_byte_len, tail_last_index, &new_indexes);
             return Err(err);
         }
         Ok(())
-    }
-
-    fn snapshot_segments(&self) -> Vec<SegmentSnap> {
-        self.segments
-            .iter()
-            .map(|s| SegmentSnap {
-                first_index: s.first_index,
-                last_index: s.last_index,
-                path: s.path.clone(),
-                byte_len: s.byte_len,
-                entry_end_offsets: s.entry_end_offsets.clone(),
-            })
-            .collect()
     }
 
     fn append_entries_mutating(&mut self, batch: Vec<EntryOf<MetaDbTypeConfig>>) -> io::Result<()> {
@@ -359,39 +343,38 @@ impl LogStoreInner {
         Ok(())
     }
 
-    fn rollback_append(&mut self, snap: &[SegmentSnap], new_indexes: &[u64]) {
+    fn rollback_append(
+        &mut self,
+        prior_segments: usize,
+        tail_byte_len: u64,
+        tail_last_index: u64,
+        new_indexes: &[u64],
+    ) {
         for idx in new_indexes {
             self.entries.remove(idx);
         }
         self.active_file = None;
-        let keep: std::collections::HashSet<&Path> =
-            snap.iter().map(|s| s.path.as_path()).collect();
-        let created: Vec<PathBuf> = self
-            .segments
-            .iter()
-            .map(|s| s.path.clone())
-            .filter(|p| !keep.contains(p.as_path()))
-            .collect();
-        for path in &created {
-            let _ = fs::remove_file(path);
-        }
-        self.segments = snap
-            .iter()
-            .map(|s| SegmentFile {
-                first_index: s.first_index,
-                last_index: s.last_index,
-                path: s.path.clone(),
-                byte_len: s.byte_len,
-                entry_end_offsets: s.entry_end_offsets.clone(),
-            })
-            .collect();
-        if let Some(last) = self.segments.last() {
-            if let Ok(f) = OpenOptions::new().write(true).open(&last.path) {
-                let _ = f.set_len(last.byte_len);
-                let _ = f.sync_data();
+        while self.segments.len() > prior_segments {
+            if let Some(seg) = self.segments.pop() {
+                let _ = fs::remove_file(&seg.path);
             }
-            self.active_file = OpenOptions::new().append(true).open(&last.path).ok();
         }
+        if prior_segments == 0 {
+            return;
+        }
+        if let Some(seg) = self.segments.last_mut() {
+            seg.byte_len = tail_byte_len;
+            seg.last_index = tail_last_index;
+            seg.entry_end_offsets.retain(|_, end| *end <= tail_byte_len);
+        }
+        let Some(path) = self.segments.last().map(|s| s.path.clone()) else {
+            return;
+        };
+        if let Ok(f) = OpenOptions::new().write(true).open(&path) {
+            let _ = f.set_len(tail_byte_len);
+            let _ = f.sync_data();
+        }
+        self.active_file = OpenOptions::new().append(true).open(&path).ok();
     }
 
     /// Crash-safe suffix-only truncation: never unlinks or rewrites committed prefix segments!

@@ -23,8 +23,16 @@ use tonic::{Request, Status};
 /// Optional shared-secret check for metadata, transaction, and control-plane RPCs.
 /// An empty secret allows the call (loopback deployments without auth).
 #[derive(Clone)]
-struct BearerAuth {
+pub struct BearerAuth {
     secret: std::sync::Arc<str>,
+}
+
+impl BearerAuth {
+    pub fn new(secret: impl AsRef<str>) -> Self {
+        Self {
+            secret: std::sync::Arc::from(secret.as_ref()),
+        }
+    }
 }
 
 impl Interceptor for BearerAuth {
@@ -530,9 +538,7 @@ impl PersistentMetaDbCluster {
                  RaftTransport on the same listener is also unauthenticated."
             );
         }
-        let auth = BearerAuth {
-            secret: std::sync::Arc::<str>::from(shared_secret),
-        };
+        let auth = BearerAuth::new(shared_secret);
 
         let grpc_handle = tokio::spawn(async move {
             let _ = Server::builder()
@@ -665,6 +671,16 @@ impl PersistentMetaDbCluster {
         // `.raftlog` retention follows the 3-watermark gate in production (metadbd's loop).
         for cell in self.global_manager.all_cells() {
             for (_, grp, _) in cell.local_shard_handles() {
+                let retained = grp.log_store().retained_entry_count();
+                if retained == 0 {
+                    continue;
+                }
+                let (state_flushed, _, last_snap) = grp.watermarks().snapshot_values();
+                // First snapshot (watermark still 0) or a large unpurged tail. Skip the
+                // full-dataset snapshot on every 250ms tick while the log is still small.
+                if last_snap > 0 && last_snap >= state_flushed && retained < 64 {
+                    continue;
+                }
                 grp.flush_snapshot_and_purge().await?;
             }
         }
@@ -694,7 +710,8 @@ impl PersistentMetaDbCluster {
             std::mem::take(&mut *guard)
         };
         for h in handles {
-            let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+            // Do not abandon the task: it may still hold the shard LSM lock.
+            let _ = h.await;
         }
         self.flush_all().await?;
         self.host.shutdown_all().await

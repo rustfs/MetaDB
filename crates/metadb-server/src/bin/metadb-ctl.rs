@@ -23,6 +23,10 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:7800")]
     endpoint: String,
 
+    /// Bearer token matching `[security].shared_secret`. Empty skips the header.
+    #[arg(long, env = "METADB_AUTH_TOKEN", default_value = "")]
+    auth_token: String,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -105,6 +109,48 @@ enum CellCmd {
     },
 }
 
+async fn open_cp(
+    url: &str,
+    token: &str,
+) -> Result<
+    ControlPlaneServiceClient<
+        tonic::service::interceptor::InterceptedService<
+            tonic::transport::Channel,
+            metadb_server::BearerAuth,
+        >,
+    >,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let channel = tonic::transport::Endpoint::from_shared(url.to_string())?
+        .connect()
+        .await?;
+    Ok(ControlPlaneServiceClient::with_interceptor(
+        channel,
+        metadb_server::BearerAuth::new(token),
+    ))
+}
+
+async fn open_meta(
+    url: &str,
+    token: &str,
+) -> Result<
+    MetadataServiceClient<
+        tonic::service::interceptor::InterceptedService<
+            tonic::transport::Channel,
+            metadb_server::BearerAuth,
+        >,
+    >,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let channel = tonic::transport::Endpoint::from_shared(url.to_string())?
+        .connect()
+        .await?;
+    Ok(MetadataServiceClient::with_interceptor(
+        channel,
+        metadb_server::BearerAuth::new(token),
+    ))
+}
+
 fn normalize_url(ep: &str) -> String {
     if ep.starts_with("http://") || ep.starts_with("https://") {
         ep.to_string()
@@ -114,15 +160,16 @@ fn normalize_url(ep: &str) -> String {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
     let url = normalize_url(&cli.endpoint);
+    let token = cli.auth_token.clone();
 
     match cli.command {
         Command::Cluster {
             sub: ClusterCmd::Status,
         } => {
-            let mut cp = ControlPlaneServiceClient::connect(url).await?;
+            let mut cp = open_cp(&url, &token).await?;
             let resp = cp
                 .get_routes(GetRoutesRequest { cell_id: 0 })
                 .await?
@@ -144,7 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Shard { sub } => {
-            let mut cp = ControlPlaneServiceClient::connect(url).await?;
+            let mut cp = open_cp(&url, &token).await?;
             match sub {
                 ShardCmd::List { cell_id } => {
                     let resp = cp
@@ -200,7 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     target_voters,
                 },
         } => {
-            let mut cp = ControlPlaneServiceClient::connect(url).await?;
+            let mut cp = open_cp(&url, &token).await?;
             let resp = cp
                 .scale_shard_replicas(ScaleShardReplicasRequest {
                     cell_id,
@@ -220,7 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Cell {
             sub: CellCmd::Register { cell_id, endpoints },
         } => {
-            let mut cp = ControlPlaneServiceClient::connect(url).await?;
+            let mut cp = open_cp(&url, &token).await?;
             let eps: Vec<String> = endpoints.split(',').map(|s| s.trim().to_string()).collect();
             let resp = cp
                 .register_cell(RegisterCellRequest {
@@ -238,7 +285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Sql { query } => {
-            let mut meta = MetadataServiceClient::connect(url).await?;
+            let mut meta = open_meta(&url, &token).await?;
             let resp = meta
                 .execute_sql(ExecuteSqlRequest {
                     sql: query,
@@ -279,7 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .into());
             }
-            let mut setup_client = MetadataServiceClient::connect(url.clone()).await?;
+            let mut setup_client = open_meta(&url, &token).await?;
             let bench_pid = if workload == "hotspot-create" {
                 999_000u64
             } else {
@@ -302,8 +349,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             for tid in 0..concurrency.max(1) {
                 let u = url.clone();
+                let token = token.clone();
                 handles.push(tokio::spawn(async move {
-                    let mut client = MetadataServiceClient::connect(u).await.unwrap();
+                    let mut client = open_meta(&u, &token).await.unwrap();
                     for i in 0..ops_per_task {
                         let seq = (tid * ops_per_task + i) as u64;
                         let _ = client
@@ -332,8 +380,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut del_handles = Vec::new();
                 for tid in 0..concurrency.max(1) {
                     let u = url.clone();
+                    let token = token.clone();
                     del_handles.push(tokio::spawn(async move {
-                        let mut client = MetadataServiceClient::connect(u).await.unwrap();
+                        let mut client = open_meta(&u, &token).await.unwrap();
                         for i in 0..ops_per_task {
                             let _ = client
                                 .unlink(UnlinkRequest {
