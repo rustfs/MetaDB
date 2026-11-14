@@ -3,8 +3,15 @@ use std::thread;
 
 use metadb_cluster::{ShardHealthState, ShardSplitMode};
 use metadb_core::{HlcTimestamp, MetaDbError, MetaKey, ROOT_INODE_ID};
-use metadb_server::{MetaDbConfig, MetaDbEngine, SqlQueryResult};
+use metadb_server::{
+    MetaDbConfig, MetaDbEngine, PersistentMetaDbCluster, ServerTomlConfig, SqlQueryResult,
+};
 use metadb_tx::AuxUpdateTask;
+use tempfile::tempdir;
+
+// T1–T6 exercise `MetaDbEngine::new_single_node`, an in-memory simulator
+// (`InMemoryBackend` + `VecDeque` log). They are not crash-recovery proof of the
+// OpenRaft + LSM engine. `test_persistent_restart_lookup_dirstat_quota` is.
 
 /// T1: Verifies that Policy/Size-Based Sharding splits shards strictly on `group_key = PID`
 /// boundaries and never separates `(PID, "_attr_")` from `(PID, child_name)`.
@@ -378,4 +385,120 @@ fn test_t6_single_node_to_distributed_multi_cell_evolution_and_sql_proxy() {
         .execute_sql("SELECT * FROM MetaTable WHERE pid = 1 AND name = 'logs';")
         .unwrap();
     assert_eq!(lookup_res, SqlQueryResult::OptionalEntry(None));
+}
+
+fn persistent_cfg(dir: &std::path::Path) -> ServerTomlConfig {
+    let toml_text = format!(
+        r#"
+[node]
+node_id = 1
+cell_id = 1
+role = "all-in-one"
+data_dir = "{}"
+grpc_listen_addr = "127.0.0.1:0"
+
+[sharding]
+bootstrap_table_shards = true
+shard_split_threshold_bytes = 4294967296
+"#,
+        dir.display()
+    );
+    ServerTomlConfig::from_toml_str(&toml_text).unwrap()
+}
+
+/// Opens a real data directory, kills the process, and checks lookup / dirstat / quota.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_persistent_restart_lookup_dirstat_quota() {
+    let dir = tempdir().unwrap();
+    let cfg = persistent_cfg(dir.path());
+    let (dir_id, file_name) = {
+        let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg.clone())
+            .await
+            .unwrap();
+        let dir_ent = cluster
+            .mkdir_auto_id(ROOT_INODE_ID, "bucket", 9, 0o755)
+            .await
+            .unwrap();
+        let file_name = "payload.bin";
+        cluster
+            .create_file_auto_id(dir_ent.attr.inode_id, file_name, 9, 0o644, 4096)
+            .await
+            .unwrap();
+        cluster.run_maintenance_tick().await.unwrap();
+        let quota = cluster.tx_router().get_quota(9).await.unwrap().unwrap();
+        assert!(quota.used_bytes >= 4096);
+        cluster.shutdown().await.unwrap();
+        (dir_ent.attr.inode_id, file_name.to_string())
+    };
+
+    let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
+    let tx = cluster.tx_router();
+    let stat = tx.dirstat(dir_id).await.unwrap();
+    assert_eq!(stat.num_children, 1);
+    assert_eq!(stat.size_bytes, 4096);
+    let found = tx.lookup(dir_id, &file_name).await.unwrap();
+    assert!(found.is_some());
+    let quota = tx
+        .get_quota(9)
+        .await
+        .unwrap()
+        .expect("quota must survive restart");
+    assert!(quota.used_bytes >= 4096);
+    cluster.shutdown().await.unwrap();
+}
+
+/// After many committed writes, one maintenance tick must drop retained Raft entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_maintenance_tick_purges_raft_log() {
+    let dir = tempdir().unwrap();
+    let cfg = persistent_cfg(dir.path());
+    let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg.clone())
+        .await
+        .unwrap();
+    for i in 0..24 {
+        cluster
+            .create_file_auto_id(ROOT_INODE_ID, &format!("f{i:02}.dat"), 3, 0o644, 64)
+            .await
+            .unwrap();
+    }
+    let before: usize = cluster
+        .cell_manager()
+        .host()
+        .all_groups()
+        .iter()
+        .map(|g| g.log_store().retained_entry_count())
+        .sum();
+    assert!(
+        before > 8,
+        "expected a non-trivial raft log, retained {before}"
+    );
+    cluster.run_maintenance_tick().await.unwrap();
+    let after: usize = cluster
+        .cell_manager()
+        .host()
+        .all_groups()
+        .iter()
+        .map(|g| g.log_store().retained_entry_count())
+        .sum();
+    assert!(
+        after < before,
+        "maintenance must purge raft logs: before {before} after {after}"
+    );
+    cluster.shutdown().await.unwrap();
+    drop(cluster);
+
+    let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
+    let snapshot_floor: u64 = cluster
+        .cell_manager()
+        .host()
+        .all_groups()
+        .iter()
+        .map(|g| g.watermarks().snapshot_values().2)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        snapshot_floor > 0,
+        "reopen must restore last_snapshot_index from the MANIFEST flushed index"
+    );
+    cluster.shutdown().await.unwrap();
 }

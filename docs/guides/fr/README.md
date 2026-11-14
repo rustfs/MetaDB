@@ -46,7 +46,7 @@ use metadb_core::ROOT_INODE_ID;
 use metadb_server::{MetaDbConfig, MetaDbEngine};
 
 fn main() -> metadb_core::Result<()> {
-    // 1. Démarrer un nœud Stage 1 (initialise la racine `/` avec PID = 1)
+    // Simulateur en mémoire uniquement. Le moteur durable est MetaDbEngine::open.
     let engine = MetaDbEngine::new_single_node(MetaDbConfig::default());
 
     // 2. Créer un répertoire `/checkpoints` et un fichier en 1 RTT (Pushdown)

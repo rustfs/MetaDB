@@ -453,6 +453,10 @@ impl ShardStateMachine {
 
         watermarks.advance_state_flushed(cp.flushed_raft_index);
         watermarks.advance_aux_outbox_durable(cp.contiguous_aux_acked_index);
+        // The MANIFEST flushed index is the local durability floor. Without this,
+        // `last_snapshot_index` stays 0 across process restarts and the 3-watermark
+        // purge gate never moves in production until an explicit OpenRaft snapshot.
+        watermarks.advance_last_snapshot(cp.flushed_raft_index);
         handler.on_snapshot_installed(&cp, &engine);
 
         let initial_frontier = AppliedFrontier {

@@ -1,10 +1,11 @@
 //! Persistent `DurableCellManager` managing OpenRaft shard groups, 3-stage recoverable
 //! `ExecuteSplit` (`SplitPlanRecord`), Jumbo Shard dedicated-node isolation, and `DualModeFineGrained`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ use crate::id_allocator::{AllocIdKind, DurableIdAllocator};
 use crate::jumbo::JumboIsolationPlanner;
 use crate::meta_cache::{CompositeMetaCache, CompositeShardRoute};
 use crate::shard::{ShardHealthState, ShardSplitMode};
-use crate::split_worker::{RaftShardSplitWorker, SplitCandidate};
+use crate::split_worker::{RaftShardSplitWorker, SplitCandidate, SplitCrashPoint};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SplitPlanState {
@@ -41,6 +42,7 @@ pub struct SplitPlanRecord {
     pub split_key: Vec<u8>,
     pub target_version: u64,
     pub state: SplitPlanState,
+    pub dual_mode_pid: Option<InodeId>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -63,6 +65,9 @@ pub struct DurableCellManager {
     handlers: RwLock<HashMap<ShardId, Arc<TxStateMachineHandler>>>,
     state: Mutex<PersistedCellState>,
     split_lock: tokio::sync::Mutex<()>,
+    /// Test hook: the next `n` `CELL_MANAGER_STATE` persists fail before touching disk.
+    fail_persists: AtomicU32,
+    crash_point: Mutex<Option<SplitCrashPoint>>,
 }
 
 impl DurableCellManager {
@@ -133,7 +138,7 @@ impl DurableCellManager {
                     },
                 );
             }
-            Self::persist_sync(&state_dir, &init)?;
+            Self::write_state_file(&state_dir, &init)?;
             init
         };
 
@@ -149,10 +154,29 @@ impl DurableCellManager {
             handlers: RwLock::new(HashMap::new()),
             state: Mutex::new(persisted),
             split_lock: tokio::sync::Mutex::new(()),
+            fail_persists: AtomicU32::new(0),
+            crash_point: Mutex::new(None),
         });
 
         mgr.boot_local_shards().await?;
+        mgr.recover_incomplete_splits().await?;
         Ok(mgr)
+    }
+
+    /// Test hook. The next `n` cell-state persists return an I/O error and leave memory unchanged.
+    pub fn testing_fail_next_persists(&self, n: u32) {
+        self.fail_persists.store(n, Ordering::Relaxed);
+    }
+
+    /// Test hook. `execute_local_split` returns after the named durable step.
+    pub fn set_split_crash_point(&self, point: Option<SplitCrashPoint>) {
+        *self.crash_point.lock().unwrap() = point;
+    }
+
+    /// Reads `CELL_MANAGER_STATE` from disk (not the in-memory cache).
+    pub fn durable_split_plan_on_disk(&self, request_uuid: u128) -> Result<bool> {
+        let st = Self::load_state_file(&self.state_dir)?;
+        Ok(st.split_plans.contains_key(&request_uuid))
     }
 
     async fn boot_local_shards(&self) -> Result<()> {
@@ -228,8 +252,11 @@ impl DurableCellManager {
 
     pub fn register_node(&self, node_id: NodeId, grpc_addr: String) -> Result<()> {
         let mut guard = self.state.lock().unwrap();
-        guard.nodes.insert(node_id, grpc_addr);
-        Self::persist_sync(&self.state_dir, &guard)
+        let mut next = guard.clone();
+        next.nodes.insert(node_id, grpc_addr);
+        self.persist_sync(&next)?;
+        *guard = next;
+        Ok(())
     }
 
     pub fn list_routes(&self) -> Vec<CompositeShardRoute> {
@@ -272,6 +299,7 @@ impl DurableCellManager {
         parent_shard_id: ShardId,
         split_key: Vec<u8>,
         target_version: u64,
+        dual_mode_pid: Option<InodeId>,
     ) -> Result<ShardId> {
         {
             let guard = self.state.lock().unwrap();
@@ -286,7 +314,13 @@ impl DurableCellManager {
                 .allocate_block(request_uuid, AllocIdKind::ShardId, 1)?;
 
         let mut guard = self.state.lock().unwrap();
-        guard.split_plans.insert(
+        if request_uuid != 0 {
+            if let Some(existing) = guard.split_plans.get(&request_uuid) {
+                return Ok(existing.child_shard_id);
+            }
+        }
+        let mut next = guard.clone();
+        next.split_plans.insert(
             request_uuid,
             SplitPlanRecord {
                 parent_shard_id,
@@ -294,9 +328,11 @@ impl DurableCellManager {
                 split_key,
                 target_version,
                 state: SplitPlanState::Planned,
+                dual_mode_pid,
             },
         );
-        Self::persist_sync(&self.state_dir, &guard)?;
+        self.persist_sync(&next)?;
+        *guard = next;
         Ok(child_shard_id)
     }
 
@@ -308,24 +344,28 @@ impl DurableCellManager {
         child_route: CompositeShardRoute,
         child_handler: Option<Arc<TxStateMachineHandler>>,
     ) -> Result<()> {
+        let next = {
+            let guard = self.state.lock().unwrap();
+            let mut next = guard.clone();
+            if let Some(plan) = next.split_plans.get_mut(&request_uuid) {
+                plan.state = SplitPlanState::Activated;
+            }
+            next.routes
+                .insert(parent_route.shard_id, parent_route.clone());
+            next.routes
+                .insert(child_route.shard_id, child_route.clone());
+            next
+        };
+        {
+            let mut guard = self.state.lock().unwrap();
+            self.persist_sync(&next)?;
+            *guard = next;
+        }
         if let Some(h) = child_handler {
             self.handlers
                 .write()
                 .unwrap()
                 .insert(child_route.shard_id, h);
-        }
-        {
-            let mut guard = self.state.lock().unwrap();
-            if let Some(plan) = guard.split_plans.get_mut(&request_uuid) {
-                plan.state = SplitPlanState::Activated;
-            }
-            guard
-                .routes
-                .insert(parent_route.shard_id, parent_route.clone());
-            guard
-                .routes
-                .insert(child_route.shard_id, child_route.clone());
-            Self::persist_sync(&self.state_dir, &guard)?;
         }
         self.meta_cache
             .apply_split_routes(parent_route, child_route);
@@ -377,11 +417,17 @@ impl DurableCellManager {
                     &nodes,
                     &all_routes,
                 );
-                if let Some(r) = st.routes.get_mut(&shard_id) {
-                    r.health_state = new_health;
-                    let updated = r.clone();
-                    Self::persist_sync(&self.state_dir, &st)?;
-                    self.meta_cache.upsert_route(updated);
+                if st.routes.contains_key(&shard_id) {
+                    let mut next = st.clone();
+                    if let Some(r) = next.routes.get_mut(&shard_id) {
+                        r.health_state = new_health;
+                    }
+                    let updated = next.routes.get(&shard_id).cloned();
+                    self.persist_sync(&next)?;
+                    *st = next;
+                    if let Some(updated) = updated {
+                        self.meta_cache.upsert_route(updated);
+                    }
                 }
                 Ok(None)
             }
@@ -397,7 +443,9 @@ impl DurableCellManager {
                     shard_id,
                     split_key.clone(),
                     live_route.epoch.version + 1,
+                    dual_mode_pid,
                 )?;
+                let crash_at = *self.crash_point.lock().unwrap();
                 let (new_parent, new_child, _child_grp, child_handler) =
                     RaftShardSplitWorker::execute_local_split(
                         &self.host,
@@ -409,6 +457,7 @@ impl DurableCellManager {
                         dual_mode_pid,
                         self.lsm_config.clone(),
                         self.raft_opts.clone(),
+                        crash_at,
                     )
                     .await?;
                 self.activate_split(req_uuid, new_parent, new_child, Some(child_handler))?;
@@ -420,14 +469,22 @@ impl DurableCellManager {
     /// Switches a Jumbo Shard into `ShardSplitMode::DualModeFineGrained` for `dominant_pid`.
     pub fn enable_dual_mode_split(&self, shard_id: ShardId, dominant_pid: InodeId) -> Result<()> {
         let mut st = self.state.lock().unwrap();
-        let route = st
+        if !st.routes.contains_key(&shard_id) {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "unknown shard {}",
+                shard_id
+            )));
+        }
+        let mut next = st.clone();
+        let route = next
             .routes
             .get_mut(&shard_id)
             .ok_or_else(|| MetaDbError::ShardRoutingError(format!("unknown shard {}", shard_id)))?;
         route.split_mode = ShardSplitMode::DualModeFineGrained;
         route.dual_mode_pid = Some(dominant_pid);
         let updated = route.clone();
-        Self::persist_sync(&self.state_dir, &st)?;
+        self.persist_sync(&next)?;
+        *st = next;
         self.meta_cache.upsert_route(updated);
         Ok(())
     }
@@ -486,21 +543,362 @@ impl DurableCellManager {
 
             let new_epoch = group.current_epoch();
             let mut st = self.state.lock().unwrap();
-            if let Some(r) = st.routes.get_mut(&sid) {
-                for (nid, addr) in &candidates {
-                    r.peers.insert(*nid, (addr.clone(), true));
+            if st.routes.contains_key(&sid) {
+                let mut next = st.clone();
+                if let Some(r) = next.routes.get_mut(&sid) {
+                    for (nid, addr) in &candidates {
+                        r.peers.insert(*nid, (addr.clone(), true));
+                    }
+                    r.epoch = new_epoch;
                 }
-                r.epoch = new_epoch;
-                let updated = r.clone();
-                Self::persist_sync(&self.state_dir, &st)?;
-                self.meta_cache.upsert_route(updated);
+                let updated = next.routes.get(&sid).cloned();
+                self.persist_sync(&next)?;
+                *st = next;
+                if let Some(updated) = updated {
+                    self.meta_cache.upsert_route(updated);
+                }
             }
             upgraded += 1;
         }
         Ok(upgraded)
     }
 
-    fn persist_sync(dir: &Path, st: &PersistedCellState) -> Result<()> {
+    fn load_state_file(dir: &Path) -> Result<PersistedCellState> {
+        let state_path = dir.join("CELL_MANAGER_STATE");
+        if !state_path.exists() {
+            return Ok(PersistedCellState::default());
+        }
+        let mut raw = Vec::new();
+        File::open(&state_path)?.read_to_end(&mut raw)?;
+        let body = verify_crc32c_le(&raw, "CELL_MANAGER_STATE")?;
+        bincode::deserialize::<PersistedCellState>(body)
+            .map_err(|e| MetaDbError::CodecError(e.to_string()))
+    }
+
+    /// Resumes splits that fenced the parent (or deleted its right-half keys) without publishing
+    /// child routes, adopts orphan child directories, and restores a parent range when a fence
+    /// cannot be completed.
+    async fn recover_incomplete_splits(&self) -> Result<()> {
+        self.discard_incomplete_splitting_dirs()?;
+
+        let plans: Vec<(u128, SplitPlanRecord)> = {
+            let st = self.state.lock().unwrap();
+            st.split_plans
+                .iter()
+                .filter(|(_, plan)| plan.state == SplitPlanState::Planned)
+                .map(|(uuid, plan)| (*uuid, plan.clone()))
+                .collect()
+        };
+        let mut resumed_children: HashSet<ShardId> = HashSet::new();
+        for (uuid, plan) in plans {
+            self.resume_planned_split(uuid, &plan).await?;
+            resumed_children.insert(plan.child_shard_id);
+        }
+
+        self.resume_registry_pending(&resumed_children).await?;
+        self.adopt_orphan_shard_dirs().await?;
+        self.restore_unpublished_fences().await?;
+        Ok(())
+    }
+
+    fn discard_incomplete_splitting_dirs(&self) -> Result<()> {
+        let shards_root = self.host.data_dir().join("shards");
+        if !shards_root.exists() {
+            return Ok(());
+        }
+        for ent in fs::read_dir(&shards_root)? {
+            let ent = ent?;
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".splitting") {
+                let _ = fs::remove_dir_all(ent.path());
+            }
+        }
+        Ok(())
+    }
+
+    async fn resume_planned_split(&self, request_uuid: u128, plan: &SplitPlanRecord) -> Result<()> {
+        let already_published = {
+            let st = self.state.lock().unwrap();
+            st.routes.contains_key(&plan.child_shard_id)
+        };
+        if already_published {
+            self.mark_plan_activated(request_uuid)?;
+            return Ok(());
+        }
+        let Some(parent_route) = ({
+            let st = self.state.lock().unwrap();
+            st.routes.get(&plan.parent_shard_id).cloned()
+        }) else {
+            return Ok(());
+        };
+        if self.host.get_group(plan.parent_shard_id).is_none() {
+            return Ok(());
+        }
+        let mut parent_route = parent_route;
+        if parent_route.epoch.version + 1 != plan.target_version {
+            parent_route.epoch.version = plan.target_version.saturating_sub(1);
+        }
+        self.finish_split(
+            request_uuid,
+            &parent_route,
+            plan.child_shard_id,
+            plan.split_key.clone(),
+            plan.dual_mode_pid,
+        )
+        .await
+    }
+
+    async fn resume_registry_pending(&self, already: &HashSet<ShardId>) -> Result<()> {
+        let pending: Vec<(ShardId, RegistryShardState)> = self
+            .host
+            .registry_entries()
+            .into_iter()
+            .filter(|(id, state)| {
+                !already.contains(id)
+                    && matches!(state, RegistryShardState::PendingChildBoot { .. })
+            })
+            .collect();
+        for (child_id, state) in pending {
+            let RegistryShardState::PendingChildBoot {
+                parent_shard_id,
+                split_key,
+                target_version,
+                dual_mode_pid,
+                ..
+            } = state
+            else {
+                continue;
+            };
+            if self.state.lock().unwrap().routes.contains_key(&child_id) {
+                continue;
+            }
+            let Some(mut parent_route) = ({
+                let st = self.state.lock().unwrap();
+                st.routes.get(&parent_shard_id).cloned()
+            }) else {
+                continue;
+            };
+            if self.host.get_group(parent_shard_id).is_none() {
+                continue;
+            }
+            if parent_route.epoch.version + 1 != target_version && target_version > 0 {
+                parent_route.epoch.version = target_version.saturating_sub(1);
+            }
+            let req_uuid = (child_id as u128) << 64 | target_version as u128;
+            self.finish_split(req_uuid, &parent_route, child_id, split_key, dual_mode_pid)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn adopt_orphan_shard_dirs(&self) -> Result<()> {
+        let known: HashSet<ShardId> = self.state.lock().unwrap().routes.keys().copied().collect();
+        let mut orphans = Vec::new();
+        let shards_root = self.host.data_dir().join("shards");
+        if shards_root.exists() {
+            for ent in fs::read_dir(&shards_root)? {
+                let ent = ent?;
+                if !ent.path().is_dir() {
+                    continue;
+                }
+                let name = ent.file_name().to_string_lossy().to_string();
+                if name.ends_with(".splitting") {
+                    continue;
+                }
+                let Ok(id) = name.parse::<ShardId>() else {
+                    continue;
+                };
+                if known.contains(&id) {
+                    continue;
+                }
+                if ent.path().join("lsm").exists() {
+                    orphans.push(id);
+                }
+            }
+        }
+        if orphans.is_empty() {
+            return Ok(());
+        }
+
+        let parents: Vec<CompositeShardRoute> = self
+            .state
+            .lock()
+            .unwrap()
+            .routes
+            .values()
+            .cloned()
+            .collect();
+        for parent_route in parents {
+            let Some(handler) = self
+                .handlers
+                .read()
+                .unwrap()
+                .get(&parent_route.shard_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let fenced = handler.key_range();
+            if fenced.end_key.as_slice() >= parent_route.range.end_key.as_slice() {
+                continue;
+            }
+            let reg = self.host.registry_entries();
+            let child_id = reg
+                .iter()
+                .find_map(|(cid, st)| {
+                    if let RegistryShardState::PendingChildBoot {
+                        parent_shard_id, ..
+                    } = st
+                    {
+                        if *parent_shard_id == parent_route.shard_id && orphans.contains(cid) {
+                            return Some(*cid);
+                        }
+                    }
+                    None
+                })
+                .or_else(|| {
+                    if orphans.len() == 1 {
+                        Some(orphans[0])
+                    } else {
+                        None
+                    }
+                });
+            let Some(child_id) = child_id else {
+                continue;
+            };
+            if self.host.get_group(parent_route.shard_id).is_none() {
+                continue;
+            }
+            let req_uuid = (child_id as u128) << 64;
+            self.finish_split(
+                req_uuid,
+                &parent_route,
+                child_id,
+                fenced.end_key.clone(),
+                parent_route.dual_mode_pid,
+            )
+            .await?;
+            orphans.retain(|id| *id != child_id);
+        }
+        Ok(())
+    }
+
+    /// Parent LSM/handler range was fenced but no child plan or directory exists.
+    /// Publish a restore command so right-half keys that are still in the parent become readable.
+    async fn restore_unpublished_fences(&self) -> Result<()> {
+        // A child directory that is not in the route table may be the only copy of the
+        // right-half keys. Widening the parent fence in that case would hide the loss.
+        if self.has_unpublished_child_dir() {
+            return Ok(());
+        }
+        let routes: Vec<CompositeShardRoute> = self
+            .state
+            .lock()
+            .unwrap()
+            .routes
+            .values()
+            .cloned()
+            .collect();
+        for route in routes {
+            let Ok((epoch, group, handler)) = self.lookup_local_handle(route.shard_id) else {
+                continue;
+            };
+            if handler.key_range() == route.range {
+                continue;
+            }
+            let cmd = metadb_tx::TxRaftCmd::RestoreShardRange {
+                restored_range: route.range.clone(),
+                new_epoch: epoch,
+            };
+            let payload =
+                bincode::serialize(&cmd).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+            group
+                .propose(epoch, self.host.clock().now(), payload)
+                .await?;
+            group.state_machine().flush_to_lsm()?;
+        }
+        Ok(())
+    }
+
+    fn has_unpublished_child_dir(&self) -> bool {
+        let known: HashSet<ShardId> = self.state.lock().unwrap().routes.keys().copied().collect();
+        let shards_root = self.host.data_dir().join("shards");
+        let Ok(rd) = fs::read_dir(&shards_root) else {
+            return false;
+        };
+        for ent in rd.flatten() {
+            if !ent.path().is_dir() {
+                continue;
+            }
+            let name = ent.file_name().to_string_lossy().to_string();
+            if name.ends_with(".splitting") {
+                continue;
+            }
+            if let Ok(id) = name.parse::<ShardId>() {
+                if !known.contains(&id) && ent.path().join("lsm").exists() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    async fn finish_split(
+        &self,
+        request_uuid: u128,
+        parent_route: &CompositeShardRoute,
+        child_shard_id: ShardId,
+        split_key: Vec<u8>,
+        dual_mode_pid: Option<InodeId>,
+    ) -> Result<()> {
+        let (_epoch, group, handler) = self.lookup_local_handle(parent_route.shard_id)?;
+        let live_route = parent_route.clone();
+        let (new_parent, new_child, _child_grp, child_handler) =
+            RaftShardSplitWorker::execute_local_split(
+                &self.host,
+                &live_route,
+                &group,
+                &handler,
+                child_shard_id,
+                split_key,
+                dual_mode_pid,
+                self.lsm_config.clone(),
+                self.raft_opts.clone(),
+                None,
+            )
+            .await?;
+        self.activate_split(request_uuid, new_parent, new_child, Some(child_handler))
+    }
+
+    fn mark_plan_activated(&self, request_uuid: u128) -> Result<()> {
+        let mut guard = self.state.lock().unwrap();
+        let Some(plan) = guard.split_plans.get(&request_uuid) else {
+            return Ok(());
+        };
+        if plan.state == SplitPlanState::Activated {
+            return Ok(());
+        }
+        let mut next = guard.clone();
+        if let Some(plan) = next.split_plans.get_mut(&request_uuid) {
+            plan.state = SplitPlanState::Activated;
+        }
+        self.persist_sync(&next)?;
+        *guard = next;
+        Ok(())
+    }
+
+    fn persist_sync(&self, st: &PersistedCellState) -> Result<()> {
+        if self.fail_persists.load(Ordering::Relaxed) > 0 {
+            self.fail_persists.fetch_sub(1, Ordering::Relaxed);
+            return Err(MetaDbError::StorageIoError(
+                "injected persist_sync failure".to_string(),
+            ));
+        }
+        Self::write_state_file(&self.state_dir, st)
+    }
+
+    fn write_state_file(dir: &Path, st: &PersistedCellState) -> Result<()> {
         let mut raw = bincode::serialize(st).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
         append_crc32c_le(&mut raw);
         let tmp = dir.join("CELL_MANAGER_STATE.tmp");

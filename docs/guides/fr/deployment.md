@@ -34,6 +34,8 @@ bootstrap_table_shards = true
 shard_split_threshold_bytes = 4294967296 # 4 Gio
 ```
 
+Rust 1.100.0 (`rust-toolchain.toml`). Seul le rôle `all-in-one` démarre. Sans `[security].shared_secret`, le gRPC n'a ni authentification ni TLS ; l'écoute par défaut est `127.0.0.1`. Ne pas exposer ce port à un réseau non fiable.
+
 ```bash
 metadbd --config /etc/metadb/standalone.toml
 ```

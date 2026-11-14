@@ -336,9 +336,16 @@ impl ShardRaftGroup {
 /// Durable entry in `<data_dir>/NODE_SHARD_REGISTRY` tracking split child bootstrap (`Resolution B15`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegistryShardState {
+    /// Child shard materialized for a split that has not yet published routes.
+    /// Consumed by `DurableCellManager` on startup so a crash after the parent fence
+    /// can resume the child boot instead of dropping the right-half key range.
     PendingChildBoot {
         parent_shard_id: ShardId,
         peers: BTreeMap<NodeId, String>,
+        split_key: Vec<u8>,
+        target_version: u64,
+        parent_end_key: Vec<u8>,
+        dual_mode_pid: Option<u64>,
     },
     Active {
         peers: BTreeMap<NodeId, String>,
@@ -397,6 +404,10 @@ impl ShardGroupHost {
 
     pub fn channel_pool(&self) -> &ChannelPool {
         &self.channel_pool
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     pub fn shard_dir(&self, shard_id: ShardId) -> PathBuf {

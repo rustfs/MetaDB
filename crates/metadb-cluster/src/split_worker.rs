@@ -22,6 +22,18 @@ use metadb_tx::{TxRaftCmd, TxStateMachineHandler};
 use crate::meta_cache::CompositeShardRoute;
 use crate::shard::ShardSplitMode;
 
+/// Crash points for split recovery tests. Production passes `None`.
+///
+/// Each point is after the named step has been committed to disk (Raft log, LSM
+/// rename, or parent-key delete) and before `activate_split` publishes routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitCrashPoint {
+    AfterFence,
+    AfterFlush,
+    AfterChildDirRename,
+    AfterParentKeyDelete,
+}
+
 /// Split boundary decision computed by `RaftShardSplitWorker::discover_split_key`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SplitCandidate {
@@ -145,6 +157,7 @@ impl RaftShardSplitWorker {
         dual_mode_pid: Option<InodeId>,
         lsm_config: LsmEngineConfig,
         raft_opts: RaftNodeOptions,
+        crash_at: Option<SplitCrashPoint>,
     ) -> Result<(
         CompositeShardRoute,
         CompositeShardRoute,
@@ -219,9 +232,11 @@ impl RaftShardSplitWorker {
                 )
                 .await?;
         }
+        Self::bail_crash(crash_at, SplitCrashPoint::AfterFence)?;
 
         // Trigger Coordinated Flush Barrier on `S_parent` so 100% of pre-fence `AttrDelta`s are folded!
         parent_group.state_machine().flush_to_lsm()?;
+        Self::bail_crash(crash_at, SplitCrashPoint::AfterFlush)?;
 
         // Stage B.1: Record `PendingChildBoot` in `NODE_SHARD_REGISTRY` (`Resolution B15`).
         let peer_addrs: BTreeMap<u64, String> = parent_route
@@ -235,6 +250,10 @@ impl RaftShardSplitWorker {
             RegistryShardState::PendingChildBoot {
                 parent_shard_id: parent_route.shard_id,
                 peers: peer_addrs.clone(),
+                split_key: split_key.clone(),
+                target_version,
+                parent_end_key: old_end_key.clone(),
+                dual_mode_pid,
             },
         )?;
 
@@ -440,6 +459,7 @@ impl RaftShardSplitWorker {
                 sync_dir(parent_fs_dir)?;
             }
         }
+        Self::bail_crash(crash_at, SplitCrashPoint::AfterChildDirRename)?;
 
         // Boot `S_child` OpenRaft group and transition `NODE_SHARD_REGISTRY` -> `Active`.
         let child_epoch = ShardEpoch {
@@ -489,6 +509,7 @@ impl RaftShardSplitWorker {
         parent_group
             .propose(parent_group.current_epoch(), host.clock().now(), payload)
             .await?;
+        Self::bail_crash(crash_at, SplitCrashPoint::AfterParentKeyDelete)?;
 
         let _ = parent_handler;
 
@@ -509,6 +530,15 @@ impl RaftShardSplitWorker {
         };
 
         Ok((new_parent_route, child_route, child_group, child_handler))
+    }
+
+    fn bail_crash(crash_at: Option<SplitCrashPoint>, here: SplitCrashPoint) -> Result<()> {
+        if crash_at == Some(here) {
+            return Err(MetaDbError::StorageIoError(format!(
+                "injected split crash at {here:?}"
+            )));
+        }
+        Ok(())
     }
 }
 

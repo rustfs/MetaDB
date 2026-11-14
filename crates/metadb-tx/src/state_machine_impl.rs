@@ -4,7 +4,7 @@
 //! - Primary-Anchored 2PC state transitions (`[0x05] WriteIntent` & `[0x06] TxnRecord`)
 //! - `PreFlushHook` Coordinated Flush Barrier (`ReplicatedAttrAggregator` + `ShardAuxOutbox` `[0x07]` spill)
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -134,6 +134,12 @@ pub enum TxRaftCmd {
         keys_to_delete: Vec<Vec<u8>>,
         updated_anchor_attr: Option<(InodeId, InodeAttr)>,
         updated_shard_delta: Option<DirShardDeltaRecord>,
+    },
+    /// Undo a split fence that was committed without a published child route.
+    /// `new_epoch.version` must be `>=` the fenced epoch so replay keeps this command last.
+    RestoreShardRange {
+        restored_range: CompositeKeyRange,
+        new_epoch: ShardEpoch,
     },
 }
 
@@ -854,6 +860,52 @@ impl TxStateMachineHandler {
                 Ok(TxRaftOutput::Quota(rec))
             }
             TxRaftCmd::ApplyAuxBatch { entries } => {
+                // Reject gaps and range errors before any `apply_committed_put`, so a failed
+                // batch does not leave a prefix of the command durable in the memtable.
+                let mut quota_cursor: BTreeMap<(u64, u64), (u64, u16)> = BTreeMap::new();
+                for item in &entries {
+                    match &item.payload {
+                        AuxTaskPayload::QuotaDelta {
+                            uid,
+                            prev_uid_cursor,
+                            ..
+                        } => {
+                            let qk = QuotaKey { uid: *uid }.encode();
+                            self.ensure_user_key_in_range(&qk)?;
+                            let key = (item.origin_shard_id, *uid);
+                            let prev = if let Some(cur) = quota_cursor.get(&key) {
+                                *cur
+                            } else {
+                                match Self::read_latest_in_apply(engine, &qk)? {
+                                    Some(raw) => QuotaRecord::decode(&raw)?
+                                        .applied_by_shard
+                                        .get(&item.origin_shard_id)
+                                        .copied()
+                                        .unwrap_or((0, 0)),
+                                    None => (0, 0),
+                                }
+                            };
+                            let cur_cursor = (item.origin_raft_index, item.task_ordinal);
+                            if cur_cursor <= prev {
+                                continue;
+                            }
+                            if *prev_uid_cursor > prev {
+                                return Err(MetaDbError::AuxOutOfOrderGap {
+                                    origin_shard_id: item.origin_shard_id,
+                                    uid: *uid,
+                                    expected_after: prev,
+                                    got_prev: *prev_uid_cursor,
+                                });
+                            }
+                            quota_cursor.insert(key, cur_cursor);
+                        }
+                        AuxTaskPayload::IndexUpsert { fid, .. }
+                        | AuxTaskPayload::IndexDelete { fid } => {
+                            let ik = SecondaryIndexKey { fid: *fid }.encode();
+                            self.ensure_user_key_in_range(&ik)?;
+                        }
+                    }
+                }
                 let mut applied_count = 0usize;
                 for item in entries {
                     match item.payload {
@@ -1380,6 +1432,19 @@ impl TxStateMachineHandler {
                 {
                     let mut m = self.meta.write().unwrap();
                     m.range = new_range;
+                    m.epoch = new_epoch;
+                }
+                self.outbox
+                    .record_entry_specs(raft_index, commit_hlc, vec![]);
+                Ok(TxRaftOutput::Unit)
+            }
+            TxRaftCmd::RestoreShardRange {
+                restored_range,
+                new_epoch,
+            } => {
+                {
+                    let mut m = self.meta.write().unwrap();
+                    m.range = restored_range;
                     m.epoch = new_epoch;
                 }
                 self.outbox

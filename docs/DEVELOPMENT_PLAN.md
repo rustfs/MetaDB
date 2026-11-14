@@ -1,7 +1,7 @@
 # MetaDB Phased Rust Development Plan
 
 * **Project**: `rustfs/MetaDB`
-* **Language & Toolchain**: 100% Pure Rust (`edition = "2021"`, zero C/C++ FFI)
+* **Language & Toolchain**: 100% Pure Rust (`edition = "2021"`, toolchain pinned to `1.100.0` in `rust-toolchain.toml`, zero C/C++ FFI)
 * **Async & Distributed Stack**: `tokio` + `tonic` / `prost` (gRPC) + `openraft` (Multi-Raft)
 * **Design Methodology**: [Google Elephant-Goldfish Model (EGM)](https://github.com/google/elephant-goldfish-model)
 * **Companion Specifications**:

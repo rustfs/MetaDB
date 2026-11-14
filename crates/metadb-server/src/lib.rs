@@ -16,7 +16,38 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::service::Interceptor;
 use tonic::transport::Server;
+use tonic::{Request, Status};
+
+/// Optional shared-secret check for metadata, transaction, and control-plane RPCs.
+/// An empty secret allows the call (loopback deployments without auth).
+#[derive(Clone)]
+struct BearerAuth {
+    secret: std::sync::Arc<str>,
+}
+
+impl Interceptor for BearerAuth {
+    fn call(&mut self, request: Request<()>) -> std::result::Result<Request<()>, Status> {
+        if self.secret.is_empty() {
+            return Ok(request);
+        }
+        let presented = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        let mut expected = String::from("Bearer ");
+        expected.push_str(&self.secret);
+        if presented == expected {
+            Ok(request)
+        } else {
+            Err(Status::unauthenticated(
+                "missing or invalid authorization bearer token",
+            ))
+        }
+    }
+}
 
 use metadb_cluster::{
     CellId, CellLocalManager, CompositeMetaCache, DurableCellManager, DurableGlobalManager,
@@ -97,8 +128,11 @@ impl MetaDbEngine {
         Ok(cluster)
     }
 
-    /// Initializes a Stage 1 Single-Node All-in-One MetaDB instance with a root shard
-    /// and pre-initialized root directory `(ROOT_INODE_ID = 1, "_attr_")`.
+    /// In-memory simulator used by synchronous API-shape tests.
+    ///
+    /// This does **not** open a data directory, OpenRaft group, or WAL-less LSM.
+    /// It is not crash-safe and is not the engine verified by the persistent test
+    /// suite. Use [`MetaDbEngine::open`] or [`PersistentMetaDbCluster::open_and_serve`].
     pub fn new_single_node(config: MetaDbConfig) -> Self {
         let clock = Arc::new(HybridLogicalClock::new());
         let meta_cache = Arc::new(MetaCache::new());
@@ -409,6 +443,13 @@ impl PersistentMetaDbCluster {
     /// Opens or bootstraps a persistent MetaDB instance from `config` and starts its gRPC listener
     /// (binding to `config.node.grpc_listen_addr`, e.g., `"127.0.0.1:0"` for OS-assigned ephemeral ports).
     pub async fn open_and_serve(config: ServerTomlConfig) -> Result<(Arc<Self>, String)> {
+        if config.node.role != ServerRole::AllInOne {
+            return Err(metadb_core::MetaDbError::CodecError(format!(
+                "server role {:?} is not implemented; only all-in-one runs a process. \
+                 be, proxy, cell-manager, and global-manager are not role-trimmed and must not be treated as disaggregated deployments",
+                config.node.role
+            )));
+        }
         let listener = TcpListener::bind(&config.node.grpc_listen_addr).await?;
         let bound_addr = listener.local_addr()?.to_string();
 
@@ -479,11 +520,31 @@ impl PersistentMetaDbCluster {
             proxy_router.clone(),
         );
 
+        let shared_secret = config.security.shared_secret.clone();
+        if shared_secret.is_empty() {
+            tracing::warn!(
+                listen = %bound_addr,
+                "gRPC metadata, transaction, and control-plane services have no authentication or TLS. \
+                 Default bind is 127.0.0.1. Do not expose this process to untrusted networks until \
+                 [security].shared_secret or an external TLS terminator is configured. \
+                 RaftTransport on the same listener is also unauthenticated."
+            );
+        }
+        let auth = BearerAuth {
+            secret: std::sync::Arc::<str>::from(shared_secret),
+        };
+
         let grpc_handle = tokio::spawn(async move {
             let _ = Server::builder()
-                .add_service(MetadataServiceServer::new(grpc_svc.clone()))
-                .add_service(TransactionServiceServer::new(grpc_svc.clone()))
-                .add_service(ControlPlaneServiceServer::new(grpc_svc))
+                .add_service(MetadataServiceServer::with_interceptor(
+                    grpc_svc.clone(),
+                    auth.clone(),
+                ))
+                .add_service(TransactionServiceServer::with_interceptor(
+                    grpc_svc.clone(),
+                    auth.clone(),
+                ))
+                .add_service(ControlPlaneServiceServer::with_interceptor(grpc_svc, auth))
                 .add_service(RaftTransportServiceServer::new(
                     MultiRaftTransportServer::new(raft_router),
                 ))
@@ -598,6 +659,13 @@ impl PersistentMetaDbCluster {
                 let _ = cell
                     .maybe_split_or_isolate_shard(grp.shard_id(), false)
                     .await;
+            }
+        }
+        // Snapshot + purge after auxiliary drain so `last_snapshot_index` advances and
+        // `.raftlog` retention follows the 3-watermark gate in production (metadbd's loop).
+        for cell in self.global_manager.all_cells() {
+            for (_, grp, _) in cell.local_shard_handles() {
+                grp.flush_snapshot_and_purge().await?;
             }
         }
         Ok(())

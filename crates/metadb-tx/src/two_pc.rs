@@ -1126,13 +1126,13 @@ impl DistributedTxRouter {
                     && irec.start_hlc <= snap.read_hlc()
                 {
                     resolved_any = true;
-                    let _ = TxnRecoveryWorker::resolve_single_txn(
+                    TxnRecoveryWorker::resolve_single_txn(
                         self.directory.as_ref(),
                         &self.clock,
                         irec.txn_id,
                         &irec.primary_key,
                     )
-                    .await;
+                    .await?;
                 }
             }
 

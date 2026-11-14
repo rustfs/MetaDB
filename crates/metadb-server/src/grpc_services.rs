@@ -1062,6 +1062,7 @@ impl ControlPlaneService for MetaDbGrpcService {
             req.parent_shard_id,
             req.split_key,
             req.target_version,
+            None,
         ) {
             Ok(child_shard_id) => Ok(Response::new(AllocSplitPlanResponse {
                 error: None,

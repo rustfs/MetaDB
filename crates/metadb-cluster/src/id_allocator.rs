@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,8 @@ impl Default for PersistedAllocatorState {
 pub struct DurableIdAllocator {
     state_dir: PathBuf,
     state: Mutex<PersistedAllocatorState>,
+    /// Test hook: the next `n` persists fail before any byte is written.
+    fail_persists: AtomicU32,
 }
 
 impl DurableIdAllocator {
@@ -76,13 +79,33 @@ impl DurableIdAllocator {
             bincode::deserialize(body).map_err(|e| MetaDbError::CodecError(e.to_string()))?
         } else {
             let init = PersistedAllocatorState::default();
-            Self::persist_sync(&state_dir, &init)?;
+            Self::write_state_file(&state_dir, &init)?;
             init
         };
         Ok(Self {
             state_dir,
             state: Mutex::new(state),
+            fail_persists: AtomicU32::new(0),
         })
+    }
+
+    /// Test hook. The next `n` `persist_sync` calls fail and leave the in-memory watermark unchanged.
+    pub fn testing_fail_next_persists(&self, n: u32) {
+        self.fail_persists.store(n, Ordering::Relaxed);
+    }
+
+    /// True when the on-disk state (not the in-memory cache) records `request_uuid`.
+    pub fn durable_grant_on_disk(&self, request_uuid: u128) -> Result<bool> {
+        let path = self.state_dir.join("ID_ALLOCATOR_STATE");
+        if !path.exists() {
+            return Ok(false);
+        }
+        let mut raw = Vec::new();
+        File::open(&path)?.read_to_end(&mut raw)?;
+        let body = verify_crc32c_le(&raw, "ID_ALLOCATOR_STATE")?;
+        let st: PersistedAllocatorState =
+            bincode::deserialize(body).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        Ok(st.recent_grants.contains_key(&request_uuid))
     }
 
     /// Durably allocates `(start_id, count)` with `request_uuid` idempotency (`fdatasync` BEFORE return).
@@ -102,62 +125,61 @@ impl DurableIdAllocator {
             }
         }
 
-        let start = match kind {
-            AllocIdKind::FileInode => {
-                let s = guard.next_file_inode_seq;
-                guard.next_file_inode_seq = guard
-                    .next_file_inode_seq
-                    .checked_add(count)
-                    .ok_or_else(|| {
-                        MetaDbError::StorageIoError("file inode seq overflow".to_string())
-                    })?;
-                make_file_inode_id(s)
-            }
-            AllocIdKind::DirInode => {
-                let s = guard.next_dir_inode_id;
-                let next = guard
-                    .next_dir_inode_id
-                    .checked_add(count)
-                    .ok_or_else(|| MetaDbError::StorageIoError("dir inode overflow".to_string()))?;
-                if (next & metadb_core::FILE_INODE_TAG_BIT) != 0 {
-                    return Err(MetaDbError::StorageIoError(
-                        "directory PID bitspace exhausted".to_string(),
-                    ));
+        let mut next = guard.clone();
+        let start =
+            match kind {
+                AllocIdKind::FileInode => {
+                    let s = next.next_file_inode_seq;
+                    next.next_file_inode_seq =
+                        next.next_file_inode_seq.checked_add(count).ok_or_else(|| {
+                            MetaDbError::StorageIoError("file inode seq overflow".to_string())
+                        })?;
+                    make_file_inode_id(s)
                 }
-                guard.next_dir_inode_id = next;
-                s
-            }
-            AllocIdKind::FileId => {
-                let s = guard.next_file_id;
-                guard.next_file_id = guard
-                    .next_file_id
-                    .checked_add(count)
-                    .ok_or_else(|| MetaDbError::StorageIoError("file_id overflow".to_string()))?;
-                s
-            }
-            AllocIdKind::ShardId => {
-                let s = guard.next_shard_id;
-                guard.next_shard_id = guard
-                    .next_shard_id
-                    .checked_add(count)
-                    .ok_or_else(|| MetaDbError::StorageIoError("shard_id overflow".to_string()))?;
-                s
-            }
-        };
+                AllocIdKind::DirInode => {
+                    let s = next.next_dir_inode_id;
+                    let advanced = next.next_dir_inode_id.checked_add(count).ok_or_else(|| {
+                        MetaDbError::StorageIoError("dir inode overflow".to_string())
+                    })?;
+                    if (advanced & metadb_core::FILE_INODE_TAG_BIT) != 0 {
+                        return Err(MetaDbError::StorageIoError(
+                            "directory PID bitspace exhausted".to_string(),
+                        ));
+                    }
+                    next.next_dir_inode_id = advanced;
+                    s
+                }
+                AllocIdKind::FileId => {
+                    let s = next.next_file_id;
+                    next.next_file_id = next.next_file_id.checked_add(count).ok_or_else(|| {
+                        MetaDbError::StorageIoError("file_id overflow".to_string())
+                    })?;
+                    s
+                }
+                AllocIdKind::ShardId => {
+                    let s = next.next_shard_id;
+                    next.next_shard_id =
+                        next.next_shard_id.checked_add(count).ok_or_else(|| {
+                            MetaDbError::StorageIoError("shard_id overflow".to_string())
+                        })?;
+                    s
+                }
+            };
 
         let grant = (start, count);
         if request_uuid != 0 {
-            if guard.grant_fifo.len() >= MAX_CACHED_GRANT_UUIDS {
-                if let Some(old_uuid) = guard.grant_fifo.pop_front() {
-                    guard.recent_grants.remove(&old_uuid);
+            if next.grant_fifo.len() >= MAX_CACHED_GRANT_UUIDS {
+                if let Some(old_uuid) = next.grant_fifo.pop_front() {
+                    next.recent_grants.remove(&old_uuid);
                 }
             }
-            guard.grant_fifo.push_back(request_uuid);
-            guard.recent_grants.insert(request_uuid, grant);
+            next.grant_fifo.push_back(request_uuid);
+            next.recent_grants.insert(request_uuid, grant);
         }
 
-        // Persist incremented high-water mark BEFORE returning grant!
-        Self::persist_sync(&self.state_dir, &guard)?;
+        // Cache the grant and bump the watermark only after the new state is durable.
+        self.persist_sync(&next)?;
+        *guard = next;
         Ok(grant)
     }
 
@@ -177,11 +199,13 @@ impl DurableIdAllocator {
                 ));
             }
         }
-        guard.rename_fence_token = guard.rename_fence_token.saturating_add(1);
-        let token = guard.rename_fence_token;
+        let mut next = guard.clone();
+        next.rename_fence_token = next.rename_fence_token.saturating_add(1);
+        let token = next.rename_fence_token;
         let expire_hlc = HlcTimestamp::new(now_hlc.physical_ms() + ttl_ms.max(100), 0);
-        guard.active_rename_lease = Some((token, expire_hlc));
-        Self::persist_sync(&self.state_dir, &guard)?;
+        next.active_rename_lease = Some((token, expire_hlc));
+        self.persist_sync(&next)?;
+        *guard = next;
         Ok((token, expire_hlc))
     }
 
@@ -189,14 +213,26 @@ impl DurableIdAllocator {
         let mut guard = self.state.lock().unwrap();
         if let Some((active_tok, _)) = guard.active_rename_lease {
             if active_tok == token {
-                guard.active_rename_lease = None;
-                Self::persist_sync(&self.state_dir, &guard)?;
+                let mut next = guard.clone();
+                next.active_rename_lease = None;
+                self.persist_sync(&next)?;
+                *guard = next;
             }
         }
         Ok(())
     }
 
-    fn persist_sync(dir: &Path, st: &PersistedAllocatorState) -> Result<()> {
+    fn persist_sync(&self, st: &PersistedAllocatorState) -> Result<()> {
+        if self.fail_persists.load(Ordering::Relaxed) > 0 {
+            self.fail_persists.fetch_sub(1, Ordering::Relaxed);
+            return Err(MetaDbError::StorageIoError(
+                "injected persist_sync failure".to_string(),
+            ));
+        }
+        Self::write_state_file(&self.state_dir, st)
+    }
+
+    fn write_state_file(dir: &Path, st: &PersistedAllocatorState) -> Result<()> {
         let mut raw = bincode::serialize(st).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
         append_crc32c_le(&mut raw);
         let tmp = dir.join("ID_ALLOCATOR_STATE.tmp");

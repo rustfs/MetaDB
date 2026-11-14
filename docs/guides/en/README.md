@@ -37,6 +37,8 @@ MetaDB's 8-crate pure-Rust implementation is verified across all core subsystems
 
 ## Quickstart: Embedded Rust SDK (`PersistentMetaDbCluster` & `MetaDbEngine`)
 
+The crash-safe engine is the async `MetaDbEngine::open` / `PersistentMetaDbCluster` API (OpenRaft + WAL-less LSM on a real `data_dir`). `MetaDbEngine::new_single_node` is an **in-memory simulator** only: it does not open a data directory and must not be treated as the verified storage engine.
+
 Add `metadb-server` and `metadb-core` from the workspace to embed MetaDB directly inside a Rust application or test harness:
 
 ```toml
@@ -50,7 +52,7 @@ use metadb_core::ROOT_INODE_ID;
 use metadb_server::{MetaDbConfig, MetaDbEngine};
 
 fn main() -> metadb_core::Result<()> {
-    // 1. Boot a Stage 1 single-node engine (pre-initializes root directory `/` with PID = 1).
+    // In-memory simulator only — not durable. Use MetaDbEngine::open for the real engine.
     let engine = MetaDbEngine::new_single_node(MetaDbConfig::default());
 
     // 2. Create a subdirectory `/checkpoints` (dir_id = 100) and a file inside it (1-RTT pushdown).

@@ -37,6 +37,8 @@
 
 ## 快速开始：嵌入式 Rust SDK（`PersistentMetaDbCluster` 与 `MetaDbEngine`）
 
+可崩溃恢复的引擎是异步的 `MetaDbEngine::open` / `PersistentMetaDbCluster`（真实 `data_dir` 上的 OpenRaft + 无 WAL LSM）。`MetaDbEngine::new_single_node` 只是**内存模拟器**：它不会打开数据目录，不能当作已验证的存储引擎。
+
 在 Cargo 工程中引入工作区内的 `metadb-core` 与 `metadb-server`，即可在进程内直接嵌入运行 MetaDB：
 
 ```toml
@@ -50,7 +52,7 @@ use metadb_core::ROOT_INODE_ID;
 use metadb_server::{MetaDbConfig, MetaDbEngine};
 
 fn main() -> metadb_core::Result<()> {
-    // 1. 启动 Stage 1 单节点引擎（自动初始化根目录 `/`，PID = 1）
+    // 仅内存模拟器，不落盘。真实引擎请使用 MetaDbEngine::open。
     let engine = MetaDbEngine::new_single_node(MetaDbConfig::default());
 
     // 2. 创建子目录 `/checkpoints` (dir_id = 100) 并通过 1-RTT 下推写入文件元数据

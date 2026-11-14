@@ -218,6 +218,49 @@ async fn test_aux_outbox_spill_contiguous_frontiers_gap_rejection_and_cleanup() 
         .unwrap_err();
     assert!(matches!(gap_err, MetaDbError::AuxOutOfOrderGap { .. }));
 
+    // A valid quota delta followed by a gap must not leave the prefix applied.
+    let prefix_gap = TxRaftCmd::ApplyAuxBatch {
+        entries: vec![
+            AuxOutboxEntry {
+                origin_shard_id: 1,
+                origin_raft_index: 10,
+                task_ordinal: 0,
+                hlc: clock.now(),
+                payload: AuxTaskPayload::QuotaDelta {
+                    uid: 42,
+                    delta_bytes: 100,
+                    delta_inodes: 1,
+                    prev_uid_cursor: (0, 0),
+                },
+            },
+            AuxOutboxEntry {
+                origin_shard_id: 1,
+                origin_raft_index: 11,
+                task_ordinal: 0,
+                hlc: clock.now(),
+                payload: AuxTaskPayload::QuotaDelta {
+                    uid: 42,
+                    delta_bytes: 50,
+                    delta_inodes: 1,
+                    prev_uid_cursor: (50, 0),
+                },
+            },
+        ],
+    };
+    let prefix_err = quota_grp
+        .propose(
+            quota_grp.current_epoch(),
+            clock.now(),
+            bincode::serialize(&prefix_gap).unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(prefix_err, MetaDbError::AuxOutOfOrderGap { .. }));
+    assert!(
+        tx.get_quota(42).await.unwrap().is_none(),
+        "gapped ApplyAuxBatch must not persist the prefix delta"
+    );
+
     // 4. Drain outbox via `AuxDispatcher` -> verify exact quota (`4 * 4096` bytes, `4` inodes),
     //    replay same batch idempotently, and verify `[0x07]` spilled keys were cleaned up!
     let pending_snapshot = meta_handler.outbox().pending_entries();
