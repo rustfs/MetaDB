@@ -40,8 +40,21 @@ shard_split_threshold_bytes = 4294967296 # 4 GiB
 
 ### Launching Standalone Node
 
+Rust **1.100.0** is pinned in `rust-toolchain.toml`. Only `--role all-in-one` starts a process. `be`, `proxy`, `cell-manager`, and `global-manager` are parsed but rejected: this binary does not trim subsystems by role.
+
 ```bash
 metadbd --config /etc/metadb/standalone.toml
+```
+
+### Network exposure
+
+`MetadataService`, `TransactionService`, `ControlPlaneService`, and `RaftTransportService` do **not** terminate TLS. With an empty `[security].shared_secret` (the default) they also perform no application authentication. The default `grpc_listen_addr` is `127.0.0.1:7800`. Do not publish that socket on an untrusted network.
+
+Set a shared secret to require `authorization: Bearer <secret>` on metadata, transaction, and control-plane RPCs (Raft transport on the same port stays unauthenticated). `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --cell-manager` send that header:
+
+```toml
+[security]
+shared_secret = "replace-with-a-long-random-string"
 ```
 
 ---
@@ -57,6 +70,8 @@ As metadata grows past `shard_split_threshold_bytes`, `CellLocalManager` and `Po
 ## Stage 3: Online Scale-Out to `3-Voter` Multi-Raft & Multi-Cell Clusters `[Implemented]`
 
 ### Step 3.1: Zero-Downtime Upgrade from `1-Voter` to `3-Voter` HA
+
+> **Current binary**: role-trimmed `be` / `proxy` / `cell-manager` / `global-manager` processes are not implemented. `metadbd` only runs `all-in-one`. The steps below describe the intended topology; launching those roles fails fast instead of silently starting every subsystem.
 
 1. Start two additional Backend (`be`) nodes pointing to the existing control plane:
    ```bash

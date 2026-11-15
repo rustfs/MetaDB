@@ -40,6 +40,10 @@ shard_split_threshold_bytes = 4294967296 # 4 GiB 分片分裂阈值
 
 ### 启动单机服务
 
+工具链固定为 Rust **1.100.0**（`rust-toolchain.toml`）。当前只有 `all-in-one` 会真正启动；`be` / `proxy` / `cell-manager` / `global-manager` 会被拒绝，而不是静默变成全功能进程。
+
+gRPC 的 metadata、transaction、control-plane 与 Raft 传输**没有 TLS**。`[security].shared_secret` 为空时也没有应用层认证，默认监听 `127.0.0.1`。在补上共享密钥或外部 TLS 终结之前，不要把该端口暴露到不可信网络。非空 `shared_secret` 要求 metadata / transaction / control-plane 携带 `authorization: Bearer <secret>`（同一端口上的 Raft 传输仍不校验该密钥）。
+
 ```bash
 metadbd --config /etc/metadb/standalone.toml
 ```

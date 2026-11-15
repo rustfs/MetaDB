@@ -45,6 +45,8 @@ struct LogStoreInner {
     segments: Vec<SegmentFile>,
     active_file: Option<File>,
     max_segment_bytes: u64,
+    /// Test hook: the next `n` append fsyncs fail after the bytes are written.
+    fail_syncs: u32,
 }
 
 impl LogStoreInner {
@@ -153,6 +155,13 @@ impl LogStoreInner {
                 let frame_body = &raw[offset + 8..frame_end];
                 let actual_crc = checksum_crc32c(frame_body);
                 if actual_crc != expected_crc {
+                    // Truncate only a bad last frame of the last segment (torn tail).
+                    // Any earlier complete frame, or a non-final segment, refuses to open.
+                    let is_last_frame = frame_end == raw.len();
+                    if is_last_segment && is_last_frame {
+                        truncate_tail = Some(offset);
+                        break;
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -209,6 +218,7 @@ impl LogStoreInner {
             segments,
             active_file,
             max_segment_bytes,
+            fail_syncs: 0,
         })
     }
 
@@ -275,6 +285,21 @@ impl LogStoreInner {
             return Ok(());
         }
 
+        let prior_segments = self.segments.len();
+        let (tail_byte_len, tail_last_index) = self
+            .segments
+            .last()
+            .map(|s| (s.byte_len, s.last_index))
+            .unwrap_or((0, 0));
+        let new_indexes: Vec<u64> = batch.iter().map(|e| e.log_id().index).collect();
+        if let Err(err) = self.append_entries_mutating(batch) {
+            self.rollback_append(prior_segments, tail_byte_len, tail_last_index, &new_indexes);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn append_entries_mutating(&mut self, batch: Vec<EntryOf<MetaDbTypeConfig>>) -> io::Result<()> {
         for entry in batch {
             let log_idx = entry.log_id().index;
             let need_new_seg = match self.segments.last() {
@@ -308,10 +333,48 @@ impl LogStoreInner {
             self.entries.insert(log_idx, entry);
         }
 
+        if self.fail_syncs > 0 {
+            self.fail_syncs -= 1;
+            return Err(io::Error::other("injected raft append sync failure"));
+        }
         if let Some(af) = self.active_file.as_mut() {
             af.sync_data()?;
         }
         Ok(())
+    }
+
+    fn rollback_append(
+        &mut self,
+        prior_segments: usize,
+        tail_byte_len: u64,
+        tail_last_index: u64,
+        new_indexes: &[u64],
+    ) {
+        for idx in new_indexes {
+            self.entries.remove(idx);
+        }
+        self.active_file = None;
+        while self.segments.len() > prior_segments {
+            if let Some(seg) = self.segments.pop() {
+                let _ = fs::remove_file(&seg.path);
+            }
+        }
+        if prior_segments == 0 {
+            return;
+        }
+        if let Some(seg) = self.segments.last_mut() {
+            seg.byte_len = tail_byte_len;
+            seg.last_index = tail_last_index;
+            seg.entry_end_offsets.retain(|_, end| *end <= tail_byte_len);
+        }
+        let Some(path) = self.segments.last().map(|s| s.path.clone()) else {
+            return;
+        };
+        if let Ok(f) = OpenOptions::new().write(true).open(&path) {
+            let _ = f.set_len(tail_byte_len);
+            let _ = f.sync_data();
+        }
+        self.active_file = OpenOptions::new().append(true).open(&path).ok();
     }
 
     /// Crash-safe suffix-only truncation: never unlinks or rewrites committed prefix segments!
@@ -412,6 +475,11 @@ impl SegmentedRaftLogStore {
 
     pub fn retained_entry_count(&self) -> usize {
         self.inner.lock().unwrap().entries.len()
+    }
+
+    /// Test hook. The next `n` append fsyncs fail and roll the in-memory log back.
+    pub fn testing_fail_next_syncs(&self, n: u32) {
+        self.inner.lock().unwrap().fail_syncs = n;
     }
 
     pub fn segment_file_count(&self) -> usize {

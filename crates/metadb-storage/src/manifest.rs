@@ -353,6 +353,12 @@ impl ManifestLog {
             let payload = &raw[offset + 8..record_end];
             let actual_crc = checksum_crc32c(payload);
             if actual_crc != expected_crc {
+                // A bad CRC on the final record is a torn tail only when a valid record
+                // already precedes it. Truncating the sole baseline would drop every SST.
+                if record_end == raw.len() && offset > 0 {
+                    truncate_to = Some(offset);
+                    break;
+                }
                 return Err(MetaDbError::ManifestCorrupted(format!(
                     "MANIFEST CRC32C mismatch at offset {} (expected 0x{:08x}, got 0x{:08x})",
                     offset, expected_crc, actual_crc

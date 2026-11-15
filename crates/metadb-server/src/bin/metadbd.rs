@@ -92,6 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cell_id = cfg.node.cell_id;
 
     let metrics_addr_opt = cfg.node.metrics_listen_addr.clone();
+    let shared_secret = cfg.security.shared_secret.clone();
     let (cluster, bound_addr) = PersistentMetaDbCluster::open_and_serve(cfg).await?;
     tracing::info!(grpc_addr = %bound_addr, "metadbd online and serving requests");
 
@@ -101,7 +102,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             format!("http://{}", cm_ep)
         };
-        let mut cp = ControlPlaneServiceClient::connect(cm_url.clone()).await?;
+        let channel = tonic::transport::Endpoint::from_shared(cm_url.clone())?
+            .connect()
+            .await?;
+        let mut cp = ControlPlaneServiceClient::with_interceptor(
+            channel,
+            metadb_server::BearerAuth::new(shared_secret),
+        );
         let reg_resp = cp
             .register_node(RegisterNodeRequest {
                 cell_id,

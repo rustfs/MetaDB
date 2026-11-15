@@ -78,6 +78,8 @@ MetaDB runs the **exact same `StorageBackend` and `openraft` state machine** fro
 
 ## Build & Test
 
+The toolchain is pinned to Rust **1.100.0** in `rust-toolchain.toml` (`rustfmt`, `clippy`). Crate edition stays `2021`.
+
 ```bash
 cargo test --workspace
 ```

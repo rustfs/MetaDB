@@ -46,7 +46,7 @@ use metadb_core::ROOT_INODE_ID;
 use metadb_server::{MetaDbConfig, MetaDbEngine};
 
 fn main() -> metadb_core::Result<()> {
-    // 1. Stage 1 シングルノードエンジンを初期化（ルート `/` PID=1 を自動生成）
+    // インメモリシミュレータのみ（非永続）。実エンジンは MetaDbEngine::open。
     let engine = MetaDbEngine::new_single_node(MetaDbConfig::default());
 
     // 2. ディレクトリ `/checkpoints` とファイルエントリを 1-RTT プッシュダウンで作成

@@ -10,6 +10,10 @@ use metadb_raft::RaftNodeOptions;
 use metadb_storage::{LsmEngineConfig, DEFAULT_MVCC_RETENTION_MS};
 
 /// Operational role of a `metadbd` process.
+///
+/// Only [`ServerRole::AllInOne`] is implemented. The other variants are accepted by
+/// config parsing so deployments can name them, but `PersistentMetaDbCluster::open_and_serve`
+/// rejects them instead of silently starting every subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ServerRole {
@@ -83,6 +87,18 @@ impl Default for StorageSection {
     }
 }
 
+/// Application-level gRPC auth. TLS is not terminated by this process.
+///
+/// An empty `shared_secret` leaves metadata and control-plane RPCs unauthenticated.
+/// The default bind address is `127.0.0.1`. Do not publish that socket on an
+/// untrusted network until a secret (or an external TLS terminator) is configured.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecuritySection {
+    /// When non-empty, every gRPC call must send `authorization: Bearer <shared_secret>`.
+    pub shared_secret: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShardingSection {
@@ -107,6 +123,7 @@ pub struct ServerTomlConfig {
     pub clock: ClockSection,
     pub storage: StorageSection,
     pub sharding: ShardingSection,
+    pub security: SecuritySection,
     #[serde(skip)]
     pub raft_options: RaftNodeOptions,
 }

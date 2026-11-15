@@ -28,4 +28,4 @@ pub use shard::{
     PolicyShardSplitter, RaftMemberRole, RaftMembership, ShardDescriptor, ShardHealthState,
     ShardSplitMode,
 };
-pub use split_worker::{RaftShardSplitWorker, SplitCandidate};
+pub use split_worker::{RaftShardSplitWorker, SplitCandidate, SplitCrashPoint};

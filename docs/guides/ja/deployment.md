@@ -34,6 +34,8 @@ bootstrap_table_shards = true
 shard_split_threshold_bytes = 4294967296 # 4 GiB
 ```
 
+Rust 1.100.0（`rust-toolchain.toml`）。実装されているロールは `all-in-one` のみ。gRPC は既定で認証も TLS もなく、待受は `127.0.0.1`。信頼できないネットワークに公開しないこと。任意の `[security].shared_secret` は metadata / transaction / control-plane に `authorization: Bearer <secret>` を要求する。
+
 ```bash
 metadbd --config /etc/metadb/standalone.toml
 ```

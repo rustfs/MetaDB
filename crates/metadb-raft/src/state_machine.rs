@@ -453,6 +453,10 @@ impl ShardStateMachine {
 
         watermarks.advance_state_flushed(cp.flushed_raft_index);
         watermarks.advance_aux_outbox_durable(cp.contiguous_aux_acked_index);
+        // The MANIFEST flushed index is the local durability floor. Without this,
+        // `last_snapshot_index` stays 0 across process restarts and the 3-watermark
+        // purge gate never moves in production until an explicit OpenRaft snapshot.
+        watermarks.advance_last_snapshot(cp.flushed_raft_index);
         handler.on_snapshot_installed(&cp, &engine);
 
         let initial_frontier = AppliedFrontier {
@@ -522,7 +526,6 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
         while let Some(item) = entries.next().await {
             let (entry, responder) = item?;
             let log_id = entry.log_id();
-            *self.shared.last_applied_log_id.write().unwrap() = Some(log_id);
 
             let resp = match entry.payload {
                 EntryPayload::Blank => {
@@ -603,6 +606,10 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
                     }
                 }
             };
+
+            // Publish the applied index only after the handler has finished writing.
+            // A concurrent checkpoint must not observe index N before N's mutation is in the memtable.
+            *self.shared.last_applied_log_id.write().unwrap() = Some(log_id);
 
             let _ = self.shared.frontier_tx.send(AppliedFrontier {
                 raft_index: log_id.index,

@@ -268,7 +268,8 @@ async fn test_suffix_only_truncate_final_crc_rejection_and_snapshot_verification
     drop(reader);
     drop(reopened_store);
 
-    // 2. Corrupt 1 payload byte inside a COMPLETE frame of the final `.raftlog` segment -> must return `Err(InvalidData)`!
+    // 2. A bad CRC that is NOT the last frame of the last segment must refuse to open.
+    //    A bad CRC on the last frame of the last segment is a torn tail and is truncated.
     let mut seg_files: Vec<_> = fs::read_dir(&grp_raft_dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -281,17 +282,47 @@ async fn test_suffix_only_truncate_final_crc_rejection_and_snapshot_verification
         })
         .collect();
     seg_files.sort();
-    let last_seg = seg_files.last().unwrap();
-    let mut seg_bytes = fs::read(last_seg).unwrap();
-    let flip_idx = seg_bytes.len() - 2;
-    seg_bytes[flip_idx] ^= 0xFF;
-    fs::write(last_seg, &seg_bytes).unwrap();
-
+    assert!(
+        seg_files.len() >= 2,
+        "need a non-final segment to prove mid-log CRC is fatal"
+    );
+    let non_final = seg_files.first().unwrap().clone();
+    let non_final_orig = fs::read(&non_final).unwrap();
+    let mut non_final_bad = non_final_orig.clone();
+    assert!(non_final_bad.len() > 16);
+    non_final_bad[16] ^= 0xFF;
+    fs::write(&non_final, &non_final_bad).unwrap();
     let corrupt_err = match metadb_raft::SegmentedRaftLogStore::open(&grp_raft_dir, wm.clone()) {
-        Ok(_) => panic!("expected InvalidData on complete-frame CRC32C mismatch in final segment"),
+        Ok(_) => panic!("expected InvalidData on CRC mismatch before the last frame"),
         Err(e) => e,
     };
     assert_eq!(corrupt_err.kind(), std::io::ErrorKind::InvalidData);
+    fs::write(&non_final, &non_final_orig).unwrap();
+
+    let last_seg = seg_files.last().unwrap();
+    let last_orig = fs::read(last_seg).unwrap();
+    let mut last_bad = last_orig.clone();
+    let frames = raft_frame_ends(&last_bad);
+    assert!(
+        !frames.is_empty(),
+        "final segment must contain at least one frame"
+    );
+    let (frame_start, frame_end) = frames[frames.len() - 1];
+    let flip_at = frame_start + 12;
+    assert!(flip_at < frame_end);
+    last_bad[flip_at] ^= 0xFF;
+    fs::write(last_seg, &last_bad).unwrap();
+    let truncated = metadb_raft::SegmentedRaftLogStore::open(&grp_raft_dir, wm.clone())
+        .expect("last-frame CRC of the last segment must be truncated, not fatal");
+    let mut truncated_reader = truncated.clone();
+    let after_torn = truncated_reader.try_get_log_entries(0..=100).await.unwrap();
+    let torn_last = after_torn.last().map(|e| e.log_id.index).unwrap_or(0);
+    assert!(
+        torn_last < 8,
+        "torn final frame must be dropped, last index was {torn_last}"
+    );
+    drop(truncated_reader);
+    drop(truncated);
 
     // 3. Verify `ShardStateMachine::install_snapshot` rejects checkpoint index mismatch and tampered file CRC32C!
     let target_sm_dir = dir.path().join("sm_install_target");
@@ -337,4 +368,20 @@ async fn test_suffix_only_truncate_final_crc_rejection_and_snapshot_verification
         .install_snapshot(&valid_snap.meta, valid_snap.snapshot)
         .await
         .unwrap();
+}
+
+/// Returns `(frame_start, frame_end)` offsets for every complete frame after the 8-byte magic.
+fn raft_frame_ends(raw: &[u8]) -> Vec<(usize, usize)> {
+    let mut offset = 8usize;
+    let mut out = Vec::new();
+    while offset + 8 <= raw.len() {
+        let frame_len = u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap()) as usize;
+        let frame_end = offset + 8 + frame_len;
+        if frame_end > raw.len() || frame_len < 8 {
+            break;
+        }
+        out.push((offset, frame_end));
+        offset = frame_end;
+    }
+    out
 }
