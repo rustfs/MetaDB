@@ -175,7 +175,7 @@ pub async fn run_mixed(
         let ops = ops.clone();
         let errors = errors.clone();
         let dirs = dirs.clone();
-        let seed = profile.seed ^ (tid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let seed = worker_seed(profile.seed, tid);
         workers.push(tokio::spawn(async move {
             client_loop(
                 cluster, live, latencies, ops, errors, dirs, tid, seed, deadline,
@@ -236,9 +236,10 @@ async fn client_loop(
         state = mix(state);
         let dir_index = (state as usize) % dirs.len();
         let pid = dirs[dir_index];
-        let kind = (state >> 8) % 20;
+        // 0..8 create, 8..12 lookup, 12..15 dirstat, 15..17 listdir, 17..19 rename, 19 unlink.
+        let kind = op_kind(state);
         let op_started = Instant::now();
-        let ok = if kind < 10 {
+        let ok = if kind < 8 {
             seq += 1;
             let name = format!("c{tid:02}_{seq:06}.dat");
             match cluster
@@ -256,7 +257,7 @@ async fn client_loop(
                 }
                 Err(_) => false,
             }
-        } else if kind < 14 {
+        } else if kind < 12 {
             let target = mine.get(&pid).and_then(|names| names.last().cloned());
             match target {
                 Some(name) => tx.lookup(pid, &name).await.map(|found| found.is_some()) == Ok(true),
@@ -267,25 +268,44 @@ async fn client_loop(
                         == Ok(true)
                 }
             }
-        } else if kind < 17 {
+        } else if kind < 15 {
             tx.dirstat(pid).await.is_ok()
-        } else if kind < 19 {
+        } else if kind < 17 {
             tx.listdir_paginated(pid, None, None, 32).await.is_ok()
-        } else if let Some(src_name) = mine.get_mut(&pid).and_then(|names| names.pop()) {
-            let dst_pid = dirs[(dir_index + 1) % dirs.len()];
-            seq += 1;
-            let dst_name = format!("c{tid:02}_{seq:06}.renamed");
-            match tx.rename(pid, &src_name, dst_pid, &dst_name, false).await {
+        } else if kind < 19 {
+            if let Some(src_name) = mine.get_mut(&pid).and_then(|names| names.pop()) {
+                let dst_pid = dirs[(dir_index + 1) % dirs.len()];
+                seq += 1;
+                let dst_name = format!("c{tid:02}_{seq:06}.renamed");
+                match tx.rename(pid, &src_name, dst_pid, &dst_name, false).await {
+                    Ok(_) => {
+                        let mut guard = live.lock().unwrap();
+                        guard.get_mut(&pid).unwrap().remove(&src_name);
+                        guard.get_mut(&dst_pid).unwrap().insert(dst_name.clone());
+                        drop(guard);
+                        mine.get_mut(&dst_pid).unwrap().push(dst_name);
+                        true
+                    }
+                    Err(_) => {
+                        mine.get_mut(&pid).unwrap().push(src_name);
+                        false
+                    }
+                }
+            } else {
+                tx.dirstat(pid).await.is_ok()
+            }
+        } else if let Some((src_pid, src_name)) = take_owned_file(&mut mine, pid) {
+            match tx.unlink(src_pid, &src_name).await {
                 Ok(_) => {
-                    let mut guard = live.lock().unwrap();
-                    guard.get_mut(&pid).unwrap().remove(&src_name);
-                    guard.get_mut(&dst_pid).unwrap().insert(dst_name.clone());
-                    drop(guard);
-                    mine.get_mut(&dst_pid).unwrap().push(dst_name);
+                    live.lock()
+                        .unwrap()
+                        .get_mut(&src_pid)
+                        .unwrap()
+                        .remove(&src_name);
                     true
                 }
                 Err(_) => {
-                    mine.get_mut(&pid).unwrap().push(src_name);
+                    mine.get_mut(&src_pid).unwrap().push(src_name);
                     false
                 }
             }
@@ -469,9 +489,65 @@ fn push_detail(details: &mut Vec<String>, line: String) {
     }
 }
 
+fn worker_seed(profile_seed: u64, tid: usize) -> u64 {
+    let derived = profile_seed ^ (tid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    if derived == 0 {
+        // xorshift stays at zero forever, which would pin client 0 to create-only ops.
+        0x6A09_E667_F3BC_C909
+    } else {
+        derived
+    }
+}
+
+fn op_kind(state: u64) -> u64 {
+    (state >> 8) % 20
+}
+
+fn take_owned_file(
+    mine: &mut HashMap<InodeId, Vec<String>>,
+    preferred: InodeId,
+) -> Option<(InodeId, String)> {
+    if let Some(name) = mine.get_mut(&preferred).and_then(|names| names.pop()) {
+        return Some((preferred, name));
+    }
+    for (pid, names) in mine.iter_mut() {
+        if let Some(name) = names.pop() {
+            return Some((*pid, name));
+        }
+    }
+    None
+}
+
 fn mix(mut state: u64) -> u64 {
     state ^= state << 13;
     state ^= state >> 7;
     state ^= state << 17;
     state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mix, op_kind, worker_seed};
+
+    #[test]
+    fn zero_seed_mixes_and_can_select_unlink() {
+        let mut state = worker_seed(0, 0);
+        assert_ne!(state, 0);
+        let colliding = 3u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        assert_ne!(worker_seed(colliding, 3), 0);
+
+        let mut saw_unlink = false;
+        let mut saw_other = false;
+        for _ in 0..4_096 {
+            state = mix(state);
+            assert_ne!(state, 0);
+            if op_kind(state) == 19 {
+                saw_unlink = true;
+            } else {
+                saw_other = true;
+            }
+        }
+        assert!(saw_unlink, "unlink (kind 19) must be reachable");
+        assert!(saw_other, "a zero seed must not collapse to one op");
+    }
 }
