@@ -29,6 +29,19 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql "SELECT * FROM MetaTable WHERE pid = 1 
 
 # Run single-directory hotspot write & bulk-TTL-delete listdir benchmarks
 metadb-ctl --endpoint 127.0.0.1:7800 bench --workload hotspot-create --concurrency 64 --ops 100000
+
+# In-process mixed workload (create, lookup, dirstat, listdir, rename, unlink).
+# Prints ops, error counts, latency percentiles, and checks directory listings plus quota.
+# `smoke` is 5s and ignores METADB_STRESS_*. `local` defaults to 30s and reads:
+#   METADB_STRESS_DURATION_SECS, METADB_STRESS_CONCURRENCY, METADB_STRESS_KEYSPACE, METADB_STRESS_SEED
+metadb-ctl bench --embedded --profile smoke
+metadb-ctl bench --embedded --profile local --duration-secs 120 --concurrency 16 --keyspace 32
+```
+
+The same harness is `metadb_server::stress`. `cargo test --workspace` runs the smoke profile. The longer local profile is:
+
+```bash
+cargo test -p metadb-server --test stress_harness stress_local -- --ignored --nocapture
 ```
 
 ---

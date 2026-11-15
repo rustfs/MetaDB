@@ -81,8 +81,42 @@ MetaDB runs the **exact same `StorageBackend` and `openraft` state machine** fro
 The toolchain is pinned to Rust **1.100.0** in `rust-toolchain.toml` (`rustfmt`, `clippy`). Crate edition stays `2021`.
 
 ```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+`cargo test --workspace` includes the persistent topology suites and the stress smoke. T1–T6 still exercise the in-memory `MetaDbEngine::new_single_node` simulator. The new suites open a real `data_dir` through `PersistentMetaDbCluster` / `DurableCellManager`.
+
+| Suite | Command |
+| :--- | :--- |
+| Single-node metadata, shutdown, and reopen | `cargo test -p metadb-server --test topology_single_node` |
+| Single-node shard split and keyspace coverage | `cargo test -p metadb-server --test topology_scale_out` |
+| 3-voter membership, metadata, leader change, and voter restart | `cargo test -p metadb-server --test topology_distributed` |
+| Stress smoke (5s mixed workload, correctness, latency) | `cargo test -p metadb-server --test stress_harness stress_smoke -- --nocapture` |
+
+### Stress profiles
+
+The reusable harness is `metadb_server::stress`. The smoke profile is fixed (5 seconds, 4 clients, 4 directories) and does not read the environment, so CI stays bounded. The local profile is ignored by `cargo test --workspace`:
+
+```bash
+# Defaults: 30s, concurrency 8, 16 directories.
+METADB_STRESS_DURATION_SECS=120 \
+METADB_STRESS_CONCURRENCY=16 \
+METADB_STRESS_KEYSPACE=32 \
+METADB_STRESS_SEED=7 \
+  cargo test -p metadb-server --test stress_harness stress_local -- --ignored --nocapture
+
+# Same harness inside a temporary all-in-one process:
+cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile smoke
+cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile local
+```
+
+`METADB_STRESS_DURATION_SECS`, `METADB_STRESS_CONCURRENCY`, `METADB_STRESS_KEYSPACE`, and `METADB_STRESS_SEED` apply to the local profile and to `metadb-ctl bench --embedded --profile local`. Explicit `--duration-secs`, `--concurrency`, `--keyspace`, and `--seed` override the profile.
+
+`metadb-ctl bench --workload hotspot-create` and `--workload bulk-ttl-delete` still drive a remote gRPC endpoint and report throughput. `--workload mixed` is the embedded harness.
+
+`metadbd` only runs `--role all-in-one`. The distributed test therefore builds a 3-voter cell in-process with localhost Raft ports via `DurableCellManager::scale_out_replicas`. It does not start three `metadbd` processes, and it does not cover a second Cell.
 
 ## License
 
