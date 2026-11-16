@@ -2,6 +2,9 @@
 
 Welcome to the official documentation hub for **MetaDB** (`rustfs/MetaDB`), a 100% pure-Rust, file-system structure-aware distributed metadata database engine built for [RustFS](https://github.com/rustfs).
 
+> **Implementation guides for this tree:** [English](./en/README.md) | [Français](./fr/README.md) | [Deutsch](./de/README.md) | [日本語](./ja/README.md) | [简体中文](./zh/README.md).
+> Those pages follow the code, including the limit that `open_and_serve` runs only `all-in-one`. The guides linked below were written earlier. Some of their multi-role and multi-cell steps are rejected or ignored by the current binary. Use `docs/{en,fr,de,ja,zh}` for operator procedures.
+
 ---
 
 ## Multilingual User & Operator Guides

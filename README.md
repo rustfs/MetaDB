@@ -2,7 +2,8 @@
 
 **MetaDB** is a high-performance, 100% pure-Rust, file-system structure-aware distributed transactional metadata database engine built for [RustFS](https://github.com/rustfs).
 
-* **User & Operator Guides**: [Documentation Hub](./docs/README.md) — [English](./docs/guides/en/README.md) | [日本語](./docs/guides/ja/README.md) | [Français](./docs/guides/fr/README.md) | [简体中文](./docs/guides/zh/README.md) | [Deutsch](./docs/guides/de/README.md)
+* **Implementation guides** (what this tree runs): [English](./docs/en/README.md) | [Français](./docs/fr/README.md) | [Deutsch](./docs/de/README.md) | [日本語](./docs/ja/README.md) | [简体中文](./docs/zh/README.md)
+* **Earlier operator guides**: [Documentation Hub](./docs/README.md) — [English](./docs/guides/en/README.md) | [日本語](./docs/guides/ja/README.md) | [Français](./docs/guides/fr/README.md) | [简体中文](./docs/guides/zh/README.md) | [Deutsch](./docs/guides/de/README.md)
 * **Architecture & Engineering**: [`Architecture.md`](./Architecture.md) | [`docs/DEVELOPMENT_PLAN.md`](./docs/DEVELOPMENT_PLAN.md) | [`docs/designs/SITEMAP.md`](./docs/designs/SITEMAP.md) | [`docs/designs/review_report.md`](./docs/designs/review_report.md)
 
 > **Academic & Architectural Attribution**:
@@ -51,6 +52,8 @@ MetaDB runs the **exact same `StorageBackend` and `openraft` state machine** fro
 * **Stage 2 — Dynamic Multi-Shard Split**: Automatically splits shards along `group_key = PID` boundaries on a single host.
 * **Stage 3 — Multi-Cell Distributed Cluster (`3-Voter` Multi-Raft)**: Online `AddLearner` -> SSTable snapshot catch-up -> joint-consensus `Voter` promotion, decentralized `HLC` clocks, stateless `MetaCache`, and a **Two-Tier Control Plane (`GlobalManager` + `CellLocalManager`)**.
 
+`metadbd` today runs Stage 1, plus in-process PID-boundary splits (Stage 2) on that same process. `open_and_serve` rejects every role except `all-in-one`. A second process bootstraps its own cell. `RegisterCell` does not store a second Cell. Learner promotion exists in-process; a three-`metadbd` deployment does not. See [docs/en/operations.md](./docs/en/operations.md).
+
 ---
 
 ## 8-Crate Pure-Rust Workspace Architecture
@@ -70,6 +73,8 @@ MetaDB runs the **exact same `StorageBackend` and `openraft` state machine** fro
 
 ## Current Implementation Status
 
+Phase completion in the list below means the crates and the tests in [docs/en/testing.md](./docs/en/testing.md) are in this tree. It does not mean a multi-process Cell deployment is supported.
+
 * **Phases 0–6 Completed & Verified**:
   * **Phase 0**: Master `Architecture.md`, EGM subsystem specs, zero-context Goldfish review & resolutions (`B1`–`B18`, `N1`–`N5`), `DEVELOPMENT_PLAN.md`, and 5-language usage guides (`en`, `ja`, `fr`, `zh`, `de`).
   * **Phases 1–6**: Full 8-crate 100% pure-Rust implementation (`zero C/C++ FFI`) passing `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` (including fault-injection suites for SSTable/MANIFEST crash recovery, `SnapshotGuard` `ReadCut` isolation, `LocalityCompactor`, `1-Voter -> 3-Voter` Multi-Raft snapshot promotion & leader failover, `[0x07]` outbox spill/cleanup, 2PC crash recovery, 3-way `DualModeFineGrained` scatter-gather, all 20 SQL templates, and end-to-end gRPC cluster evolution).
@@ -86,7 +91,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-`cargo test --workspace` includes the persistent topology suites and the stress smoke. T1–T6 still exercise the in-memory `MetaDbEngine::new_single_node` simulator. The new suites open a real `data_dir` through `PersistentMetaDbCluster` / `DurableCellManager`.
+Operator and developer guides in English, French, German, Japanese, and Simplified Chinese are under [docs/en/](./docs/en/README.md) (and `docs/fr`, `docs/de`, `docs/ja`, `docs/zh`).
+
+`cargo test --workspace` includes the persistent topology suites and the stress smoke. T1–T6 still exercise the in-memory `MetaDbEngine::new_single_node` simulator. The persistent suites open a real `data_dir` through `PersistentMetaDbCluster` / `DurableCellManager`.
 
 | Suite | Command |
 | :--- | :--- |
@@ -120,7 +127,7 @@ cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile local
 
 `metadb-ctl bench --workload hotspot-create` and `--workload bulk-ttl-delete` still drive a remote gRPC endpoint and report throughput only. `--workload mixed` is the embedded harness.
 
-`metadbd` only runs `--role all-in-one`. The distributed test therefore builds a 3-voter cell in-process with localhost Raft ports via `DurableCellManager::scale_out_replicas`. It does not start three `metadbd` processes, and it does not cover a second Cell.
+`metadbd` only runs `--role all-in-one`. `topology_distributed` still builds a 3-voter cell in-process. A second OS process can join that cell's Raft groups: `cargo test -p metadb-server --test join_existing_group`. `RegisterCell` does not create a second Cell. CI runs `cargo fmt`, `cargo clippy --locked`, and `cargo test --locked`, times the job out at 45 minutes, cancels a superseded run, and rejects a bare `#[ignore]` attribute.
 
 ## License
 
