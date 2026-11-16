@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use metadb_core::schema::validate_user_entry_name;
 use metadb_core::{
@@ -21,6 +21,8 @@ use crate::rename_cycle::RenameCycleWalker;
 pub struct PushdownExecutor {
     attr_aggregator: Arc<AsyncAttrAggregator>,
     aux_sink: Arc<AsyncAuxiliarySink>,
+    /// Serializes mkdir's inode claim and both namespace writes.
+    mkdir_gate: Mutex<()>,
 }
 
 impl PushdownExecutor {
@@ -31,6 +33,7 @@ impl PushdownExecutor {
         Self {
             attr_aggregator,
             aux_sink,
+            mkdir_gate: Mutex::new(()),
         }
     }
 
@@ -162,6 +165,7 @@ impl PushdownExecutor {
         mode: u32,
         hlc: HlcTimestamp,
     ) -> Result<MetaEntry> {
+        let _gate = self.mkdir_gate.lock().unwrap();
         validate_user_entry_name(name)?;
         validate_dir_inode_id(new_dir_id)?;
 
@@ -201,8 +205,9 @@ impl PushdownExecutor {
             applied_lsn: 0,
         };
 
-        parent_engine.put(child_key_bytes, dir_entry_attr.encode(), hlc);
+        // Claim the inode before publishing the parent dentry. A failed claim leaves no alias.
         self.init_directory_attr(new_dir_engine, new_dir_id, pid, uid, mode, hlc)?;
+        parent_engine.put(child_key_bytes, dir_entry_attr.encode(), hlc);
 
         self.attr_aggregator
             .record_delta(parent_engine, pid, 1, 0, hlc);
@@ -395,6 +400,7 @@ impl TwoPhaseCommitCoordinator {
         &self,
         src_engine: &LifecycleStorageEngine,
         dst_engine: &LifecycleStorageEngine,
+        inode_engine: &LifecycleStorageEngine,
         src_pid: InodeId,
         src_name: &str,
         dst_pid: InodeId,
@@ -429,13 +435,13 @@ impl TwoPhaseCommitCoordinator {
         }
 
         if attr.entry_type == EntryType::Directory && src_pid != dst_pid {
+            let lookup_engines = [inode_engine, dst_engine, src_engine];
             RenameCycleWalker::new(attr.inode_id, dst_pid).walk(|cursor| {
                 let key = MetaKey::dir_attr(cursor).encode();
-                if let Some(raw) = dst_engine.get(&key, commit_hlc)? {
-                    return Ok(Some(InodeAttr::decode(&raw)?.parent_pid));
-                }
-                if let Some(raw) = src_engine.get(&key, commit_hlc)? {
-                    return Ok(Some(InodeAttr::decode(&raw)?.parent_pid));
+                for engine in lookup_engines {
+                    if let Some(raw) = engine.get(&key, commit_hlc)? {
+                        return Ok(Some(InodeAttr::decode(&raw)?.parent_pid));
+                    }
                 }
                 Ok(None)
             })?;
@@ -450,7 +456,7 @@ impl TwoPhaseCommitCoordinator {
 
         if attr.entry_type == EntryType::Directory && src_pid != dst_pid {
             let dir_key = MetaKey::dir_attr(attr.inode_id).encode();
-            for engine in [dst_engine, src_engine] {
+            for engine in [inode_engine, dst_engine, src_engine] {
                 if let Some(raw) = engine.get(&dir_key, commit_hlc)? {
                     let mut dir_self = InodeAttr::decode(&raw)?;
                     dir_self.parent_pid = dst_pid;
@@ -486,5 +492,63 @@ impl TwoPhaseCommitCoordinator {
         }
 
         Ok(MetaEntry { key: dst_key, attr })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use metadb_core::{EntryType, HlcTimestamp, InodeAttr, MetaKey};
+    use metadb_storage::LifecycleStorageEngine;
+
+    use super::*;
+
+    #[test]
+    fn rename_updates_directory_attr_on_its_own_shard() {
+        let src = LifecycleStorageEngine::new(1, 5_000, 128, false);
+        let dst = LifecycleStorageEngine::new(2, 5_000, 128, false);
+        let inode_engine = LifecycleStorageEngine::new(3, 5_000, 128, false);
+        let hlc = HlcTimestamp::new(10, 0);
+        let push = Arc::new(PushdownExecutor::new(
+            Arc::new(AsyncAttrAggregator::new()),
+            Arc::new(AsyncAuxiliarySink::new()),
+        ));
+        push.init_directory_attr(&src, 1, 1, 0, 0o755, hlc).unwrap();
+        push.init_directory_attr(&dst, 20, 1, 0, 0o755, hlc)
+            .unwrap();
+        push.init_directory_attr(&inode_engine, 30, 1, 1, 0o755, hlc)
+            .unwrap();
+        let dentry = InodeAttr {
+            inode_id: 30,
+            parent_pid: 1,
+            entry_type: EntryType::Directory,
+            uid: 1,
+            mode: 0o755,
+            link_count: 1,
+            num_children: 0,
+            size_bytes: 0,
+            create_time: hlc,
+            modify_time: hlc,
+            fid: None,
+            applied_lsn: 0,
+        };
+        src.put(MetaKey::child(1, "child").encode(), dentry.encode(), hlc);
+        TwoPhaseCommitCoordinator::new(push)
+            .rename(&src, &dst, &inode_engine, 1, "child", 20, "moved", hlc)
+            .unwrap();
+        let raw = inode_engine
+            .get(&MetaKey::dir_attr(30).encode(), hlc)
+            .unwrap()
+            .unwrap();
+        assert_eq!(InodeAttr::decode(&raw).unwrap().parent_pid, 20);
+        assert!(src
+            .get(&MetaKey::child(1, "child").encode(), hlc)
+            .unwrap()
+            .is_none());
+        assert!(dst
+            .get(&MetaKey::child(20, "moved").encode(), hlc)
+            .unwrap()
+            .is_some());
     }
 }

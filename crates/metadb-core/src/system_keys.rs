@@ -5,6 +5,7 @@
 //! - `0x05`: `WriteIntent` (Raft-replicated 2PC participant locks)
 //! - `0x06`: `TxnRecord` (Primary-Anchored 2PC commit/abort source of truth)
 //! - `0x07`: `SpilledAuxOutbox` (`[0x07][origin_raft_index: 8B BE][task_ordinal: 2B BE]`)
+//! - `0x08`: `OriginQuotaCursor` (`[0x08][uid: 8B BE]`), retained after the task is acknowledged
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,8 +17,8 @@ use crate::error::{MetaDbError, Result};
 use crate::hlc::HlcTimestamp;
 use crate::schema::{
     FileId, InodeId, MetaKey, ShardId, UserId, SYSTEM_PREFIX_DIR_SHARD_DELTA,
-    SYSTEM_PREFIX_SPILLED_AUX_OUTBOX, SYSTEM_PREFIX_TXN_RECORD, SYSTEM_PREFIX_WRITE_INTENT,
-    TABLE_PREFIX_META, TABLE_PREFIX_SECONDARY_INDEX,
+    SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR, SYSTEM_PREFIX_SPILLED_AUX_OUTBOX, SYSTEM_PREFIX_TXN_RECORD,
+    SYSTEM_PREFIX_WRITE_INTENT, TABLE_PREFIX_META, TABLE_PREFIX_SECONDARY_INDEX,
 };
 
 const SYSTEM_CODEC_V1: u8 = 1;
@@ -141,12 +142,6 @@ pub enum IntentOp {
         attr_deltas: Vec<AttrDeltaSpec>,
         aux_specs: Vec<AuxIntentSpec>,
     },
-    /// Exclusive create. Prepare and commit both reject the intent when `user_key` already exists.
-    Insert {
-        value: Vec<u8>,
-        attr_deltas: Vec<AttrDeltaSpec>,
-        aux_specs: Vec<AuxIntentSpec>,
-    },
     /// Exclusive write lock proposing a key deletion.
     Delete {
         attr_deltas: Vec<AttrDeltaSpec>,
@@ -162,6 +157,14 @@ pub enum IntentOp {
     DirExistsFenceSet {
         /// Map from `txn_id` -> `(primary_key, expire_hlc)` for concurrent cross-shard `Rename`/`Mkdir`.
         holders: BTreeMap<TxnId, (Vec<u8>, HlcTimestamp)>,
+    },
+    /// Exclusive create. Prepare and commit both reject the intent when `user_key` already exists.
+    ///
+    /// Appended so the bincode tags of `Put`, `Delete`, `DeletingDir`, and `DirExistsFenceSet` stay stable.
+    Insert {
+        value: Vec<u8>,
+        attr_deltas: Vec<AttrDeltaSpec>,
+        aux_specs: Vec<AuxIntentSpec>,
     },
 }
 
@@ -350,6 +353,65 @@ impl SpilledAuxOutboxKey {
     }
 }
 
+/// Last quota cursor emitted by an origin shard for one user (`[0x08][uid: 8B BE]`).
+///
+/// Kept after the corresponding `[0x07]` task is acknowledged so a restarted outbox
+/// does not claim `prev_uid_cursor = (0, 0)` against a cursor the quota shard already applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OriginQuotaCursorKey {
+    pub uid: UserId,
+}
+
+impl OriginQuotaCursorKey {
+    pub fn encode(self) -> [u8; 9] {
+        let mut buf = [0u8; 9];
+        buf[0] = SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR;
+        buf[1..9].copy_from_slice(&self.uid.to_be_bytes());
+        buf
+    }
+
+    pub const fn prefix_start() -> [u8; 1] {
+        [SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR]
+    }
+
+    pub const fn prefix_end() -> [u8; 1] {
+        [SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR + 1]
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 9 || bytes[0] != SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR {
+            return Err(MetaDbError::CodecError(
+                "invalid OriginQuotaCursorKey".to_string(),
+            ));
+        }
+        Ok(Self {
+            uid: u64::from_be_bytes(bytes[1..9].try_into().unwrap()),
+        })
+    }
+}
+
+pub fn encode_origin_quota_cursor(raft_index: u64, task_ordinal: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 8 + 2 + 4);
+    buf.push(SYSTEM_CODEC_V1);
+    buf.extend_from_slice(&raft_index.to_be_bytes());
+    buf.extend_from_slice(&task_ordinal.to_be_bytes());
+    append_crc32c_be(&mut buf);
+    buf
+}
+
+pub fn decode_origin_quota_cursor(bytes: &[u8]) -> Result<(u64, u16)> {
+    let body = verify_crc32c_be(bytes, "OriginQuotaCursor")?;
+    if body.len() != 11 || body[0] != SYSTEM_CODEC_V1 {
+        return Err(MetaDbError::CodecError(
+            "invalid OriginQuotaCursor".to_string(),
+        ));
+    }
+    Ok((
+        u64::from_be_bytes(body[1..9].try_into().unwrap()),
+        u16::from_be_bytes(body[9..11].try_into().unwrap()),
+    ))
+}
+
 /// Persisted auxiliary outbox entry stored in `[0x07]` or dispatched via `ApplyAuxBatchRpc`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuxOutboxEntry {
@@ -412,7 +474,7 @@ pub fn affinity_key_for_raw_entry(raw_key: &[u8], raw_value: &[u8]) -> Result<Op
             let rec = TxnStatusRecord::decode(raw_value)?;
             Ok(Some(rec.primary_key))
         }
-        SYSTEM_PREFIX_SPILLED_AUX_OUTBOX => Ok(None),
+        SYSTEM_PREFIX_SPILLED_AUX_OUTBOX | SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR => Ok(None),
         other => Err(MetaDbError::CodecError(format!(
             "unknown keyspace prefix 0x{:02x}",
             other

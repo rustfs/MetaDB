@@ -1,6 +1,9 @@
 //! Adversarial checks against the in-memory engine: path-component names, non-negative
 //! sizes, quota saturation, directory-inode reuse, and deep rename cycles.
 
+use std::sync::Arc;
+use std::thread;
+
 use metadb_core::{MetaDbError, ROOT_INODE_ID};
 use metadb_server::{MetaDbConfig, MetaDbEngine};
 
@@ -93,6 +96,32 @@ fn reused_directory_inode_does_not_clobber_attr() {
         }
     ));
     assert_eq!(db.dirstat(ROOT_INODE_ID).unwrap().num_children, 1);
+}
+
+#[test]
+fn concurrent_mkdir_claims_one_inode() {
+    let db = Arc::new(engine());
+    let mut handles = Vec::new();
+    for i in 0..8u64 {
+        let db = Arc::clone(&db);
+        handles.push(thread::spawn(move || {
+            db.mkdir(ROOT_INODE_ID, &format!("n{i}"), 50, i, 0o755)
+        }));
+    }
+    let winners: Vec<_> = handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .filter(|r| r.is_ok())
+        .collect();
+    assert_eq!(winners.len(), 1);
+    let names: Vec<_> = db
+        .listdir(ROOT_INODE_ID)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.key.name)
+        .collect();
+    assert_eq!(names.len(), 1);
+    assert_eq!(db.dirstat(50).unwrap().num_children, 0);
 }
 
 #[test]

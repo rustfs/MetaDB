@@ -12,8 +12,6 @@ pub type Result<T> = std::result::Result<T, MetaDbError>;
 pub enum MetaDbError {
     /// Attempted to use a reserved or illegal entry name (`"_attr_"`, `"."`, `".."`, empty, NUL, or a path separator).
     ReservedEntryName(String),
-    /// Caller supplied a negative file size. Sizes are non-negative byte counts.
-    InvalidFileSize(i64),
     /// Target file or directory entry already exists.
     AlreadyExists { pid: u64, name: String },
     /// Target file or directory entry was not found.
@@ -85,6 +83,10 @@ pub enum MetaDbError {
     ConsensusError(String),
     /// Lightweight SQL template parse error.
     SqlParseError(String),
+    /// Caller supplied a negative file size. Sizes are non-negative byte counts.
+    ///
+    /// Appended so existing bincode variant tags stay stable for `ErrorDetailProto`.
+    InvalidFileSize(i64),
 }
 
 impl fmt::Display for MetaDbError {

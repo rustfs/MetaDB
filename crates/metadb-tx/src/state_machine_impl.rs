@@ -357,6 +357,7 @@ impl TxStateMachineHandler {
                 validate_dir_inode_id(dir_id)?;
                 let key = MetaKey::dir_attr(dir_id).encode();
                 self.ensure_user_key_in_range(&key)?;
+                Self::ensure_no_conflicting_intent(engine, &key, false)?;
                 if Self::read_latest_in_apply(engine, &key)?.is_some() {
                     return Err(MetaDbError::AlreadyExists {
                         pid: dir_id,
@@ -1726,6 +1727,8 @@ impl ShardApplyHandler for TxStateMachineHandler {
         let cmd: TxRaftCmd = bincode::deserialize(&request.payload)
             .map_err(|e| MetaDbError::CodecError(e.to_string()))?;
         let out = self.apply_tx_cmd(raft_index, commit_hlc, cmd, engine)?;
+        self.outbox
+            .persist_quota_cursors(engine, commit_hlc, raft_index);
         bincode::serialize(&out).map_err(|e| MetaDbError::CodecError(e.to_string()))
     }
 

@@ -39,6 +39,8 @@ pub const SYSTEM_PREFIX_DIR_SHARD_DELTA: u8 = 0x04;
 pub const SYSTEM_PREFIX_WRITE_INTENT: u8 = 0x05;
 pub const SYSTEM_PREFIX_TXN_RECORD: u8 = 0x06;
 pub const SYSTEM_PREFIX_SPILLED_AUX_OUTBOX: u8 = 0x07;
+/// Per-origin-shard last emitted quota cursor. Stays on the origin shard across splits.
+pub const SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR: u8 = 0x08;
 
 /// Total-order version tuple `(hlc, origin_shard_id, origin_raft_index, task_ordinal)`
 /// used by `SecondaryIndexTable` to break cross-shard HLC ties deterministically.
@@ -754,5 +756,47 @@ mod tests {
         assert_eq!(saturating_add_i64(10, -3), 7);
         assert_eq!(negate_accounted_size(-50), 0);
         assert_eq!(negate_accounted_size(50), -50);
+    }
+
+    #[test]
+    fn bincode_variant_tags_stay_stable() {
+        let not_found = MetaDbError::NotFound {
+            pid: 1,
+            name: "a".to_string(),
+        };
+        assert_eq!(
+            &bincode::serialize(&not_found).unwrap()[..4],
+            &2u32.to_le_bytes()
+        );
+        let already = MetaDbError::AlreadyExists {
+            pid: 1,
+            name: "a".to_string(),
+        };
+        assert_eq!(
+            &bincode::serialize(&already).unwrap()[..4],
+            &1u32.to_le_bytes()
+        );
+        assert_eq!(
+            &bincode::serialize(&MetaDbError::InvalidFileSize(-1)).unwrap()[..4],
+            &23u32.to_le_bytes()
+        );
+
+        let delete = IntentOp::Delete {
+            attr_deltas: vec![],
+            aux_specs: vec![],
+        };
+        assert_eq!(
+            &bincode::serialize(&delete).unwrap()[..4],
+            &1u32.to_le_bytes()
+        );
+        let insert = IntentOp::Insert {
+            value: vec![],
+            attr_deltas: vec![],
+            aux_specs: vec![],
+        };
+        assert_eq!(
+            &bincode::serialize(&insert).unwrap()[..4],
+            &4u32.to_le_bytes()
+        );
     }
 }

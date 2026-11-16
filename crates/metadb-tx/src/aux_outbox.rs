@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use metadb_core::{
-    saturating_add_i64, AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, DirShardDeltaKey,
-    DirShardDeltaRecord, HlcTimestamp, InodeAttr, InodeId, MetaKey, Result, ShardId,
-    SpilledAuxOutboxKey, UserId,
+    decode_origin_quota_cursor, encode_origin_quota_cursor, saturating_add_i64, AuxIntentSpec,
+    AuxOutboxEntry, AuxTaskPayload, DirShardDeltaKey, DirShardDeltaRecord, HlcTimestamp, InodeAttr,
+    InodeId, MetaKey, OriginQuotaCursorKey, Result, ShardId, SpilledAuxOutboxKey, UserId,
 };
 use metadb_raft::ShardWatermarkTracker;
 use metadb_storage::{LifecycleStorageEngine, MvccValue, SnapshotGuard, ViewAtRaftIndex};
@@ -369,6 +369,26 @@ impl ShardAuxOutbox {
         }
     }
 
+    /// Writes each quota cursor emitted by `raft_index` to `[0x08][uid]`.
+    ///
+    /// Acknowledged `[0x07]` tasks are deleted, so rehydrate cannot recover the predecessor
+    /// from the spill alone.
+    pub fn persist_quota_cursors(
+        &self,
+        engine: &LifecycleStorageEngine,
+        hlc: HlcTimestamp,
+        raft_index: u64,
+    ) {
+        let guard = self.inner.read().unwrap();
+        for (&uid, &(idx, ord)) in &guard.last_uid_cursor {
+            if idx != raft_index {
+                continue;
+            }
+            let key = OriginQuotaCursorKey { uid }.encode().to_vec();
+            engine.apply_committed_put(key, encode_origin_quota_cursor(idx, ord), hlc, raft_index);
+        }
+    }
+
     /// Spills un-acked tasks `<= sealed_raft_index` into `[0x07][origin_raft_index][task_ordinal]`
     /// whenever `force_spill_next_seal` is set OR unspilled task count `>= spill_threshold`.
     pub fn spill_into_seal_batch(
@@ -479,9 +499,11 @@ impl ShardAuxOutbox {
             let sk = SpilledAuxOutboxKey::decode(&k_bytes)?;
             let entry = AuxOutboxEntry::decode(&v_bytes)?;
             if let AuxTaskPayload::QuotaDelta { uid, .. } = &entry.payload {
-                guard
-                    .last_uid_cursor
-                    .insert(*uid, (sk.origin_raft_index, sk.task_ordinal));
+                bump_uid_cursor(
+                    &mut guard.last_uid_cursor,
+                    *uid,
+                    (sk.origin_raft_index, sk.task_ordinal),
+                );
             }
             guard.tasks.insert(
                 (sk.origin_raft_index, sk.task_ordinal),
@@ -491,6 +513,17 @@ impl ShardAuxOutbox {
                     durable_spilled: true,
                 },
             );
+        }
+
+        let cursor_rows = engine.scan_with_snapshot(
+            &OriginQuotaCursorKey::prefix_start(),
+            &OriginQuotaCursorKey::prefix_end(),
+            &snap,
+        )?;
+        for (k_bytes, v_bytes) in cursor_rows {
+            let key = OriginQuotaCursorKey::decode(&k_bytes)?;
+            let cursor = decode_origin_quota_cursor(&v_bytes)?;
+            bump_uid_cursor(&mut guard.last_uid_cursor, key.uid, cursor);
         }
 
         let frontier = guard.contiguous_durable_frontier();
@@ -514,5 +547,68 @@ impl ShardAuxOutbox {
 
     pub fn contiguous_durable_frontier(&self) -> u64 {
         self.inner.read().unwrap().contiguous_durable_frontier()
+    }
+}
+
+fn bump_uid_cursor(map: &mut BTreeMap<UserId, (u64, u16)>, uid: UserId, cursor: (u64, u16)) {
+    map.entry(uid)
+        .and_modify(|cur| {
+            if cursor > *cur {
+                *cur = cursor;
+            }
+        })
+        .or_insert(cursor);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use metadb_core::{AuxIntentSpec, AuxTaskPayload, HlcTimestamp};
+    use metadb_raft::ShardWatermarkTracker;
+    use metadb_storage::LifecycleStorageEngine;
+
+    use super::*;
+
+    #[test]
+    fn rehydrate_keeps_acked_quota_cursor() {
+        let engine = LifecycleStorageEngine::new(1, 5_000, 128, false);
+        let hlc = HlcTimestamp::new(1_000, 0);
+        let wm = Arc::new(ShardWatermarkTracker::default());
+        let outbox = ShardAuxOutbox::new(1, 64, wm.clone());
+        outbox.record_entry_specs(
+            3,
+            hlc,
+            vec![AuxIntentSpec::QuotaDelta {
+                uid: 7,
+                delta_bytes: 10,
+                delta_inodes: 1,
+            }],
+        );
+        outbox.persist_quota_cursors(&engine, hlc, 3);
+        outbox.apply_acked_tasks(4, hlc, &[(3, 0)], &engine);
+        assert_eq!(outbox.pending_count(), 0);
+
+        let restarted = ShardAuxOutbox::new(1, 64, wm);
+        restarted.rehydrate_from_storage(3, 3, &engine).unwrap();
+        restarted.record_entry_specs(
+            8,
+            hlc,
+            vec![AuxIntentSpec::QuotaDelta {
+                uid: 7,
+                delta_bytes: 1,
+                delta_inodes: 0,
+            }],
+        );
+        let pending = restarted.pending_entries();
+        assert_eq!(pending.len(), 1);
+        match &pending[0].payload {
+            AuxTaskPayload::QuotaDelta {
+                prev_uid_cursor, ..
+            } => {
+                assert_eq!(*prev_uid_cursor, (3, 0));
+            }
+            other => panic!("expected quota delta, got {other:?}"),
+        }
     }
 }
