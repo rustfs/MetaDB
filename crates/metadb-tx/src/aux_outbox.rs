@@ -16,12 +16,24 @@ use metadb_storage::{LifecycleStorageEngine, MvccValue, SnapshotGuard, ViewAtRaf
 /// Default maximum un-acknowledged tasks held in RAM before spilling to `[0x07]` on L0 flush.
 pub const DEFAULT_OUTBOX_SPILL_THRESHOLD: usize = 256;
 
+/// Folded `i128` directory deltas are stored in `i64` attributes.
+/// Values outside `i64` saturate; the caller then clamps a negative total to 0.
+fn clamp_delta_to_i64(value: i128) -> i64 {
+    if value > i64::MAX as i128 {
+        i64::MAX
+    } else if value < i64::MIN as i128 {
+        i64::MIN
+    } else {
+        value as i64
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReplicatedAttrDelta {
     pub raft_index: u64,
     pub hlc: HlcTimestamp,
-    pub delta_children: i64,
-    pub delta_bytes: i64,
+    pub delta_children: i128,
+    pub delta_bytes: i128,
 }
 
 /// Deterministic per-shard attribute delta aggregator integrated with `PreFlushHook` (`consensus_and_transactions.md` §7.2).
@@ -51,15 +63,25 @@ impl ReplicatedAttrAggregator {
         delta_bytes: i64,
     ) {
         let mut guard = self.pending_by_pid.write().unwrap();
-        guard
-            .entry(pid)
-            .or_default()
-            .push_back(ReplicatedAttrDelta {
+        let queue = guard.entry(pid).or_default();
+        if let Some(previous) = queue
+            .back_mut()
+            .filter(|delta| delta.raft_index == raft_index)
+        {
+            // A 2PC command may modify several keys in one directory. Fold its
+            // deltas as one atomic step, avoiding transient counter overflow and
+            // ensuring an applied-index baseline includes the whole command.
+            previous.delta_children += i128::from(delta_children);
+            previous.delta_bytes += i128::from(delta_bytes);
+            previous.hlc = previous.hlc.max(hlc);
+        } else {
+            queue.push_back(ReplicatedAttrDelta {
                 raft_index,
                 hlc,
-                delta_children,
-                delta_bytes,
+                delta_children: i128::from(delta_children),
+                delta_bytes: i128::from(delta_bytes),
             });
+        }
     }
 
     /// Reconciles an authoritative `(pid, "_attr_")` record at `snap.cut()` (`Resolution B1`).
@@ -71,15 +93,23 @@ impl ReplicatedAttrAggregator {
     ) -> InodeAttr {
         let cut = snap.cut();
         let guard = self.pending_by_pid.read().unwrap();
+        let baseline = base.applied_lsn;
         if let Some(q) = guard.get(&pid) {
             for d in q {
-                if d.raft_index > base.applied_lsn
+                if d.raft_index > baseline
                     && d.raft_index <= cut.max_raft_index
                     && d.hlc <= cut.max_hlc
                 {
-                    base.num_children =
-                        saturating_add_i64(base.num_children, d.delta_children).max(0);
-                    base.size_bytes = saturating_add_i64(base.size_bytes, d.delta_bytes).max(0);
+                    base.num_children = saturating_add_i64(
+                        base.num_children,
+                        clamp_delta_to_i64(d.delta_children),
+                    )
+                    .max(0);
+                    base.size_bytes = saturating_add_i64(
+                        base.size_bytes,
+                        clamp_delta_to_i64(d.delta_bytes),
+                    )
+                    .max(0);
                     if d.hlc > base.modify_time {
                         base.modify_time = d.hlc;
                     }
@@ -99,15 +129,23 @@ impl ReplicatedAttrAggregator {
     ) -> DirShardDeltaRecord {
         let cut = snap.cut();
         let guard = self.pending_by_pid.read().unwrap();
+        let baseline = base.applied_raft_index;
         if let Some(q) = guard.get(&pid) {
             for d in q {
-                if d.raft_index > base.applied_raft_index
+                if d.raft_index > baseline
                     && d.raft_index <= cut.max_raft_index
                     && d.hlc <= cut.max_hlc
                 {
-                    base.num_children =
-                        saturating_add_i64(base.num_children, d.delta_children).max(0);
-                    base.size_bytes = saturating_add_i64(base.size_bytes, d.delta_bytes).max(0);
+                    base.num_children = saturating_add_i64(
+                        base.num_children,
+                        clamp_delta_to_i64(d.delta_children),
+                    )
+                    .max(0);
+                    base.size_bytes = saturating_add_i64(
+                        base.size_bytes,
+                        clamp_delta_to_i64(d.delta_bytes),
+                    )
+                    .max(0);
                     if d.hlc > base.modify_time {
                         base.modify_time = d.hlc;
                     }
@@ -116,6 +154,32 @@ impl ReplicatedAttrAggregator {
             }
         }
         base
+    }
+
+    pub(crate) fn pending_totals_since(&self, pid: InodeId, baseline: u64) -> (i128, i128) {
+        let guard = self.pending_by_pid.read().unwrap();
+        guard
+            .get(&pid)
+            .into_iter()
+            .flat_map(|q| q.iter())
+            .filter(|delta| delta.raft_index > baseline)
+            .fold((0, 0), |(children, bytes), delta| {
+                (children + delta.delta_children, bytes + delta.delta_bytes)
+            })
+    }
+
+    /// Last child mutation represented by pending deltas at a serialized apply boundary.
+    pub(crate) fn latest_delta_hlc(&self, pid: InodeId, max_raft_index: u64) -> HlcTimestamp {
+        self.pending_by_pid
+            .read()
+            .unwrap()
+            .get(&pid)
+            .into_iter()
+            .flat_map(|queue| queue.iter())
+            .filter(|delta| delta.raft_index <= max_raft_index)
+            .map(|delta| delta.hlc)
+            .max()
+            .unwrap_or(HlcTimestamp::ZERO)
     }
 
     /// Folds deltas in `(baseline.applied_index, sealed_raft_index]` reading `view_at_m`
@@ -138,11 +202,20 @@ impl ReplicatedAttrAggregator {
             if let Some(raw_attr) = view_at_m.get(&attr_key)? {
                 let mut attr = InodeAttr::decode(&raw_attr)?;
                 let mut changed = false;
+                let baseline = attr.applied_lsn;
                 for d in queue {
                     if d.raft_index > attr.applied_lsn && d.raft_index <= sealed_raft_index {
                         attr.num_children =
-                            saturating_add_i64(attr.num_children, d.delta_children).max(0);
-                        attr.size_bytes = saturating_add_i64(attr.size_bytes, d.delta_bytes).max(0);
+                            saturating_add_i64(
+                                attr.num_children,
+                                clamp_delta_to_i64(d.delta_children),
+                            )
+                            .max(0);
+                        attr.size_bytes = saturating_add_i64(
+                            attr.size_bytes,
+                            clamp_delta_to_i64(d.delta_bytes),
+                        )
+                        .max(0);
                         if d.hlc > attr.modify_time {
                             attr.modify_time = d.hlc;
                         }
@@ -161,11 +234,20 @@ impl ReplicatedAttrAggregator {
             if let Some(raw_sub) = view_at_m.get(&shard_delta_key)? {
                 let mut sub = DirShardDeltaRecord::decode(&raw_sub)?;
                 let mut changed = false;
+                let baseline = sub.applied_raft_index;
                 for d in queue {
                     if d.raft_index > sub.applied_raft_index && d.raft_index <= sealed_raft_index {
                         sub.num_children =
-                            saturating_add_i64(sub.num_children, d.delta_children).max(0);
-                        sub.size_bytes = saturating_add_i64(sub.size_bytes, d.delta_bytes).max(0);
+                            saturating_add_i64(
+                                sub.num_children,
+                                clamp_delta_to_i64(d.delta_children),
+                            )
+                            .max(0);
+                        sub.size_bytes = saturating_add_i64(
+                            sub.size_bytes,
+                            clamp_delta_to_i64(d.delta_bytes),
+                        )
+                        .max(0);
                         if d.hlc > sub.modify_time {
                             sub.modify_time = d.hlc;
                         }

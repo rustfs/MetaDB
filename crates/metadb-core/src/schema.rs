@@ -27,6 +27,10 @@ pub const FILE_INODE_TAG_BIT: InodeId = 1u64 << 63;
 /// attributes with all of its direct children in `MetaTable` (§3.1 of `arXiv:2610.32247v1`).
 pub const ATTR_ENTRY_NAME: &str = "_attr_";
 
+/// Maximum UTF-8 name length that fits an unshared SST key, including the
+/// one-byte WriteIntent prefix and the nine-byte MetaKey prefix.
+pub const MAX_USER_NAME_BYTES: usize = u16::MAX as usize - 10;
+
 /// Fixed byte length of a serialized `InodeAttr` (`88` bytes including version & CRC32C).
 pub const INODE_ATTR_ENCODED_LEN: usize = 88;
 const INODE_ATTR_CODEC_V1: u8 = 1;
@@ -75,6 +79,13 @@ pub fn validate_user_entry_name(name: &str) -> Result<()> {
         || name.contains('\\')
     {
         return Err(MetaDbError::ReservedEntryName(name.to_string()));
+    }
+    if name.len() > MAX_USER_NAME_BYTES {
+        return Err(MetaDbError::CodecError(format!(
+            "entry name has {} bytes; maximum is {}",
+            name.len(),
+            MAX_USER_NAME_BYTES
+        )));
     }
     Ok(())
 }

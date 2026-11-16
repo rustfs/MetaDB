@@ -41,6 +41,11 @@ impl ShardDirectory for MultiShardTestCluster {
         Err(MetaDbError::ShardRoutingError("unrouted key".to_string()))
     }
 
+    fn allocate_txn_id(&self, coord_node_id: u64) -> Result<metadb_core::TxnId> {
+        static NEXT_TXN: AtomicU64 = AtomicU64::new(1);
+        Ok(((coord_node_id as u128) << 64) | NEXT_TXN.fetch_add(1, Ordering::Relaxed) as u128)
+    }
+
     fn route_user_range(
         &self,
         start_user_key: &[u8],

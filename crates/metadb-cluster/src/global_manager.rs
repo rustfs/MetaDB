@@ -79,6 +79,15 @@ impl DurableGlobalManager {
 
 #[tonic::async_trait]
 impl ShardDirectory for DurableGlobalManager {
+    fn allocate_txn_id(&self, coordinator_node_id: u64) -> Result<metadb_core::TxnId> {
+        // Share the persisted sequence with FileId grants. Gaps in that sequence
+        // are harmless; resetting a process-local counter can alias live 2PC records.
+        let (seq, _) =
+            self.id_allocator
+                .allocate_block(0, crate::id_allocator::AllocIdKind::FileId, 1)?;
+        Ok(((coordinator_node_id as u128) << 64) | seq as u128)
+    }
+
     fn route_user_key(&self, user_key: &[u8]) -> Result<RoutedShardHandle> {
         let route = match self.meta_cache.lookup_key(user_key) {
             Some(r) => r,

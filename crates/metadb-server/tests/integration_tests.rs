@@ -615,5 +615,6 @@ fn prepare_req(
         rename_fence_token: 0,
         encoded_intent_keys: vec![WriteIntentKey::new(intent_user_key.clone()).encode()],
         encoded_intent_records: vec![record.encode()],
+        expected_values: vec![],
     }
 }

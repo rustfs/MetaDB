@@ -64,8 +64,21 @@ impl RaftShardSplitWorker {
             return Ok(None);
         }
 
+        // A bootstrap shard can contain several user tables. Split at a real
+        // table boundary before applying any table-specific row codec.
+        let first_table = rows[0].0.first().copied();
+        if let Some((key, _)) = rows
+            .iter()
+            .find(|(key, _)| key.first().copied() != first_table)
+        {
+            return Ok(Some(SplitCandidate::SplitAt {
+                split_key: vec![key[0]],
+                dual_mode_pid: None,
+            }));
+        }
+
         // Non-MetaTable shards (`0x02 QuotaTable`, `0x03 SecondaryIndexTable`) split at byte midpoint.
-        if route.range.start_key.first().copied() != Some(TABLE_PREFIX_META) {
+        if first_table != Some(TABLE_PREFIX_META) {
             let total: usize = rows.iter().map(|(k, v)| k.len() + v.len()).sum();
             let half = total / 2;
             let mut acc = 0usize;
@@ -166,28 +179,35 @@ impl RaftShardSplitWorker {
         Arc<TxStateMachineHandler>,
     )> {
         let old_end_key = parent_route.range.end_key.clone();
+        let now_hlc = host.clock().now();
         // Never publish an epoch older than the one already applied. A stale plan must
         // not rewind `version` and then re-fence a range that a newer split already owns.
 
         // Stage A: Scan `concat([0x05], split_key) .. concat([0x05], old_end_key)` (`Resolution B14`)
         // and verify no active `deleting_fence` (`Resolution B17`) before splitting!
-        let now_hlc = host.clock().now();
         {
             let (_, snap) = parent_group
                 .linearizable_read(parent_group.current_epoch())
                 .await?;
             let eng = parent_group.engine();
-            let i_start = WriteIntentKey::encode_range_bound(&split_key);
-            let i_end = WriteIntentKey::encode_range_bound(&old_end_key);
-            for (_, iv) in eng.scan_with_snapshot(&i_start, &i_end, &snap)? {
+            // Expiration only permits recovery; it never proves that a pending
+            // intent is aborted. Drain every transaction before copying a shard.
+            if let Some((_, iv)) = eng
+                .scan_with_snapshot(&[0x05], &[0x06], &snap)?
+                .into_iter()
+                .next()
+            {
                 let irec = WriteIntentRecord::decode(&iv)?;
-                if irec.expire_hlc >= now_hlc {
-                    return Err(MetaDbError::WriteIntentConflict {
-                        conflicting_txn_id: irec.txn_id,
-                        primary_key: irec.primary_key,
-                        expire_hlc: irec.expire_hlc.0,
-                    });
-                }
+                return Err(MetaDbError::WriteIntentConflict {
+                    conflicting_txn_id: irec.txn_id,
+                    primary_key: irec.primary_key,
+                    expire_hlc: irec.expire_hlc.0,
+                });
+            }
+            if !eng.scan_with_snapshot(&[0x06], &[0x07], &snap)?.is_empty() {
+                return Err(MetaDbError::TransactionAborted(
+                    "split deferred until transaction decisions are acknowledged".into(),
+                ));
             }
             if let Some(dpid) = dual_mode_pid {
                 let dk = DirShardDeltaKey { pid: dpid }.encode();

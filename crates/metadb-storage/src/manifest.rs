@@ -98,6 +98,18 @@ impl VersionEdit {
     }
 
     pub fn decode_payload(raw: &[u8]) -> Result<Self> {
+        let (edit, consumed) = Self::decode_prefix(raw)?;
+        if consumed != raw.len() {
+            return Err(MetaDbError::ManifestCorrupted(
+                "trailing bytes inside VersionEdit record".to_string(),
+            ));
+        }
+        Ok(edit)
+    }
+
+    // The payload grammar is self-delimiting. Recovery also uses this to detect
+    // an intact edit hidden by a corrupted (unchecksummed) frame length.
+    fn decode_prefix(raw: &[u8]) -> Result<(Self, usize)> {
         let mut pos = 0usize;
         let read_u8 = |p: &mut usize| -> Result<u8> {
             if *p >= raw.len() {
@@ -110,7 +122,7 @@ impl VersionEdit {
             Ok(v)
         };
         let read_u32 = |p: &mut usize| -> Result<u32> {
-            if *p + 4 > raw.len() {
+            if raw.len().saturating_sub(*p) < 4 {
                 return Err(MetaDbError::ManifestCorrupted(
                     "unexpected EOF reading u32 in VersionEdit".to_string(),
                 ));
@@ -120,7 +132,7 @@ impl VersionEdit {
             Ok(v)
         };
         let read_u64 = |p: &mut usize| -> Result<u64> {
-            if *p + 8 > raw.len() {
+            if raw.len().saturating_sub(*p) < 8 {
                 return Err(MetaDbError::ManifestCorrupted(
                     "unexpected EOF reading u64 in VersionEdit".to_string(),
                 ));
@@ -131,7 +143,7 @@ impl VersionEdit {
         };
         let read_vec = |p: &mut usize| -> Result<Vec<u8>> {
             let len = read_u32(p)? as usize;
-            if *p + len > raw.len() {
+            if len > raw.len().saturating_sub(*p) {
                 return Err(MetaDbError::ManifestCorrupted(
                     "unexpected EOF reading bytes in VersionEdit".to_string(),
                 ));
@@ -200,6 +212,11 @@ impl VersionEdit {
         };
 
         let deleted_count = read_u32(&mut pos)? as usize;
+        if deleted_count > raw.len().saturating_sub(pos) / 9 {
+            return Err(MetaDbError::ManifestCorrupted(
+                "deleted file count exceeds VersionEdit bytes".to_string(),
+            ));
+        }
         let mut deleted_files = Vec::with_capacity(deleted_count);
         for _ in 0..deleted_count {
             let level = read_u8(&mut pos)?;
@@ -208,6 +225,12 @@ impl VersionEdit {
         }
 
         let added_count = read_u32(&mut pos)? as usize;
+        // Each file uses 65 bytes, even with empty min/max keys.
+        if added_count > raw.len().saturating_sub(pos) / 65 {
+            return Err(MetaDbError::ManifestCorrupted(
+                "added file count exceeds VersionEdit bytes".to_string(),
+            ));
+        }
         let mut added_files = Vec::with_capacity(added_count);
         for _ in 0..added_count {
             let level = read_u8(&mut pos)?;
@@ -234,19 +257,16 @@ impl VersionEdit {
             });
         }
 
-        if pos != raw.len() {
-            return Err(MetaDbError::ManifestCorrupted(
-                "trailing bytes inside VersionEdit record".to_string(),
-            ));
-        }
-
-        Ok(Self {
-            next_file_id,
-            next_flush_generation,
-            checkpoint,
-            deleted_files,
-            added_files,
-        })
+        Ok((
+            Self {
+                next_file_id,
+                next_flush_generation,
+                checkpoint,
+                deleted_files,
+                added_files,
+            },
+            pos,
+        ))
     }
 }
 
@@ -271,18 +291,43 @@ impl ManifestLog {
     /// Opens an existing `lsm_dir` (replaying `CURRENT` + cleaning `.sst.tmp` / orphan `.sst`s)
     /// or initializes a fresh `MANIFEST-000001`.
     pub fn open_or_create(lsm_dir: &Path) -> Result<(Self, RecoveredManifestState)> {
-        fs::create_dir_all(lsm_dir)?;
+        Self::open_internal(lsm_dir, true)
+    }
+
+    /// Verifies an existing checkpoint without initializing, repairing, or deleting files.
+    pub fn open_existing(lsm_dir: &Path) -> Result<(Self, RecoveredManifestState)> {
+        Self::open_internal(lsm_dir, false)
+    }
+
+    fn open_internal(lsm_dir: &Path, recover: bool) -> Result<(Self, RecoveredManifestState)> {
+        if recover {
+            fs::create_dir_all(lsm_dir)?;
+        }
         let current_path = lsm_dir.join("CURRENT");
 
-        if !current_path.exists() {
+        if !current_path.try_exists()? {
+            if !recover {
+                return Err(MetaDbError::ManifestCorrupted(
+                    "CURRENT is missing from an existing checkpoint".to_string(),
+                ));
+            }
+            // The backend creates LOCK before opening the manifest. Anything
+            // else may belong to an existing database or interrupted rotation;
+            // never overwrite it or run orphan cleanup without its CURRENT.
+            for entry in fs::read_dir(lsm_dir)? {
+                if entry?.file_name() != "LOCK" {
+                    return Err(MetaDbError::ManifestCorrupted(
+                        "CURRENT is missing from a nonempty database directory".to_string(),
+                    ));
+                }
+            }
             let seq = 1u64;
             let manifest_name = format!("MANIFEST-{:06}", seq);
             let manifest_path = lsm_dir.join(&manifest_name);
             let mut f = OpenOptions::new()
-                .create(true)
+                .create_new(true)
                 .read(true)
                 .write(true)
-                .truncate(true)
                 .open(&manifest_path)?;
             let init_edit = VersionEdit {
                 next_file_id: Some(1),
@@ -324,6 +369,11 @@ impl ManifestLog {
 
         let mut raw = Vec::new();
         File::open(&manifest_path)?.read_to_end(&mut raw)?;
+        if raw.is_empty() {
+            return Err(MetaDbError::ManifestCorrupted(
+                "MANIFEST has no baseline record".to_string(),
+            ));
+        }
 
         let mut next_file_id = 1u64;
         let mut next_flush_generation = 1u64;
@@ -335,7 +385,12 @@ impl ManifestLog {
 
         while offset < raw.len() {
             // Only an incomplete/torn final record at EOF may be truncated (Resolution B3).
-            if offset + 8 > raw.len() {
+            if raw.len() - offset < 8 {
+                if offset == 0 {
+                    return Err(MetaDbError::ManifestCorrupted(
+                        "incomplete MANIFEST baseline header".to_string(),
+                    ));
+                }
                 truncate_to = Some(offset);
                 break;
             }
@@ -345,7 +400,20 @@ impl ManifestLog {
             let record_end = offset.saturating_add(8).saturating_add(payload_len);
 
             if record_end > raw.len() {
-                // Torn final record at EOF!
+                if offset == 0 {
+                    return Err(MetaDbError::ManifestCorrupted(
+                        "incomplete MANIFEST baseline payload".to_string(),
+                    ));
+                }
+                if VersionEdit::decode_prefix(&raw[offset + 8..]).is_ok() {
+                    return Err(MetaDbError::ManifestCorrupted(format!(
+                        "MANIFEST frame length exceeds complete edit at offset {}",
+                        offset
+                    )));
+                }
+                // No complete edit remains: recover an incomplete append tail.
+                // The v1 frame length has no checksum, so simultaneous length
+                // and payload damage cannot always be distinguished from a tear.
                 truncate_to = Some(offset);
                 break;
             }
@@ -353,12 +421,6 @@ impl ManifestLog {
             let payload = &raw[offset + 8..record_end];
             let actual_crc = checksum_crc32c(payload);
             if actual_crc != expected_crc {
-                // A bad CRC on the final record is a torn tail only when a valid record
-                // already precedes it. Truncating the sole baseline would drop every SST.
-                if record_end == raw.len() && offset > 0 {
-                    truncate_to = Some(offset);
-                    break;
-                }
                 return Err(MetaDbError::ManifestCorrupted(format!(
                     "MANIFEST CRC32C mismatch at offset {} (expected 0x{:08x}, got 0x{:08x})",
                     offset, expected_crc, actual_crc
@@ -366,6 +428,16 @@ impl ManifestLog {
             }
 
             let edit = VersionEdit::decode_payload(payload)?;
+            if offset == 0
+                && (edit.next_file_id.is_none()
+                    || edit.next_flush_generation.is_none()
+                    || edit.checkpoint.is_none()
+                    || !edit.deleted_files.is_empty())
+            {
+                return Err(MetaDbError::ManifestCorrupted(
+                    "MANIFEST first record is not a complete baseline".to_string(),
+                ));
+            }
             if let Some(id) = edit.next_file_id {
                 next_file_id = next_file_id.max(id);
             }
@@ -379,8 +451,15 @@ impl ManifestLog {
                 live_files.remove(&del);
             }
             for add in edit.added_files {
-                next_file_id = next_file_id.max(add.file_id + 1);
-                next_flush_generation = next_flush_generation.max(add.flush_generation + 1);
+                let following_id = add.file_id.checked_add(1).ok_or_else(|| {
+                    MetaDbError::ManifestCorrupted("SST file id overflow".to_string())
+                })?;
+                let following_generation =
+                    add.flush_generation.checked_add(1).ok_or_else(|| {
+                        MetaDbError::ManifestCorrupted("SST flush generation overflow".to_string())
+                    })?;
+                next_file_id = next_file_id.max(following_id);
+                next_flush_generation = next_flush_generation.max(following_generation);
                 live_files.insert((add.level, add.file_id), add);
             }
 
@@ -392,12 +471,19 @@ impl ManifestLog {
             .append(true)
             .open(&manifest_path)?;
         if let Some(valid_len) = truncate_to {
+            if !recover {
+                return Err(MetaDbError::ManifestCorrupted(
+                    "incomplete MANIFEST in existing checkpoint".to_string(),
+                ));
+            }
             let trunc_file = OpenOptions::new().write(true).open(&manifest_path)?;
             trunc_file.set_len(valid_len as u64)?;
             trunc_file.sync_data()?;
         }
 
-        Self::cleanup_orphan_files(lsm_dir, &live_files, &manifest_name)?;
+        if recover {
+            Self::cleanup_orphan_files(lsm_dir, &live_files, &manifest_name)?;
+        }
 
         Ok((
             Self {

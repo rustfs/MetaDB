@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     tonic_prost_build::configure()
+        .type_attribute(".", "#[derive(serde::Serialize)]")
         .build_server(true)
         .build_client(true)
         .compile_protos(&protos, &["proto"])?;

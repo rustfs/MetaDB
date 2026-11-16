@@ -17,11 +17,17 @@ pub struct BlockCacheKey {
     pub block_offset: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ScopedCacheKey {
+    reader_id: u64,
+    block: BlockCacheKey,
+}
+
 struct LruShard {
     capacity_bytes: usize,
     used_bytes: usize,
-    order: VecDeque<BlockCacheKey>,
-    entries: HashMap<BlockCacheKey, Arc<DataBlock>>,
+    order: VecDeque<ScopedCacheKey>,
+    entries: HashMap<ScopedCacheKey, Arc<DataBlock>>,
 }
 
 impl LruShard {
@@ -34,7 +40,7 @@ impl LruShard {
         }
     }
 
-    fn get(&mut self, key: &BlockCacheKey) -> Option<Arc<DataBlock>> {
+    fn get(&mut self, key: &ScopedCacheKey) -> Option<Arc<DataBlock>> {
         let block = self.entries.get(key)?.clone();
         if self.order.back() != Some(key) {
             self.order.retain(|k| k != key);
@@ -43,7 +49,7 @@ impl LruShard {
         Some(block)
     }
 
-    fn insert(&mut self, key: BlockCacheKey, block: Arc<DataBlock>) {
+    fn insert(&mut self, key: ScopedCacheKey, block: Arc<DataBlock>) {
         let block_bytes = block.byte_size().max(64);
         if block_bytes > self.capacity_bytes {
             return;
@@ -80,16 +86,41 @@ impl ShardedBlockCache {
     }
 
     pub fn get(&self, key: &BlockCacheKey) -> Option<Arc<DataBlock>> {
-        let idx = Self::shard_index(key);
-        self.shards[idx].lock().unwrap().get(key)
+        self.get_for_reader(0, key)
     }
 
     pub fn insert(&self, key: BlockCacheKey, block: Arc<DataBlock>) {
+        self.insert_for_reader(0, key, block);
+    }
+
+    pub(crate) fn get_for_reader(
+        &self,
+        reader_id: u64,
+        key: &BlockCacheKey,
+    ) -> Option<Arc<DataBlock>> {
+        let key = ScopedCacheKey {
+            reader_id,
+            block: *key,
+        };
+        let idx = Self::shard_index(&key);
+        self.shards[idx].lock().unwrap().get(&key)
+    }
+
+    pub(crate) fn insert_for_reader(
+        &self,
+        reader_id: u64,
+        key: BlockCacheKey,
+        block: Arc<DataBlock>,
+    ) {
+        let key = ScopedCacheKey {
+            reader_id,
+            block: key,
+        };
         let idx = Self::shard_index(&key);
         self.shards[idx].lock().unwrap().insert(key, block);
     }
 
-    fn shard_index(key: &BlockCacheKey) -> usize {
+    fn shard_index(key: &ScopedCacheKey) -> usize {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         key.hash(&mut hasher);
         (hasher.finish() as usize) & (NUM_CACHE_SHARDS - 1)

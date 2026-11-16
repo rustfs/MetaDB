@@ -678,7 +678,7 @@ impl PersistentMetaDbCluster {
                     _ = bg_rx.changed() => break,
                     _ = tokio::time::sleep(Duration::from_millis(250)) => {
                         let Some(c) = bg_cluster.upgrade() else { break; };
-                        let _ = c.run_maintenance_tick().await;
+                        let _ = c.run_maintenance_tick_inner(false).await;
                     }
                 }
             }
@@ -747,6 +747,10 @@ impl PersistentMetaDbCluster {
 
     /// Runs one deterministic pass of `AuxDispatcher`, `TxnRecoveryWorker`, and split checks.
     pub async fn run_maintenance_tick(&self) -> Result<()> {
+        self.run_maintenance_tick_inner(true).await
+    }
+
+    async fn run_maintenance_tick_inner(&self, force_snapshot: bool) -> Result<()> {
         for cell in self.global_manager.all_cells() {
             for (_, grp, handler) in cell.local_shard_handles() {
                 let _ = AuxDispatcher::drain_shard_outbox(
@@ -779,7 +783,7 @@ impl PersistentMetaDbCluster {
                 let (state_flushed, _, last_snap) = grp.watermarks().snapshot_values();
                 // First snapshot (watermark still 0) or a large unpurged tail. Skip the
                 // full-dataset snapshot on every 250ms tick while the log is still small.
-                if last_snap > 0 && last_snap >= state_flushed && retained < 64 {
+                if !force_snapshot && last_snap > 0 && last_snap >= state_flushed && retained < 64 {
                     continue;
                 }
                 grp.flush_snapshot_and_purge().await?;

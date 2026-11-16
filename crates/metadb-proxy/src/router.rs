@@ -119,6 +119,15 @@ impl StatelessProxyRouter {
                     .set_quota_limit(uid, quota_limit_bytes)
                     .await?,
             ))),
+            MetadataSqlCommand::UpsertQuotaLimit {
+                uid,
+                insert_quota_limit_bytes,
+                update_quota_limit_bytes,
+            } => Ok(ProxySqlResult::Quota(Some(
+                self.tx_router
+                    .upsert_quota_limit(uid, insert_quota_limit_bytes, update_quota_limit_bytes)
+                    .await?,
+            ))),
             MetadataSqlCommand::ListQuotas { start_uid, limit } => Ok(ProxySqlResult::Quotas(
                 self.tx_router.list_quotas(start_uid, limit).await?,
             )),

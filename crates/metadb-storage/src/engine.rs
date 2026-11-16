@@ -83,12 +83,33 @@ impl LifecycleStorageEngine {
         block_cache: Arc<ShardedBlockCache>,
         config: LsmEngineConfig,
     ) -> Result<Self> {
-        let lsm = Arc::new(LsmStorageBackend::open(
+        let lsm =
+            LsmStorageBackend::open(shard_id, lsm_dir, block_cache, config.bloom_bits_per_key)?;
+        Ok(Self::with_lsm_backend(shard_id, lsm, config))
+    }
+
+    /// Opens a complete existing checkpoint without creating or repairing its manifest.
+    pub fn open_lsm_existing(
+        shard_id: ShardId,
+        lsm_dir: impl AsRef<Path>,
+        block_cache: Arc<ShardedBlockCache>,
+        config: LsmEngineConfig,
+    ) -> Result<Self> {
+        let lsm = LsmStorageBackend::open_existing(
             shard_id,
             lsm_dir,
             block_cache,
             config.bloom_bits_per_key,
-        )?);
+        )?;
+        Ok(Self::with_lsm_backend(shard_id, lsm, config))
+    }
+
+    fn with_lsm_backend(
+        shard_id: ShardId,
+        lsm: LsmStorageBackend,
+        config: LsmEngineConfig,
+    ) -> Self {
+        let lsm = Arc::new(lsm);
         let cp = lsm.current_version().checkpoint.clone();
         let mvcc = Arc::new(MemMvccStore::with_recovered_watermarks(
             config.mvcc_retention_ms,
@@ -99,14 +120,14 @@ impl LifecycleStorageEngine {
             config.tombstone_density_threshold,
             config.tombstone_min_ratio_permille,
         ));
-        Ok(Self {
+        Self {
             shard_id,
             raft_log: Arc::new(RaftLog::new(shard_id)),
             mvcc,
             compactor,
             backend: lsm,
             auto_locality_compaction: config.auto_locality_compaction,
-        })
+        }
     }
 
     pub fn shard_id(&self) -> ShardId {

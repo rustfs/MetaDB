@@ -530,8 +530,13 @@ impl MetadataService for MetaDbGrpcService {
                     }
                     ProxySqlResult::OptionalEntry(None) => {}
                     ProxySqlResult::Attr(a) => resp.single_attr = Some(InodeAttrProto::from(&a)),
-                    ProxySqlResult::Entries { entries, .. } => {
+                    ProxySqlResult::Entries {
+                        entries,
+                        next_cursor,
+                    } => {
                         resp.entries = entries.iter().map(MetaEntryProto::from).collect();
+                        resp.has_more = next_cursor.is_some();
+                        resp.next_cursor = next_cursor.unwrap_or_default();
                     }
                     ProxySqlResult::Quota(q) => {
                         resp.single_quota = q.as_ref().map(QuotaRecordProto::from);
@@ -717,6 +722,12 @@ impl TransactionService for MetaDbGrpcService {
         let ep: ShardEpoch = hdr.expected_epoch.unwrap_or_default().into();
         let txn_id = decode_req_txn_id(&req.txn_id_be)?;
 
+        if req.encoded_intent_keys.len() != req.encoded_intent_records.len() {
+            return Err(Status::invalid_argument(
+                "intent keys and records must have equal lengths",
+            ));
+        }
+
         let mut intents = Vec::with_capacity(req.encoded_intent_keys.len());
         for (ik, ir) in req
             .encoded_intent_keys
@@ -730,7 +741,7 @@ impl TransactionService for MetaDbGrpcService {
             intents.push((wk.target_user_key, wrec.op));
         }
 
-        let cmd = TxRaftCmd::Prepare2pc {
+        let cmd = TxRaftCmd::Prepare2pcChecked {
             txn_id,
             is_primary: req.is_primary,
             primary_key: req.primary_key.clone(),
@@ -739,6 +750,11 @@ impl TransactionService for MetaDbGrpcService {
             expire_hlc: HlcTimestamp(req.expire_hlc),
             rename_fence_token: req.has_rename_fence_token.then_some(req.rename_fence_token),
             intents,
+            expected_values: req
+                .expected_values
+                .into_iter()
+                .map(|entry| (entry.user_key, entry.value))
+                .collect(),
         };
 
         // Prepare runs on the participant named by the routing header. `primary_key`

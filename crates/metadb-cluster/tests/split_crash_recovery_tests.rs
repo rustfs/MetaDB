@@ -43,6 +43,8 @@ fn persist_failure_does_not_cache_id_grant_until_disk_has_it() {
         grant
     );
 
+    assert!(DurableIdAllocator::open(dir.path()).is_err());
+    drop(alloc);
     let reopened = DurableIdAllocator::open(dir.path()).unwrap();
     assert_eq!(
         reopened

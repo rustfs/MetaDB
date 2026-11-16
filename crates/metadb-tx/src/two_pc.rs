@@ -3,7 +3,6 @@
 //! Primary-Anchored Two-Phase Commit (`2PC`) Coordinator.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use metadb_core::schema::validate_user_entry_name;
@@ -48,6 +47,14 @@ pub trait ShardDirectory: Send + Sync + 'static {
     /// Resolves `(ShardEpoch, Arc<ShardRaftGroup>, Arc<TxStateMachineHandler>)` for `user_key`.
     fn route_user_key(&self, user_key: &[u8]) -> Result<RoutedShardHandle>;
 
+    /// Allocates an identity that must never be reused, including after coordinator restart.
+    /// Implementations must reserve the sequence durably before returning it.
+    fn allocate_txn_id(&self, _coord_node_id: u64) -> Result<TxnId> {
+        Err(MetaDbError::TransactionAborted(
+            "ShardDirectory does not provide durable transaction IDs".to_string(),
+        ))
+    }
+
     /// Resolves all shards intersecting `[start_user_key, end_user_key)` in ascending key order.
     fn route_user_range(
         &self,
@@ -69,7 +76,6 @@ pub trait ShardDirectory: Send + Sync + 'static {
 /// Executes both `1-RTT` single-shard pushdown and Primary-Anchored `2PC` across `ShardRaftGroup`s.
 pub struct DistributedTxRouter {
     coord_node_id: u64,
-    next_txn_seq: AtomicU64,
     clock: Arc<HybridLogicalClock>,
     directory: Arc<dyn ShardDirectory>,
     ttl_ms: u64,
@@ -83,7 +89,6 @@ impl DistributedTxRouter {
     ) -> Self {
         Self {
             coord_node_id,
-            next_txn_seq: AtomicU64::new(1),
             clock,
             directory,
             ttl_ms: DEFAULT_2PC_TTL_MS,
@@ -101,11 +106,6 @@ impl DistributedTxRouter {
 
     pub fn clock(&self) -> &Arc<HybridLogicalClock> {
         &self.clock
-    }
-
-    fn alloc_txn_id(&self) -> TxnId {
-        let seq = self.next_txn_seq.fetch_add(1, Ordering::Relaxed);
-        ((self.coord_node_id as u128) << 64) | (seq as u128)
     }
 
     async fn propose_cmd(
@@ -335,7 +335,7 @@ impl DistributedTxRouter {
                 },
             ),
             (
-                new_attr_bytes,
+                new_attr_bytes.clone(),
                 IntentOp::Insert {
                     value: self_attr.encode(),
                     attr_deltas: vec![],
@@ -345,7 +345,13 @@ impl DistributedTxRouter {
         ];
 
         let commit_hlc = self
-            .execute_two_pc(&child_bytes, intents_by_key, None, TwoPcCrashStage::None)
+            .execute_two_pc(
+                &child_bytes,
+                intents_by_key,
+                vec![(child_bytes.clone(), None), (new_attr_bytes, None)],
+                None,
+                TwoPcCrashStage::None,
+            )
             .await?;
 
         let mut committed_attr = dentry_attr;
@@ -430,8 +436,14 @@ impl DistributedTxRouter {
             ));
         }
 
-        self.execute_two_pc(&child_bytes, intents_by_key, None, TwoPcCrashStage::None)
-            .await?;
+        self.execute_two_pc(
+            &child_bytes,
+            intents_by_key,
+            vec![(child_bytes.clone(), Some(entry.attr.encode()))],
+            None,
+            TwoPcCrashStage::None,
+        )
+        .await?;
         Ok(entry.attr)
     }
 
@@ -467,6 +479,12 @@ impl DistributedTxRouter {
                     "unexpected SetAttr output".to_string(),
                 )),
             };
+        }
+
+        if patch.size_bytes.is_some() || patch.fid.is_some() {
+            return Err(MetaDbError::CodecError(
+                "directory size and fid are derived attributes".into(),
+            ));
         }
 
         // Directory `SetAttr`: check if single-shard colocated or multi-shard (`Resolution B10`).
@@ -513,7 +531,11 @@ impl DistributedTxRouter {
         }
 
         let dir_attr_key = MetaKey::dir_attr(dir_id).encode();
-        let mut dir_self = self.dirstat(dir_id).await?;
+        let dir_self_raw = self
+            .read_raw_user_value(&dir_attr_key)
+            .await?
+            .ok_or(MetaDbError::DirectoryNotFound(dir_id))?;
+        let mut dir_self = InodeAttr::decode(&dir_self_raw)?;
         dir_self.mode = new_dentry.mode;
         dir_self.uid = new_dentry.uid;
 
@@ -527,7 +549,7 @@ impl DistributedTxRouter {
                 },
             ),
             (
-                dir_attr_key,
+                dir_attr_key.clone(),
                 IntentOp::Put {
                     value: dir_self.encode(),
                     attr_deltas: vec![],
@@ -536,7 +558,16 @@ impl DistributedTxRouter {
             ),
         ];
         let commit_hlc = self
-            .execute_two_pc(&child_bytes, intents, None, TwoPcCrashStage::None)
+            .execute_two_pc(
+                &child_bytes,
+                intents,
+                vec![
+                    (child_bytes.clone(), Some(existing.attr.encode())),
+                    (dir_attr_key, Some(dir_self_raw)),
+                ],
+                None,
+                TwoPcCrashStage::None,
+            )
             .await?;
         new_dentry.modify_time = commit_hlc;
         Ok(MetaEntry {
@@ -635,6 +666,7 @@ impl DistributedTxRouter {
             };
         }
 
+        crate::validation::validate_size(src_entry.attr.size_bytes)?;
         // Cross-shard 2PC `Rename`:
         let lease_opt = if src_entry.attr.entry_type == EntryType::Directory && src_pid != dst_pid {
             let lease = self
@@ -658,12 +690,20 @@ impl DistributedTxRouter {
 
         // Check destination existence & victim accounting (`Resolution B11`).
         let dst_existing = self.lookup(dst_pid, dst_name).await?;
+        let mut expected_values = vec![
+            (src_bytes.clone(), Some(src_entry.attr.encode())),
+            (
+                dst_bytes.clone(),
+                dst_existing.as_ref().map(|entry| entry.attr.encode()),
+            ),
+        ];
         let mut dst_aux_specs = Vec::new();
         let src_accounted = src_entry.attr.size_bytes.max(0);
         let mut dst_delta_children = 1i64;
         let mut dst_delta_bytes = src_accounted;
 
         if let Some(victim_entry) = dst_existing {
+            crate::validation::validate_size(victim_entry.attr.size_bytes)?;
             if !overwrite {
                 if let Some(l) = lease_opt {
                     self.directory
@@ -763,10 +803,16 @@ impl DistributedTxRouter {
         ));
 
         if moved_attr.entry_type == EntryType::Directory && src_pid != dst_pid {
-            let mut dir_self = self.dirstat(moved_attr.inode_id).await?;
+            let dir_self_key = MetaKey::dir_attr(moved_attr.inode_id).encode();
+            let dir_self_raw = self
+                .read_raw_user_value(&dir_self_key)
+                .await?
+                .ok_or(MetaDbError::DirectoryNotFound(moved_attr.inode_id))?;
+            let mut dir_self = InodeAttr::decode(&dir_self_raw)?;
             dir_self.parent_pid = dst_pid;
+            expected_values.push((dir_self_key.clone(), Some(dir_self_raw)));
             intents.push((
-                MetaKey::dir_attr(moved_attr.inode_id).encode(),
+                dir_self_key,
                 IntentOp::Put {
                     value: dir_self.encode(),
                     attr_deltas: vec![],
@@ -776,7 +822,7 @@ impl DistributedTxRouter {
         }
 
         let res = self
-            .execute_two_pc(&src_bytes, intents, lease_opt, crash_stage)
+            .execute_two_pc(&src_bytes, intents, expected_values, lease_opt, crash_stage)
             .await;
 
         if let Some(l) = lease_opt {
@@ -797,10 +843,11 @@ impl DistributedTxRouter {
         &self,
         primary_key: &[u8],
         intents: Vec<(Vec<u8>, IntentOp)>,
+        expected_values: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         lease_opt: Option<DirRenameLease>,
         crash_stage: TwoPcCrashStage,
     ) -> Result<HlcTimestamp> {
-        let txn_id = self.alloc_txn_id();
+        let txn_id = self.directory.allocate_txn_id(self.coord_node_id)?;
         let start_hlc = self.clock.now();
         let expire_hlc = lease_opt
             .map(|l| l.expire_hlc)
@@ -833,7 +880,12 @@ impl DistributedTxRouter {
 
         for (sid, (ep, grp, shard_intents)) in ordered_groups {
             let shard_keys: Vec<Vec<u8>> = shard_intents.iter().map(|(k, _)| k.clone()).collect();
-            let prep_cmd = TxRaftCmd::Prepare2pc {
+            let shard_expected_values = expected_values
+                .iter()
+                .filter(|(key, _)| shard_keys.contains(key))
+                .cloned()
+                .collect();
+            let prep_cmd = TxRaftCmd::Prepare2pcChecked {
                 txn_id,
                 is_primary: sid == primary_shard_id,
                 primary_key: primary_key.to_vec(),
@@ -842,6 +894,7 @@ impl DistributedTxRouter {
                 expire_hlc,
                 rename_fence_token,
                 intents: shard_intents,
+                expected_values: shard_expected_values,
             };
             match Self::propose_cmd(&grp, ep, start_hlc, &prep_cmd).await {
                 Ok((_, TxRaftOutput::Prepared { prepared_hlc })) => {
@@ -985,6 +1038,38 @@ impl DistributedTxRouter {
         }
         Err(MetaDbError::ShardRoutingError(
             "lookup exceeded max intent/route retries".to_string(),
+        ))
+    }
+
+    /// Reads committed bytes used as the predicate for an anchor attribute mutation.
+    async fn read_raw_user_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        for _ in 0..12 {
+            let (epoch, group, _) = self.directory.route_user_key(key)?;
+            let (_, snap) = match group.linearizable_read(epoch).await {
+                Ok(pair) => pair,
+                Err(MetaDbError::EpochMismatch { .. } | MetaDbError::NotLeader { .. }) => continue,
+                Err(err) => return Err(err),
+            };
+            let engine = group.engine();
+            let intent_key = WriteIntentKey::new(key.to_vec()).encode();
+            if let Some(raw) = engine.get_with_snapshot(&intent_key, &snap)? {
+                let intent = WriteIntentRecord::decode(&raw)?;
+                if !matches!(intent.op, IntentOp::DirExistsFenceSet { .. }) {
+                    drop(snap);
+                    TxnRecoveryWorker::resolve_single_txn(
+                        self.directory.as_ref(),
+                        &self.clock,
+                        intent.txn_id,
+                        &intent.primary_key,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+            return engine.get_with_snapshot(key, &snap);
+        }
+        Err(MetaDbError::ShardRoutingError(
+            "anchor read exceeded max intent/route retries".to_string(),
         ))
     }
 
@@ -1196,6 +1281,26 @@ impl DistributedTxRouter {
             TxRaftOutput::Quota(q) => Ok(q),
             _ => Err(MetaDbError::CodecError(
                 "unexpected SetQuotaLimit output".to_string(),
+            )),
+        }
+    }
+
+    pub async fn upsert_quota_limit(
+        &self,
+        uid: UserId,
+        insert_quota_limit_bytes: u64,
+        update_quota_limit_bytes: u64,
+    ) -> Result<QuotaRecord> {
+        let qk = QuotaKey { uid }.encode();
+        let cmd = TxRaftCmd::UpsertQuotaLimit {
+            uid,
+            insert_quota_limit_bytes,
+            update_quota_limit_bytes,
+        };
+        match self.propose_key_with_retry(&qk, &cmd).await? {
+            TxRaftOutput::Quota(q) => Ok(q),
+            _ => Err(MetaDbError::CodecError(
+                "unexpected UpsertQuotaLimit output".into(),
             )),
         }
     }

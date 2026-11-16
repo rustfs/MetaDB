@@ -451,9 +451,8 @@ impl ShardRaftGroup {
         &self,
         expected_epoch: ShardEpoch,
     ) -> Result<(ReadToken, SnapshotGuard)> {
-        let engine = self.engine();
         self.read_batcher
-            .acquire_linearizable_guard(expected_epoch, &engine)
+            .acquire_linearizable_guard(expected_epoch, &self.state_machine)
             .await
     }
 
@@ -469,8 +468,11 @@ impl ShardRaftGroup {
     ) -> Result<(ReadToken, SnapshotGuard)> {
         let _ = self.clock.update_checked(barrier_hlc)?;
         let token = self.read_batcher.linearizable_token(expected_epoch).await?;
-        let engine = self.engine();
-        let snap = engine.acquire_fixed_snapshot(barrier_hlc)?;
+        let snap = self.state_machine.acquire_snapshot(
+            expected_epoch,
+            token.read_index,
+            Some(barrier_hlc),
+        )?;
         Ok((token, snap))
     }
 
@@ -580,6 +582,10 @@ impl ShardGroupHost {
 
     pub fn channel_pool(&self) -> &ChannelPool {
         &self.channel_pool
+    }
+
+    pub fn set_shared_secret(&self, secret: Option<String>) {
+        self.channel_pool.set_shared_secret(secret);
     }
 
     pub fn data_dir(&self) -> &Path {

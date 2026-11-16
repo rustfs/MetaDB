@@ -8,9 +8,10 @@ use openraft::ReadPolicy;
 use tokio::sync::{oneshot, watch, Mutex};
 
 use metadb_core::{HlcTimestamp, MetaDbError, Result, ShardEpoch, ShardId};
-use metadb_storage::{LifecycleStorageEngine, SnapshotGuard};
+use metadb_storage::SnapshotGuard;
 
 use crate::network::MetaDbRaft;
+use crate::state_machine::ShardStateMachine;
 use crate::types::AppliedFrontier;
 
 const MICRO_BATCH_WINDOW: Duration = Duration::from_micros(200);
@@ -89,20 +90,10 @@ impl ReadIndexBatcher {
     pub async fn acquire_linearizable_guard(
         &self,
         expected_epoch: ShardEpoch,
-        engine: &LifecycleStorageEngine,
+        state_machine: &ShardStateMachine,
     ) -> Result<(ReadToken, SnapshotGuard)> {
         let token = self.linearizable_token(expected_epoch).await?;
-        let snap = engine.acquire_linearizable_snapshot(token.read_index)?;
-        // Re-verify epoch after acquiring `SnapshotGuard` to close the window between
-        // `linearizable_token()` and snapshot guard registration.
-        let post_guard_epoch = self.current_frontier().epoch;
-        if post_guard_epoch != expected_epoch {
-            return Err(MetaDbError::EpochMismatch {
-                shard_id: self.shard_id,
-                expected: expected_epoch,
-                actual: post_guard_epoch,
-            });
-        }
+        let snap = state_machine.acquire_snapshot(expected_epoch, token.read_index, None)?;
         Ok((token, snap))
     }
 

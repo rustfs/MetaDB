@@ -1,10 +1,11 @@
 //! Deterministic `RaftStateMachine` backed by WAL-less `LifecycleStorageEngine`,
 //! atomic SSTable snapshot build/install (`Resolution B6`), and `ShardApplyHandler`.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use openraft::entry::RaftEntry;
 use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine};
@@ -20,7 +21,7 @@ use metadb_core::{
     append_crc32c_le, checksum_crc32c, verify_crc32c_le, HlcTimestamp, MetaDbError, Result,
     ShardEpoch, ShardId,
 };
-use metadb_storage::sstable::sync_dir;
+use metadb_storage::sstable::{sst_file_name, sync_dir};
 use metadb_storage::{
     DurableShardCheckpoint, LifecycleStorageEngine, LsmEngineConfig, PreFlushHook,
     ShardedBlockCache,
@@ -136,7 +137,29 @@ struct PersistedSnapshotMeta {
     file_specs: Vec<(String, u64, u32)>,
 }
 
+fn checkpoint_log_id(checkpoint: &DurableShardCheckpoint) -> Option<LogIdOf<MetaDbTypeConfig>> {
+    if (
+        checkpoint.flushed_raft_term,
+        checkpoint.flushed_raft_leader,
+        checkpoint.flushed_raft_index,
+    ) == (0, 0, 0)
+    {
+        None
+    } else {
+        Some(LogIdOf::<MetaDbTypeConfig>::new(
+            CommittedLeaderIdOf::<MetaDbTypeConfig>::new(
+                checkpoint.flushed_raft_term,
+                checkpoint.flushed_raft_leader,
+            ),
+            checkpoint.flushed_raft_index,
+        ))
+    }
+}
+
 struct StateMachineShared {
+    // Serializes a complete command (including metadata publication) against
+    // checkpoints, snapshot replacement, and read-cut acquisition.
+    operation_lock: Mutex<()>,
     shard_id: ShardId,
     shard_dir: PathBuf,
     block_cache: Arc<ShardedBlockCache>,
@@ -156,6 +179,11 @@ impl StateMachineShared {
     }
 
     fn flush_to_lsm(&self) -> Result<(u64, DurableShardCheckpoint)> {
+        let _operation = self.operation_lock.lock().unwrap();
+        self.flush_to_lsm_locked()
+    }
+
+    fn flush_to_lsm_locked(&self) -> Result<(u64, DurableShardCheckpoint)> {
         let engine = self.current_engine();
         let last_log = *self.last_applied_log_id.read().unwrap();
         let last_hlc = *self.last_applied_hlc.read().unwrap();
@@ -192,6 +220,7 @@ impl StateMachineShared {
     }
 
     fn build_snapshot_sync(&self) -> io::Result<SnapshotOf<MetaDbTypeConfig, SnapshotArchive>> {
+        let _operation = self.operation_lock.lock().unwrap();
         let current_idx = self
             .last_applied_log_id
             .read()
@@ -201,7 +230,7 @@ impl StateMachineShared {
         self.handler.prepare_for_snapshot(current_idx);
 
         let (_, _) = self
-            .flush_to_lsm()
+            .flush_to_lsm_locked()
             .map_err(|e| io::Error::other(e.to_string()))?;
 
         let engine = self.current_engine();
@@ -225,17 +254,7 @@ impl StateMachineShared {
             .create_checkpoint(&ckpt_lsm_dir)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let last_log_id = if checkpoint.flushed_raft_index == 0 {
-            None
-        } else {
-            Some(LogIdOf::<MetaDbTypeConfig>::new(
-                CommittedLeaderIdOf::<MetaDbTypeConfig>::new(
-                    checkpoint.flushed_raft_term,
-                    checkpoint.flushed_raft_leader,
-                ),
-                checkpoint.flushed_raft_index,
-            ))
-        };
+        let last_log_id = checkpoint_log_id(&checkpoint);
 
         let last_membership: StoredMembershipOf<MetaDbTypeConfig> =
             if checkpoint.membership_bytes.is_empty() {
@@ -291,6 +310,8 @@ impl StateMachineShared {
             mf.sync_data()?;
         }
 
+        // Persist SNAPSHOT_META's directory entry before publishing the snapshot.
+        sync_dir(&tmp_dir).map_err(|e| io::Error::other(e.to_string()))?;
         fs::rename(&tmp_dir, &final_dir)?;
         sync_dir(&snaps_root).map_err(|e| io::Error::other(e.to_string()))?;
         // Remove older `snap_*` directories only AFTER `final_dir` is durably fsync'd in `snaps_root`.
@@ -433,17 +454,7 @@ impl ShardStateMachine {
 
         // Report `MANIFEST`'s `flushed_raft_log_id` (`F`) as `applied_state` on startup so OpenRaft
         // automatically replays committed `.raftlog` entries strictly above `F` (`Resolution B5`)!
-        let initial_log_id = if cp.flushed_raft_index == 0 {
-            None
-        } else {
-            Some(LogIdOf::<MetaDbTypeConfig>::new(
-                CommittedLeaderIdOf::<MetaDbTypeConfig>::new(
-                    cp.flushed_raft_term,
-                    cp.flushed_raft_leader,
-                ),
-                cp.flushed_raft_index,
-            ))
-        };
+        let initial_log_id = checkpoint_log_id(&cp);
         let initial_membership: StoredMembershipOf<MetaDbTypeConfig> =
             if cp.membership_bytes.is_empty() {
                 StoredMembership::default()
@@ -467,6 +478,7 @@ impl ShardStateMachine {
         let (frontier_tx, frontier_rx) = watch::channel(initial_frontier);
 
         let shared = Arc::new(StateMachineShared {
+            operation_lock: Mutex::new(()),
             shard_id,
             shard_dir,
             block_cache,
@@ -493,6 +505,30 @@ impl ShardStateMachine {
 
     pub fn flush_to_lsm(&self) -> Result<(u64, DurableShardCheckpoint)> {
         self.shared.flush_to_lsm()
+    }
+
+    /// Pin a read cut only between complete state-machine commands and validate
+    /// the epoch under the same lock as split/membership application.
+    pub fn acquire_snapshot(
+        &self,
+        expected_epoch: ShardEpoch,
+        read_index: u64,
+        barrier_hlc: Option<HlcTimestamp>,
+    ) -> Result<metadb_storage::SnapshotGuard> {
+        let _operation = self.shared.operation_lock.lock().unwrap();
+        let actual = self.shared.handler.current_epoch();
+        if actual != expected_epoch {
+            return Err(MetaDbError::EpochMismatch {
+                shard_id: self.shared.shard_id,
+                expected: expected_epoch,
+                actual,
+            });
+        }
+        let engine = self.shared.current_engine();
+        match barrier_hlc {
+            Some(hlc) => engine.acquire_fixed_snapshot(hlc),
+            None => engine.acquire_linearizable_snapshot(read_index),
+        }
     }
 }
 
@@ -521,10 +557,10 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
             > + Unpin
             + OptionalSend,
     {
-        let engine = self.shared.current_engine();
-
         while let Some(item) = entries.next().await {
             let (entry, responder) = item?;
+            let _operation = self.shared.operation_lock.lock().unwrap();
+            let engine = self.shared.current_engine();
             let log_id = entry.log_id();
 
             let resp = match entry.payload {
@@ -635,12 +671,8 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
         meta: &SnapshotMetaOf<MetaDbTypeConfig>,
         snapshot: Self::SnapshotData,
     ) -> std::result::Result<(), io::Error> {
+        let _operation = self.shared.operation_lock.lock().unwrap();
         let snap_idx = meta.last_log_id.map(|id| id.index).unwrap_or(0);
-        if let Some(cur) = *self.shared.last_applied_log_id.read().unwrap() {
-            if snap_idx <= cur.index {
-                return Ok(());
-            }
-        }
         if snapshot.checkpoint.flushed_raft_index != snap_idx {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -650,11 +682,37 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
                 ),
             ));
         }
+        if meta.last_log_id != checkpoint_log_id(&snapshot.checkpoint) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot log identity differs from checkpoint",
+            ));
+        }
+        let membership: StoredMembershipOf<MetaDbTypeConfig> =
+            if snapshot.checkpoint.membership_bytes.is_empty() {
+                StoredMembership::default()
+            } else {
+                bincode::deserialize(&snapshot.checkpoint.membership_bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            };
+        if membership != meta.last_membership {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot membership differs from checkpoint",
+            ));
+        }
 
         // Verify per-file `(expected_len, crc32c)` BEFORE staging or touching live `lsm/`.
         let mut file_specs = Vec::with_capacity(snapshot.files.len());
+        let mut supplied_names = BTreeSet::new();
         for entry in &snapshot.files {
-            if entry.name.is_empty() || entry.name.contains('/') || entry.name.contains("..") {
+            if entry.name.is_empty()
+                || entry.name == "."
+                || entry.name.contains('/')
+                || entry.name.contains('\\')
+                || entry.name.contains("..")
+                || !supplied_names.insert(entry.name.clone())
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("invalid snapshot relative file name: {:?}", entry.name),
@@ -683,6 +741,12 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
             }
             file_specs.push((entry.name.clone(), entry.expected_len, entry.crc32c));
         }
+        if !supplied_names.contains("CURRENT") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot is missing CURRENT",
+            ));
+        }
 
         let staging_dir = self
             .shared
@@ -708,7 +772,7 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
         // Verify the staged LSM directory opens cleanly and passes all SSTable/MANIFEST CRC32Cs
         // BEFORE swapping!
         let verified_engine = Arc::new(
-            LifecycleStorageEngine::open_lsm(
+            LifecycleStorageEngine::open_lsm_existing(
                 self.shared.shard_id,
                 &staging_dir,
                 self.shared.block_cache.clone(),
@@ -716,7 +780,50 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
             )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
         );
+        if verified_engine.durable_checkpoint() != snapshot.checkpoint {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "staged MANIFEST checkpoint differs from advertised checkpoint",
+            ));
+        }
+        let mut required_names = BTreeSet::from([
+            "CURRENT".to_string(),
+            fs::read_to_string(staging_dir.join("CURRENT"))?
+                .trim()
+                .to_string(),
+        ]);
+        for reader in verified_engine
+            .backend()
+            .current_version()
+            .levels
+            .iter()
+            .flatten()
+        {
+            required_names.insert(sst_file_name(reader.meta().file_id));
+            reader
+                .verify_all_data_blocks()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        }
+        if supplied_names != required_names {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot file set differs from the MANIFEST requirements",
+            ));
+        }
         drop(verified_engine);
+
+        if let Some(current) = *self.shared.last_applied_log_id.read().unwrap() {
+            if snap_idx == current.index && meta.last_log_id != Some(current) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot conflicts with the applied log identity",
+                ));
+            }
+            if snap_idx <= current.index {
+                fs::remove_dir_all(&staging_dir)?;
+                return Ok(());
+            }
+        }
 
         let live_lsm_dir = self.shared.shard_dir.join("lsm");
         let old_lsm_dir = self
@@ -787,6 +894,7 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
             mf.write_all(&meta_bytes)?;
             mf.sync_data()?;
         }
+        sync_dir(&saved_tmp).map_err(|e| io::Error::other(e.to_string()))?;
         fs::rename(&saved_tmp, &saved_snap_dir)?;
         sync_dir(&snaps_root).map_err(|e| io::Error::other(e.to_string()))?;
         for d in fs::read_dir(&snaps_root)? {

@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use openraft::async_runtime::watch::WatchReceiver;
+use openraft::{BasicNode, ChangeMembers, Precondition};
 use serde::{Deserialize, Serialize};
 
 use metadb_core::{
@@ -128,12 +130,52 @@ impl DurableCellManager {
         fs::create_dir_all(&state_dir)?;
         let state_path = state_dir.join("CELL_MANAGER_STATE");
 
-        let is_existing = state_path.exists();
+        let is_existing = state_path.try_exists()?;
+        if !is_existing && state_dir.join("CELL_OWNER").try_exists()? {
+            return Err(MetaDbError::StorageIoError(
+                "CELL_MANAGER_STATE is missing from an existing cell directory".to_string(),
+            ));
+        }
         let persisted = if is_existing {
             let mut raw = Vec::new();
             File::open(&state_path)?.read_to_end(&mut raw)?;
             let body = verify_crc32c_le(&raw, "CELL_MANAGER_STATE")?;
-            decode_cell_state(body)?
+            let mut state = decode_cell_state(body)?;
+            let old_addr = state.nodes.get(&host.node_id()).ok_or_else(|| {
+                MetaDbError::ShardRoutingError(
+                    "data directory belongs to a different node ID".to_string(),
+                )
+            })?;
+            if state.routes.values().any(|route| route.cell_id != cell_id) {
+                return Err(MetaDbError::ShardRoutingError(
+                    "data directory belongs to a different cell ID".to_string(),
+                ));
+            }
+            if old_addr != &local_addr {
+                for route in state
+                    .routes
+                    .values()
+                    .filter(|route| route.peers.contains_key(&host.node_id()))
+                {
+                    let voters: Vec<_> = route
+                        .peers
+                        .iter()
+                        .filter(|(_, (_, voter))| *voter)
+                        .map(|(&id, _)| id)
+                        .collect();
+                    if voters != [host.node_id()] {
+                        return Err(MetaDbError::ShardRoutingError(
+                            "a replicated node must restart at its persisted address; change node addresses online before restarting".to_string()));
+                    }
+                }
+                state.nodes.insert(host.node_id(), local_addr.clone());
+                for route in state.routes.values_mut() {
+                    if let Some((address, _)) = route.peers.get_mut(&host.node_id()) {
+                        *address = local_addr.clone();
+                    }
+                }
+            }
+            state
         } else {
             let mut init = PersistedCellState::default();
             init.nodes.insert(host.node_id(), local_addr.clone());
@@ -181,6 +223,14 @@ impl DurableCellManager {
             init
         };
 
+        Self::verify_or_initialize_owner(
+            &state_dir,
+            host.node_id(),
+            cell_id,
+            &persisted,
+            is_existing,
+        )?;
+
         let mgr = Arc::new(Self {
             cell_id,
             state_dir,
@@ -197,8 +247,14 @@ impl DurableCellManager {
             crash_point: Mutex::new(None),
         });
 
-        mgr.boot_local_shards().await?;
-        mgr.recover_incomplete_splits().await?;
+        if let Err(error) = mgr.boot_local_shards().await {
+            let _ = mgr.host.shutdown_all().await;
+            return Err(error);
+        }
+        if let Err(error) = mgr.recover_incomplete_splits().await {
+            let _ = mgr.host.shutdown_all().await;
+            return Err(error);
+        }
         Ok(mgr)
     }
 
@@ -529,6 +585,47 @@ impl DurableCellManager {
                     group.initialize_if_needed(voter_addrs.clone()).await?;
                 }
                 self.host.register_running_group(group.clone());
+                let membership = group
+                    .raft()
+                    .metrics()
+                    .borrow_watched()
+                    .membership_config
+                    .clone();
+                let local_addr = &route.peers[&self.host.node_id()].0;
+                if membership
+                    .membership()
+                    .get_node(&self.host.node_id())
+                    .is_some_and(|node| node.addr != *local_addr)
+                {
+                    let voters: Vec<_> = membership.membership().voter_ids().collect();
+                    if voters != [self.host.node_id()]
+                        || membership.membership().get_joint_config().len() != 1
+                    {
+                        return Err(MetaDbError::ShardRoutingError(
+                            "persisted Raft peer address differs from the listener; a replicated address change requires an online membership update".to_string()));
+                    }
+                    // ReadIndex waits for a committed log from the recovered leader's
+                    // current term before changing membership metadata.
+                    let _ = group.linearizable_read(group.current_epoch()).await?;
+                    group
+                        .raft()
+                        .change_membership_if(
+                            ChangeMembers::SetNodes(BTreeMap::from([(
+                                self.host.node_id(),
+                                BasicNode::new(local_addr),
+                            )])),
+                            true,
+                            [Precondition::LastMembershipLogId {
+                                last_membership_log_id: *membership.log_id(),
+                            }],
+                        )
+                        .await
+                        .map_err(|error| {
+                            MetaDbError::ConsensusError(format!(
+                                "failed to update the local Raft peer address: {error}"
+                            ))
+                        })?;
+                }
                 self.host.record_registry_state(
                     route.shard_id,
                     RegistryShardState::Active { peers: voter_addrs },
@@ -540,6 +637,16 @@ impl DurableCellManager {
 
                 let mut synced_route = route.clone();
                 synced_route.epoch = group.current_epoch();
+                {
+                    let mut state = self.state.lock().unwrap();
+                    let mut next = state.clone();
+                    next.routes
+                        .insert(synced_route.shard_id, synced_route.clone());
+                    // Persist refreshed node/route addresses only after the Raft
+                    // membership update has committed. Repeating it is safe on restart.
+                    self.persist_sync(&next)?;
+                    *state = next;
+                }
                 self.meta_cache.upsert_route(synced_route);
             } else {
                 self.meta_cache.upsert_route(route);
@@ -1366,6 +1473,57 @@ impl DurableCellManager {
             f.sync_data()?;
         }
         fs::rename(&tmp, &dst)?;
+        sync_dir(dir)?;
+        Ok(())
+    }
+
+    fn verify_or_initialize_owner(
+        dir: &Path,
+        node_id: NodeId,
+        cell_id: CellId,
+        state: &PersistedCellState,
+        legacy: bool,
+    ) -> Result<()> {
+        let path = dir.join("CELL_OWNER");
+        if path.try_exists()? {
+            let raw = fs::read(path)?;
+            let body = verify_crc32c_le(&raw, "CELL_OWNER")?;
+            if body.len() != 16
+                || body[..8] != node_id.to_le_bytes()
+                || body[8..] != cell_id.to_le_bytes()
+            {
+                return Err(MetaDbError::ShardRoutingError(
+                    "cell directory owner does not match the configured node and cell IDs"
+                        .to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        // Legacy singleton routes identify the sole owner unambiguously. A
+        // cluster-wide nodes map does not: it also contains registered peers.
+        if legacy
+            && state
+                .routes
+                .values()
+                .any(|route| route.peers.len() != 1 || !route.peers.contains_key(&node_id))
+        {
+            return Err(MetaDbError::ShardRoutingError(
+                "legacy replicated cell directory has no owner marker; migrate ownership offline before startup".to_string(),
+            ));
+        }
+        let mut raw = node_id.to_le_bytes().to_vec();
+        raw.extend_from_slice(&cell_id.to_le_bytes());
+        append_crc32c_le(&mut raw);
+        let tmp = dir.join("CELL_OWNER.tmp");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(&raw)?;
+        file.sync_data()?;
+        drop(file);
+        fs::rename(tmp, path)?;
         sync_dir(dir)?;
         Ok(())
     }
