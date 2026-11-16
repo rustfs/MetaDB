@@ -38,8 +38,18 @@ struct PersistedAllocatorState {
     next_shard_id: ShardId,
     rename_fence_token: u64,
     active_rename_lease: Option<(u64, HlcTimestamp)>,
-    recent_grants: BTreeMap<u128, (u64, u64)>,
+    recent_grants: BTreeMap<u128, CachedIdGrant>,
     grant_fifo: VecDeque<u128>,
+    /// Next low 64 bits of a `LocalIdBuffer` request UUID. Persisted so a reopened
+    /// buffer cannot replay an earlier UUID and receive a different kind of grant.
+    next_client_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct CachedIdGrant {
+    kind: AllocIdKind,
+    start: u64,
+    count: u64,
 }
 
 impl Default for PersistedAllocatorState {
@@ -55,6 +65,7 @@ impl Default for PersistedAllocatorState {
             active_rename_lease: None,
             recent_grants: BTreeMap::new(),
             grant_fifo: VecDeque::new(),
+            next_client_seq: 1,
         }
     }
 }
@@ -120,8 +131,14 @@ impl DurableIdAllocator {
         let count = count.max(1);
         let mut guard = self.state.lock().unwrap();
         if request_uuid != 0 {
-            if let Some(&cached) = guard.recent_grants.get(&request_uuid) {
-                return Ok(cached);
+            if let Some(cached) = guard.recent_grants.get(&request_uuid) {
+                if cached.kind != kind {
+                    return Err(MetaDbError::StorageIoError(format!(
+                        "request uuid {request_uuid:#x} already granted {:?} ids, refused for {kind:?}",
+                        cached.kind
+                    )));
+                }
+                return Ok((cached.start, cached.count));
             }
         }
 
@@ -166,7 +183,7 @@ impl DurableIdAllocator {
                 }
             };
 
-        let grant = (start, count);
+        let grant = CachedIdGrant { kind, start, count };
         if request_uuid != 0 {
             if next.grant_fifo.len() >= MAX_CACHED_GRANT_UUIDS {
                 if let Some(old_uuid) = next.grant_fifo.pop_front() {
@@ -180,7 +197,21 @@ impl DurableIdAllocator {
         // Cache the grant and bump the watermark only after the new state is durable.
         self.persist_sync(&next)?;
         *guard = next;
-        Ok(grant)
+        Ok((start, count))
+    }
+
+    /// Durable request UUID for `LocalIdBuffer`. The counter survives reopen, so a new
+    /// buffer cannot reuse the UUID of a directory grant and receive directory IDs for a file.
+    pub fn next_client_request_uuid(&self, node_id: u64) -> Result<u128> {
+        let mut guard = self.state.lock().unwrap();
+        let mut next = guard.clone();
+        let seq = next.next_client_seq;
+        next.next_client_seq = seq.checked_add(1).ok_or_else(|| {
+            MetaDbError::StorageIoError("client request uuid sequence overflow".to_string())
+        })?;
+        self.persist_sync(&next)?;
+        *guard = next;
+        Ok(((node_id as u128) << 64) | (seq as u128))
     }
 
     /// Acquires a monotonic fenced `DirRenameLease` (`Resolution B13`), rejecting concurrent leases
@@ -261,8 +292,7 @@ struct LocalBlockCursor {
 /// Fast local consumer buffer leasing blocks from `DurableIdAllocator` with zero per-file disk I/O.
 pub struct LocalIdBuffer {
     allocator: std::sync::Arc<DurableIdAllocator>,
-    uuid_seed: u128,
-    seq: std::sync::atomic::AtomicU64,
+    node_id: u64,
     file_inodes: Mutex<LocalBlockCursor>,
     dir_inodes: Mutex<LocalBlockCursor>,
     file_ids: Mutex<LocalBlockCursor>,
@@ -272,23 +302,22 @@ impl LocalIdBuffer {
     pub fn new(allocator: std::sync::Arc<DurableIdAllocator>, node_id: u64) -> Self {
         Self {
             allocator,
-            uuid_seed: (node_id as u128) << 64,
-            seq: std::sync::atomic::AtomicU64::new(1),
+            node_id,
             file_inodes: Mutex::new(LocalBlockCursor::default()),
             dir_inodes: Mutex::new(LocalBlockCursor::default()),
             file_ids: Mutex::new(LocalBlockCursor::default()),
         }
     }
 
-    fn next_uuid(&self) -> u128 {
-        self.uuid_seed | (self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128)
+    fn next_uuid(&self) -> Result<u128> {
+        self.allocator.next_client_request_uuid(self.node_id)
     }
 
     pub fn next_file_inode_id(&self) -> Result<InodeId> {
         let mut g = self.file_inodes.lock().unwrap();
         if g.next >= g.end {
             let (start, count) = self.allocator.allocate_block(
-                self.next_uuid(),
+                self.next_uuid()?,
                 AllocIdKind::FileInode,
                 CELL_FILE_ID_BLOCK_SIZE,
             )?;
@@ -304,7 +333,7 @@ impl LocalIdBuffer {
         let mut g = self.dir_inodes.lock().unwrap();
         if g.next >= g.end {
             let (start, count) = self.allocator.allocate_block(
-                self.next_uuid(),
+                self.next_uuid()?,
                 AllocIdKind::DirInode,
                 CELL_DIR_AFFINITY_BLOCK_SIZE,
             )?;
@@ -320,7 +349,7 @@ impl LocalIdBuffer {
         let mut g = self.file_ids.lock().unwrap();
         if g.next >= g.end {
             let (start, count) = self.allocator.allocate_block(
-                self.next_uuid(),
+                self.next_uuid()?,
                 AllocIdKind::FileId,
                 CELL_FILE_ID_BLOCK_SIZE,
             )?;
@@ -330,5 +359,49 @@ impl LocalIdBuffer {
         let id = g.next;
         g.next += 1;
         Ok(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metadb_core::{is_dir_inode_id, is_file_inode_id};
+    use tempfile::tempdir;
+
+    #[test]
+    fn reopened_local_buffer_does_not_reuse_directory_grant_as_file_inode() {
+        let dir = tempdir().unwrap();
+        let alloc = std::sync::Arc::new(DurableIdAllocator::open(dir.path()).unwrap());
+        let dir_id = {
+            let buf = LocalIdBuffer::new(alloc.clone(), 7);
+            let id = buf.next_dir_inode_id().unwrap();
+            assert!(
+                is_dir_inode_id(id),
+                "directory id {id:#x} is tagged as a file"
+            );
+            id
+        };
+        let buf = LocalIdBuffer::new(alloc, 7);
+        let file_id = buf.next_file_inode_id().unwrap();
+        assert!(
+            is_file_inode_id(file_id),
+            "reopened buffer returned a directory inode {file_id:#x} for a file"
+        );
+        assert_ne!(file_id, dir_id);
+    }
+
+    #[test]
+    fn request_uuid_cannot_change_id_kind() {
+        let dir = tempdir().unwrap();
+        let alloc = DurableIdAllocator::open(dir.path()).unwrap();
+        alloc.allocate_block(9, AllocIdKind::DirInode, 4).unwrap();
+        let err = alloc
+            .allocate_block(9, AllocIdKind::FileInode, 4)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("already granted"),
+            "unexpected error: {message}"
+        );
     }
 }

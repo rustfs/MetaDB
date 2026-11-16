@@ -116,7 +116,7 @@ use metadb_proto::metadata_service_server::MetadataServiceServer;
 use metadb_proto::raft_transport_service_server::RaftTransportServiceServer;
 use metadb_proto::transaction_service_server::TransactionServiceServer;
 use metadb_proxy::{MetadataSqlCommand, SqlTemplateParser, StatelessProxyRouter};
-use metadb_raft::{MultiRaftTransportServer, ShardGroupHost};
+use metadb_raft::{MultiRaftTransportServer, ProposalShutdownGate, ShardGroupHost};
 use metadb_storage::mvcc::DEFAULT_MVCC_RETENTION_MS;
 use metadb_storage::{LifecycleStorageEngine, ShardedBlockCache};
 use metadb_tx::{
@@ -756,6 +756,13 @@ impl PersistentMetaDbCluster {
         self.stop_tasks().await;
         self.flush_all().await?;
         self.host.shutdown_all().await
+    }
+
+    /// Installs `gate` on every local Raft group so a test can park `client_write`.
+    pub fn install_proposal_shutdown_gate(&self, gate: &Arc<ProposalShutdownGate>) {
+        for group in self.host.all_groups() {
+            group.set_proposal_shutdown_gate(Some(gate.clone()));
+        }
     }
 
     /// Stops gRPC and maintenance, then shuts Raft down without flushing memtables.

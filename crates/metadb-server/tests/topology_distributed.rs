@@ -21,8 +21,8 @@ use metadb_core::{
 };
 use metadb_proto::raft_transport_service_server::RaftTransportServiceServer;
 use metadb_raft::{
-    ChannelPool, MultiRaftRouter, MultiRaftTransportServer, RaftNodeOptions, ShardGroupHost,
-    ShardRaftGroup, ShardWatermarkTracker,
+    ChannelPool, MultiRaftRouter, MultiRaftTransportServer, ProposalShutdownGate, RaftNodeOptions,
+    ShardGroupHost, ShardRaftGroup, ShardWatermarkTracker,
 };
 use metadb_storage::{LsmEngineConfig, ShardedBlockCache};
 use metadb_tx::{
@@ -425,6 +425,7 @@ struct BurstReport {
 }
 
 struct LiveBurst {
+    tx: Arc<Mutex<Arc<DistributedTxRouter>>>,
     acked: Arc<Mutex<HashMap<String, (InodeId, FileId)>>>,
     attempted: Arc<Mutex<HashSet<String>>>,
     in_flight: Arc<AtomicUsize>,
@@ -444,7 +445,9 @@ impl LiveBurst {
         ids: Arc<AtomicU64>,
         max_per_worker: u64,
         deadline: Option<Instant>,
+        pace: Option<Duration>,
     ) -> Self {
+        let tx = Arc::new(Mutex::new(tx));
         let acked = Arc::new(Mutex::new(HashMap::new()));
         let attempted = Arc::new(Mutex::new(HashSet::new()));
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -478,6 +481,7 @@ impl LiveBurst {
                     let seq = ids.fetch_add(1, Ordering::Relaxed);
                     let name = format!("{prefix}{tid:02}_{seq:05}.dat");
                     attempted.lock().unwrap().insert(name.clone());
+                    let tx = tx.lock().unwrap().clone();
                     in_flight.fetch_add(1, Ordering::Relaxed);
                     let started = Instant::now();
                     let result = tokio::time::timeout(
@@ -519,10 +523,14 @@ impl LiveBurst {
                             format!("create {name} timed out"),
                         ),
                     }
+                    if let Some(pace) = pace {
+                        tokio::time::sleep(pace).await;
+                    }
                 }
             }));
         }
         Self {
+            tx,
             acked,
             attempted,
             in_flight,
@@ -535,23 +543,32 @@ impl LiveBurst {
         }
     }
 
-    async fn wait_until_overlapping(&self, min_acked: usize) {
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    fn acked_len(&self) -> usize {
+        self.acked.lock().unwrap().len()
+    }
+
+    fn retarget(&self, tx: Arc<DistributedTxRouter>) {
+        *self.tx.lock().unwrap() = tx;
+    }
+
+    async fn wait_until_acked(&self, min_acked: usize) {
         let started = Instant::now();
         loop {
-            let n = self.acked.lock().unwrap().len();
-            let busy = self.in_flight.load(Ordering::Relaxed);
-            if n >= min_acked && busy >= 1 {
+            if self.acked_len() >= min_acked {
                 return;
             }
             if started.elapsed() > Duration::from_secs(20) {
-                panic!("create load did not overlap a propose (acked={n} in_flight={busy})");
+                panic!(
+                    "create load did not reach {min_acked} acknowledged creates (acked={})",
+                    self.acked_len()
+                );
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    }
-
-    fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::Relaxed)
     }
 
     fn allow_errors(&self) {
@@ -683,16 +700,32 @@ async fn three_voter_leader_loss_under_load() {
     let upgraded = cell.scale_out_replicas(3).await.unwrap();
     assert!(upgraded >= 1, "expected the meta shard to gain voters");
 
+    let gate = Arc::new(ProposalShutdownGate::new());
+    for group in host.all_groups() {
+        group.set_proposal_shutdown_gate(Some(gate.clone()));
+    }
     let ids = Arc::new(AtomicU64::new(2));
     let phase_started = Instant::now();
-    let burst = LiveBurst::start(tx.clone(), bucket_id, "a", ids.clone(), 40, None);
-    burst.wait_until_overlapping(LOAD_MIN_ACKED).await;
-    let in_flight = burst.in_flight();
+    let burst = LiveBurst::start(tx.clone(), bucket_id, "a", ids.clone(), 40, None, None);
+    burst.wait_until_acked(LOAD_MIN_ACKED).await;
+    gate.arm();
+    tokio::time::timeout(Duration::from_secs(10), gate.wait_for_arrival())
+        .await
+        .expect("no create reached propose() on the leader");
+    let pending = gate.depth();
+    assert!(
+        pending >= 1,
+        "leader shutdown had no proposal parked inside propose()"
+    );
     burst.allow_errors();
     burst.request_stop();
-    tokio::time::timeout(Duration::from_secs(15), host.shutdown_all_no_flush())
+    let shutting_down = host.clone();
+    let shutdown = tokio::spawn(async move { shutting_down.shutdown_all_no_flush().await });
+    gate.release_for_shutdown();
+    tokio::time::timeout(Duration::from_secs(15), shutdown)
         .await
         .expect("leader shutdown_all_no_flush timed out")
+        .expect("shutdown task panicked")
         .unwrap();
     let phase_a = burst.finish().await;
 
@@ -735,22 +768,23 @@ async fn three_voter_leader_loss_under_load() {
         attempted.len(),
         listing,
         phase_a.crash_window_errors,
-        in_flight,
+        pending,
         &phase_a.latencies_us,
     );
 
     let restart_started = Instant::now();
-    // Keep the overlap short: enough in-flight creates to hit the restarting voter,
-    // not a multi-thousand-op soak. The ignored stress_local profile covers duration.
+    // `ShardRaftGroup::start` waits for recovery before `register_group`. Workers stay
+    // up through that registration, then must acknowledge more creates on the current leader.
     let phase_b = LiveBurst::start(
         failover.clone(),
         bucket_id,
         "b",
         ids,
-        40,
-        Some(Instant::now() + Duration::from_secs(1)),
+        8_000,
+        Some(Instant::now() + Duration::from_secs(20)),
+        Some(Duration::from_millis(20)),
     );
-    phase_b.wait_until_overlapping(8).await;
+    phase_b.wait_until_acked(1).await;
     let restart_in_flight = phase_b.in_flight();
     phase_b.allow_errors();
     let restart_cache = Arc::new(ShardedBlockCache::new(4 * 1024 * 1024));
@@ -789,18 +823,40 @@ async fn three_voter_leader_loss_under_load() {
         .await
         .unwrap();
     host.register_running_group(restarted.clone());
-    phase_b.request_stop();
-    let phase_b = phase_b.finish().await;
-
-    acked.extend(phase_b.acked);
-    attempted.extend(phase_b.attempted);
-    // Restarting the stopped voter can move the Raft leader. Follow whoever wins
-    // before checking the committed listing.
     let candidates = [
         (peer2.group.clone(), peer2.handler.clone()),
         (peer3.group.clone(), peer3.handler.clone()),
         (restarted.clone(), restart_handler),
     ];
+    let acked_at_register = phase_b.acked_len();
+    assert!(
+        acked_at_register >= 1,
+        "creates stopped before the restarted voter registered"
+    );
+    let (leader, handler) = wait_leader(&candidates).await;
+    phase_b.retarget(Arc::new(DistributedTxRouter::new(
+        leader.node_id(),
+        clock.clone(),
+        Arc::new(LeaderDirectory::new(
+            range.clone(),
+            leader,
+            handler,
+            clock.clone(),
+        )),
+    )));
+    phase_b.wait_until_acked(acked_at_register + 8).await;
+    phase_b.request_stop();
+    let phase_b = phase_b.finish().await;
+    assert!(
+        phase_b.acked.len() >= acked_at_register + 8,
+        "restarted voter registered without a later acknowledged create"
+    );
+
+    let acked_after_register = phase_b.acked.len();
+    acked.extend(phase_b.acked);
+    attempted.extend(phase_b.attempted);
+    // Restarting the stopped voter can move the Raft leader. Follow whoever wins
+    // before checking the committed listing.
     let check_deadline = Instant::now() + Duration::from_secs(10);
     let (listing, committed, leader_after_restart) = loop {
         let (leader, handler) = wait_leader(&candidates).await;
@@ -825,6 +881,10 @@ async fn three_voter_leader_loss_under_load() {
     };
     let catch_started = Instant::now();
     wait_engine_has_names(&restarted, &clock, bucket_id, &committed).await;
+    println!(
+        "metadb failure profile=quorum-post-register acked_at_register={acked_at_register} acked_after={acked_after_register} added={}",
+        acked_after_register - acked_at_register
+    );
     println!("metadb failure profile=quorum-restart-leader node={leader_after_restart}");
     emit_failure(
         "quorum-restart-under-load",
@@ -969,7 +1029,7 @@ fn emit_failure(
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
     println!(
-        "metadb failure profile={profile} acked={acked} attempted={attempted} listing={listing} crash_window_errors={crash_window_errors} in_flight_at_stop={in_flight} elapsed_ms={} latency_us p50={} p99={} max={}",
+        "metadb failure profile={profile} acked={acked} attempted={attempted} listing={listing} crash_window_errors={crash_window_errors} overlap={in_flight} elapsed_ms={} latency_us p50={} p99={} max={}",
         elapsed.as_millis(),
         percentile(&sorted, 50),
         percentile(&sorted, 99),

@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use metadb_core::{FileId, InodeId, UserId, ROOT_INODE_ID};
+use metadb_core::{is_file_inode_id, FileId, InodeId, UserId, ROOT_INODE_ID};
+use metadb_raft::ProposalShutdownGate;
 use metadb_server::stress::persistent_config;
 use metadb_server::PersistentMetaDbCluster;
 use metadb_tx::DistributedTxRouter;
@@ -95,6 +96,11 @@ impl LiveBurst {
                     match result {
                         Ok(Ok(entry)) => {
                             let fid = entry.attr.fid.expect("file create returns a file id");
+                            assert!(
+                                is_file_inode_id(entry.attr.inode_id),
+                                "create {name} returned directory inode {:#x}",
+                                entry.attr.inode_id
+                            );
                             acked.lock().unwrap().insert(
                                 name,
                                 LiveFile {
@@ -146,10 +152,6 @@ impl LiveBurst {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    }
-
-    fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::Relaxed)
     }
 
     fn begin_shutdown(&self) {
@@ -209,13 +211,27 @@ async fn unflushed_restart_under_create_load() {
             .unwrap();
         let hot_id = hot.attr.inode_id;
         let archive_id = archive.attr.inode_id;
+        let gate = Arc::new(ProposalShutdownGate::new());
+        cluster.install_proposal_shutdown_gate(&gate);
         let burst = LiveBurst::start(cluster.clone(), hot_id);
         burst.wait_until_overlapping().await;
-        let in_flight = burst.in_flight();
-        burst.begin_shutdown();
-        tokio::time::timeout(Duration::from_secs(15), cluster.shutdown_without_flush())
+        gate.arm();
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_for_arrival())
             .await
-            .expect("shutdown_without_flush timed out while creates were in flight")
+            .expect("no create reached propose() before shutdown");
+        let pending = gate.depth();
+        assert!(
+            pending >= 1,
+            "shutdown had no proposal parked inside propose()"
+        );
+        burst.begin_shutdown();
+        let shutting_down = cluster.clone();
+        let shutdown = tokio::spawn(async move { shutting_down.shutdown_without_flush().await });
+        gate.release_for_shutdown();
+        tokio::time::timeout(Duration::from_secs(15), shutdown)
+            .await
+            .expect("shutdown_without_flush timed out while a proposal was inside propose()")
+            .expect("shutdown task panicked")
             .unwrap();
         // Join workers before reopen so their `ShardRaftGroup` clones drop the LSM lock.
         let report = burst.finish().await;
@@ -240,7 +256,7 @@ async fn unflushed_restart_under_create_load() {
             report.attempted.len(),
             listing,
             report.crash_window_errors,
-            in_flight,
+            pending,
             &report.latencies_us,
         );
         (cluster, hot_id, archive_id)
@@ -368,6 +384,13 @@ async fn apply_joined_tail(
                     .create_file_auto_id(hot_id, &name, FILE_UID, FILE_MODE, FILE_BYTES)
                     .await
                     .unwrap_or_else(|err| panic!("post-recovery create {name} failed: {err}"));
+                assert!(
+                    is_file_inode_id(entry.attr.inode_id),
+                    "post-recovery create {name} returned directory inode {:#x}",
+                    entry.attr.inode_id
+                );
+                assert_ne!(entry.attr.inode_id, hot_id);
+                assert_ne!(entry.attr.inode_id, archive_id);
                 created.push((name, entry.attr.inode_id, entry.attr.fid.expect("file id")));
             }
             TailEvent::Creates(created)
@@ -425,6 +448,12 @@ async fn rebuild_model(
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("listed {name} did not look up"));
+        assert!(
+            is_file_inode_id(entry.attr.inode_id),
+            "recovered file {name} has directory inode {:#x}",
+            entry.attr.inode_id
+        );
+        assert_ne!(entry.attr.inode_id, hot_id);
         model.insert(
             name,
             LiveFile {
@@ -575,7 +604,7 @@ fn emit(
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
     println!(
-        "metadb failure profile={profile} acked={acked} attempted={attempted} listing={listing} crash_window_errors={crash_window_errors} in_flight_at_stop={in_flight} elapsed_ms={} latency_us p50={} p99={} max={}",
+        "metadb failure profile={profile} acked={acked} attempted={attempted} listing={listing} crash_window_errors={crash_window_errors} proposals_parked={in_flight} elapsed_ms={} latency_us p50={} p99={} max={}",
         elapsed.as_millis(),
         percentile(&sorted, 50),
         percentile(&sorted, 99),
