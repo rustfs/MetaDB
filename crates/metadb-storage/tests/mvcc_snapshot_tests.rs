@@ -187,45 +187,55 @@ fn test_snapshot_guard_read_cut_safe_flush_gate_and_view_at_raft_index() {
     );
 }
 
-/// Keys sealed into an `ImmMemTable` and keys written into the new active memtable
-/// must all survive a 256-key paged scan, including when the active keys sort first.
+/// Sealed multiples of 10 and active odd keys interleave. Both layers contribute
+/// keys inside the first 256-key page and past it.
 #[test]
 fn test_paged_scan_keeps_interleaved_imm_and_active_keys() {
     let engine = LifecycleStorageEngine::new(1, 60_000, 128, false);
-    for n in 1u32..=60 {
+    let sealed_prefix: Vec<u32> = (10..=600).step_by(10).collect();
+    let active: Vec<u32> = (1..=599).step_by(2).collect();
+
+    let mut lsn = 0u64;
+    for &n in &sealed_prefix {
+        lsn += 1;
         engine.apply_committed_put(
             page_key(n),
             b"imm".to_vec(),
             HlcTimestamp::new(1_000, 1),
-            u64::from(n),
+            lsn,
         );
     }
-    let pin = engine.acquire_linearizable_snapshot(60).unwrap();
+    // Hold a snapshot from before the last sealed key so the higher HLC keeps the
+    // sealed memtable queued instead of flushing it before the active writes.
+    let pin = engine.acquire_linearizable_snapshot(lsn).unwrap();
+    lsn += 1;
     engine.apply_committed_put(
-        page_key(61),
-        b"imm-high".to_vec(),
+        page_key(610),
+        b"imm".to_vec(),
         HlcTimestamp::new(1_500, 1),
-        61,
+        lsn,
     );
     engine
         .seal_and_flush_with_hook(
             DurableShardCheckpoint {
-                flushed_raft_index: 61,
+                flushed_raft_index: lsn,
                 flushed_max_hlc: HlcTimestamp::new(1_500, 1),
                 ..Default::default()
             },
             None,
         )
         .unwrap();
-    for n in 200u32..500 {
+    for &n in &active {
+        lsn += 1;
         engine.apply_committed_put(
             page_key(n),
             b"active".to_vec(),
             HlcTimestamp::new(2_000, 1),
-            u64::from(n),
+            lsn,
         );
     }
-    let snap = engine.acquire_linearizable_snapshot(499).unwrap();
+
+    let snap = engine.acquire_linearizable_snapshot(lsn).unwrap();
     let rows = engine
         .scan_with_snapshot(&page_key(0), &page_key(1_000), &snap)
         .unwrap();
@@ -233,8 +243,18 @@ fn test_paged_scan_keeps_interleaved_imm_and_active_keys() {
         .iter()
         .map(|(k, _)| u32::from_be_bytes(k[1..5].try_into().unwrap()))
         .collect();
-    let expect: Vec<u32> = (1..=61).chain(200..500).collect();
+    let mut expect = sealed_prefix.clone();
+    expect.push(610);
+    expect.extend(&active);
+    expect.sort_unstable();
+
     assert_eq!(got, expect);
+    assert!(got.len() > 256);
+    assert_eq!(got.first().copied(), Some(active[0]));
+    assert!(active[0] < sealed_prefix[0]);
+    assert!(got.iter().take(256).any(|n| n % 10 == 0));
+    assert!(got.iter().skip(256).any(|n| n % 10 == 0));
+    assert!(got.iter().take(256).any(|n| n % 2 == 1));
     drop(pin);
 }
 
