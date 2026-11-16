@@ -12,7 +12,7 @@
 1. **Overview & Embedded Quickstart** *(this page)*
 2. [**Deployment & Online Cluster Scale-Out**](./deployment.md) — Single-Node `metadbd`, `1-Voter -> 3-Voter` Multi-Raft promotion, and Multi-Cell `GlobalManager` / `CellLocalManager` / `MetaCache` topology.
 3. [**Client APIs, gRPC & 20 SQL Templates**](./client-apis-and-sql.md) — Embedded Rust SDK, `tonic` gRPC services, and the complete reference of 20 metadata SQL templates.
-4. [**Operations, `metadb-ctl` & Performance Tuning**](./operations-and-tuning.md) — CLI administration, Jumbo Shard isolation & Dual-Mode splitting, `SnapshotGuard` MVCC & `LocalityCompactor` tuning, and troubleshooting.
+4. [**Operations, `metadb-ctl` & Performance Tuning**](./operations-and-tuning.md) — CLI administration, Jumbo Shard isolation & Dual-Mode splitting, `SnapshotGuard` MVCC & `LocalityCompactor` tuning, the embedded stress harness, and troubleshooting.
 
 ---
 

@@ -56,13 +56,34 @@ enum Command {
     /// Execute one of the 20 metadata SQL templates.
     Sql { query: String },
     /// Run a concurrent synthetic metadata workload benchmark.
+    ///
+    /// `--workload hotspot-create` and `bulk-ttl-delete` call a remote `metadbd`.
+    /// `--workload mixed` or `--embedded` starts a temporary all-in-one node and runs
+    /// [`metadb_server::stress`] (correctness checks plus latency percentiles).
     Bench {
         #[arg(long, default_value = "hotspot-create")]
         workload: String,
-        #[arg(long, default_value_t = 16)]
-        concurrency: usize,
+        /// Remote-bench workers. Defaults to 16 when omitted.
+        /// When set, also overrides the embedded profile's concurrency.
+        #[arg(long)]
+        concurrency: Option<usize>,
         #[arg(long, default_value_t = 1000)]
         ops: usize,
+        /// Start an in-process persistent node instead of dialing `--endpoint`.
+        #[arg(long)]
+        embedded: bool,
+        /// Embedded profile: `smoke` (5s, ignores env) or `local` (env-driven, default 30s).
+        #[arg(long, default_value = "smoke")]
+        profile: String,
+        /// Overrides the embedded profile duration.
+        #[arg(long)]
+        duration_secs: Option<u64>,
+        /// Overrides the embedded profile directory count.
+        #[arg(long)]
+        keyspace: Option<usize>,
+        /// Overrides the embedded profile seed.
+        #[arg(long)]
+        seed: Option<u64>,
     },
 }
 
@@ -149,6 +170,57 @@ async fn open_meta(
         channel,
         metadb_server::BearerAuth::new(token),
     ))
+}
+
+async fn run_embedded_bench(
+    profile_name: &str,
+    duration_secs: Option<u64>,
+    concurrency: Option<usize>,
+    keyspace: Option<usize>,
+    seed: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut profile = match profile_name {
+        "smoke" | "ci" => metadb_server::stress::StressProfile::smoke(),
+        "local" => metadb_server::stress::StressProfile::from_env(),
+        other => {
+            return Err(
+                format!("unsupported --profile '{other}': expected 'smoke' or 'local'").into(),
+            );
+        }
+    };
+    if let Some(secs) = duration_secs {
+        profile.duration = std::time::Duration::from_secs(secs.max(1));
+    }
+    if let Some(n) = concurrency {
+        profile.concurrency = n.max(1);
+    }
+    if let Some(n) = keyspace {
+        profile.keyspace_dirs = n.max(1);
+    }
+    if let Some(n) = seed {
+        profile.seed = n;
+    }
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "metadb-stress-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&data_dir)?;
+    let cfg = metadb_server::stress::persistent_config(&data_dir, 4 * 1024 * 1024 * 1024);
+    let (cluster, addr) = metadb_server::PersistentMetaDbCluster::open_and_serve(cfg).await?;
+    println!("embedded metadbd listening on {addr}");
+    let report = metadb_server::stress::run_mixed(cluster.clone(), &profile).await;
+    println!("{report}");
+    cluster.shutdown().await?;
+    let _ = std::fs::remove_dir_all(&data_dir);
+    if report.errors > 0 || report.correctness_errors > 0 {
+        return Err(format!("embedded stress failed: {report}").into());
+    }
+    Ok(())
 }
 
 fn normalize_url(ep: &str) -> String {
@@ -318,10 +390,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             workload,
             concurrency,
             ops,
+            embedded,
+            profile,
+            duration_secs,
+            keyspace,
+            seed,
         } => {
+            if embedded || workload == "mixed" {
+                run_embedded_bench(&profile, duration_secs, concurrency, keyspace, seed).await?;
+                return Ok(());
+            }
+            let concurrency = concurrency.unwrap_or(16);
             if workload != "hotspot-create" && workload != "bulk-ttl-delete" {
                 return Err(format!(
-                    "unsupported --workload '{}': expected 'hotspot-create' or 'bulk-ttl-delete'",
+                    "unsupported --workload '{}': expected 'hotspot-create', 'bulk-ttl-delete', or 'mixed'",
                     workload
                 )
                 .into());

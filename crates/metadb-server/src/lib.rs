@@ -9,6 +9,7 @@
 pub mod config;
 pub mod grpc_services;
 pub mod metrics;
+pub mod stress;
 
 use std::sync::Arc;
 use std::time::Duration;
