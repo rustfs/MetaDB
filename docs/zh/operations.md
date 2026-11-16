@@ -137,7 +137,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 - 心跳是一个 RPC，`metadbd` 里没有发送方。`StoreHeartbeat` 不持久化。
 - 公开 gRPC 端口上的 Raft 不认证。进程不终结 TLS。
 - `memtable_size_bytes` 和所有 Raft 计时字段不会通过 TOML 改变运行行为。
-- `metadb-ctl bench` 只报告吞吐量。它不在运行后检查列举、dirstat 或配额，也不打印延迟分位数。
+- `metadb-ctl bench` 报告的是尝试的吞吐量。`unwrap` 只抓住传输或状态失败。`AlreadyExists` 这类应用错误放在 OK 响应里并被丢掉，unlink 也一样，因此再跑一次仍可能打印吞吐量。它不在运行后检查列举、dirstat 或配额，也不打印延迟分位数。
 
 ## 文档缺口
 

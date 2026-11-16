@@ -2,7 +2,7 @@
 
 [Überblick](./README.md) · [English](../en/configuration.md) · [Français](../fr/configuration.md) · [日本語](../ja/configuration.md) · [简体中文](../zh/configuration.md)
 
-`metadbd --config` und `ServerTomlConfig::from_toml_file` / `from_toml_str` lesen TOML (`crates/metadb-server/src/config.rs`). Unbekannte Schlüssel weist serde zurück. Jeder Abschnitt ist optional, weil jede Struktur `#[serde(default)]` verwendet. Ausgelassene Felder nehmen die Vorgaben unten an.
+`metadbd --config` und `ServerTomlConfig::from_toml_file` / `from_toml_str` lesen TOML (`crates/metadb-server/src/config.rs`). Unbekannte Schlüssel werden ignoriert. Die Strukturen verwenden `#[serde(default)]` und setzen `deny_unknown_fields` nicht, und `from_toml_str` ruft `toml::from_str` direkt auf. Ein falsch geschriebener Schlüssel behält seine Vorgabe, auch ein leeres `security.shared_secret`, und der Start gelingt trotzdem. Jeder Abschnitt ist optional. Ausgelassene Felder nehmen die Vorgaben unten an.
 
 ## Vorgaben
 
@@ -73,7 +73,7 @@ Wenn `shared_secret` nicht leer ist, verlangen `MetadataService`, `TransactionSe
 
 `RaftTransportService` wird ohne den Interceptor registriert. Ein Bearer-Token authentifiziert Raft-RPCs auf diesem Port nicht.
 
-Ein leeres Geheimnis lässt diese RPCs zu. Der Code warnt beim Start davor. Die Standardbindung auf `127.0.0.1` lassen, oder einen TLS-Terminator vor einen durch ein Geheimnis geschützten Listener setzen, bevor der Port freigegeben wird.
+Ein leeres Geheimnis lässt Metadaten-, Transaktions- und Control-Plane-RPCs zu. Der Code warnt beim Start davor. Ein Bearer-Geheimnis deckt `RaftTransportService` nicht ab, und ein TLS-Terminator vor dem Listener fügt diese Prüfung nicht hinzu: nach der Terminierung bleiben Raft-RPCs unauthentifiziert. Bevor ein nicht vertrauenswürdiger Client den Port erreichen kann, die Bindung auf einem vertrauenswürdigen Netz wie `127.0.0.1` lassen, oder jeden Dienst hinter einen Proxy setzen, der den Client authentifiziert (zum Beispiel gegenseitiges TLS), und den direkten Zugriff auf diesen Prozess sperren.
 
 ## Was sich nicht konfigurieren lässt
 

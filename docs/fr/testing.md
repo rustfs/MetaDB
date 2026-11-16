@@ -103,12 +103,12 @@ Options : `--workload` vaut `hotspot-create` (le défaut) ou `bulk-ttl-delete`. 
 
 Comportement issu de `crates/metadb-server/src/bin/metadb-ctl.rs` :
 
-- Chaque tâche exécute `ops / concurrency` itérations, et au moins une. Le reste de la division est abandonné, donc le nombre d'opérations imprimé peut être inférieur à `--ops`. Si `--ops` est inférieur à `--concurrency`, le nombre peut être supérieur à `--ops` car chaque tâche s'exécute encore une fois.
-- `hotspot-create` fait un mkdir de l'inode `999000` nommé `bench_hotspot_create` sous l'inode parent `1`, puis crée des fichiers de 4096 octets. L'erreur de mkdir est ignorée. Les erreurs de création interrompent le processus (`unwrap`).
-- `bulk-ttl-delete` fait les mêmes créations sous l'inode `999001` (`bench_bulk_ttl_delete`), puis les unlink, puis un `ListDir` avec `limit = 1000`.
-- `hotspot-create` imprime `Completed <n> single-directory hotspot creates in <s>s (<ops/s> ops/s)`.
-- `bulk-ttl-delete` imprime le nombre de suppressions, les secondes, les ops/s, le nombre d'entrées vivantes renvoyé par cette liste, et la durée de la liste en millisecondes.
-- Le client ne calcule pas de percentiles de latence et ne vérifie ni dirstat ni quota. Une seconde exécution contre le même serveur peut échouer parce que les noms de fichiers et les identifiants d'inode fixes existent déjà.
+- Chaque tâche exécute `ops / concurrency` itérations, et au moins une. Le reste de la division est abandonné, donc le nombre imprimé peut être inférieur à `--ops`. Si `--ops` est inférieur à `--concurrency`, le nombre peut être supérieur à `--ops` car chaque tâche s'exécute encore une fois. Le nombre imprimé est celui des tentatives, pas celui des mutations acceptées.
+- `hotspot-create` fait un mkdir de l'inode `999000` nommé `bench_hotspot_create` sous l'inode parent `1`, puis appelle `CreateFile` pour des fichiers de 4096 octets. Le `Result` du mkdir est abandonné. `unwrap` porte seulement sur le `Result` tonic, donc un échec de transport ou de statut interrompt le processus. `CreateFile` renvoie les échecs d'application tels que `AlreadyExists` dans un `CreateFileResponse.error` OK, et le client ignore ce champ.
+- `bulk-ttl-delete` fait les mêmes créations sous l'inode `999001` (`bench_bulk_ttl_delete`), puis appelle `Unlink` de la même façon (`unwrap` de transport, `error` d'application ignorée), puis un `ListDir` avec `limit = 1000`.
+- `hotspot-create` imprime `Completed <n> single-directory hotspot creates in <s>s (<ops/s> ops/s)` après les tentatives, y compris celles dont l'erreur d'application a été ignorée.
+- `bulk-ttl-delete` imprime le nombre de tentatives d'unlink, les secondes, les ops/s, le nombre d'entrées vivantes renvoyé par cette liste, et la durée de la liste en millisecondes. L'appel de liste est vérifié ; les unlink ne le sont pas.
+- Le client ne calcule pas de percentiles de latence et ne vérifie ni dirstat ni quota. Une seconde exécution contre le même serveur peut encore imprimer `Completed` et un débit lorsque chaque création est rejetée avec `AlreadyExists`.
 
 Ne pas traiter un nombre issu de cette commande comme un résultat du dépôt. Il dépend de la machine, du profil de compilation et du serveur visé. Cet arbre n'enregistre pas d'échantillon.
 

@@ -2,7 +2,7 @@
 
 [概览](./README.md) · [English](../en/configuration.md) · [Français](../fr/configuration.md) · [Deutsch](../de/configuration.md) · [日本語](../ja/configuration.md)
 
-`metadbd --config` 以及 `ServerTomlConfig::from_toml_file` / `from_toml_str` 读取 TOML（`crates/metadb-server/src/config.rs`）。未知键会被 serde 拒绝。每个结构体都使用 `#[serde(default)]`，因此每个节都可以省略。省略的字段取下面的默认值。
+`metadbd --config` 以及 `ServerTomlConfig::from_toml_file` / `from_toml_str` 读取 TOML（`crates/metadb-server/src/config.rs`）。未知键会被忽略。这些结构体使用 `#[serde(default)]`，没有 `deny_unknown_fields`，`from_toml_str` 直接调用 `toml::from_str`。拼错的键保持默认值，包括空的 `security.shared_secret`，进程仍然会启动。每个节都可以省略。省略的字段取下面的默认值。
 
 ## 默认值
 
@@ -73,7 +73,7 @@ shared_secret = "replace-with-a-long-random-string"
 
 `RaftTransportService` 注册时没有拦截器。持有者令牌不能认证该端口上的 Raft RPC。
 
-空密钥允许这些 RPC。代码在启动时对此发出警告。在暴露端口之前，保持默认绑定在 `127.0.0.1`，或在受密钥保护的监听器前面放一个 TLS 终结器。
+空密钥允许元数据、事务和控制面 RPC。代码在启动时对此发出警告。持有者密钥不覆盖 `RaftTransportService`，在监听器前面终结 TLS 也不会补上这项检查：终结之后，Raft RPC 仍然不认证。在不可信客户端能够到达该端口之前，把绑定留在 `127.0.0.1` 这类可信网络上，或把每个服务放到会认证客户端的代理后面（例如双向 TLS），并阻断对本进程的直接访问。
 
 ## 不能配置的内容
 

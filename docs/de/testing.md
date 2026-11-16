@@ -103,12 +103,12 @@ Flags: `--workload` ist `hotspot-create` (die Vorgabe) oder `bulk-ttl-delete`. `
 
 Verhalten aus `crates/metadb-server/src/bin/metadb-ctl.rs`:
 
-- Jede Aufgabe läuft `ops / concurrency` Iterationen, mindestens eine. Der Divisionsrest entfällt, daher kann die gedruckte Operationszahl kleiner als `--ops` sein. Ist `--ops` kleiner als `--concurrency`, kann die Zahl größer als `--ops` sein, weil jede Aufgabe trotzdem einmal läuft.
-- `hotspot-create` legt per mkdir Inode `999000` namens `bench_hotspot_create` unter Eltern-Inode `1` an und erzeugt dann Dateien von 4096 Bytes. Der mkdir-Fehler wird ignoriert. Anlegefehler beenden den Prozess (`unwrap`).
-- `bulk-ttl-delete` tut dieselben Anlegevorgänge unter Inode `999001` (`bench_bulk_ttl_delete`), dann unlink, dann ein `ListDir` mit `limit = 1000`.
-- `hotspot-create` druckt `Completed <n> single-directory hotspot creates in <s>s (<ops/s> ops/s)`.
-- `bulk-ttl-delete` druckt Löschzahl, Sekunden, ops/s, die von dieser Liste gelieferte Zahl lebender Einträge und die Listendauer in Millisekunden.
-- Der Client berechnet keine Latenzperzentile und prüft weder dirstat noch Quota. Ein zweiter Lauf gegen denselben Server kann scheitern, weil die Dateinamen und die festen Inode-Kennungen schon existieren.
+- Jede Aufgabe läuft `ops / concurrency` Iterationen, mindestens eine. Der Divisionsrest entfällt, daher kann die gedruckte Zahl kleiner als `--ops` sein. Ist `--ops` kleiner als `--concurrency`, kann die Zahl größer als `--ops` sein, weil jede Aufgabe trotzdem einmal läuft. Die gedruckte Zahl ist die Zahl der Versuche, nicht die Zahl angenommener Mutationen.
+- `hotspot-create` legt per mkdir Inode `999000` namens `bench_hotspot_create` unter Eltern-Inode `1` an und ruft dann `CreateFile` für Dateien von 4096 Bytes auf. Das mkdir-`Result` wird verworfen. `unwrap` gilt nur für das tonic-`Result`, daher beendet ein Transport- oder Statusfehler den Prozess. `CreateFile` liefert Anwendungsfehler wie `AlreadyExists` in einem OK-`CreateFileResponse.error`, und der Client verwirft dieses Feld.
+- `bulk-ttl-delete` tut dieselben Anlegevorgänge unter Inode `999001` (`bench_bulk_ttl_delete`), ruft `Unlink` auf dieselbe Weise auf (Transport-`unwrap`, Anwendungs-`error` ignoriert) und dann ein `ListDir` mit `limit = 1000`.
+- `hotspot-create` druckt `Completed <n> single-directory hotspot creates in <s>s (<ops/s> ops/s)` nach den Versuchen, auch nach Versuchen, deren Anwendungsfehler ignoriert wurde.
+- `bulk-ttl-delete` druckt die Zahl der Unlink-Versuche, Sekunden, ops/s, die von dieser Liste gelieferte Zahl lebender Einträge und die Listendauer in Millisekunden. Der Listenaufruf wird geprüft; die Unlinks nicht.
+- Der Client berechnet keine Latenzperzentile und prüft weder dirstat noch Quota. Ein zweiter Lauf gegen denselben Server kann weiter `Completed` und einen Durchsatz drucken, wenn jede Anlage mit `AlreadyExists` abgewiesen wird.
 
 Eine Zahl aus diesem Befehl nicht als Repository-Ergebnis behandeln. Sie hängt von der Maschine, dem Build-Profil und dem angesprochenen Server ab. Dieser Baum zeichnet keine Stichprobe auf.
 

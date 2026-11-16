@@ -2,7 +2,7 @@
 
 [Présentation](./README.md) · [English](../en/configuration.md) · [Deutsch](../de/configuration.md) · [日本語](../ja/configuration.md) · [简体中文](../zh/configuration.md)
 
-`metadbd --config` et `ServerTomlConfig::from_toml_file` / `from_toml_str` lisent le TOML (`crates/metadb-server/src/config.rs`). Les clés inconnues sont rejetées par serde. Chaque section est facultative car chaque struct utilise `#[serde(default)]`. Les champs omis prennent les valeurs par défaut ci-dessous.
+`metadbd --config` et `ServerTomlConfig::from_toml_file` / `from_toml_str` lisent le TOML (`crates/metadb-server/src/config.rs`). Les clés inconnues sont ignorées. Les structs utilisent `#[serde(default)]` et ne posent pas `deny_unknown_fields`, et `from_toml_str` appelle `toml::from_str` directement. Une clé mal orthographiée conserve sa valeur par défaut, y compris un `security.shared_secret` vide, et le démarrage réussit quand même. Chaque section est facultative. Les champs omis prennent les valeurs par défaut ci-dessous.
 
 ## Valeurs par défaut
 
@@ -73,7 +73,7 @@ Lorsque `shared_secret` n'est pas vide, `MetadataService`, `TransactionService` 
 
 `RaftTransportService` est enregistré sans l'intercepteur. Un jeton bearer n'authentifie pas les RPC Raft sur ce port.
 
-Un secret vide autorise ces RPC. Le code avertit de cela au démarrage. Garder la liaison par défaut sur `127.0.0.1`, ou placer un terminateur TLS devant un écouteur protégé par un secret, avant d'exposer le port.
+Un secret vide autorise les RPC de métadonnées, de transaction et de plan de contrôle. Le code avertit de cela au démarrage. Un secret bearer ne couvre pas `RaftTransportService`, et un terminateur TLS devant l'écouteur n'ajoute pas ce contrôle : après terminaison, les RPC Raft restent non authentifiés. Avant qu'un client non fiable puisse atteindre le port, garder la liaison sur un réseau de confiance tel que `127.0.0.1`, ou placer chaque service derrière un proxy qui authentifie le client (par exemple TLS mutuel) et bloquer l'accès direct à ce processus.
 
 ## Ce que l'on ne peut pas configurer
 

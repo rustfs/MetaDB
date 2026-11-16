@@ -2,7 +2,7 @@
 
 [Overview](./README.md) · [Français](../fr/configuration.md) · [Deutsch](../de/configuration.md) · [日本語](../ja/configuration.md) · [简体中文](../zh/configuration.md)
 
-`metadbd --config` and `ServerTomlConfig::from_toml_file` / `from_toml_str` read TOML (`crates/metadb-server/src/config.rs`). Unknown keys are rejected by serde. Every section is optional because each struct uses `#[serde(default)]`. Omitted fields take the defaults below.
+`metadbd --config` and `ServerTomlConfig::from_toml_file` / `from_toml_str` read TOML (`crates/metadb-server/src/config.rs`). Unknown keys are ignored. The structs use `#[serde(default)]` and do not set `deny_unknown_fields`, and `from_toml_str` calls `toml::from_str` directly. A misspelled key keeps its default, including an empty `security.shared_secret`, and startup still succeeds. Every section is optional. Omitted fields take the defaults below.
 
 ## Defaults
 
@@ -73,7 +73,7 @@ When `shared_secret` is non-empty, `MetadataService`, `TransactionService`, and 
 
 `RaftTransportService` is registered without the interceptor. A bearer token does not authenticate Raft RPCs on that port.
 
-An empty secret allows those RPCs. The code warns about this at startup. Keep the default bind on `127.0.0.1`, or put a TLS terminator in front of a secret-protected listener, before exposing the port.
+An empty secret allows metadata, transaction, and control-plane RPCs. The code warns about this at startup. A bearer secret does not cover `RaftTransportService`, and a TLS terminator in front of the listener does not add that check: after termination, Raft RPCs are still unauthenticated. Before an untrusted client can reach the port, keep the bind on a trusted network such as `127.0.0.1`, or put every service behind a proxy that authenticates the client (for example mutual TLS) and block direct access to this process.
 
 ## What you cannot configure
 

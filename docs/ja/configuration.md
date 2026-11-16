@@ -2,7 +2,7 @@
 
 [概要](./README.md) · [English](../en/configuration.md) · [Français](../fr/configuration.md) · [Deutsch](../de/configuration.md) · [简体中文](../zh/configuration.md)
 
-`metadbd --config` と `ServerTomlConfig::from_toml_file` / `from_toml_str` は TOML を読みます（`crates/metadb-server/src/config.rs`）。未知のキーは serde が拒否します。各構造体が `#[serde(default)]` を使うため、すべてのセクションは省略できます。省略した項目は次の既定値になります。
+`metadbd --config` と `ServerTomlConfig::from_toml_file` / `from_toml_str` は TOML を読みます（`crates/metadb-server/src/config.rs`）。未知のキーは無視されます。構造体は `#[serde(default)]` を使い、`deny_unknown_fields` は付けず、`from_toml_str` は `toml::from_str` を直接呼びます。綴りの違うキーは既定値のままです。空の `security.shared_secret` もその例で、起動は成功します。すべてのセクションは省略できます。省略した項目は次の既定値になります。
 
 ## 既定値
 
@@ -73,7 +73,7 @@ CLI フラグはファイルを解析したあとで上書きします。`--node
 
 `RaftTransportService` はインターセプタなしで登録されます。ベアラトークンは、そのポートの Raft RPC を認証しません。
 
-シークレットが空ならそれらの RPC は通ります。コードは起動時にこれを警告します。ポートを公開する前に、既定のバインドを `127.0.0.1` のままにするか、シークレットで保護したリスナーの前に TLS 終端を置いてください。
+シークレットが空なら、メタデータ、トランザクション、コントロールプレーンの RPC は通ります。コードは起動時にこれを警告します。ベアラシークレットは `RaftTransportService` を覆いません。リスナーの前で TLS を終端してもその検査は付きません。終端のあと、Raft RPC は無認証のままです。信頼できないクライアントがポートへ届く前に、バインドを `127.0.0.1` のような信頼できるネットワークに留めるか、すべてのサービスをクライアントを認証するプロキシ（たとえば相互 TLS）の後ろに置き、このプロセスへの直接アクセスを塞いでください。
 
 ## 設定できないもの
 

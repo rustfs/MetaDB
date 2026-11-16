@@ -103,12 +103,12 @@ cargo run -p metadb-server --bin metadb-ctl -- \
 
 `crates/metadb-server/src/bin/metadb-ctl.rs` の挙動:
 
-- 各タスクは `ops / concurrency` 回、少なくとも 1 回実行します。除算の余りは捨てられるので、印字される操作数は `--ops` より小さくなり得ます。`--ops` が `--concurrency` より小さいときは、各タスクがそれでも 1 回動くため、数は `--ops` より大きくなり得ます。
-- `hotspot-create` は親 inode `1` の下に、名前 `bench_hotspot_create` の inode `999000` を mkdir し、4096 バイトのファイルを作ります。mkdir のエラーは無視されます。作成エラーはプロセスを中断します（`unwrap`）。
-- `bulk-ttl-delete` は inode `999001`（`bench_bulk_ttl_delete`）の下で同じ作成を行い、unlink し、`limit = 1000` の `ListDir` を 1 回行います。
-- `hotspot-create` は `Completed <n> single-directory hotspot creates in <s>s (<ops/s> ops/s)` を印字します。
-- `bulk-ttl-delete` は削除数、秒、ops/s、その一覧が返した生存エントリ数、一覧の所要ミリ秒を印字します。
-- クライアントはレイテンシのパーセンタイルを計算せず、dirstat もクォータも確認しません。同じサーバへの 2 回目は、ファイル名と固定 inode ID がすでに存在するため失敗することがあります。
+- 各タスクは `ops / concurrency` 回、少なくとも 1 回実行します。除算の余りは捨てられるので、印字される数は `--ops` より小さくなり得ます。`--ops` が `--concurrency` より小さいときは、各タスクがそれでも 1 回動くため、数は `--ops` より大きくなり得ます。印字される数は試行回数であり、受理された変異の数ではありません。
+- `hotspot-create` は親 inode `1` の下に、名前 `bench_hotspot_create` の inode `999000` を mkdir し、4096 バイトのファイルに対して `CreateFile` を呼びます。mkdir の `Result` は捨てられます。`unwrap` がかかるのは tonic の `Result` だけなので、トランスポートまたはステータスの失敗がプロセスを中断します。`CreateFile` は `AlreadyExists` のようなアプリケーション失敗を、OK な `CreateFileResponse.error` の中に返します。クライアントはそのフィールドを捨てます。
+- `bulk-ttl-delete` は inode `999001`（`bench_bulk_ttl_delete`）の下で同じ作成を行い、同じやり方で `Unlink` を呼び（トランスポートの `unwrap`、アプリケーションの `error` は無視）、`limit = 1000` の `ListDir` を 1 回行います。
+- `hotspot-create` は試行のあと、アプリケーションエラーが無視された試行も含めて、`Completed <n> single-directory hotspot creates in <s>s (<ops/s> ops/s)` を印字します。
+- `bulk-ttl-delete` は unlink の試行数、秒、ops/s、その一覧が返した生存エントリ数、一覧の所要ミリ秒を印字します。一覧の呼び出しは確認されます。unlink は確認されません。
+- クライアントはレイテンシのパーセンタイルを計算せず、dirstat もクォータも確認しません。同じサーバへの 2 回目でも、すべての作成が `AlreadyExists` で拒否されても `Completed` とスループットを印字することがあります。
 
 このコマンドの数値をリポジトリの結果として扱わないでください。マシン、ビルドプロファイル、向けたサーバに依存します。このツリーはサンプルを記録していません。
 

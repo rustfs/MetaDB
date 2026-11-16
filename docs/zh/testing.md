@@ -103,12 +103,12 @@ cargo run -p metadb-server --bin metadb-ctl -- \
 
 来自 `crates/metadb-server/src/bin/metadb-ctl.rs` 的行为：
 
-- 每个任务运行 `ops / concurrency` 次，至少一次。除法余数被丢掉，因此打印的操作数可以小于 `--ops`。若 `--ops` 小于 `--concurrency`，因为每个任务仍会跑一次，数量可以大于 `--ops`。
-- `hotspot-create` 在父 inode `1` 下 mkdir inode `999000`，名为 `bench_hotspot_create`，然后创建 4096 字节的文件。mkdir 的错误被忽略。创建错误会中止进程（`unwrap`）。
-- `bulk-ttl-delete` 在 inode `999001`（`bench_bulk_ttl_delete`）下做同样的创建，然后 unlink，再做一次 `limit = 1000` 的 `ListDir`。
-- `hotspot-create` 打印 `Completed <n> single-directory hotspot creates in <s>s (<ops/s> ops/s)`。
-- `bulk-ttl-delete` 打印删除次数、秒数、ops/s、该次列举返回的存活条目数，以及列举耗时的毫秒数。
-- 客户端不计算延迟分位数，也不检查 dirstat 或配额。对同一服务器再跑一次可能失败，因为文件名和固定的 inode 标识已经存在。
+- 每个任务运行 `ops / concurrency` 次，至少一次。除法余数被丢掉，因此打印的数量可以小于 `--ops`。若 `--ops` 小于 `--concurrency`，因为每个任务仍会跑一次，数量可以大于 `--ops`。打印的数量是尝试次数，不是被接受的变更次数。
+- `hotspot-create` 在父 inode `1` 下 mkdir inode `999000`，名为 `bench_hotspot_create`，然后对 4096 字节的文件调用 `CreateFile`。mkdir 的 `Result` 被丢弃。`unwrap` 只作用在 tonic 的 `Result` 上，因此传输或状态失败会中止进程。`CreateFile` 把 `AlreadyExists` 这类应用错误放进 OK 的 `CreateFileResponse.error`，客户端丢掉该字段。
+- `bulk-ttl-delete` 在 inode `999001`（`bench_bulk_ttl_delete`）下做同样的创建，然后以同样方式调用 `Unlink`（传输层 `unwrap`，应用层 `error` 被忽略），再做一次 `limit = 1000` 的 `ListDir`。
+- `hotspot-create` 在这些尝试之后打印 `Completed <n> single-directory hotspot creates in <s>s (<ops/s> ops/s)`，包括应用错误被忽略的尝试。
+- `bulk-ttl-delete` 打印 unlink 尝试次数、秒数、ops/s、该次列举返回的存活条目数，以及列举耗时的毫秒数。列举调用会被检查；unlink 不会。
+- 客户端不计算延迟分位数，也不检查 dirstat 或配额。对同一服务器再跑一次时，即使每次创建都被 `AlreadyExists` 拒绝，仍可能打印 `Completed` 和吞吐量。
 
 不要把这条命令打出的数字当作仓库结果。它取决于机器、构建配置和你指向的服务器。本树没有记录样本。
 

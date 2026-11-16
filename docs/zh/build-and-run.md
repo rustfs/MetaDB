@@ -64,7 +64,7 @@ cargo run -p metadb-server --bin metadbd -- --config ./standalone.toml
 
 日志使用 `tracing-subscriber` 的 `EnvFilter`。默认过滤器是 `info`。用标准环境变量 `RUST_LOG` 覆盖，例如 `RUST_LOG=debug`。
 
-`security.shared_secret` 为空时，进程在启动时记录一条警告：gRPC 没有认证，也没有 TLS。默认绑定是 `127.0.0.1`。不要把这个套接字公布到不可信网络。设置 `[security].shared_secret`，或在进程前面终结 TLS。同一端口上的 Raft 传输无论哪种情况都不做认证。
+`security.shared_secret` 为空时，进程在启动时记录一条警告：gRPC 没有认证，也没有 TLS。默认绑定是 `127.0.0.1`。不要把这个套接字公布到不可信网络。`[security].shared_secret` 只认证元数据、事务和控制面 RPC。同一端口上的 `RaftTransportService` 没有拦截器，因此持有者令牌盖不住它，在监听器前面终结 TLS 也不会补上这项检查。把监听器留在可信网络上，或把包括 Raft 在内的每个服务放到会认证客户端的代理后面，并阻断对本进程的直接访问。
 
 Ctrl-C 会刷出分片状态并停止 OpenRaft 组（`cluster.shutdown()`）。
 

@@ -137,7 +137,7 @@ Les variantes sont définies dans `crates/metadb-core/src/error.rs`. Les méthod
 - Les battements de cœur sont un RPC sans émetteur dans `metadbd`. `StoreHeartbeat` ne persiste pas.
 - Raft sur le port gRPC public n'est pas authentifié. Le processus ne termine pas TLS.
 - `memtable_size_bytes` et tous les champs de temporisation Raft ne changent pas le comportement d'exécution via le TOML.
-- `metadb-ctl bench` ne rapporte que le débit. Il ne vérifie ni le listage, ni dirstat, ni le quota après l'exécution, et il n'imprime pas de percentiles de latence.
+- `metadb-ctl bench` rapporte un débit sur des tentatives. `unwrap` ne prend que les échecs de transport ou de statut. Les erreurs d'application telles que `AlreadyExists` reviennent dans une réponse OK et sont abandonnées, y compris pour unlink, donc une seconde exécution peut encore imprimer un débit. Il ne vérifie ni le listage, ni dirstat, ni le quota après l'exécution, et il n'imprime pas de percentiles de latence.
 
 ## Lacunes de documentation
 

@@ -137,7 +137,7 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 - Heartbeats are an RPC with no sender in `metadbd`. `StoreHeartbeat` does not persist.
 - Raft on the public gRPC port is unauthenticated. The process does not terminate TLS.
 - `memtable_size_bytes` and all Raft timer fields do not change runtime behavior through TOML.
-- `metadb-ctl bench` reports throughput only. It does not check listing, dirstat, or quota after the run, and it does not print latency percentiles.
+- `metadb-ctl bench` reports throughput for attempts. `unwrap` catches transport or status failures only. Application errors such as `AlreadyExists` come back inside an OK response and are discarded, including on unlink, so a repeat run can still print a throughput. It does not check listing, dirstat, or quota after the run, and it does not print latency percentiles.
 
 ## Documentation gaps
 

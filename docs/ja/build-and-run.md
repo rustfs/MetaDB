@@ -64,7 +64,7 @@ cargo run -p metadb-server --bin metadbd -- --config ./standalone.toml
 
 ログは `tracing-subscriber` の `EnvFilter` を使います。既定のフィルタは `info` です。標準の環境変数 `RUST_LOG` で上書きします。例: `RUST_LOG=debug`。
 
-`security.shared_secret` が空のとき、起動時に gRPC には認証も TLS も無いという警告が出ます。既定のバインドは `127.0.0.1` です。信頼できないネットワークへこのソケットを出さないでください。`[security].shared_secret` を設定するか、プロセスの前で TLS を終端してください。同じポートの Raft トランスポートは、どちらにしても認証されません。
+`security.shared_secret` が空のとき、起動時に gRPC には認証も TLS も無いという警告が出ます。既定のバインドは `127.0.0.1` です。信頼できないネットワークへこのソケットを出さないでください。`[security].shared_secret` が認証するのは、メタデータ、トランザクション、コントロールプレーンの RPC だけです。同じポートの `RaftTransportService` にはインターセプタが無いので、ベアラトークンはそれを覆わず、リスナーの前で TLS を終端してもその検査は付きません。リスナーを信頼できるネットワークに留めるか、Raft を含むすべてのサービスを、クライアントを認証するプロキシの後ろに置き、このプロセスへの直接アクセスを塞いでください。
 
 Ctrl-C はシャード状態をフラッシュし、OpenRaft グループを止めます（`cluster.shutdown()`）。
 
