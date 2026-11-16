@@ -20,6 +20,8 @@ Splitting waits until local intents and unacknowledged transaction decisions are
 
 Recovery keeps a deferred split plan pending and the original parent route available, allowing startup and transaction maintenance to proceed. Maintenance retries the plan after draining transaction state. Once the parent fence is committed, recovery completes the existing split without waiting for new transactions in the retained range. Only explicitly retryable drain conditions are deferred; corruption and storage errors still stop recovery.
 
+Routing validates published epochs and ranges against the live shard before returning a handle. Client operations wait for route publication with a bounded retry deadline, and reads recheck ownership at their snapshot boundary. A fenced parent cannot report a moved key as absent or silently omit an unpublished child from a directory listing.
+
 Directory creation rejects root/self/invalid IDs and existing authoritative directory identities. Mutations validate sizes and directory capacity before changing keys. Prepared transactions reserve positive directory capacity. Split cleanup reconstructs retained directory counters during apply, and metadata-only directory updates preserve pending and flushed child accounting.
 
 Quota batches validate and stage their complete effects before mutation. Internal balances remain signed so independent origin streams commute: a delete delivered before the corresponding create can temporarily make a balance negative and then converge to zero. Overflow rejects the entire batch. Callers must not interpret a temporarily negative asynchronous balance as a final quota decision.
