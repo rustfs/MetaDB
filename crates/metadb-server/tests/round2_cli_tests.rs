@@ -173,64 +173,102 @@ async fn idle_metrics_connection_must_not_block_other_scrapes() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let dir = tempfile::tempdir().unwrap();
-    let port_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = port_reservation.local_addr().unwrap();
     let config_path = dir.path().join("server.toml");
+    let stdout_path = dir.path().join("daemon.stdout");
+    let stderr_path = dir.path().join("daemon.stderr");
+    let daemon_output = || {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            std::fs::read_to_string(&stdout_path).unwrap_or_default(),
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
+        )
+    };
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.path().join("data");
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
-    cfg.node.metrics_listen_addr = Some(address.to_string());
+    cfg.node.metrics_listen_addr = Some("127.0.0.1:0".into());
     std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
-    drop(port_reservation);
     let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_metadbd"))
         .arg("--config")
         .arg(&config_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "info")
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let mut idle = tokio::time::timeout(Duration::from_secs(20), async {
+    // Discover the actual ephemeral listener instead of releasing a reserved
+    // port before spawn. Bootstrap replays several Raft groups, so distinguish
+    // process exit from bounded readiness under the full parallel CLI suite.
+    let readiness = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            if let Ok(socket) = tokio::net::TcpStream::connect(address).await {
-                break socket;
+            if let Some(status) = daemon.try_wait().unwrap() {
+                return Err(format!("metadbd exited before metrics readiness: {status}"));
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let output = daemon_output();
+            for line in output
+                .lines()
+                .filter(|line| line.contains("Prometheus metrics endpoint listening"))
+            {
+                // Locate the numeric address so diagnostics remain usable even
+                // if a tracing formatter includes ANSI styling around fields.
+                if let Some(start) = line.find("127.0.0.1:") {
+                    let address: String = line[start..]
+                        .chars()
+                        .take_while(|ch| ch.is_ascii_digit() || matches!(ch, '.' | ':'))
+                        .collect();
+                    if let Ok(address) = address.parse::<std::net::SocketAddr>() {
+                        if let Ok(socket) = tokio::net::TcpStream::connect(address).await {
+                            return Ok((address, socket));
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .unwrap();
-    // Let the daemon accept the first connection and enter its request read.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let mut scrape = tokio::net::TcpStream::connect(address).await.unwrap();
-    scrape
-        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    let mut response = vec![0u8; 4096];
-    let while_idle =
-        tokio::time::timeout(Duration::from_millis(250), scrape.read(&mut response)).await;
-    let blocked = while_idle.is_err();
-    if blocked {
-        drop(idle);
-        let count = tokio::time::timeout(Duration::from_secs(2), scrape.read(&mut response))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(String::from_utf8_lossy(&response[..count]).contains("HTTP/1.1 200 OK"));
-    } else {
-        let count = while_idle.unwrap().unwrap();
-        assert!(String::from_utf8_lossy(&response[..count]).contains("HTTP/1.1 200 OK"));
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), idle.read(&mut response))
-                .await
-                .unwrap()
-                .unwrap(),
-            0,
-            "idle metrics connection did not expire"
-        );
+    .await;
+    let (address, first_idle) = match readiness {
+        Ok(Ok(ready)) => ready,
+        failed => {
+            let _ = daemon.start_kill();
+            let _ = daemon.wait().await;
+            panic!("metrics readiness failed: {failed:?}\n{}", daemon_output());
+        }
+    };
+    let mut idle_connections = vec![first_idle];
+    for _ in 1..8 {
+        idle_connections.push(tokio::net::TcpStream::connect(address).await.unwrap());
     }
-    let _idle_during_shutdown = tokio::net::TcpStream::connect(address).await.unwrap();
+    // A serial implementation with the two-second connection deadline would
+    // spend sixteen seconds on these clients before reaching the actual scrape.
+    // Five seconds tolerates scheduler load without accepting that regression.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let scrape = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut socket = tokio::net::TcpStream::connect(address).await?;
+        socket
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut response = Vec::new();
+        socket.read_to_end(&mut response).await?;
+        Ok::<_, std::io::Error>(response)
+    })
+    .await;
+    let idle_expiration = tokio::time::timeout(Duration::from_secs(5), async {
+        for mut socket in idle_connections {
+            let mut byte = [0];
+            if socket.read(&mut byte).await? != 0 {
+                return Err(std::io::Error::other(
+                    "idle client received unexpected data",
+                ));
+            }
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await;
+    let mut idle_during_shutdown = tokio::net::TcpStream::connect(address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
     #[cfg(unix)]
     {
         let status = tokio::process::Command::new("kill")
@@ -239,13 +277,15 @@ async fn idle_metrics_connection_must_not_block_other_scrapes() {
             .await
             .unwrap();
         assert!(status.success());
+        let shutdown = tokio::time::timeout(Duration::from_secs(10), daemon.wait()).await;
+        if shutdown.is_err() {
+            let _ = daemon.start_kill();
+            let _ = daemon.wait().await;
+        }
         assert!(
-            tokio::time::timeout(Duration::from_secs(10), daemon.wait())
-                .await
-                .unwrap()
-                .unwrap()
-                .success(),
-            "daemon failed graceful shutdown with an idle metrics connection"
+            shutdown.unwrap().unwrap().success(),
+            "daemon failed graceful shutdown with an idle metrics connection:\n{}",
+            daemon_output()
         );
     }
     #[cfg(not(unix))]
@@ -253,10 +293,23 @@ async fn idle_metrics_connection_must_not_block_other_scrapes() {
         daemon.start_kill().unwrap();
         daemon.wait().await.unwrap();
     }
-    assert!(
-        !blocked,
-        "one idle TCP connection blocked every metrics request until it disconnected"
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), idle_during_shutdown.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0,
+        "shutdown left an idle metrics connection open"
     );
+    let response = scrape
+        .expect("idle clients blocked the metrics scrape")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&response).contains("HTTP/1.1 200 OK"));
+    assert!(String::from_utf8_lossy(&response).contains("metadb_shards"));
+    idle_expiration
+        .expect("idle metrics connections did not expire concurrently")
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

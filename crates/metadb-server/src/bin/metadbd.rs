@@ -146,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let metrics_task = if let Some(m_addr) = metrics_addr_opt {
         let m_listener = TcpListener::bind(&m_addr).await?;
-        tracing::info!(metrics_addr = %m_addr, "Prometheus metrics endpoint listening");
+        tracing::info!(metrics_addr = %m_listener.local_addr()?, "Prometheus metrics endpoint listening");
         let (stop, stopped) = oneshot::channel();
         let m_cluster = cluster.clone();
         Some((
