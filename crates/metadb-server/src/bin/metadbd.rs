@@ -107,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         let mut cp = ControlPlaneServiceClient::with_interceptor(
             channel,
-            metadb_server::BearerAuth::new(shared_secret),
+            metadb_server::BearerAuthClient::new(shared_secret),
         );
         let reg_resp = cp
             .register_node(RegisterNodeRequest {

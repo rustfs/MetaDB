@@ -21,8 +21,9 @@ use tonic::service::Interceptor;
 use tonic::transport::Server;
 use tonic::{Request, Status};
 
-/// Optional shared-secret check for metadata, transaction, and control-plane RPCs.
+/// Server interceptor for metadata, transaction, and control-plane RPCs.
 /// An empty secret allows the call (loopback deployments without auth).
+/// A non-empty secret requires `authorization: Bearer <secret>` on the incoming request.
 #[derive(Clone)]
 pub struct BearerAuth {
     secret: std::sync::Arc<str>,
@@ -36,6 +37,21 @@ impl BearerAuth {
     }
 }
 
+fn bearer_header_matches(presented: &str, secret: &str) -> bool {
+    let mut expected = Vec::with_capacity(7 + secret.len());
+    expected.extend_from_slice(b"Bearer ");
+    expected.extend_from_slice(secret.as_bytes());
+    let got = presented.as_bytes();
+    let mut diff = got.len() ^ expected.len();
+    let n = got.len().max(expected.len());
+    for i in 0..n {
+        let x = got.get(i).copied().unwrap_or(0);
+        let y = expected.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
+    }
+    diff == 0
+}
+
 impl Interceptor for BearerAuth {
     fn call(&mut self, request: Request<()>) -> std::result::Result<Request<()>, Status> {
         if self.secret.is_empty() {
@@ -46,15 +62,44 @@ impl Interceptor for BearerAuth {
             .get("authorization")
             .and_then(|value| value.to_str().ok())
             .unwrap_or("");
-        let mut expected = String::from("Bearer ");
-        expected.push_str(&self.secret);
-        if presented == expected {
+        if bearer_header_matches(presented, &self.secret) {
             Ok(request)
         } else {
             Err(Status::unauthenticated(
                 "missing or invalid authorization bearer token",
             ))
         }
+    }
+}
+
+/// Client interceptor. Attaches `authorization: Bearer <secret>` to outgoing RPCs.
+/// An empty secret leaves the request unchanged.
+#[derive(Clone)]
+pub struct BearerAuthClient {
+    secret: std::sync::Arc<str>,
+}
+
+impl BearerAuthClient {
+    pub fn new(secret: impl AsRef<str>) -> Self {
+        Self {
+            secret: std::sync::Arc::from(secret.as_ref()),
+        }
+    }
+}
+
+impl Interceptor for BearerAuthClient {
+    fn call(&mut self, mut request: Request<()>) -> std::result::Result<Request<()>, Status> {
+        if self.secret.is_empty() {
+            return Ok(request);
+        }
+        let mut token = String::from("Bearer ");
+        token.push_str(&self.secret);
+        let mut value = tonic::metadata::MetadataValue::try_from(token).map_err(|_| {
+            Status::internal("shared secret is not a valid authorization header value")
+        })?;
+        value.set_sensitive(true);
+        request.metadata_mut().insert("authorization", value);
+        Ok(request)
     }
 }
 
@@ -497,7 +542,7 @@ impl PersistentMetaDbCluster {
             bound_addr.clone(),
             config.sharding.bootstrap_table_shards,
             config.sharding.shard_split_threshold_bytes,
-            config.to_lsm_config(),
+            config.to_lsm_config()?,
             config.raft_options.clone(),
             id_allocator.clone(),
             meta_cache.clone(),
@@ -719,5 +764,58 @@ impl PersistentMetaDbCluster {
         }
         self.flush_all().await?;
         self.host.shutdown_all().await
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use tonic::metadata::MetadataValue;
+
+    fn authorization(req: &Request<()>) -> Option<String> {
+        req.metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn server_requires_exact_bearer_and_client_attaches_it() {
+        let mut server = BearerAuth::new("s3cr3t");
+        assert!(server.call(Request::new(())).is_err());
+
+        let mut prefix = Request::new(());
+        prefix.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from("Bearer s3cr3").unwrap(),
+        );
+        assert!(server.call(prefix).is_err());
+
+        let mut extra = Request::new(());
+        extra.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from("Bearer s3cr3t-extra").unwrap(),
+        );
+        assert!(server.call(extra).is_err());
+
+        let mut client = BearerAuthClient::new("s3cr3t");
+        let outgoing = client.call(Request::new(())).unwrap();
+        assert_eq!(authorization(&outgoing).as_deref(), Some("Bearer s3cr3t"));
+
+        let mut inbound = Request::new(());
+        inbound.metadata_mut().insert(
+            "authorization",
+            outgoing.metadata().get("authorization").unwrap().clone(),
+        );
+        assert!(server.call(inbound).is_ok());
+    }
+
+    #[test]
+    fn empty_secret_allows_calls_and_adds_no_header() {
+        let mut server = BearerAuth::new("");
+        assert!(server.call(Request::new(())).is_ok());
+        let mut client = BearerAuthClient::new("");
+        let outgoing = client.call(Request::new(())).unwrap();
+        assert!(authorization(&outgoing).is_none());
     }
 }

@@ -137,7 +137,7 @@ async fn open_cp(
     ControlPlaneServiceClient<
         tonic::service::interceptor::InterceptedService<
             tonic::transport::Channel,
-            metadb_server::BearerAuth,
+            metadb_server::BearerAuthClient,
         >,
     >,
     Box<dyn std::error::Error + Send + Sync>,
@@ -147,7 +147,7 @@ async fn open_cp(
         .await?;
     Ok(ControlPlaneServiceClient::with_interceptor(
         channel,
-        metadb_server::BearerAuth::new(token),
+        metadb_server::BearerAuthClient::new(token),
     ))
 }
 
@@ -158,7 +158,7 @@ async fn open_meta(
     MetadataServiceClient<
         tonic::service::interceptor::InterceptedService<
             tonic::transport::Channel,
-            metadb_server::BearerAuth,
+            metadb_server::BearerAuthClient,
         >,
     >,
     Box<dyn std::error::Error + Send + Sync>,
@@ -168,7 +168,7 @@ async fn open_meta(
         .await?;
     Ok(MetadataServiceClient::with_interceptor(
         channel,
-        metadb_server::BearerAuth::new(token),
+        metadb_server::BearerAuthClient::new(token),
     ))
 }
 

@@ -98,6 +98,23 @@ fn decode_req_txn_id(bytes: &[u8]) -> Result<u128, Status> {
         .map_err(|e| Status::invalid_argument(e.to_string()))
 }
 
+fn decode_sql_params(raw: &[SqlParamValue]) -> std::result::Result<Vec<SqlParam>, MetaDbError> {
+    let mut params = Vec::with_capacity(raw.len());
+    for p in raw {
+        let Some(kind) = &p.kind else {
+            return Err(MetaDbError::SqlParseError(
+                "SQL parameter is missing a value".to_string(),
+            ));
+        };
+        params.push(match kind {
+            sql_param_value::Kind::U64Val(v) => SqlParam::U64(*v),
+            sql_param_value::Kind::I64Val(v) => SqlParam::I64(*v),
+            sql_param_value::Kind::StrVal(s) => SqlParam::Str(s.clone()),
+        });
+    }
+    Ok(params)
+}
+
 fn decode_req_optional_uuid(bytes: &[u8]) -> Result<u128, Status> {
     metadb_proto::convert::decode_optional_u128_be(bytes)
         .map_err(|e| Status::invalid_argument(e.to_string()))
@@ -484,16 +501,15 @@ impl MetadataService for MetaDbGrpcService {
                 ..Default::default()
             }));
         }
-        let mut params = Vec::with_capacity(req.params.len());
-        for p in req.params {
-            if let Some(kind) = p.kind {
-                match kind {
-                    sql_param_value::Kind::U64Val(v) => params.push(SqlParam::U64(v)),
-                    sql_param_value::Kind::I64Val(v) => params.push(SqlParam::I64(v)),
-                    sql_param_value::Kind::StrVal(s) => params.push(SqlParam::Str(s)),
-                }
+        let params = match decode_sql_params(&req.params) {
+            Ok(params) => params,
+            Err(e) => {
+                return Ok(Response::new(ExecuteSqlResponse {
+                    error: Some(ErrorDetailProto::from(&e)),
+                    ..Default::default()
+                }));
             }
-        }
+        };
 
         match self.proxy_router.execute_sql(&req.sql, &params).await {
             Ok(res) => {
@@ -719,14 +735,20 @@ impl TransactionService for MetaDbGrpcService {
             intents,
         };
 
-        let (_, grp, _) = match self.global_manager.route_user_key(&req.primary_key) {
-            Ok(t) => t,
-            Err(e) => {
-                return Ok(Response::new(Prepare2pcResponse {
-                    error: Some(ErrorDetailProto::from(&e)),
-                    prepared_hlc: 0,
-                }))
-            }
+        // Prepare runs on the participant named by the routing header. `primary_key`
+        // identifies the transaction record's home shard, which is a different
+        // participant when this call is a secondary prepare.
+        let find_res = self
+            .global_manager
+            .all_cells()
+            .into_iter()
+            .find_map(|c| c.lookup_local_handle(hdr.shard_id).ok());
+        let Some((_, grp, _)) = find_res else {
+            let e = MetaDbError::ShardRoutingError(format!("unknown shard {}", hdr.shard_id));
+            return Ok(Response::new(Prepare2pcResponse {
+                error: Some(ErrorDetailProto::from(&e)),
+                prepared_hlc: 0,
+            }));
         };
         let payload = bincode::serialize(&cmd).map_err(|e| Status::internal(e.to_string()))?;
         match grp.propose(ep, HlcTimestamp(req.start_hlc), payload).await {
@@ -1251,5 +1273,36 @@ impl ControlPlaneService for MetaDbGrpcService {
         Ok(Response::new(RegisterCellResponse {
             error: Some(ErrorDetailProto::from(&e)),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_sql_params_rejects_an_unset_value() {
+        let ok = decode_sql_params(&[
+            SqlParamValue {
+                kind: Some(sql_param_value::Kind::U64Val(1)),
+            },
+            SqlParamValue {
+                kind: Some(sql_param_value::Kind::StrVal("a".to_string())),
+            },
+        ])
+        .unwrap();
+        assert_eq!(ok, vec![SqlParam::U64(1), SqlParam::Str("a".to_string())]);
+
+        let err = decode_sql_params(&[
+            SqlParamValue {
+                kind: Some(sql_param_value::Kind::U64Val(1)),
+            },
+            SqlParamValue { kind: None },
+            SqlParamValue {
+                kind: Some(sql_param_value::Kind::U64Val(2)),
+            },
+        ])
+        .unwrap_err();
+        assert!(matches!(err, MetaDbError::SqlParseError(_)));
     }
 }

@@ -6,12 +6,17 @@ on:
   pull_request:
     branches: ["main"]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   rust-check-lint-test:
-    name: Format, Clippy & Test (100% Pure Rust)
+    name: Format, Clippy & Test (locked toolchain)
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -34,7 +39,14 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy with warnings denied
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run full workspace test suite
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+
+      - name: Reject ignored tests that have no reason
+        run: |
+          if grep -R -n -E '#\[ignore\]' --include='*.rs' crates; then
+            echo 'bare #[ignore] is not allowed; use #[ignore = "why CI skips this test"]'
+            exit 1
+          fi

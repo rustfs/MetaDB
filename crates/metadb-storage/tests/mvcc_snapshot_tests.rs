@@ -186,3 +186,61 @@ fn test_snapshot_guard_read_cut_safe_flush_gate_and_view_at_raft_index() {
         MetaKey::child(88, "item_0599.dat").encode()
     );
 }
+
+/// Keys sealed into an `ImmMemTable` and keys written into the new active memtable
+/// must all survive a 256-key paged scan, including when the active keys sort first.
+#[test]
+fn test_paged_scan_keeps_interleaved_imm_and_active_keys() {
+    let engine = LifecycleStorageEngine::new(1, 60_000, 128, false);
+    for n in 1u32..=60 {
+        engine.apply_committed_put(
+            page_key(n),
+            b"imm".to_vec(),
+            HlcTimestamp::new(1_000, 1),
+            u64::from(n),
+        );
+    }
+    let pin = engine.acquire_linearizable_snapshot(60).unwrap();
+    engine.apply_committed_put(
+        page_key(61),
+        b"imm-high".to_vec(),
+        HlcTimestamp::new(1_500, 1),
+        61,
+    );
+    engine
+        .seal_and_flush_with_hook(
+            DurableShardCheckpoint {
+                flushed_raft_index: 61,
+                flushed_max_hlc: HlcTimestamp::new(1_500, 1),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+    for n in 200u32..500 {
+        engine.apply_committed_put(
+            page_key(n),
+            b"active".to_vec(),
+            HlcTimestamp::new(2_000, 1),
+            u64::from(n),
+        );
+    }
+    let snap = engine.acquire_linearizable_snapshot(499).unwrap();
+    let rows = engine
+        .scan_with_snapshot(&page_key(0), &page_key(1_000), &snap)
+        .unwrap();
+    let got: Vec<u32> = rows
+        .iter()
+        .map(|(k, _)| u32::from_be_bytes(k[1..5].try_into().unwrap()))
+        .collect();
+    let expect: Vec<u32> = (1..=61).chain(200..500).collect();
+    assert_eq!(got, expect);
+    drop(pin);
+}
+
+fn page_key(n: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(5);
+    key.push(b'k');
+    key.extend_from_slice(&n.to_be_bytes());
+    key
+}
