@@ -54,6 +54,19 @@ struct PersistedCellState {
     /// which would fork a new cluster if the local log were empty.
     #[serde(default)]
     joined_existing: bool,
+    /// Promotion was requested, or had already committed, before `joined_existing` was published.
+    /// Restart resumes this join instead of rejecting the node id as a fresh member.
+    #[serde(default)]
+    join_pending: bool,
+}
+
+/// On-disk layout after `joined_existing` and before `join_pending`.
+#[derive(Debug, Deserialize)]
+struct CellStateJoinedOnly {
+    nodes: BTreeMap<NodeId, String>,
+    routes: BTreeMap<ShardId, CompositeShardRoute>,
+    split_plans: BTreeMap<u128, SplitPlanRecord>,
+    joined_existing: bool,
 }
 
 /// On-disk layout before `joined_existing` was stored in the same record.
@@ -75,6 +88,8 @@ pub enum CellDirectoryRole {
     Bootstrapped,
     /// This directory joined an existing Raft group.
     Joined,
+    /// Join was persisted but not finished. Resume it; do not bootstrap.
+    Joining,
 }
 
 /// Cell-level manager coordinating OpenRaft shards, `ExecuteSplit`, Jumbo isolation, and `ConfChange`.
@@ -209,7 +224,6 @@ impl DurableCellManager {
         let persisted = if state_path.exists() {
             let mut loaded = Self::load_state_file(&state_dir)?;
             loaded.nodes.insert(host.node_id(), local_addr);
-            loaded.joined_existing = false;
             Self::write_state_file(&state_dir, &loaded)?;
             loaded
         } else {
@@ -245,6 +259,8 @@ impl DurableCellManager {
         let st = Self::load_state_file(state_dir)?;
         if st.joined_existing {
             Ok(CellDirectoryRole::Joined)
+        } else if st.join_pending {
+            Ok(CellDirectoryRole::Joining)
         } else if st.routes.is_empty() {
             Ok(CellDirectoryRole::Empty)
         } else {
@@ -252,8 +268,113 @@ impl DurableCellManager {
         }
     }
 
+    /// Address this node must keep listening on so existing Raft peers can dial it.
+    pub fn persisted_advertise_addr(
+        state_dir: impl AsRef<Path>,
+        node_id: NodeId,
+    ) -> Result<Option<String>> {
+        let state_dir = state_dir.as_ref();
+        if !state_dir.join("CELL_MANAGER_STATE").exists() {
+            return Ok(None);
+        }
+        let st = Self::load_state_file(state_dir)?;
+        let mut voter_addrs = BTreeSet::new();
+        for route in st.routes.values() {
+            if let Some((addr, is_voter)) = route.peers.get(&node_id) {
+                if *is_voter && !addr.is_empty() {
+                    voter_addrs.insert(addr.clone());
+                }
+            }
+        }
+        if voter_addrs.len() > 1 {
+            return Err(MetaDbError::ConsensusError(format!(
+                "node {node_id} has conflicting persisted raft addresses: {voter_addrs:?}"
+            )));
+        }
+        if let Some(addr) = voter_addrs.into_iter().next() {
+            return Ok(Some(addr));
+        }
+        Ok(st
+            .nodes
+            .get(&node_id)
+            .filter(|addr| !addr.is_empty())
+            .cloned())
+    }
+
     pub fn joined_existing(&self) -> bool {
         self.state.lock().unwrap().joined_existing
+    }
+
+    pub fn join_pending(&self) -> bool {
+        self.state.lock().unwrap().join_pending
+    }
+
+    /// Records the routes this process intends to join before membership is proposed.
+    pub fn begin_join(&self, routes: &[CompositeShardRoute]) -> Result<()> {
+        let mut guard = self.state.lock().unwrap();
+        if guard.joined_existing {
+            return Ok(());
+        }
+        let mut next = guard.clone();
+        next.join_pending = true;
+        for route in routes {
+            next.routes.insert(route.shard_id, route.clone());
+            self.meta_cache.upsert_route(route.clone());
+        }
+        self.persist_sync(&next)?;
+        *guard = next;
+        Ok(())
+    }
+
+    /// Test hook. Leaves Raft logs in place but clears the finished-join flag so reopen resumes.
+    pub fn testing_mark_join_interrupted(&self) -> Result<()> {
+        let mut guard = self.state.lock().unwrap();
+        let mut next = guard.clone();
+        next.joined_existing = false;
+        next.join_pending = true;
+        self.persist_sync(&next)?;
+        *guard = next;
+        Ok(())
+    }
+
+    /// Replaces cached peer sets with the committed Raft membership.
+    pub fn routes_with_local_membership(&self) -> Result<Vec<CompositeShardRoute>> {
+        let mut routes = self.list_routes();
+        for route in &mut routes {
+            let (_, group, _) = self.lookup_local_handle(route.shard_id)?;
+            let voters = group.uniform_voter_addrs()?;
+            route.epoch = group.current_epoch();
+            route.peers = voters
+                .into_iter()
+                .map(|(node_id, addr)| (node_id, (addr, true)))
+                .collect();
+        }
+        Ok(routes)
+    }
+
+    /// Committed voter ids for `shard_id`, taken from Raft rather than the route cache.
+    pub fn raft_voter_ids(&self, shard_id: ShardId) -> Result<BTreeSet<NodeId>> {
+        let (_, group, _) = self.lookup_local_handle(shard_id)?;
+        Ok(group.uniform_voter_addrs()?.into_keys().collect())
+    }
+
+    /// Voter set `remove_voter` would submit, planned from Raft membership.
+    pub fn voters_after_removal(
+        &self,
+        shard_id: ShardId,
+        node_id: NodeId,
+    ) -> Result<BTreeSet<NodeId>> {
+        let mut voters = self.raft_voter_ids(shard_id)?;
+        if !voters.contains(&node_id) {
+            return Ok(voters);
+        }
+        if voters.len() <= 1 {
+            return Err(MetaDbError::ConsensusError(format!(
+                "refusing to remove the last voter of shard {shard_id}"
+            )));
+        }
+        voters.remove(&node_id);
+        Ok(voters)
     }
 
     /// Starts one uninitialized Raft replica per route. The leader's `ConfChange` replicates
@@ -317,6 +438,7 @@ impl DurableCellManager {
         let mut guard = self.state.lock().unwrap();
         let mut next = guard.clone();
         next.joined_existing = true;
+        next.join_pending = false;
         for route in &routes {
             for (nid, (addr, _)) in &route.peers {
                 next.nodes.insert(*nid, addr.clone());
@@ -728,35 +850,18 @@ impl DurableCellManager {
         };
         let mut changed = 0usize;
         for sid in shard_ids {
+            let voters = self.voters_after_removal(sid, node_id)?;
             let (_, group, _) = self.lookup_local_handle(sid)?;
-            let existing_peers = self.route_peers(sid);
-            let mut voters: BTreeSet<NodeId> = existing_peers
-                .iter()
-                .filter(|(_, (_, is_voter))| *is_voter)
-                .map(|(nid, _)| *nid)
-                .collect();
-            if !voters.contains(&node_id) {
+            let current = group.uniform_voter_addrs()?;
+            if current.len() == voters.len() && current.keys().all(|id| voters.contains(id)) {
                 continue;
             }
-            if voters.len() <= 1 {
-                return Err(MetaDbError::ConsensusError(format!(
-                    "refusing to remove the last voter of shard {sid}"
-                )));
-            }
-            voters.remove(&node_id);
             ConfChangeOrchestrator::change_voters(group.raft(), voters.clone()).await?;
-            self.persist_voter_set(sid, &voters, group.current_epoch())?;
+            let committed = group.wait_uniform_voter_addrs().await?;
+            self.persist_voter_set(sid, &committed, group.current_epoch())?;
             changed += 1;
         }
         Ok(changed)
-    }
-
-    fn route_peers(&self, shard_id: ShardId) -> BTreeMap<NodeId, (String, bool)> {
-        let st = self.state.lock().unwrap();
-        st.routes
-            .get(&shard_id)
-            .map(|r| r.peers.clone())
-            .unwrap_or_default()
     }
 
     async fn retarget_shard_voters(
@@ -766,12 +871,8 @@ impl DurableCellManager {
         nodes: &BTreeMap<NodeId, String>,
     ) -> Result<()> {
         let (_, group, _) = self.lookup_local_handle(shard_id)?;
-        let existing_peers = self.route_peers(shard_id);
-        let current_voters: BTreeSet<NodeId> = existing_peers
-            .iter()
-            .filter(|(_, (_, is_voter))| *is_voter)
-            .map(|(nid, _)| *nid)
-            .collect();
+        let current = group.uniform_voter_addrs()?;
+        let current_voters: BTreeSet<NodeId> = current.keys().copied().collect();
         let mut final_voters = current_voters.clone();
         if final_voters.len() > target_voters {
             while final_voters.len() > target_voters {
@@ -801,34 +902,39 @@ impl DurableCellManager {
         }
 
         let mut addrs = nodes.clone();
-        for (nid, (addr, _)) in &existing_peers {
+        for (nid, addr) in &current {
             addrs.entry(*nid).or_insert_with(|| addr.clone());
         }
         let learners_to_add: Vec<(NodeId, String)> = final_voters
             .iter()
-            .filter(|nid| !existing_peers.contains_key(nid))
+            .filter(|nid| !current_voters.contains(nid))
             .filter_map(|nid| addrs.get(nid).map(|addr| (*nid, addr.clone())))
             .collect();
         if !learners_to_add.is_empty() {
+            // Split children seed inherited keys into SSTables at Raft index 0. Purge a snapshot
+            // first so the learner cannot become a voter by replaying a log that never contained them.
+            let min_matched = group.prepare_learner_snapshot().await?;
             ConfChangeOrchestrator::add_learners_and_promote_voters(
                 group.raft(),
                 &learners_to_add,
                 final_voters.clone(),
                 64,
                 Duration::from_secs(20),
+                min_matched,
             )
             .await?;
         } else if current_voters != final_voters {
             ConfChangeOrchestrator::change_voters(group.raft(), final_voters.clone()).await?;
         }
-        self.persist_voter_set(shard_id, &final_voters, group.current_epoch())?;
+        let committed = group.wait_uniform_voter_addrs().await?;
+        self.persist_voter_set(shard_id, &committed, group.current_epoch())?;
         Ok(())
     }
 
     fn persist_voter_set(
         &self,
         shard_id: ShardId,
-        voters: &BTreeSet<NodeId>,
+        voters: &BTreeMap<NodeId, String>,
         epoch: metadb_core::ShardEpoch,
     ) -> Result<()> {
         let mut st = self.state.lock().unwrap();
@@ -838,19 +944,14 @@ impl DurableCellManager {
         let mut next = st.clone();
         if let Some(route) = next.routes.get_mut(&shard_id) {
             let mut peers = BTreeMap::new();
-            for nid in voters {
-                let addr = route
-                    .peers
-                    .get(nid)
-                    .map(|(addr, _)| addr.clone())
-                    .or_else(|| next.nodes.get(nid).cloned())
-                    .unwrap_or_default();
+            for (nid, addr) in voters {
                 if addr.is_empty() {
                     return Err(MetaDbError::ConsensusError(format!(
                         "missing grpc address for voter {nid} on shard {shard_id}"
                     )));
                 }
-                peers.insert(*nid, (addr, true));
+                next.nodes.insert(*nid, addr.clone());
+                peers.insert(*nid, (addr.clone(), true));
             }
             route.peers = peers;
             route.epoch = epoch;
@@ -1292,12 +1393,22 @@ fn decode_cell_state(body: &[u8]) -> Result<PersistedCellState> {
     if let Ok(state) = bincode::deserialize::<PersistedCellState>(body) {
         return Ok(state);
     }
+    if let Ok(prior) = bincode::deserialize::<CellStateJoinedOnly>(body) {
+        return Ok(PersistedCellState {
+            nodes: prior.nodes,
+            routes: prior.routes,
+            split_plans: prior.split_plans,
+            joined_existing: prior.joined_existing,
+            join_pending: false,
+        });
+    }
     if let Ok(prior) = bincode::deserialize::<CellStateBeforeJoinFlag>(body) {
         return Ok(PersistedCellState {
             nodes: prior.nodes,
             routes: prior.routes,
             split_plans: prior.split_plans,
             joined_existing: false,
+            join_pending: false,
         });
     }
     let legacy: LegacyPersistedCellState = bincode::deserialize(body)
@@ -1323,5 +1434,6 @@ fn decode_cell_state(body: &[u8]) -> Result<PersistedCellState> {
             })
             .collect(),
         joined_existing: false,
+        join_pending: false,
     })
 }

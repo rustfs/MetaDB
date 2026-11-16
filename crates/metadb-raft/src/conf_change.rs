@@ -24,6 +24,7 @@ impl ConfChangeOrchestrator {
         final_voters: BTreeSet<NodeId>,
         catchup_threshold: u64,
         timeout: Duration,
+        min_matched_index: u64,
     ) -> Result<()> {
         for (node_id, addr) in learners_to_add {
             raft.add_learner(*node_id, BasicNode::new(addr), false)
@@ -43,7 +44,10 @@ impl ConfChangeOrchestrator {
                             .get(nid)
                             .and_then(|opt| opt.map(|id| id.index))
                             .unwrap_or(0);
-                        last_idx.saturating_sub(matched) <= catchup_threshold
+                        // `min_matched_index` is a purged snapshot index. Log replay alone cannot
+                        // reach it, so the learner must install that snapshot first.
+                        matched >= min_matched_index
+                            && last_idx.saturating_sub(matched) <= catchup_threshold
                     })
                 } else {
                     false

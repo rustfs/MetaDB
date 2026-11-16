@@ -517,9 +517,33 @@ impl PersistentMetaDbCluster {
                 config.node.role
             )));
         }
-        let listener = TcpListener::bind(&config.node.grpc_listen_addr).await?;
-        let bound_addr = listener.local_addr()?.to_string();
         std::fs::create_dir_all(&config.node.data_dir)?;
+        let cell_dir = config
+            .node
+            .data_dir
+            .join(format!("cell_{}", config.node.cell_id));
+        let persisted_addr = if cell_dir.join("CELL_MANAGER_STATE").exists() {
+            DurableCellManager::persisted_advertise_addr(&cell_dir, config.node.node_id)?
+        } else {
+            None
+        };
+        let listen_addr = if listen_port_is_ephemeral(&config.node.grpc_listen_addr) {
+            persisted_addr
+                .clone()
+                .unwrap_or_else(|| config.node.grpc_listen_addr.clone())
+        } else {
+            config.node.grpc_listen_addr.clone()
+        };
+        let listener = TcpListener::bind(&listen_addr).await?;
+        let bound_addr = listener.local_addr()?.to_string();
+        if let Some(prev) = &persisted_addr {
+            if &bound_addr != prev {
+                return Err(MetaDbError::ConsensusError(format!(
+                    "node {} is already a raft member at {prev}; refusing to listen on {bound_addr}",
+                    config.node.node_id
+                )));
+            }
+        }
 
         let clock = Arc::new(HybridLogicalClock::with_max_drift_ms(
             config.clock.max_clock_drift_ms,
@@ -540,10 +564,6 @@ impl PersistentMetaDbCluster {
             clock.clone(),
         )?);
         let raft_router = host.router().clone();
-        let cell_dir = config
-            .node
-            .data_dir
-            .join(format!("cell_{}", config.node.cell_id));
         let directory_role = if cell_dir.join("CELL_MANAGER_STATE").exists() {
             DurableCellManager::inspect_directory(&cell_dir)?
         } else {
@@ -553,7 +573,7 @@ impl PersistentMetaDbCluster {
         let join_fresh = !join_addr.is_empty()
             && matches!(
                 directory_role,
-                CellDirectoryRole::Absent | CellDirectoryRole::Empty
+                CellDirectoryRole::Absent | CellDirectoryRole::Empty | CellDirectoryRole::Joining
             );
         if !join_addr.is_empty() && !join_fresh {
             tracing::info!(
@@ -937,7 +957,10 @@ async fn control_plane_client(
     secret: &str,
 ) -> Result<
     ControlPlaneServiceClient<
-        tonic::service::interceptor::InterceptedService<tonic::transport::Channel, BearerAuth>,
+        tonic::service::interceptor::InterceptedService<
+            tonic::transport::Channel,
+            BearerAuthClient,
+        >,
     >,
 > {
     let endpoint = Endpoint::from_shared(addr.to_string())
@@ -947,8 +970,14 @@ async fn control_plane_client(
     })?;
     Ok(ControlPlaneServiceClient::with_interceptor(
         channel,
-        BearerAuth::new(secret),
+        BearerAuthClient::new(secret),
     ))
+}
+
+fn listen_port_is_ephemeral(addr: &str) -> bool {
+    addr.rsplit_once(':')
+        .map(|(_, port)| port == "0")
+        .unwrap_or(false)
 }
 
 /// Registers this process with `config.cluster.join` and waits until every local shard
@@ -982,18 +1011,22 @@ async fn join_existing_raft_group(
             config.node.cell_id
         )));
     }
-    if routes.iter().any(|route| {
+    let our_id = config.node.node_id;
+    let seed_has_us = routes.iter().any(|route| {
         route
             .peers
-            .get(&config.node.node_id)
+            .get(&our_id)
             .map(|(_, is_voter)| *is_voter)
             .unwrap_or(false)
-    }) {
+    });
+    if seed_has_us && !cell_manager.join_pending() {
         return Err(MetaDbError::ConsensusError(format!(
-            "node_id {} is already a voter; reopen that node's data directory instead of joining a fresh one",
-            config.node.node_id
+            "node_id {our_id} is already a voter; reopen that node's data directory instead of joining a fresh one"
         )));
     }
+    // Persist intent before promotion. A crash after the leader commits membership can resume
+    // from this flag instead of coming back as an empty node the leader still counts.
+    cell_manager.begin_join(&routes)?;
     let voter_ids: BTreeSet<NodeId> = routes
         .iter()
         .flat_map(|route| {
@@ -1005,6 +1038,9 @@ async fn join_existing_raft_group(
         })
         .collect();
     cell_manager.start_joining_replicas(&routes).await?;
+    if seed_has_us {
+        return finish_resumed_join(config, cell_manager, &mut client, &seed, routes).await;
+    }
 
     let registered = client
         .register_node(RegisterNodeRequest {
@@ -1038,51 +1074,80 @@ async fn join_existing_raft_group(
         }
     }
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while !cell_manager.local_voters_include(config.node.node_id) {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(MetaDbError::ConsensusError(format!(
-                "timed out joining cell {} via {seed} as node {}",
-                config.node.cell_id, config.node.node_id
-            )));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    let refreshed = client
-        .get_routes(GetRoutesRequest {
-            cell_id: config.node.cell_id,
-        })
-        .await
-        .map_err(|e| {
-            MetaDbError::ConsensusError(format!("get_routes after join from {seed}: {e}"))
-        })?
-        .into_inner();
-    let mut joined_routes = Vec::with_capacity(refreshed.shards.len());
-    for shard in refreshed.shards {
-        joined_routes.push(grpc_services::composite_route_from_proto(shard)?);
-    }
-    if joined_routes.is_empty() {
-        joined_routes = routes;
-    }
-    let our_id = config.node.node_id;
-    if joined_routes.iter().any(|route| {
-        !route
-            .peers
-            .get(&our_id)
-            .map(|(_, is_voter)| *is_voter)
-            .unwrap_or(false)
-    }) {
-        return Err(MetaDbError::ConsensusError(format!(
-            "node {our_id} is not a voter on every shard after joining {seed}; join with the next node id in ascending order"
-        )));
-    }
-    cell_manager.install_joined_membership(joined_routes)?;
+    finish_resumed_join(config, cell_manager, &mut client, &seed, routes).await?;
     tracing::info!(
         node_id = our_id,
         seed = %seed,
         voters = target_voters,
         "joined existing raft group"
     );
+    Ok(())
+}
+
+async fn finish_resumed_join(
+    config: &ServerTomlConfig,
+    cell_manager: &DurableCellManager,
+    client: &mut ControlPlaneServiceClient<
+        tonic::service::interceptor::InterceptedService<
+            tonic::transport::Channel,
+            BearerAuthClient,
+        >,
+    >,
+    seed: &str,
+    fallback_routes: Vec<metadb_cluster::CompositeShardRoute>,
+) -> Result<()> {
+    let our_id = config.node.node_id;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !cell_manager.local_voters_include(our_id) {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(MetaDbError::ConsensusError(format!(
+                "timed out joining cell {} via {seed} as node {our_id}",
+                config.node.cell_id
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut joined_routes = Vec::new();
+    if let Ok(response) = client
+        .get_routes(GetRoutesRequest {
+            cell_id: config.node.cell_id,
+        })
+        .await
+    {
+        let refreshed = response.into_inner();
+        if rpc_message(refreshed.error).is_none() {
+            for shard in refreshed.shards {
+                joined_routes.push(grpc_services::composite_route_from_proto(shard)?);
+            }
+        }
+    }
+    let seed_lists_us = !joined_routes.is_empty()
+        && joined_routes.iter().all(|route| {
+            route
+                .peers
+                .get(&our_id)
+                .map(|(_, is_voter)| *is_voter)
+                .unwrap_or(false)
+        });
+    if !seed_lists_us {
+        joined_routes = match cell_manager.routes_with_local_membership() {
+            Ok(routes) if !routes.is_empty() => routes,
+            _ => fallback_routes,
+        };
+    }
+    if joined_routes.is_empty()
+        || joined_routes.iter().any(|route| {
+            !route
+                .peers
+                .get(&our_id)
+                .map(|(_, is_voter)| *is_voter)
+                .unwrap_or(false)
+        })
+    {
+        return Err(MetaDbError::ConsensusError(format!(
+            "node {our_id} is not a voter on every shard after joining {seed}; join with the next node id in ascending order"
+        )));
+    }
+    cell_manager.install_joined_membership(joined_routes)?;
     Ok(())
 }

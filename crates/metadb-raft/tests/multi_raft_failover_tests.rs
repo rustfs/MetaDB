@@ -119,6 +119,7 @@ async fn test_online_1_to_3_voter_snapshot_promotion_and_leader_failover() {
         BTreeSet::from([1, 2, 3]),
         5,
         Duration::from_secs(10),
+        0,
     )
     .await
     .unwrap();

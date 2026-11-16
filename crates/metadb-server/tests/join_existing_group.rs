@@ -172,7 +172,7 @@ async fn second_process_joins_existing_raft_group_fails_over_and_reopens() {
     assert_eq!(voter_set(&node1), BTreeSet::from([1]));
 
     let cfg2 = fast_config(&dir2, 2, &addr1);
-    let (node2, _addr2) = PersistentMetaDbCluster::open_and_serve(cfg2.clone())
+    let (node2, addr2) = PersistentMetaDbCluster::open_and_serve(cfg2.clone())
         .await
         .unwrap();
     assert!(node2.cell_manager().joined_existing());
@@ -184,7 +184,7 @@ async fn second_process_joins_existing_raft_group_fails_over_and_reopens() {
     wait_applied(&node2, "on_two_voters.dat").await;
 
     let cfg3 = fast_config(&dir3, 3, &addr1);
-    let (node3, _addr3) = PersistentMetaDbCluster::open_and_serve(cfg3.clone())
+    let (node3, addr3) = PersistentMetaDbCluster::open_and_serve(cfg3.clone())
         .await
         .unwrap();
     assert!(node3.cell_manager().joined_existing());
@@ -214,10 +214,10 @@ async fn second_process_joins_existing_raft_group_fails_over_and_reopens() {
 
     // Membership is still {1,2,3}. Node 1 is stopped, so the other survivor must stay up
     // while this leader reopens; two live voters are the quorum.
-    let leader_dir_cfg = if leader_id == 2 {
-        cfg2.clone()
+    let (leader_dir_cfg, leader_addr) = if leader_id == 2 {
+        (cfg2.clone(), addr2.clone())
     } else {
-        cfg3.clone()
+        (cfg3.clone(), addr3.clone())
     };
     let keep = if leader_id == 2 {
         Arc::clone(&node3)
@@ -227,9 +227,13 @@ async fn second_process_joins_existing_raft_group_fails_over_and_reopens() {
     leader.shutdown().await.unwrap();
     drop(leader);
 
-    let (reopened, _) = PersistentMetaDbCluster::open_and_serve(leader_dir_cfg)
+    let (reopened, reopened_addr) = PersistentMetaDbCluster::open_and_serve(leader_dir_cfg)
         .await
         .unwrap();
+    assert_eq!(
+        reopened_addr, leader_addr,
+        "restart on an ephemeral port must keep the raft advertise address"
+    );
     assert!(reopened.cell_manager().joined_existing());
     let readers = [Arc::clone(&keep), Arc::clone(&reopened)];
     for name in names {
@@ -277,6 +281,95 @@ async fn joined_voter_can_be_removed_while_the_others_stay_up() {
 
     node1.shutdown().await.unwrap();
     node2.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_route_cache_does_not_drop_a_live_voter() {
+    let dir = tempdir().unwrap();
+    let (node1, addr1) =
+        PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n1"), 1, ""))
+            .await
+            .unwrap();
+    node1
+        .tx_router()
+        .mkdir(ROOT_INODE_ID, "bucket", BUCKET_ID, 7, 0o755)
+        .await
+        .unwrap();
+    assert!(create_named(&node1, "before_join.dat", 100, 500).await);
+    let (node2, _) =
+        PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n2"), 2, &addr1))
+            .await
+            .unwrap();
+    let (node3, _) =
+        PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n3"), 3, &addr1))
+            .await
+            .unwrap();
+    wait_applied(&node2, "before_join.dat").await;
+    assert_eq!(voter_set(&node2), BTreeSet::from([1, 2]));
+    assert_eq!(
+        node2.cell_manager().raft_voter_ids(1).unwrap(),
+        BTreeSet::from([1, 2, 3])
+    );
+    assert_eq!(
+        node2.cell_manager().voters_after_removal(1, 1).unwrap(),
+        BTreeSet::from([2, 3])
+    );
+    node1.shutdown().await.unwrap();
+    node2.shutdown().await.unwrap();
+    node3.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interrupted_join_resumes_instead_of_forking() {
+    let dir = tempdir().unwrap();
+    let (node1, addr1) =
+        PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n1"), 1, ""))
+            .await
+            .unwrap();
+    node1
+        .tx_router()
+        .mkdir(ROOT_INODE_ID, "bucket", BUCKET_ID, 7, 0o755)
+        .await
+        .unwrap();
+    assert!(create_named(&node1, "before_join.dat", 100, 500).await);
+    let cfg2 = fast_config(&dir.path().join("n2"), 2, &addr1);
+    let (node2, addr2) = PersistentMetaDbCluster::open_and_serve(cfg2.clone())
+        .await
+        .unwrap();
+    wait_applied(&node2, "before_join.dat").await;
+    node2
+        .cell_manager()
+        .testing_mark_join_interrupted()
+        .unwrap();
+    node2.shutdown().await.unwrap();
+    drop(node2);
+    let (resumed, resumed_addr) = PersistentMetaDbCluster::open_and_serve(cfg2).await.unwrap();
+    assert_eq!(resumed_addr, addr2);
+    assert!(resumed.cell_manager().joined_existing());
+    wait_applied(&resumed, "before_join.dat").await;
+    resumed.shutdown().await.unwrap();
+    node1.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_sends_the_shared_secret() {
+    let dir = tempdir().unwrap();
+    let mut cfg1 = fast_config(&dir.path().join("n1"), 1, "");
+    cfg1.security.shared_secret = "join-secret".to_string();
+    let (node1, addr1) = PersistentMetaDbCluster::open_and_serve(cfg1).await.unwrap();
+    node1
+        .tx_router()
+        .mkdir(ROOT_INODE_ID, "bucket", BUCKET_ID, 7, 0o755)
+        .await
+        .unwrap();
+    assert!(create_named(&node1, "before_join.dat", 100, 500).await);
+    let mut cfg2 = fast_config(&dir.path().join("n2"), 2, &addr1);
+    cfg2.security.shared_secret = "join-secret".to_string();
+    let (node2, _) = PersistentMetaDbCluster::open_and_serve(cfg2).await.unwrap();
+    wait_applied(&node2, "before_join.dat").await;
+    assert_eq!(voter_set(&node1), BTreeSet::from([1, 2]));
+    node2.shutdown().await.unwrap();
+    node1.shutdown().await.unwrap();
 }
 
 struct Metadbd {

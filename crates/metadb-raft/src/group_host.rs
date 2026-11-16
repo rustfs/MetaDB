@@ -312,6 +312,78 @@ impl ShardRaftGroup {
         is_voter
     }
 
+    /// Voter ids and dial addresses from a uniform Raft membership.
+    ///
+    /// A joint configuration is refused so a later add or remove is not planned from a
+    /// half-applied voter set. `change_membership` can return before this metrics watch
+    /// shows the uniform config, so callers retry for a short interval.
+    pub fn uniform_voter_addrs(&self) -> Result<BTreeMap<NodeId, String>> {
+        let metrics = self.raft.metrics();
+        let snapshot = metrics.borrow_watched().clone();
+        let effective = snapshot
+            .membership_config
+            .membership()
+            .get_joint_config()
+            .clone();
+        if effective.len() != 1 {
+            return Err(MetaDbError::ConsensusError(format!(
+                "shard {} membership change is still in joint consensus",
+                self.shard_id
+            )));
+        }
+        let mut out = BTreeMap::new();
+        for id in &effective[0] {
+            let addr = snapshot
+                .membership_config
+                .membership()
+                .get_node(id)
+                .map(|node| node.addr.clone())
+                .unwrap_or_default();
+            if addr.is_empty() {
+                return Err(MetaDbError::ConsensusError(format!(
+                    "voter {id} on shard {} has no raft address",
+                    self.shard_id
+                )));
+            }
+            out.insert(*id, addr);
+        }
+        Ok(out)
+    }
+
+    pub async fn wait_uniform_voter_addrs(&self) -> Result<BTreeMap<NodeId, String>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.uniform_voter_addrs() {
+                Ok(voters) => return Ok(voters),
+                Err(err) if tokio::time::Instant::now() >= deadline => return Err(err),
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    }
+
+    /// Appends a blank entry, snapshots the state machine, and purges the log through that
+    /// snapshot so a new replica must install the checkpoint instead of replaying an empty prefix.
+    pub async fn prepare_learner_snapshot(&self) -> Result<u64> {
+        self.raft.write_blank().await.map_err(|e| {
+            MetaDbError::ConsensusError(format!(
+                "blank barrier before learner snapshot on shard {} failed: {e}",
+                self.shard_id
+            ))
+        })?;
+        let _ = self.flush_snapshot_and_purge().await?;
+        let metrics = self.raft.metrics();
+        let snapshot = metrics.borrow_watched().clone();
+        let snap_idx = snapshot.snapshot.as_ref().map(|id| id.index).unwrap_or(0);
+        let purged = snapshot.purged.as_ref().map(|id| id.index).unwrap_or(0);
+        if snap_idx == 0 || purged < snap_idx {
+            return Err(MetaDbError::ConsensusError(format!(
+                "shard {} snapshot {snap_idx} was not purged (purged {purged}); refusing to promote a replica that could miss state seeded outside the log",
+                self.shard_id
+            )));
+        }
+        Ok(snap_idx)
+    }
+
     /// Proposes a mutation to OpenRaft after pre-checking `expected_epoch` (`Resolution B16`)
     /// and stamping a drift-checked causal HLC timestamp.
     pub async fn propose(
