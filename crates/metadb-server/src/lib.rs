@@ -753,6 +753,23 @@ impl PersistentMetaDbCluster {
 
     /// Gracefully stops gRPC/background loops, flushes all shard state to disk, and stops OpenRaft groups.
     pub async fn shutdown(&self) -> Result<()> {
+        self.stop_tasks().await;
+        self.flush_all().await?;
+        self.host.shutdown_all().await
+    }
+
+    /// Stops gRPC and maintenance, then shuts Raft down without flushing memtables.
+    ///
+    /// Committed entries that have not reached an LSM checkpoint stay in `.raftlog` and are
+    /// replayed by the next [`open_and_serve`](Self::open_and_serve) on the same `data_dir`.
+    /// This is the in-process crash used by failure-under-load tests: the LSM `LOCK` is
+    /// released, but the memtable is not checkpointed first.
+    pub async fn shutdown_without_flush(&self) -> Result<()> {
+        self.stop_tasks().await;
+        self.host.shutdown_all_no_flush().await
+    }
+
+    async fn stop_tasks(&self) {
         let _ = self.shutdown_tx.send(true);
         let handles: Vec<_> = {
             let mut guard = self.task_handles.lock().await;
@@ -762,8 +779,6 @@ impl PersistentMetaDbCluster {
             // Do not abandon the task: it may still hold the shard LSM lock.
             let _ = h.await;
         }
-        self.flush_all().await?;
-        self.host.shutdown_all().await
     }
 }
 

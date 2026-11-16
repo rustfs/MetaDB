@@ -42,6 +42,12 @@ The same harness is `metadb_server::stress`. `cargo test --workspace` runs the s
 
 ```bash
 cargo test -p metadb-server --test stress_harness stress_local -- --ignored --nocapture
+
+# Unflushed restart overlapping in-flight creates, then a rename/unlink tail.
+cargo test -p metadb-server --test stress_crash_restart -- --nocapture
+
+# 3-voter leader stop under creates, then voter restart while creates continue.
+cargo test -p metadb-server --test topology_distributed three_voter_leader_loss_under_load -- --nocapture
 ```
 
 ---
