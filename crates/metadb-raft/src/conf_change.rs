@@ -64,10 +64,23 @@ impl ConfChangeOrchestrator {
             }
         }
 
-        raft.change_membership(final_voters, false)
+        tokio::time::timeout(timeout, raft.change_membership(final_voters, false))
             .await
+            .map_err(|_| MetaDbError::ConsensusError("change_membership timed out".to_string()))?
             .map_err(|e| MetaDbError::ConsensusError(format!("change_membership failed: {}", e)))?;
 
+        Ok(())
+    }
+
+    /// Replaces the voter set. Used to drop replicas; learners are added separately.
+    pub async fn change_voters(raft: &MetaDbRaft, final_voters: BTreeSet<NodeId>) -> Result<()> {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            raft.change_membership(final_voters, false),
+        )
+        .await
+        .map_err(|_| MetaDbError::ConsensusError("change_membership timed out".to_string()))?
+        .map_err(|e| MetaDbError::ConsensusError(format!("change_membership failed: {}", e)))?;
         Ok(())
     }
 }

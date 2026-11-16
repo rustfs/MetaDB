@@ -15,7 +15,7 @@ pub mod meta_cache;
 pub mod shard;
 pub mod split_worker;
 
-pub use cell_manager::{DurableCellManager, SplitPlanRecord, SplitPlanState};
+pub use cell_manager::{CellDirectoryRole, DurableCellManager, SplitPlanRecord, SplitPlanState};
 pub use control_plane::{CellId, CellLocalManager, GlobalManager, MetaCache, ShardRoute};
 pub use global_manager::DurableGlobalManager;
 pub use id_allocator::{

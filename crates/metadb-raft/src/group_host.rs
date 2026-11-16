@@ -300,6 +300,18 @@ impl ShardRaftGroup {
         self.state_machine.handler().current_epoch()
     }
 
+    /// True when the applied Raft membership lists `node_id` as a voter.
+    pub fn membership_contains_voter(&self, node_id: NodeId) -> bool {
+        let metrics = self.raft.metrics();
+        let snapshot = metrics.borrow_watched().clone();
+        let is_voter = snapshot
+            .membership_config
+            .membership()
+            .voter_ids()
+            .any(|id| id == node_id);
+        is_voter
+    }
+
     /// Proposes a mutation to OpenRaft after pre-checking `expected_epoch` (`Resolution B16`)
     /// and stamping a drift-checked causal HLC timestamp.
     pub async fn propose(

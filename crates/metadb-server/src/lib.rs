@@ -11,6 +11,7 @@ pub mod grpc_services;
 pub mod metrics;
 pub mod stress;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::service::Interceptor;
-use tonic::transport::Server;
+use tonic::transport::{Endpoint, Server};
 use tonic::{Request, Status};
 
 /// Server interceptor for metadata, transaction, and control-plane RPCs.
@@ -104,19 +105,25 @@ impl Interceptor for BearerAuthClient {
 }
 
 use metadb_cluster::{
-    CellId, CellLocalManager, CompositeMetaCache, DurableCellManager, DurableGlobalManager,
-    DurableIdAllocator, GlobalManager, LocalIdBuffer, MetaCache, ShardDescriptor,
+    CellDirectoryRole, CellId, CellLocalManager, CompositeMetaCache, DurableCellManager,
+    DurableGlobalManager, DurableIdAllocator, GlobalManager, LocalIdBuffer, MetaCache,
+    ShardDescriptor,
 };
 use metadb_core::{
     CompositeKeyRange, EntryType, FileId, HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId,
-    MetaEntry, NodeId, QuotaRecord, Result, SecondaryIndexRecord, UserId, ROOT_INODE_ID,
+    MetaDbError, MetaEntry, NodeId, QuotaRecord, Result, SecondaryIndexRecord, UserId,
+    ROOT_INODE_ID,
 };
+use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::control_plane_service_server::ControlPlaneServiceServer;
 use metadb_proto::metadata_service_server::MetadataServiceServer;
 use metadb_proto::raft_transport_service_server::RaftTransportServiceServer;
 use metadb_proto::transaction_service_server::TransactionServiceServer;
+use metadb_proto::{GetRoutesRequest, RegisterNodeRequest, ScaleShardReplicasRequest};
 use metadb_proxy::{MetadataSqlCommand, SqlTemplateParser, StatelessProxyRouter};
-use metadb_raft::{MultiRaftTransportServer, ProposalShutdownGate, ShardGroupHost};
+use metadb_raft::{
+    MultiRaftRouter, MultiRaftTransportServer, ProposalShutdownGate, ShardGroupHost,
+};
 use metadb_storage::mvcc::DEFAULT_MVCC_RETENTION_MS;
 use metadb_storage::{LifecycleStorageEngine, ShardedBlockCache};
 use metadb_tx::{
@@ -499,9 +506,12 @@ pub struct PersistentMetaDbCluster {
 impl PersistentMetaDbCluster {
     /// Opens or bootstraps a persistent MetaDB instance from `config` and starts its gRPC listener
     /// (binding to `config.node.grpc_listen_addr`, e.g., `"127.0.0.1:0"` for OS-assigned ephemeral ports).
+    ///
+    /// When `config.cluster.join` is set and this data directory does not already own a cell,
+    /// the process registers with that leader and joins every shard Raft group before returning.
     pub async fn open_and_serve(config: ServerTomlConfig) -> Result<(Arc<Self>, String)> {
         if config.node.role != ServerRole::AllInOne {
-            return Err(metadb_core::MetaDbError::CodecError(format!(
+            return Err(MetaDbError::CodecError(format!(
                 "server role {:?} is not implemented; only all-in-one runs a process. \
                  be, proxy, cell-manager, and global-manager are not role-trimmed and must not be treated as disaggregated deployments",
                 config.node.role
@@ -509,6 +519,7 @@ impl PersistentMetaDbCluster {
         }
         let listener = TcpListener::bind(&config.node.grpc_listen_addr).await?;
         let bound_addr = listener.local_addr()?.to_string();
+        std::fs::create_dir_all(&config.node.data_dir)?;
 
         let clock = Arc::new(HybridLogicalClock::with_max_drift_ms(
             config.clock.max_clock_drift_ms,
@@ -522,32 +533,64 @@ impl PersistentMetaDbCluster {
             config.node.node_id,
         ));
         let meta_cache = Arc::new(CompositeMetaCache::new());
-
         let host = Arc::new(ShardGroupHost::open(
             config.node.node_id,
             config.node.data_dir.join("be"),
             block_cache,
             clock.clone(),
         )?);
-
-        // Start RaftTransportService BEFORE initializing Multi-Raft groups so multi-node RPCs resolve immediately!
         let raft_router = host.router().clone();
-        let cell_manager = DurableCellManager::open_or_bootstrap(
-            config.node.cell_id,
-            config
-                .node
-                .data_dir
-                .join(format!("cell_{}", config.node.cell_id)),
-            host.clone(),
-            bound_addr.clone(),
-            config.sharding.bootstrap_table_shards,
-            config.sharding.shard_split_threshold_bytes,
-            config.to_lsm_config()?,
-            config.raft_options.clone(),
-            id_allocator.clone(),
-            meta_cache.clone(),
-        )
-        .await?;
+        let cell_dir = config
+            .node
+            .data_dir
+            .join(format!("cell_{}", config.node.cell_id));
+        let directory_role = if cell_dir.join("CELL_MANAGER_STATE").exists() {
+            DurableCellManager::inspect_directory(&cell_dir)?
+        } else {
+            CellDirectoryRole::Absent
+        };
+        let join_addr = config.cluster.join.trim().to_string();
+        let join_fresh = !join_addr.is_empty()
+            && matches!(
+                directory_role,
+                CellDirectoryRole::Absent | CellDirectoryRole::Empty
+            );
+        if !join_addr.is_empty() && !join_fresh {
+            tracing::info!(
+                join = %join_addr,
+                "data directory already owns a cell; reopening local Raft state"
+            );
+        }
+
+        let lsm_config = config.to_lsm_config()?;
+        let cell_manager = if join_fresh {
+            DurableCellManager::open_joining(
+                config.node.cell_id,
+                &cell_dir,
+                host.clone(),
+                bound_addr.clone(),
+                config.sharding.shard_split_threshold_bytes,
+                lsm_config,
+                config.raft_options.clone(),
+                id_allocator.clone(),
+                meta_cache.clone(),
+            )
+            .await?
+        } else {
+            DurableCellManager::open_or_bootstrap(
+                config.node.cell_id,
+                &cell_dir,
+                host.clone(),
+                bound_addr.clone(),
+                config.sharding.bootstrap_table_shards,
+                config.sharding.shard_split_threshold_bytes,
+                lsm_config,
+                config.raft_options.clone(),
+                id_allocator.clone(),
+                meta_cache.clone(),
+            )
+            .await?
+        };
 
         let global_manager = Arc::new(DurableGlobalManager::new(
             clock.clone(),
@@ -555,28 +598,18 @@ impl PersistentMetaDbCluster {
             meta_cache,
         ));
         global_manager.register_cell(CompositeKeyRange::all_user_tables(), cell_manager.clone());
-
         let tx_router = Arc::new(DistributedTxRouter::new(
             config.node.node_id,
             clock.clone(),
             global_manager.clone(),
         ));
         let proxy_router = Arc::new(StatelessProxyRouter::new(tx_router.clone()));
-
-        // Ensure root directory `/` (`ROOT_INODE_ID = 1`) exists idempotently on bootstrap!
-        if tx_router.dirstat(ROOT_INODE_ID).await.is_err() {
-            let _ = tx_router
-                .init_dir_attr(ROOT_INODE_ID, ROOT_INODE_ID, 0, 0o755)
-                .await;
-        }
-
-        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let grpc_svc = MetaDbGrpcService::new(
             global_manager.clone(),
             tx_router.clone(),
             proxy_router.clone(),
         );
-
         let shared_secret = config.security.shared_secret.clone();
         if shared_secret.is_empty() {
             tracing::warn!(
@@ -587,27 +620,21 @@ impl PersistentMetaDbCluster {
                  RaftTransport on the same listener is also unauthenticated."
             );
         }
-        let auth = BearerAuth::new(shared_secret);
+        let grpc_handle =
+            spawn_grpc_server(listener, grpc_svc, shared_secret, raft_router, shutdown_rx);
 
-        let grpc_handle = tokio::spawn(async move {
-            let _ = Server::builder()
-                .add_service(MetadataServiceServer::with_interceptor(
-                    grpc_svc.clone(),
-                    auth.clone(),
-                ))
-                .add_service(TransactionServiceServer::with_interceptor(
-                    grpc_svc.clone(),
-                    auth.clone(),
-                ))
-                .add_service(ControlPlaneServiceServer::with_interceptor(grpc_svc, auth))
-                .add_service(RaftTransportServiceServer::new(
-                    MultiRaftTransportServer::new(raft_router),
-                ))
-                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                    let _ = shutdown_rx.changed().await;
-                })
+        if join_fresh {
+            // Raft RPCs from the leader arrive on this listener while membership is proposed.
+            wait_until_accepting(&bound_addr).await;
+            join_existing_raft_group(&config, &cell_manager, &bound_addr).await?;
+        }
+
+        // A joined replica already has the root directory in the replicated state machine.
+        if !cell_manager.joined_existing() && tx_router.dirstat(ROOT_INODE_ID).await.is_err() {
+            let _ = tx_router
+                .init_dir_attr(ROOT_INODE_ID, ROOT_INODE_ID, 0, 0o755)
                 .await;
-        });
+        }
 
         let cluster = Arc::new(Self {
             config,
@@ -638,6 +665,11 @@ impl PersistentMetaDbCluster {
         });
         cluster.task_handles.lock().await.push(bg_handle);
 
+        // Publish only after bootstrap or join has finished, so readers know the port is serving.
+        std::fs::write(
+            cluster.config().node.data_dir.join("GRPC_ADDR"),
+            &bound_addr,
+        )?;
         Ok((cluster, bound_addr))
     }
 
@@ -840,4 +872,217 @@ mod auth_tests {
         let outgoing = client.call(Request::new(())).unwrap();
         assert!(authorization(&outgoing).is_none());
     }
+}
+
+fn spawn_grpc_server(
+    listener: TcpListener,
+    grpc_svc: MetaDbGrpcService,
+    shared_secret: String,
+    raft_router: MultiRaftRouter,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let auth = BearerAuth::new(shared_secret);
+    tokio::spawn(async move {
+        let _ = Server::builder()
+            .add_service(MetadataServiceServer::with_interceptor(
+                grpc_svc.clone(),
+                auth.clone(),
+            ))
+            .add_service(TransactionServiceServer::with_interceptor(
+                grpc_svc.clone(),
+                auth.clone(),
+            ))
+            .add_service(ControlPlaneServiceServer::with_interceptor(grpc_svc, auth))
+            .add_service(RaftTransportServiceServer::new(
+                MultiRaftTransportServer::new(raft_router),
+            ))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _ = shutdown_rx.changed().await;
+            })
+            .await;
+    })
+}
+
+async fn wait_until_accepting(addr: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn normalize_rpc_addr(addr: &str) -> String {
+    let addr = addr.trim();
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    }
+}
+
+fn rpc_message(err: Option<metadb_proto::ErrorDetailProto>) -> Option<String> {
+    err.and_then(|err| {
+        if err.message.is_empty() && err.error_kind.is_empty() {
+            None
+        } else {
+            Some(format!("{} {}", err.error_kind, err.message))
+        }
+    })
+}
+
+async fn control_plane_client(
+    addr: &str,
+    secret: &str,
+) -> Result<
+    ControlPlaneServiceClient<
+        tonic::service::interceptor::InterceptedService<tonic::transport::Channel, BearerAuth>,
+    >,
+> {
+    let endpoint = Endpoint::from_shared(addr.to_string())
+        .map_err(|e| MetaDbError::ConsensusError(format!("invalid seed address {addr}: {e}")))?;
+    let channel = endpoint.connect().await.map_err(|e| {
+        MetaDbError::ConsensusError(format!("connect to raft leader {addr} failed: {e}"))
+    })?;
+    Ok(ControlPlaneServiceClient::with_interceptor(
+        channel,
+        BearerAuth::new(secret),
+    ))
+}
+
+/// Registers this process with `config.cluster.join` and waits until every local shard
+/// has applied a voter membership that includes this node.
+async fn join_existing_raft_group(
+    config: &ServerTomlConfig,
+    cell_manager: &DurableCellManager,
+    bound_addr: &str,
+) -> Result<()> {
+    let seed = normalize_rpc_addr(&config.cluster.join);
+    let mut client = control_plane_client(&seed, &config.security.shared_secret).await?;
+    let listed = client
+        .get_routes(GetRoutesRequest {
+            cell_id: config.node.cell_id,
+        })
+        .await
+        .map_err(|e| MetaDbError::ConsensusError(format!("get_routes from {seed}: {e}")))?
+        .into_inner();
+    if let Some(message) = rpc_message(listed.error) {
+        return Err(MetaDbError::ConsensusError(format!(
+            "get_routes from {seed}: {message}"
+        )));
+    }
+    let mut routes = Vec::with_capacity(listed.shards.len());
+    for shard in listed.shards {
+        routes.push(grpc_services::composite_route_from_proto(shard)?);
+    }
+    if routes.is_empty() {
+        return Err(MetaDbError::ConsensusError(format!(
+            "seed {seed} has no shard routes in cell {}",
+            config.node.cell_id
+        )));
+    }
+    if routes.iter().any(|route| {
+        route
+            .peers
+            .get(&config.node.node_id)
+            .map(|(_, is_voter)| *is_voter)
+            .unwrap_or(false)
+    }) {
+        return Err(MetaDbError::ConsensusError(format!(
+            "node_id {} is already a voter; reopen that node's data directory instead of joining a fresh one",
+            config.node.node_id
+        )));
+    }
+    let voter_ids: BTreeSet<NodeId> = routes
+        .iter()
+        .flat_map(|route| {
+            route
+                .peers
+                .iter()
+                .filter(|(_, (_, is_voter))| *is_voter)
+                .map(|(node_id, _)| *node_id)
+        })
+        .collect();
+    cell_manager.start_joining_replicas(&routes).await?;
+
+    let registered = client
+        .register_node(RegisterNodeRequest {
+            cell_id: config.node.cell_id,
+            node_id: config.node.node_id,
+            grpc_addr: bound_addr.to_string(),
+        })
+        .await
+        .map_err(|e| MetaDbError::ConsensusError(format!("register_node at {seed}: {e}")))?
+        .into_inner();
+    if let Some(message) = rpc_message(registered.error) {
+        return Err(MetaDbError::ConsensusError(format!(
+            "register_node at {seed}: {message}"
+        )));
+    }
+
+    let target_voters = u32::try_from(voter_ids.len().saturating_add(1)).unwrap_or(u32::MAX);
+    let scaled = client
+        .scale_shard_replicas(ScaleShardReplicasRequest {
+            cell_id: config.node.cell_id,
+            target_voters,
+        })
+        .await
+        .map_err(|e| MetaDbError::ConsensusError(format!("scale_shard_replicas at {seed}: {e}")))?
+        .into_inner();
+    if let Some(message) = rpc_message(scaled.error) {
+        if !cell_manager.local_voters_include(config.node.node_id) {
+            return Err(MetaDbError::ConsensusError(format!(
+                "scale_shard_replicas at {seed}: {message}"
+            )));
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !cell_manager.local_voters_include(config.node.node_id) {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(MetaDbError::ConsensusError(format!(
+                "timed out joining cell {} via {seed} as node {}",
+                config.node.cell_id, config.node.node_id
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let refreshed = client
+        .get_routes(GetRoutesRequest {
+            cell_id: config.node.cell_id,
+        })
+        .await
+        .map_err(|e| {
+            MetaDbError::ConsensusError(format!("get_routes after join from {seed}: {e}"))
+        })?
+        .into_inner();
+    let mut joined_routes = Vec::with_capacity(refreshed.shards.len());
+    for shard in refreshed.shards {
+        joined_routes.push(grpc_services::composite_route_from_proto(shard)?);
+    }
+    if joined_routes.is_empty() {
+        joined_routes = routes;
+    }
+    let our_id = config.node.node_id;
+    if joined_routes.iter().any(|route| {
+        !route
+            .peers
+            .get(&our_id)
+            .map(|(_, is_voter)| *is_voter)
+            .unwrap_or(false)
+    }) {
+        return Err(MetaDbError::ConsensusError(format!(
+            "node {our_id} is not a voter on every shard after joining {seed}; join with the next node id in ascending order"
+        )));
+    }
+    cell_manager.install_joined_membership(joined_routes)?;
+    tracing::info!(
+        node_id = our_id,
+        seed = %seed,
+        voters = target_voters,
+        "joined existing raft group"
+    );
+    Ok(())
 }
