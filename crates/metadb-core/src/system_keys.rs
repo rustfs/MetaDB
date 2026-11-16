@@ -135,8 +135,14 @@ pub enum AuxIntentSpec {
 /// Lock operation stored inside `[0x05][target_user_key]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IntentOp {
-    /// Exclusive write lock proposing a key upsert.
+    /// Exclusive write lock proposing a key upsert. Overwrites an existing value.
     Put {
+        value: Vec<u8>,
+        attr_deltas: Vec<AttrDeltaSpec>,
+        aux_specs: Vec<AuxIntentSpec>,
+    },
+    /// Exclusive create. Prepare and commit both reject the intent when `user_key` already exists.
+    Insert {
         value: Vec<u8>,
         attr_deltas: Vec<AttrDeltaSpec>,
         aux_specs: Vec<AuxIntentSpec>,

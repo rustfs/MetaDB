@@ -59,13 +59,56 @@ pub const fn is_dir_inode_id(id: InodeId) -> bool {
     id != 0 && (id & FILE_INODE_TAG_BIT) == 0
 }
 
-/// Validates that a user-supplied file or directory name does not collide with
-/// the reserved `"_attr_"` entry or contain illegal empty/null characters.
+/// Validates that a user-supplied file or directory name is a single path component.
+///
+/// Rejects the reserved `"_attr_"` row, `"."` / `".."`, empty names, NUL bytes, and
+/// `/` or `\` separators so a name cannot escape its parent directory.
 pub fn validate_user_entry_name(name: &str) -> Result<()> {
-    if name.is_empty() || name == ATTR_ENTRY_NAME || name.contains('\0') {
+    if name.is_empty()
+        || name == ATTR_ENTRY_NAME
+        || name == "."
+        || name == ".."
+        || name.contains('\0')
+        || name.contains('/')
+        || name.contains('\\')
+    {
         return Err(MetaDbError::ReservedEntryName(name.to_string()));
     }
     Ok(())
+}
+
+/// Rejects directory inode ids that are zero or tagged as file inodes (bit 63).
+pub fn validate_dir_inode_id(id: InodeId) -> Result<()> {
+    if !is_dir_inode_id(id) {
+        return Err(MetaDbError::CodecError(format!(
+            "invalid directory inode id {}",
+            id
+        )));
+    }
+    Ok(())
+}
+
+/// File and directory byte counts stored in metadata are non-negative.
+pub fn validate_file_size(size_bytes: i64) -> Result<()> {
+    if size_bytes < 0 {
+        return Err(MetaDbError::InvalidFileSize(size_bytes));
+    }
+    Ok(())
+}
+
+/// `checked_add` that saturates at `i64::MIN` / `i64::MAX` instead of wrapping or panicking.
+#[inline]
+pub fn saturating_add_i64(lhs: i64, rhs: i64) -> i64 {
+    lhs.checked_add(rhs)
+        .unwrap_or(if rhs < 0 { i64::MIN } else { i64::MAX })
+}
+
+/// Negates a stored size for a quota or directory delta.
+///
+/// A corrupt negative size contributes nothing, so unlinking it cannot inflate usage.
+#[inline]
+pub fn negate_accounted_size(size_bytes: i64) -> i64 {
+    -size_bytes.max(0)
 }
 
 /// Primary key of `MetaTable`: `(PID, name)`.
@@ -683,5 +726,33 @@ mod tests {
         // Empty tombstone payload on `0x06 TxnRecord` returns `Ok(None)` safely.
         let tk = TxnRecordKey { txn_id: 99 }.encode();
         assert_eq!(affinity_key_for_raw_entry(&tk, &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn test_name_and_size_guards_do_not_wrap() {
+        for bad in ["", "_attr_", ".", "..", "a/b", "a\\b", "foo/../x", "a\0b"] {
+            assert!(
+                matches!(
+                    validate_user_entry_name(bad),
+                    Err(MetaDbError::ReservedEntryName(_))
+                ),
+                "name {:?} must be rejected",
+                bad
+            );
+        }
+        assert!(validate_user_entry_name(".hidden").is_ok());
+        assert!(validate_user_entry_name("foo..bar").is_ok());
+        assert!(matches!(
+            validate_file_size(-1),
+            Err(MetaDbError::InvalidFileSize(-1))
+        ));
+        assert!(validate_file_size(0).is_ok());
+        assert!(validate_dir_inode_id(0).is_err());
+        assert!(validate_dir_inode_id(FILE_INODE_TAG_BIT | 3).is_err());
+        assert!(validate_dir_inode_id(2).is_ok());
+        assert_eq!(saturating_add_i64(i64::MAX, 1), i64::MAX);
+        assert_eq!(saturating_add_i64(10, -3), 7);
+        assert_eq!(negate_accounted_size(-50), 0);
+        assert_eq!(negate_accounted_size(50), -50);
     }
 }

@@ -8,15 +8,17 @@ use std::sync::Arc;
 
 use metadb_core::schema::validate_user_entry_name;
 use metadb_core::{
+    negate_accounted_size, saturating_add_i64, validate_dir_inode_id, validate_file_size,
     AttrDeltaSpec, AuxIntentSpec, DirShardDeltaKey, DirShardDeltaRecord, EntryType, FileId,
     HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId, IntentOp, MetaDbError, MetaEntry,
     MetaKey, QuotaKey, QuotaRecord, Result, SecondaryIndexKey, SecondaryIndexRecord, ShardEpoch,
-    ShardId, TxnId, UserId, WriteIntentKey, WriteIntentRecord, ROOT_INODE_ID, TABLE_PREFIX_QUOTA,
+    ShardId, TxnId, UserId, WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME, TABLE_PREFIX_QUOTA,
     TABLE_PREFIX_SECONDARY_INDEX,
 };
 use metadb_raft::ShardRaftGroup;
 
 use crate::recovery_worker::TxnRecoveryWorker;
+use crate::rename_cycle::RenameCycleWalker;
 use crate::state_machine_impl::{SetAttrPatch, TxRaftCmd, TxRaftOutput, TxStateMachineHandler};
 
 pub const DEFAULT_2PC_TTL_MS: u64 = 3_000;
@@ -199,6 +201,7 @@ impl DistributedTxRouter {
         size_bytes: i64,
     ) -> Result<MetaEntry> {
         validate_user_entry_name(name)?;
+        validate_file_size(size_bytes)?;
         let key = MetaKey::child(pid, name).encode();
         let cmd = TxRaftCmd::CreateFile {
             pid,
@@ -245,6 +248,17 @@ impl DistributedTxRouter {
         mode: u32,
     ) -> Result<MetaEntry> {
         validate_user_entry_name(name)?;
+        validate_dir_inode_id(new_dir_id)?;
+        match self.dirstat(new_dir_id).await {
+            Ok(_) => {
+                return Err(MetaDbError::AlreadyExists {
+                    pid: new_dir_id,
+                    name: ATTR_ENTRY_NAME.to_string(),
+                });
+            }
+            Err(MetaDbError::DirectoryNotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
         let child_meta_key = MetaKey::child(pid, name);
         let child_bytes = child_meta_key.encode();
         let new_attr_bytes = MetaKey::dir_attr(new_dir_id).encode();
@@ -306,7 +320,7 @@ impl DistributedTxRouter {
             ),
             (
                 child_bytes.clone(),
-                IntentOp::Put {
+                IntentOp::Insert {
                     value: dentry_attr.encode(),
                     attr_deltas: vec![AttrDeltaSpec {
                         pid,
@@ -322,7 +336,7 @@ impl DistributedTxRouter {
             ),
             (
                 new_attr_bytes,
-                IntentOp::Put {
+                IntentOp::Insert {
                     value: self_attr.encode(),
                     attr_deltas: vec![],
                     aux_specs: vec![],
@@ -430,6 +444,9 @@ impl DistributedTxRouter {
         patch: SetAttrPatch,
     ) -> Result<MetaEntry> {
         validate_user_entry_name(name)?;
+        if let Some(sz) = patch.size_bytes {
+            validate_file_size(sz)?;
+        }
         let Some(existing) = self.lookup(pid, name).await? else {
             return Err(MetaDbError::NotFound {
                 pid,
@@ -528,6 +545,21 @@ impl DistributedTxRouter {
         })
     }
 
+    async fn ensure_directory_rename_acyclic(
+        &self,
+        src_dir_id: InodeId,
+        dst_pid: InodeId,
+    ) -> Result<()> {
+        let mut walker = RenameCycleWalker::new(src_dir_id, dst_pid);
+        let mut cursor = dst_pid;
+        loop {
+            if !walker.observe(cursor)? {
+                return Ok(());
+            }
+            cursor = self.dirstat(cursor).await?.parent_pid;
+        }
+    }
+
     /// Atomic `Rename` (`1-RTT` within one shard, or crash-recoverable Primary-Anchored `2PC` across shards).
     pub async fn rename(
         &self,
@@ -609,31 +641,15 @@ impl DistributedTxRouter {
                 .directory
                 .acquire_dir_rename_lease(src_entry.attr.inode_id, self.ttl_ms)
                 .await?;
-            // Walk ancestor chain `dst_pid -> parent_pid -> ... -> ROOT_INODE_ID` (`Resolution B13`).
-            let mut cur = dst_pid;
-            for _ in 0..1024 {
-                if cur == src_entry.attr.inode_id {
-                    self.directory
-                        .release_dir_rename_lease(lease.rename_fence_token)
-                        .await;
-                    return Err(MetaDbError::InvalidRenameCycle {
-                        dir_id: src_entry.attr.inode_id,
-                        dst_pid,
-                    });
-                }
-                if cur <= ROOT_INODE_ID {
-                    break;
-                }
-                let anc = match self.dirstat(cur).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        self.directory
-                            .release_dir_rename_lease(lease.rename_fence_token)
-                            .await;
-                        return Err(e);
-                    }
-                };
-                cur = anc.parent_pid;
+            // Walk the full ancestor chain. A truncated walk must not allow the rename.
+            if let Err(e) = self
+                .ensure_directory_rename_acyclic(src_entry.attr.inode_id, dst_pid)
+                .await
+            {
+                self.directory
+                    .release_dir_rename_lease(lease.rename_fence_token)
+                    .await;
+                return Err(e);
             }
             Some(lease)
         } else {
@@ -643,8 +659,9 @@ impl DistributedTxRouter {
         // Check destination existence & victim accounting (`Resolution B11`).
         let dst_existing = self.lookup(dst_pid, dst_name).await?;
         let mut dst_aux_specs = Vec::new();
+        let src_accounted = src_entry.attr.size_bytes.max(0);
         let mut dst_delta_children = 1i64;
-        let mut dst_delta_bytes = src_entry.attr.size_bytes;
+        let mut dst_delta_bytes = src_accounted;
 
         if let Some(victim_entry) = dst_existing {
             if !overwrite {
@@ -672,10 +689,13 @@ impl DistributedTxRouter {
                 });
             }
             dst_delta_children = 0; // +1 - 1 = 0 net child delta on destination!
-            dst_delta_bytes = src_entry.attr.size_bytes - victim_entry.attr.size_bytes;
+            dst_delta_bytes = saturating_add_i64(
+                src_accounted,
+                negate_accounted_size(victim_entry.attr.size_bytes),
+            );
             dst_aux_specs.push(AuxIntentSpec::QuotaDelta {
                 uid: victim_entry.attr.uid,
-                delta_bytes: -victim_entry.attr.size_bytes,
+                delta_bytes: negate_accounted_size(victim_entry.attr.size_bytes),
                 delta_inodes: -1,
             });
             if let Some(vfid) = victim_entry.attr.fid {
@@ -710,7 +730,7 @@ impl DistributedTxRouter {
                     vec![AttrDeltaSpec {
                         pid: src_pid,
                         delta_children: -1,
-                        delta_bytes: -src_entry.attr.size_bytes,
+                        delta_bytes: negate_accounted_size(src_accounted),
                     }]
                 } else {
                     vec![]
@@ -732,7 +752,10 @@ impl DistributedTxRouter {
                     vec![AttrDeltaSpec {
                         pid: dst_pid,
                         delta_children: dst_delta_children - 1,
-                        delta_bytes: dst_delta_bytes - src_entry.attr.size_bytes,
+                        delta_bytes: saturating_add_i64(
+                            dst_delta_bytes,
+                            negate_accounted_size(src_accounted),
+                        ),
                     }]
                 },
                 aux_specs: dst_aux_specs,
@@ -1041,8 +1064,8 @@ impl DistributedTxRouter {
                         InodeAttr::decode(&raw)?,
                         &snap,
                     );
-                    total_children += rec.num_children;
-                    total_bytes += rec.size_bytes;
+                    total_children = saturating_add_i64(total_children, rec.num_children);
+                    total_bytes = saturating_add_i64(total_bytes, rec.size_bytes);
                     latest_mtime = latest_mtime.max(rec.modify_time);
                     anchor_attr = Some(rec);
                 } else if let Some(raw_sub) = eng.get_with_snapshot(&delta_key, &snap)? {
@@ -1051,8 +1074,8 @@ impl DistributedTxRouter {
                         DirShardDeltaRecord::decode(&raw_sub)?,
                         &snap,
                     );
-                    total_children += sub.num_children;
-                    total_bytes += sub.size_bytes;
+                    total_children = saturating_add_i64(total_children, sub.num_children);
+                    total_bytes = saturating_add_i64(total_bytes, sub.size_bytes);
                     latest_mtime = latest_mtime.max(sub.modify_time);
                 }
             }
@@ -1082,17 +1105,7 @@ impl DistributedTxRouter {
         limit: usize,
     ) -> Result<(Vec<MetaEntry>, Option<String>)> {
         let effective_limit = if limit == 0 { 10_000 } else { limit };
-        let scan_start = match after_name {
-            Some(cursor) if !cursor.is_empty() => {
-                let mut k = MetaKey::child(pid, cursor).encode();
-                k.push(0x00); // Strictly `> after_name`!
-                k
-            }
-            _ => match name_prefix {
-                Some(pfx) if !pfx.is_empty() => MetaKey::child(pid, pfx).encode(),
-                _ => MetaKey::encode_pid_prefix_start(pid),
-            },
-        };
+        let scan_start = listdir_scan_start(pid, after_name, name_prefix);
         let scan_end = MetaKey::encode_pid_prefix_end(pid);
         if scan_start >= scan_end {
             return Ok((Vec::new(), None));
@@ -1273,3 +1286,47 @@ impl DistributedTxRouter {
 
 #[allow(dead_code)]
 const _ASSERT_QUOTA_PREFIX: u8 = TABLE_PREFIX_QUOTA;
+
+/// Lower bound for a keyset `listdir`. When both a cursor and a prefix are set, the scan
+/// starts at the later of the two so names before the prefix are not treated as the end
+/// of the page.
+fn listdir_scan_start(
+    pid: InodeId,
+    after_name: Option<&str>,
+    name_prefix: Option<&str>,
+) -> Vec<u8> {
+    let mut start = match name_prefix {
+        Some(pfx) if !pfx.is_empty() => MetaKey::child(pid, pfx).encode(),
+        _ => MetaKey::encode_pid_prefix_start(pid),
+    };
+    if let Some(cursor) = after_name {
+        if !cursor.is_empty() {
+            let mut exclusive = MetaKey::child(pid, cursor).encode();
+            // Names cannot contain NUL, so `cursor || 0x00` is the first key strictly after it.
+            exclusive.push(0x00);
+            if exclusive > start {
+                start = exclusive;
+            }
+        }
+    }
+    start
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listdir_prefix_is_not_skipped_when_cursor_is_before_it() {
+        let prefixed = MetaKey::child(1, "b").encode();
+        let start = listdir_scan_start(1, Some("a"), Some("b"));
+        assert!(
+            start >= prefixed,
+            "cursor 'a' must not pull the scan below prefix 'b'"
+        );
+        let within = listdir_scan_start(1, Some("ba"), Some("b"));
+        let mut after_ba = MetaKey::child(1, "ba").encode();
+        after_ba.push(0x00);
+        assert_eq!(within, after_ba);
+    }
+}

@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use metadb_core::{
-    AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, DirShardDeltaKey, DirShardDeltaRecord,
-    HlcTimestamp, InodeAttr, InodeId, MetaKey, Result, ShardId, SpilledAuxOutboxKey, UserId,
+    saturating_add_i64, AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, DirShardDeltaKey,
+    DirShardDeltaRecord, HlcTimestamp, InodeAttr, InodeId, MetaKey, Result, ShardId,
+    SpilledAuxOutboxKey, UserId,
 };
 use metadb_raft::ShardWatermarkTracker;
 use metadb_storage::{LifecycleStorageEngine, MvccValue, SnapshotGuard, ViewAtRaftIndex};
@@ -76,8 +77,9 @@ impl ReplicatedAttrAggregator {
                     && d.raft_index <= cut.max_raft_index
                     && d.hlc <= cut.max_hlc
                 {
-                    base.num_children = (base.num_children + d.delta_children).max(0);
-                    base.size_bytes = (base.size_bytes + d.delta_bytes).max(0);
+                    base.num_children =
+                        saturating_add_i64(base.num_children, d.delta_children).max(0);
+                    base.size_bytes = saturating_add_i64(base.size_bytes, d.delta_bytes).max(0);
                     if d.hlc > base.modify_time {
                         base.modify_time = d.hlc;
                     }
@@ -103,8 +105,9 @@ impl ReplicatedAttrAggregator {
                     && d.raft_index <= cut.max_raft_index
                     && d.hlc <= cut.max_hlc
                 {
-                    base.num_children = (base.num_children + d.delta_children).max(0);
-                    base.size_bytes = (base.size_bytes + d.delta_bytes).max(0);
+                    base.num_children =
+                        saturating_add_i64(base.num_children, d.delta_children).max(0);
+                    base.size_bytes = saturating_add_i64(base.size_bytes, d.delta_bytes).max(0);
                     if d.hlc > base.modify_time {
                         base.modify_time = d.hlc;
                     }
@@ -137,8 +140,9 @@ impl ReplicatedAttrAggregator {
                 let mut changed = false;
                 for d in queue {
                     if d.raft_index > attr.applied_lsn && d.raft_index <= sealed_raft_index {
-                        attr.num_children = (attr.num_children + d.delta_children).max(0);
-                        attr.size_bytes = (attr.size_bytes + d.delta_bytes).max(0);
+                        attr.num_children =
+                            saturating_add_i64(attr.num_children, d.delta_children).max(0);
+                        attr.size_bytes = saturating_add_i64(attr.size_bytes, d.delta_bytes).max(0);
                         if d.hlc > attr.modify_time {
                             attr.modify_time = d.hlc;
                         }
@@ -159,8 +163,9 @@ impl ReplicatedAttrAggregator {
                 let mut changed = false;
                 for d in queue {
                     if d.raft_index > sub.applied_raft_index && d.raft_index <= sealed_raft_index {
-                        sub.num_children = (sub.num_children + d.delta_children).max(0);
-                        sub.size_bytes = (sub.size_bytes + d.delta_bytes).max(0);
+                        sub.num_children =
+                            saturating_add_i64(sub.num_children, d.delta_children).max(0);
+                        sub.size_bytes = saturating_add_i64(sub.size_bytes, d.delta_bytes).max(0);
                         if d.hlc > sub.modify_time {
                             sub.modify_time = d.hlc;
                         }

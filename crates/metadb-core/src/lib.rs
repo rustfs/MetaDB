@@ -19,7 +19,8 @@ pub use epoch::{CellId, CompositeKeyRange, ShardEpoch, TxnId};
 pub use error::{MetaDbError, Result};
 pub use hlc::{HlcTimestamp, HybridLogicalClock, DEFAULT_MAX_CLOCK_DRIFT_MS};
 pub use schema::{
-    is_dir_inode_id, is_file_inode_id, make_file_inode_id, validate_user_entry_name,
+    is_dir_inode_id, is_file_inode_id, make_file_inode_id, negate_accounted_size,
+    saturating_add_i64, validate_dir_inode_id, validate_file_size, validate_user_entry_name,
     AuxOrderingTuple, EntryType, FileId, InodeAttr, InodeId, MetaEntry, MetaKey, NodeId, QuotaKey,
     QuotaRecord, SecondaryIndexKey, SecondaryIndexRecord, ShardId, UserId, ATTR_ENTRY_NAME,
     FILE_INODE_TAG_BIT, INODE_ATTR_ENCODED_LEN, ROOT_INODE_ID, SYSTEM_PREFIX_DIR_SHARD_DELTA,

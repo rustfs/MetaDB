@@ -10,6 +10,7 @@ pub mod aux_outbox;
 pub mod aux_sink;
 pub mod pushdown;
 pub mod recovery_worker;
+pub mod rename_cycle;
 pub mod state_machine_impl;
 pub mod two_pc;
 

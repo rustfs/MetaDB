@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::RwLock;
 
 use metadb_core::{
-    FileId, HlcTimestamp, InodeId, QuotaRecord, SecondaryIndexRecord, ShardId, UserId,
+    saturating_add_i64, FileId, HlcTimestamp, InodeId, QuotaRecord, SecondaryIndexRecord, ShardId,
+    UserId,
 };
 use metadb_storage::{LifecycleStorageEngine, LogSequenceNumber, RaftLogPayload};
 
@@ -243,8 +244,8 @@ impl AsyncAuxiliarySink {
                 if (lsn, 0u16) <= prev_cursor {
                     return false; // Duplicate replay from Raft log recovery suppressed!
                 }
-                record.used_bytes = (record.used_bytes + delta_bytes).max(0);
-                record.used_inodes = (record.used_inodes + delta_inodes).max(0);
+                record.used_bytes = saturating_add_i64(record.used_bytes, delta_bytes).max(0);
+                record.used_inodes = saturating_add_i64(record.used_inodes, delta_inodes).max(0);
                 record.last_applied_hlc = record.last_applied_hlc.max(hlc);
                 record.applied_by_shard.insert(origin_shard_id, (lsn, 0));
                 true

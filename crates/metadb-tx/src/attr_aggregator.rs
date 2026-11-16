@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
-use metadb_core::{HlcTimestamp, InodeAttr, InodeId, MetaKey, Result};
+use metadb_core::{saturating_add_i64, HlcTimestamp, InodeAttr, InodeId, MetaKey, Result};
 use metadb_storage::{LifecycleStorageEngine, LogSequenceNumber, RaftLogPayload};
 
 /// A single queued parent-directory attribute modification (§5.2).
@@ -84,8 +84,10 @@ impl AsyncAttrAggregator {
         if let Some(queue) = guard.get(&pid) {
             for item in queue.iter() {
                 if item.seq > persisted.applied_lsn {
-                    persisted.num_children = (persisted.num_children + item.delta_children).max(0);
-                    persisted.size_bytes = (persisted.size_bytes + item.delta_bytes).max(0);
+                    persisted.num_children =
+                        saturating_add_i64(persisted.num_children, item.delta_children).max(0);
+                    persisted.size_bytes =
+                        saturating_add_i64(persisted.size_bytes, item.delta_bytes).max(0);
                     if item.modify_time > persisted.modify_time {
                         persisted.modify_time = item.modify_time;
                     }
@@ -123,8 +125,10 @@ impl AsyncAttrAggregator {
                 let mut attr = InodeAttr::decode(&raw_bytes)?;
                 for item in queue.iter() {
                     if item.seq > attr.applied_lsn {
-                        attr.num_children = (attr.num_children + item.delta_children).max(0);
-                        attr.size_bytes = (attr.size_bytes + item.delta_bytes).max(0);
+                        attr.num_children =
+                            saturating_add_i64(attr.num_children, item.delta_children).max(0);
+                        attr.size_bytes =
+                            saturating_add_i64(attr.size_bytes, item.delta_bytes).max(0);
                         if item.modify_time > attr.modify_time {
                             attr.modify_time = item.modify_time;
                         }
