@@ -797,6 +797,18 @@ impl DurableCellManager {
         let _guard = self.split_lock.lock().await;
         // Finish or drop any plan left by a crash before discovering a new boundary.
         self.recover_incomplete_splits().await?;
+        // Recovery can defer a pre-fence plan until transaction maintenance has
+        // drained the original shard. Keep its durable boundary and child ID.
+        if self
+            .state
+            .lock()
+            .unwrap()
+            .split_plans
+            .values()
+            .any(|plan| plan.parent_shard_id == shard_id && plan.state == SplitPlanState::Planned)
+        {
+            return Ok(None);
+        }
         let route = {
             let st = self.state.lock().unwrap();
             st.routes.get(&shard_id).cloned().ok_or_else(|| {
@@ -1099,7 +1111,17 @@ impl DurableCellManager {
         };
         let mut resumed_children: HashSet<ShardId> = HashSet::new();
         for (uuid, plan) in plans {
-            self.resume_planned_split(uuid, &plan).await?;
+            match self.resume_planned_split(uuid, &plan).await {
+                Ok(()) => {}
+                Err(MetaDbError::WriteIntentConflict { .. } | MetaDbError::SplitDeferred(_)) => {
+                    // Transaction recovery starts after Cell opening. A plan that
+                    // has not fenced its parent must leave its original route
+                    // available so that recovery can drain it, then retry on the
+                    // next maintenance pass. Storage/codec/consensus errors still
+                    // abort opening instead of being mistaken for deferrals.
+                }
+                Err(error) => return Err(error),
+            }
             resumed_children.insert(plan.child_shard_id);
         }
 

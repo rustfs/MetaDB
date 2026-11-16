@@ -8,7 +8,8 @@ use std::sync::Arc;
 use metadb_core::{
     affinity_key_for_raw_entry, saturating_add_i64, CompositeKeyRange, DirShardDeltaKey,
     DirShardDeltaRecord, EntryType, HlcTimestamp, InodeAttr, InodeId, MetaDbError, MetaKey, Result,
-    ShardEpoch, ShardId, WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME, TABLE_PREFIX_META,
+    ShardEpoch, ShardId, TxnRecordKey, TxnStatusRecord, WriteIntentKey, WriteIntentRecord,
+    ATTR_ENTRY_NAME, TABLE_PREFIX_META,
 };
 use metadb_raft::{
     RaftNodeOptions, RegistryShardState, ShardGroupHost, ShardRaftGroup, ShardWatermarkTracker,
@@ -180,40 +181,66 @@ impl RaftShardSplitWorker {
     )> {
         let old_end_key = parent_route.range.end_key.clone();
         let now_hlc = host.clock().now();
+        let left_range =
+            CompositeKeyRange::new(parent_route.range.start_key.clone(), split_key.clone())?;
+        let right_range = CompositeKeyRange::new(split_key.clone(), old_end_key.clone())?;
         // Never publish an epoch older than the one already applied. A stale plan must
         // not rewind `version` and then re-fence a range that a newer split already owns.
+        let current_version = parent_group.current_epoch().version;
+        if current_version > target_version {
+            return Err(MetaDbError::ShardRoutingError(
+                "split plan is older than the current parent epoch".into(),
+            ));
+        }
+        let already_fenced = current_version == target_version;
+        if already_fenced && parent_handler.key_range() != left_range {
+            return Err(MetaDbError::ShardRoutingError(
+                "split plan does not match the committed parent fence".into(),
+            ));
+        }
 
-        // Stage A: Scan `concat([0x05], split_key) .. concat([0x05], old_end_key)` (`Resolution B14`)
-        // and verify no active `deleting_fence` (`Resolution B17`) before splitting!
-        {
+        // Stage A: Drain all shard-local intents and decisions (`Resolution B14`)
+        // and verify no active `deleting_fence` (`Resolution B17`) before fencing.
+        // Once the atomic fence has committed, any new transaction can touch
+        // only the retained range. It must not prevent finishing publication of
+        // the child after a crash, and its state remains on the original parent.
+        if !already_fenced {
             let (_, snap) = parent_group
                 .linearizable_read(parent_group.current_epoch())
                 .await?;
             let eng = parent_group.engine();
             // Expiration only permits recovery; it never proves that a pending
             // intent is aborted. Drain every transaction before copying a shard.
-            if let Some((_, iv)) = eng
-                .scan_with_snapshot(&[0x05], &[0x06], &snap)?
-                .into_iter()
-                .next()
-            {
-                let irec = WriteIntentRecord::decode(&iv)?;
+            let mut first_intent = None;
+            for (key, value) in eng.scan_with_snapshot(&[0x05], &[0x06], &snap)? {
+                WriteIntentKey::decode(&key)?;
+                let record = WriteIntentRecord::decode(&value)?;
+                first_intent.get_or_insert(record);
+            }
+            let decisions = eng.scan_with_snapshot(&[0x06], &[0x07], &snap)?;
+            // Only valid transaction state is retryable. Corrupt records must
+            // remain fatal even when another valid intent would defer the split.
+            for (key, value) in &decisions {
+                TxnRecordKey::decode(key)?;
+                TxnStatusRecord::decode(value)?;
+            }
+            if let Some(irec) = first_intent {
                 return Err(MetaDbError::WriteIntentConflict {
                     conflicting_txn_id: irec.txn_id,
                     primary_key: irec.primary_key,
                     expire_hlc: irec.expire_hlc.0,
                 });
             }
-            if !eng.scan_with_snapshot(&[0x06], &[0x07], &snap)?.is_empty() {
-                return Err(MetaDbError::TransactionAborted(
-                    "split deferred until transaction decisions are acknowledged".into(),
+            if !decisions.is_empty() {
+                return Err(MetaDbError::SplitDeferred(
+                    "transaction decisions must be acknowledged before fencing".into(),
                 ));
             }
             if let Some(dpid) = dual_mode_pid {
                 let dk = DirShardDeltaKey { pid: dpid }.encode();
                 if let Some(raw_sub) = eng.get_with_snapshot(&dk, &snap)? {
                     if DirShardDeltaRecord::decode(&raw_sub)?.deleting_fence {
-                        return Err(MetaDbError::TransactionAborted(
+                        return Err(MetaDbError::SplitDeferred(
                             "cannot split DualMode directory while Rmdir deleting_fence is active"
                                 .to_string(),
                         ));
@@ -221,7 +248,7 @@ impl RaftShardSplitWorker {
                 }
                 let anchor_ik = WriteIntentKey::new(MetaKey::dir_attr(dpid).encode()).encode();
                 if eng.get_with_snapshot(&anchor_ik, &snap)?.is_some() {
-                    return Err(MetaDbError::TransactionAborted(
+                    return Err(MetaDbError::SplitDeferred(
                         "cannot split DualMode directory while intent is held on _attr_"
                             .to_string(),
                     ));
@@ -229,9 +256,6 @@ impl RaftShardSplitWorker {
             }
         }
 
-        let left_range =
-            CompositeKeyRange::new(parent_route.range.start_key.clone(), split_key.clone())?;
-        let right_range = CompositeKeyRange::new(split_key.clone(), old_end_key.clone())?;
         let new_parent_epoch = ShardEpoch {
             conf_ver: parent_group.current_epoch().conf_ver,
             version: target_version.max(parent_group.current_epoch().version),
@@ -239,7 +263,7 @@ impl RaftShardSplitWorker {
 
         // Atomically fence `S_parent` to `left_range` + `new_parent_epoch` BEFORE flushing & scanning
         // so zero concurrent writes or `AttrDelta`s can land in `right_range` on `S_parent` during split!
-        if parent_group.current_epoch().version < target_version {
+        if !already_fenced {
             let fence_cmd = TxRaftCmd::FenceShardRangeForSplit {
                 new_range: left_range.clone(),
                 new_epoch: new_parent_epoch,
@@ -294,6 +318,11 @@ impl RaftShardSplitWorker {
         for (raw_k, raw_v) in &all_raw {
             if let Some(aff_key) = affinity_key_for_raw_entry(raw_k, raw_v)? {
                 if aff_key >= split_key {
+                    if matches!(raw_k.first(), Some(0x05 | 0x06)) {
+                        return Err(MetaDbError::ShardRoutingError(
+                            "transaction state exists outside the committed parent fence".into(),
+                        ));
+                    }
                     // Reset `applied_lsn` / `applied_raft_index` to `0` on migrated directory attribute
                     // records because pre-split deltas were just flushed on `S_parent` and `S_child`'s
                     // brand-new OpenRaft log starts at index `1`!

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use metadb_core::{
     AttrDeltaSpec, AuxOutboxEntry, AuxTaskPayload, CompositeKeyRange, HlcTimestamp, InodeAttr,
-    IntentOp, MetaKey, QuotaKey, QuotaRecord, ShardEpoch, WriteIntentKey,
+    IntentOp, MetaDbError, MetaKey, QuotaKey, QuotaRecord, ShardEpoch, WriteIntentKey,
 };
 use metadb_raft::{MetaDbRaftRequest, ShardApplyHandler, ShardWatermarkTracker};
 use metadb_storage::{LifecycleStorageEngine, LsmEngineConfig, ShardedBlockCache};
@@ -404,18 +404,17 @@ fn fence_rechecks_intents_at_the_serialized_apply_boundary() {
     };
     // Simulate the lease expiring between the worker's scan and Raft apply.
     let hlc = HlcTimestamp::new(6, 0);
-    assert!(handler
-        .apply_command(
-            4,
+    let deferred = handler.apply_command(
+        4,
+        hlc,
+        &MetaDbRaftRequest {
+            expected_epoch: handler.current_epoch(),
             hlc,
-            &MetaDbRaftRequest {
-                expected_epoch: handler.current_epoch(),
-                hlc,
-                payload: bincode::serialize(&fence).unwrap()
-            },
-            &engine
-        )
-        .is_err());
+            payload: bincode::serialize(&fence).unwrap(),
+        },
+        &engine,
+    );
+    assert!(matches!(deferred, Err(MetaDbError::SplitDeferred(_))));
     assert_eq!(handler.key_range(), before);
     assert!(read(&engine, &WriteIntentKey::new(key).encode()).is_some());
 }

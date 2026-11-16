@@ -92,6 +92,9 @@ pub enum MetaDbError {
     ///
     /// Appended after `InvalidFileSize` so that variant stays bincode index 23.
     HlcSaturated,
+    /// A shard split must wait for transaction recovery before fencing its range.
+    /// Appended after `HlcSaturated` so earlier variant tags stay stable.
+    SplitDeferred(String),
 }
 
 impl fmt::Display for MetaDbError {
@@ -202,6 +205,7 @@ impl fmt::Display for MetaDbError {
                 f,
                 "HLC saturated at the 48-bit physical ceiling; refusing to wrap the logical counter"
             ),
+            MetaDbError::SplitDeferred(msg) => write!(f, "shard split deferred: {}", msg),
         }
     }
 }

@@ -1862,8 +1862,8 @@ impl TxStateMachineHandler {
                 // This check shares Raft's serialized apply boundary with the
                 // fence. Prepare cannot race between the worker's scan and fence.
                 if !Self::scan_latest_in_apply(engine, &[0x05], &[0x07])?.is_empty() {
-                    return Err(MetaDbError::TransactionAborted(
-                        "split deferred until all intents and decisions are drained".into(),
+                    return Err(MetaDbError::SplitDeferred(
+                        "all intents and decisions must be drained before fencing".into(),
                     ));
                 }
                 {

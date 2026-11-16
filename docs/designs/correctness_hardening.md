@@ -18,6 +18,8 @@ Checked prepares compare the exact committed values read by a coordinator before
 
 Splitting waits until local intents and unacknowledged transaction decisions are drained. An expired lease is not permission to copy an unresolved intent. The replicated fence checks this condition again, closing the gap between the worker's scan and fence apply. Secondary commit/abort paths validate range ownership. The conservative drain currently covers the whole shard and may defer splits during long-running transactions or recovery.
 
+Recovery keeps a deferred split plan pending and the original parent route available, allowing startup and transaction maintenance to proceed. Maintenance retries the plan after draining transaction state. Once the parent fence is committed, recovery completes the existing split without waiting for new transactions in the retained range. Only explicitly retryable drain conditions are deferred; corruption and storage errors still stop recovery.
+
 Directory creation rejects root/self/invalid IDs and existing authoritative directory identities. Mutations validate sizes and directory capacity before changing keys. Prepared transactions reserve positive directory capacity. Split cleanup reconstructs retained directory counters during apply, and metadata-only directory updates preserve pending and flushed child accounting.
 
 Quota batches validate and stage their complete effects before mutation. Internal balances remain signed so independent origin streams commute: a delete delivered before the corresponding create can temporarily make a balance negative and then converge to zero. Overflow rejects the entire batch. Callers must not interpret a temporarily negative asynchronous balance as a final quota decision.
