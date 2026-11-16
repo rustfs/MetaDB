@@ -986,15 +986,18 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<StoreHeartbeatRequest>,
     ) -> Result<Response<StoreHeartbeatResponse>, Status> {
-        let req = request.into_inner();
-        for s in req.shards {
-            if let Some(desc) = s.descriptor {
-                if let Ok(route) = route_conv::from_proto_route(desc) {
-                    self.global_manager.meta_cache().upsert_route(route);
-                }
-            }
-        }
-        Ok(Response::new(StoreHeartbeatResponse { error: None }))
+        // Client heartbeat descriptors are not a routing source. Installing them
+        // replaced `CompositeMetaCache` entries and could wedge `route_user_key`
+        // onto a shard id this process does not host. Split scheduling still runs
+        // from the local maintenance tick, not from this RPC.
+        let _req = request.into_inner();
+        let e = MetaDbError::ShardRoutingError(
+            "StoreHeartbeat does not update routes or schedule splits; client shard descriptors are not applied"
+                .to_string(),
+        );
+        Ok(Response::new(StoreHeartbeatResponse {
+            error: Some(ErrorDetailProto::from(&e)),
+        }))
     }
 
     async fn get_routes(
@@ -1007,7 +1010,11 @@ impl ControlPlaneService for MetaDbGrpcService {
         } else if let Some(cell) = self.global_manager.get_cell(req.cell_id) {
             cell.list_routes()
         } else {
-            vec![]
+            let e = MetaDbError::ShardRoutingError(format!("unknown cell {}", req.cell_id));
+            return Ok(Response::new(GetRoutesResponse {
+                error: Some(ErrorDetailProto::from(&e)),
+                shards: Vec::new(),
+            }));
         };
         Ok(Response::new(GetRoutesResponse {
             error: None,
@@ -1133,10 +1140,16 @@ impl ControlPlaneService for MetaDbGrpcService {
         request: Request<ReleaseDirRenameLeaseRequest>,
     ) -> Result<Response<ReleaseDirRenameLeaseResponse>, Status> {
         let req = request.into_inner();
-        self.global_manager
+        match self
+            .global_manager
+            .id_allocator()
             .release_dir_rename_lease(req.rename_fence_token)
-            .await;
-        Ok(Response::new(ReleaseDirRenameLeaseResponse { error: None }))
+        {
+            Ok(()) => Ok(Response::new(ReleaseDirRenameLeaseResponse { error: None })),
+            Err(e) => Ok(Response::new(ReleaseDirRenameLeaseResponse {
+                error: Some(ErrorDetailProto::from(&e)),
+            })),
+        }
     }
 
     async fn trigger_shard_split(
@@ -1230,7 +1243,13 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<RegisterCellRequest>,
     ) -> Result<Response<RegisterCellResponse>, Status> {
-        let _req = request.into_inner();
-        Ok(Response::new(RegisterCellResponse { error: None }))
+        let req = request.into_inner();
+        let e = MetaDbError::ShardRoutingError(format!(
+            "RegisterCell({}) is not implemented; this process hosts a single all-in-one cell and does not federate additional cells",
+            req.cell_id
+        ));
+        Ok(Response::new(RegisterCellResponse {
+            error: Some(ErrorDetailProto::from(&e)),
+        }))
     }
 }

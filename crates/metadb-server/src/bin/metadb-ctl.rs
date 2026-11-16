@@ -231,6 +231,17 @@ fn normalize_url(ep: &str) -> String {
     }
 }
 
+fn reject_app_error(
+    action: &str,
+    error: Option<metadb_proto::ErrorDetailProto>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(error) = error {
+        Err(format!("{action}: {}", error.message).into())
+    } else {
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
@@ -246,6 +257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .get_routes(GetRoutesRequest { cell_id: 0 })
                 .await?
                 .into_inner();
+            reject_app_error("cluster status", resp.error)?;
             println!("Active Shards: {}", resp.shards.len());
             for s in resp.shards {
                 let ep = s.epoch.unwrap_or_default();
@@ -270,6 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .get_routes(GetRoutesRequest { cell_id })
                         .await?
                         .into_inner();
+                    reject_app_error("shard list", resp.error)?;
                     for s in resp.shards {
                         let ep = s.epoch.unwrap_or_default();
                         println!(
@@ -283,14 +296,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .trigger_shard_split(TriggerShardSplitRequest { shard_id })
                         .await?
                         .into_inner();
-                    if let Some(err) = resp.error {
-                        eprintln!("Split error: {}", err.message);
-                    } else {
-                        println!(
-                            "split_executed={} child_shard_id={}",
-                            resp.split_executed, resp.child_shard_id
-                        );
-                    }
+                    reject_app_error("shard split", resp.error)?;
+                    println!(
+                        "split_executed={} child_shard_id={}",
+                        resp.split_executed, resp.child_shard_id
+                    );
                 }
                 ShardCmd::EnableDualMode { shard_id, pid } => {
                     let resp = cp
@@ -301,14 +311,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         })
                         .await?
                         .into_inner();
-                    if let Some(err) = resp.error {
-                        eprintln!("EnableDualMode error: {}", err.message);
-                    } else {
-                        println!(
-                            "DualModeFineGrained enabled on shard {} (PID {})",
-                            shard_id, pid
-                        );
-                    }
+                    reject_app_error("enable-dual-mode", resp.error)?;
+                    println!(
+                        "DualModeFineGrained enabled on shard {} (PID {})",
+                        shard_id, pid
+                    );
                 }
             }
         }
@@ -327,14 +334,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 })
                 .await?
                 .into_inner();
-            if let Some(err) = resp.error {
-                eprintln!("ScaleReplicas error: {}", err.message);
-            } else {
-                println!(
-                    "Upgraded {} shard(s) to {}-Voter",
-                    resp.upgraded_shards, target_voters
-                );
-            }
+            reject_app_error("scale-replicas", resp.error)?;
+            println!(
+                "Upgraded {} shard(s) to {}-Voter",
+                resp.upgraded_shards, target_voters
+            );
         }
         Command::Cell {
             sub: CellCmd::Register { cell_id, endpoints },
@@ -350,11 +354,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 })
                 .await?
                 .into_inner();
-            if let Some(err) = resp.error {
-                eprintln!("RegisterCell error: {}", err.message);
-            } else {
-                println!("Registered Cell {}", cell_id);
-            }
+            reject_app_error("cell register", resp.error)?;
+            println!("Registered Cell {}", cell_id);
         }
         Command::Sql { query } => {
             let mut meta = open_meta(&url, &token).await?;
@@ -366,9 +367,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 })
                 .await?
                 .into_inner();
-            if let Some(err) = resp.error {
-                eprintln!("SQL error: {}", err.message);
-            } else if let Some(attr) = resp.single_attr {
+            reject_app_error("sql", resp.error)?;
+            if let Some(attr) = resp.single_attr {
                 println!(
                     "InodeAttr(id={}, children={}, size_bytes={}, mode=0o{:o})",
                     attr.inode_id, attr.num_children, attr.size_bytes, attr.mode
