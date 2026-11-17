@@ -54,6 +54,25 @@ impl LocalityCompactor {
         self.density_threshold
     }
 
+    /// Replaces in-memory bucket counters. Used when opening an LSM so compaction
+    /// decisions follow the tombstones and live keys already on disk.
+    pub fn restore_counts(&self, counts: BTreeMap<RangeBucketPrefix, (usize, usize)>) {
+        let mut guard = self.inner.write().unwrap();
+        guard.buckets.clear();
+        for (prefix, (tombstones, live_writes)) in counts {
+            if tombstones == 0 && live_writes == 0 {
+                continue;
+            }
+            guard.buckets.insert(
+                prefix,
+                BucketDensity {
+                    tombstones,
+                    live_writes,
+                },
+            );
+        }
+    }
+
     /// Extracts the 9-byte `[table_prefix][group_key: 8B]` bucket prefix from a raw key.
     pub fn bucket_for_key(key: &[u8]) -> Option<RangeBucketPrefix> {
         if key.len() >= 9 {

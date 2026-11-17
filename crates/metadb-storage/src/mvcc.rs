@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use metadb_core::{HlcTimestamp, MetaDbError, Result};
@@ -168,6 +168,8 @@ pub struct ActiveSnapshotRegistry {
     next_id: AtomicU64,
     retention: Duration,
     slots: Mutex<BTreeMap<u64, Arc<SnapshotSlot>>>,
+    flush_mu: Mutex<()>,
+    flush_cv: Condvar,
 }
 
 impl ActiveSnapshotRegistry {
@@ -176,6 +178,8 @@ impl ActiveSnapshotRegistry {
             next_id: AtomicU64::new(1),
             retention: Duration::from_millis(retention_ms.max(1)),
             slots: Mutex::new(BTreeMap::new()),
+            flush_mu: Mutex::new(()),
+            flush_cv: Condvar::new(),
         }
     }
 
@@ -198,10 +202,23 @@ impl ActiveSnapshotRegistry {
         slot
     }
 
+    /// Wakes writers blocked on the immutable-memtable cap.
+    pub fn notify_flush_waiters(&self) {
+        let _guard = self.flush_mu.lock().unwrap();
+        self.flush_cv.notify_all();
+    }
+
+    /// Parks until a snapshot is dropped or `timeout` elapses.
+    pub fn wait_for_flush_progress(&self, timeout: Duration) {
+        let guard = self.flush_mu.lock().unwrap();
+        let _ = self.flush_cv.wait_timeout(guard, timeout);
+    }
+
     pub fn unregister(&self, id: u64) {
         let removed = self.slots.lock().unwrap().remove(&id);
         if let Some(slot) = removed {
             *slot.state.write().unwrap() = None;
+            self.notify_flush_waiters();
         }
     }
 
@@ -231,8 +248,13 @@ impl ActiveSnapshotRegistry {
                 });
             }
         }
+        let expired_any = !expired_ids.is_empty();
         for id in expired_ids {
             guard.remove(&id);
+        }
+        drop(guard);
+        if expired_any {
+            self.notify_flush_waiters();
         }
         min_hlc.zip(min_flushed)
     }
@@ -316,6 +338,7 @@ struct MemMvccInner {
     last_flushed_lsn: LogSequenceNumber,
     total_mvcc_writes: u64,
     total_pruned_versions: u64,
+    active_bytes: usize,
 }
 
 /// In-Memory MVCC store coordinating active version chains, `ImmMemTable` queue,
@@ -351,6 +374,7 @@ impl MemMvccStore {
                 last_flushed_lsn: flushed_lsn,
                 total_mvcc_writes: 0,
                 total_pruned_versions: 0,
+                active_bytes: 0,
             }),
             flush_mutex: std::sync::Mutex::new(()),
         }
@@ -361,10 +385,12 @@ impl MemMvccStore {
     }
 
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>, hlc: HlcTimestamp, lsn: LogSequenceNumber) {
+        let accounted = key.len().saturating_add(value.len()).max(1);
         let mut guard = self.inner.write().unwrap();
         guard.latest_hlc = guard.latest_hlc.max(hlc);
         guard.latest_lsn = guard.latest_lsn.max(lsn);
         guard.total_mvcc_writes += 1;
+        guard.active_bytes = guard.active_bytes.saturating_add(accounted);
         guard.hlc_to_lsn.push_back((hlc, lsn));
         guard
             .active_versions
@@ -380,10 +406,12 @@ impl MemMvccStore {
     }
 
     pub fn delete(&self, key: Vec<u8>, hlc: HlcTimestamp, lsn: LogSequenceNumber) {
+        let accounted = key.len().max(1);
         let mut guard = self.inner.write().unwrap();
         guard.latest_hlc = guard.latest_hlc.max(hlc);
         guard.latest_lsn = guard.latest_lsn.max(lsn);
         guard.total_mvcc_writes += 1;
+        guard.active_bytes = guard.active_bytes.saturating_add(accounted);
         guard.hlc_to_lsn.push_back((hlc, lsn));
         guard
             .active_versions
@@ -396,6 +424,14 @@ impl MemMvccStore {
                 lsn,
                 value: MvccValue::Tombstone,
             });
+    }
+
+    pub fn active_memtable_bytes(&self) -> usize {
+        self.inner.read().unwrap().active_bytes
+    }
+
+    pub fn retention_ms(&self) -> u64 {
+        self.retention_ms
     }
 
     pub fn acquire_linearizable_snapshot(
@@ -701,10 +737,11 @@ impl MemMvccStore {
             }
         }
 
-        if guard.active_versions.read().unwrap().is_empty()
-            && sealed_index == guard.last_flushed_lsn
-        {
-            return Ok(None);
+        if guard.active_versions.read().unwrap().is_empty() {
+            guard.active_bytes = 0;
+            if sealed_index == guard.last_flushed_lsn {
+                return Ok(None);
+            }
         }
 
         let seal_id = guard.next_seal_id;
@@ -713,6 +750,7 @@ impl MemMvccStore {
             &mut guard.active_versions,
             Arc::new(RwLock::new(BTreeMap::new())),
         );
+        guard.active_bytes = 0;
         let entries: BTreeMap<Vec<u8>, Vec<MvccVersion>> = old_active
             .read()
             .unwrap()
@@ -801,6 +839,7 @@ impl MemMvccStore {
                     .unwrap_or(false)
                 {
                     guard.imm_queue.pop_front();
+                    self.registry.notify_flush_waiters();
                 }
                 guard.disk_flushed_max_hlc = guard.disk_flushed_max_hlc.max(candidate.max_hlc);
                 guard.last_flushed_lsn = guard.last_flushed_lsn.max(candidate.max_raft_index);
@@ -858,6 +897,7 @@ impl MemMvccStore {
         g.active_versions = Arc::new(RwLock::new(BTreeMap::new()));
         g.hlc_to_lsn.clear();
         g.imm_queue.clear();
+        g.active_bytes = 0;
         g.latest_lsn = snapshot_lsn;
         g.latest_hlc = snapshot_hlc;
         g.last_flushed_lsn = snapshot_lsn;

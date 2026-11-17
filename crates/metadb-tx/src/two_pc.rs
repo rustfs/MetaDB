@@ -18,7 +18,7 @@ use metadb_core::{
     TABLE_PREFIX_SECONDARY_INDEX,
 };
 use metadb_raft::ShardRaftGroup;
-use metadb_storage::SnapshotGuard;
+use metadb_storage::{ScanControl, SnapshotGuard};
 
 use crate::recovery_worker::TxnRecoveryWorker;
 use crate::rename_cycle::RenameCycleWalker;
@@ -1380,26 +1380,38 @@ impl DistributedTxRouter {
             };
             Self::validate_read_epoch(&group, epoch)?;
 
-            let rows = eng.scan_with_snapshot(sub_start, sub_end, &final_snap)?;
-            for (k_bytes, v_bytes) in rows {
-                let mk = MetaKey::decode(&k_bytes)?;
+            let mut stop = ListDirStop::Continue;
+            let need = effective_limit;
+            eng.scan_live_until(sub_start, sub_end, &final_snap, |k_bytes, v_bytes| {
+                let mk = MetaKey::decode(k_bytes)?;
                 // Strict `_attr_` isolation rule (`Resolution N2` / `G-P1`): never expose `_attr_`!
                 if mk.is_attr_key() {
-                    continue;
+                    return Ok(ScanControl::Continue);
                 }
                 if let Some(pfx) = name_prefix {
                     if !mk.name.starts_with(pfx) {
-                        return Ok((collected.clone(), None));
+                        stop = ListDirStop::PrefixEnded;
+                        return Ok(ScanControl::Stop);
                     }
                 }
                 collected.push(MetaEntry {
                     key: mk,
-                    attr: InodeAttr::decode(&v_bytes)?,
+                    attr: InodeAttr::decode(v_bytes)?,
                 });
-                if collected.len() >= effective_limit {
+                if collected.len() >= need {
+                    stop = ListDirStop::PageFull;
+                    Ok(ScanControl::Stop)
+                } else {
+                    Ok(ScanControl::Continue)
+                }
+            })?;
+            match stop {
+                ListDirStop::PrefixEnded => return Ok((collected, None)),
+                ListDirStop::PageFull => {
                     let next_cursor = collected.last().map(|e| e.key.name.clone());
                     return Ok((collected, next_cursor));
                 }
+                ListDirStop::Continue => {}
             }
         }
 
@@ -1551,10 +1563,17 @@ impl DistributedTxRouter {
 #[allow(dead_code)]
 const _ASSERT_QUOTA_PREFIX: u8 = TABLE_PREFIX_QUOTA;
 
+#[derive(Clone, Copy)]
+enum ListDirStop {
+    Continue,
+    PageFull,
+    PrefixEnded,
+}
+
 /// Lower bound for a keyset `listdir`. When both a cursor and a prefix are set, the scan
 /// starts at the later of the two so names before the prefix are not treated as the end
 /// of the page.
-fn listdir_scan_start(
+pub(crate) fn listdir_scan_start(
     pid: InodeId,
     after_name: Option<&str>,
     name_prefix: Option<&str>,

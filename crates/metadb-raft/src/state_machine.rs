@@ -24,7 +24,7 @@ use metadb_core::{
 };
 use metadb_storage::sstable::{sst_file_name, sync_dir};
 use metadb_storage::{
-    DurableShardCheckpoint, LifecycleStorageEngine, LsmEngineConfig, PreFlushHook,
+    DurableShardCheckpoint, FlushIdentity, LifecycleStorageEngine, LsmEngineConfig, PreFlushHook,
     ShardedBlockCache,
 };
 
@@ -141,6 +141,37 @@ struct PersistedSnapshotMeta {
     file_specs: Vec<(String, u64, u32)>,
 }
 
+fn attach_flush_hook(engine: &LifecycleStorageEngine, handler: &Arc<dyn ShardApplyHandler>) {
+    engine.set_pre_flush_hook(Arc::new(HandlerFlushHook {
+        handler: handler.clone(),
+    }));
+}
+
+struct HandlerFlushHook {
+    handler: Arc<dyn ShardApplyHandler>,
+}
+
+impl PreFlushHook for HandlerFlushHook {
+    fn on_seal_memtable(
+        &self,
+        sealed_raft_index: u64,
+        sealed_max_hlc: HlcTimestamp,
+        view_at_m: &metadb_storage::ViewAtRaftIndex<'_>,
+    ) -> Result<Vec<(Vec<u8>, HlcTimestamp, metadb_storage::MvccValue)>> {
+        match self.handler.pre_flush_hook() {
+            Some(hook) => hook.on_seal_memtable(sealed_raft_index, sealed_max_hlc, view_at_m),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn on_flush_durable(&self, durable_raft_index: u64, durable_max_hlc: HlcTimestamp) -> u64 {
+        match self.handler.pre_flush_hook() {
+            Some(hook) => hook.on_flush_durable(durable_raft_index, durable_max_hlc),
+            None => 0,
+        }
+    }
+}
+
 fn checkpoint_log_id(checkpoint: &DurableShardCheckpoint) -> Option<LogIdOf<MetaDbTypeConfig>> {
     if (
         checkpoint.flushed_raft_term,
@@ -221,6 +252,41 @@ impl StateMachineShared {
         }
         let updated_cp = engine.durable_checkpoint();
         Ok((state_flushed, updated_cp))
+    }
+
+    fn refresh_flushed_checkpoint(
+        &self,
+        engine: &LifecycleStorageEngine,
+        log_id: &LogIdOf<MetaDbTypeConfig>,
+        applied_hlc: HlcTimestamp,
+    ) -> Result<()> {
+        let current = engine.durable_checkpoint();
+        // Only the apply that flushed this index may stamp its term and descriptor.
+        if current.flushed_raft_index != log_id.index {
+            return Ok(());
+        }
+        let membership = self.last_membership.read().unwrap().clone();
+        let membership_bytes = bincode::serialize(&membership).unwrap_or_default();
+        let descriptor = self.handler.encode_descriptor_bytes();
+        let corrected = DurableShardCheckpoint {
+            flushed_raft_term: log_id.committed_leader_id().term,
+            flushed_raft_leader: log_id.committed_leader_id().node_id,
+            flushed_raft_index: current.flushed_raft_index,
+            flushed_max_hlc: current.flushed_max_hlc.max(applied_hlc),
+            contiguous_aux_acked_index: current.contiguous_aux_acked_index,
+            membership_bytes,
+            descriptor_bytes: descriptor,
+        };
+        if corrected != current {
+            engine.persist_checkpoint(corrected.clone())?;
+        }
+        self.watermarks
+            .advance_state_flushed(corrected.flushed_raft_index);
+        if self.handler.pre_flush_hook().is_some() {
+            self.watermarks
+                .advance_aux_outbox_durable(engine.last_aux_frontier());
+        }
+        Ok(())
     }
 
     fn build_snapshot_sync(&self) -> io::Result<SnapshotOf<MetaDbTypeConfig, SnapshotArchive>> {
@@ -454,6 +520,7 @@ impl ShardStateMachine {
             block_cache.clone(),
             lsm_config.clone(),
         )?);
+        attach_flush_hook(&engine, &handler);
         let cp = engine.durable_checkpoint();
 
         // Report `MANIFEST`'s `flushed_raft_log_id` (`F`) as `applied_state` on startup so OpenRaft
@@ -632,9 +699,29 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
                             actual: cur_epoch,
                         })
                     } else {
+                        let membership = self.shared.last_membership.read().unwrap().clone();
+                        engine.set_flush_identity(FlushIdentity {
+                            term: log_id.committed_leader_id().term,
+                            leader: log_id.committed_leader_id().node_id,
+                            membership: bincode::serialize(&membership).unwrap_or_default(),
+                            descriptor: self.shared.handler.encode_descriptor_bytes(),
+                            aux_index: self.shared.watermarks.snapshot_values().1,
+                        });
                         self.shared
                             .handler
                             .apply_command(log_id.index, commit_hlc, &req, &engine)
+                    };
+                    let apply_res = match apply_res {
+                        Ok(bytes) => self
+                            .shared
+                            .refresh_flushed_checkpoint(&engine, &log_id, commit_hlc)
+                            .map(|()| bytes),
+                        Err(error) => {
+                            let _ = self
+                                .shared
+                                .refresh_flushed_checkpoint(&engine, &log_id, commit_hlc);
+                            Err(error)
+                        }
                     };
 
                     let updated_epoch = self.shared.handler.current_epoch();
@@ -852,6 +939,7 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
             )
             .map_err(|e| io::Error::other(e.to_string()))?,
         );
+        attach_flush_hook(&reopened, &self.shared.handler);
 
         *self.shared.engine.write().unwrap() = reopened.clone();
         *self.shared.last_applied_log_id.write().unwrap() = meta.last_log_id;

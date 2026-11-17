@@ -26,7 +26,9 @@ pub mod version_set;
 pub use backend::{InMemoryBackend, LsmStorageBackend, PersistentEntry, StorageBackend};
 pub use cache::ShardedBlockCache;
 pub use compaction::{CompactionStats, LocalityCompactor};
-pub use engine::{LifecycleStorageEngine, LsmEngineConfig, StorageMetrics};
+pub use engine::{
+    FlushIdentity, LifecycleStorageEngine, LsmEngineConfig, ScanControl, StorageMetrics,
+};
 pub use manifest::{DurableShardCheckpoint, ManifestLog, VersionEdit};
 pub use mvcc::{
     ActiveMemTable, ActiveSnapshotRegistry, ImmMemTable, MemMvccStore, MvccValue, MvccVersion,

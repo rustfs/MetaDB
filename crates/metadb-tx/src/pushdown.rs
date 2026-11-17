@@ -6,7 +6,7 @@ use metadb_core::{
     HlcTimestamp, InodeAttr, InodeId, MetaDbError, MetaEntry, MetaKey, Result, UserId,
     ATTR_ENTRY_NAME,
 };
-use metadb_storage::LifecycleStorageEngine;
+use metadb_storage::{LifecycleStorageEngine, ScanControl};
 
 use crate::attr_aggregator::AsyncAttrAggregator;
 use crate::aux_sink::AsyncAuxiliarySink;
@@ -382,19 +382,48 @@ impl PushdownExecutor {
         pid: InodeId,
         read_hlc: HlcTimestamp,
     ) -> Result<Vec<MetaEntry>> {
-        let start = MetaKey::encode_pid_prefix_start(pid);
-        let end = MetaKey::encode_pid_prefix_end(pid);
-        let rows = engine.scan_range(&start, &end, read_hlc)?;
+        self.listdir_limited(engine, pid, None, None, usize::MAX, read_hlc)
+    }
 
-        let mut entries = Vec::with_capacity(rows.len());
-        for (k_bytes, v_bytes) in rows {
-            let key = MetaKey::decode(&k_bytes)?;
-            if key.is_attr_key() {
-                continue;
-            }
-            let attr = InodeAttr::decode(&v_bytes)?;
-            entries.push(MetaEntry { key, attr });
+    /// Pinned, tombstone-aware directory page. Stops once `limit` child entries are collected
+    /// instead of reading the rest of the parent range.
+    pub fn listdir_limited(
+        &self,
+        engine: &LifecycleStorageEngine,
+        pid: InodeId,
+        after_name: Option<&str>,
+        name_prefix: Option<&str>,
+        limit: usize,
+        read_hlc: HlcTimestamp,
+    ) -> Result<Vec<MetaEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
         }
+        let start = crate::two_pc::listdir_scan_start(pid, after_name, name_prefix);
+        let end = MetaKey::encode_pid_prefix_end(pid);
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        let snap = engine.acquire_fixed_snapshot(read_hlc)?;
+        let mut entries = Vec::new();
+        engine.scan_live_until(&start, &end, &snap, |k_bytes, v_bytes| {
+            let key = MetaKey::decode(k_bytes)?;
+            if key.is_attr_key() {
+                return Ok(ScanControl::Continue);
+            }
+            if let Some(prefix) = name_prefix {
+                if !key.name.starts_with(prefix) {
+                    return Ok(ScanControl::Stop);
+                }
+            }
+            let attr = InodeAttr::decode(v_bytes)?;
+            entries.push(MetaEntry { key, attr });
+            if entries.len() >= limit {
+                Ok(ScanControl::Stop)
+            } else {
+                Ok(ScanControl::Continue)
+            }
+        })?;
         Ok(entries)
     }
 }
@@ -523,6 +552,62 @@ mod tests {
     use metadb_storage::LifecycleStorageEngine;
 
     use super::*;
+
+    #[test]
+    fn listdir_limit_stops_before_later_tombstones() {
+        use metadb_storage::{LsmEngineConfig, ShardedBlockCache};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let cache = Arc::new(ShardedBlockCache::new(4 * 1024 * 1024));
+        let engine = LifecycleStorageEngine::open_lsm(
+            1,
+            dir.path(),
+            cache,
+            LsmEngineConfig {
+                auto_locality_compaction: false,
+                tombstone_density_threshold: 100_000,
+                memtable_size_bytes: 32 * 1024 * 1024,
+                ..LsmEngineConfig::default()
+            },
+        )
+        .unwrap();
+        let hlc = HlcTimestamp::new(1_000, 1);
+        let attr = InodeAttr {
+            inode_id: 40,
+            parent_pid: 4,
+            entry_type: EntryType::File,
+            uid: 1,
+            mode: 0o644,
+            link_count: 1,
+            num_children: 0,
+            size_bytes: 4,
+            create_time: hlc,
+            modify_time: hlc,
+            fid: Some(9),
+            applied_lsn: 1,
+        };
+        engine.apply_committed_put(MetaKey::child(4, "a").encode(), attr.encode(), hlc, 1);
+        for index in 0..2048u64 {
+            engine.apply_committed_delete(
+                MetaKey::child(4, format!("t{index:04}")).encode(),
+                HlcTimestamp::new(1_000, 2),
+                index + 2,
+            );
+        }
+        engine.flush_mvcc_to_persistent();
+        let before = engine.metrics().tombstones_traversed_on_scans;
+        let push = PushdownExecutor::new(
+            Arc::new(AsyncAttrAggregator::new()),
+            Arc::new(AsyncAuxiliarySink::new()),
+        );
+        let page = push
+            .listdir_limited(&engine, 4, None, None, 1, HlcTimestamp::new(2_000, 0))
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].key.name, "a");
+        assert_eq!(engine.metrics().tombstones_traversed_on_scans - before, 0);
+    }
 
     #[test]
     fn rename_updates_directory_attr_on_its_own_shard() {

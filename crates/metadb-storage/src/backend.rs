@@ -12,7 +12,7 @@ use crate::block::BlockEntryValue;
 use crate::cache::ShardedBlockCache;
 use crate::manifest::{DurableShardCheckpoint, ManifestLog, VersionEdit};
 use crate::sstable::{sst_file_name, sync_dir, SstFileMeta, SstableBuilder, SstableReader};
-use crate::version_set::{Version, NUM_LSM_LEVELS};
+use crate::version_set::{MergedCursor, Version, NUM_LSM_LEVELS};
 
 pub const DEFAULT_L0_COMPACTION_TRIGGER: usize = 4;
 pub const TARGET_L1_SST_BYTES: usize = 64 * 1024 * 1024;
@@ -469,63 +469,36 @@ impl StorageBackend for LsmStorageBackend {
             lvl.sort_by(|a, b| a.meta().min_key.cmp(&b.meta().min_key));
         }
 
-        // Step 3: Merge 100% of keys from all participating SSTables in deterministic precedence order!
-        let mut merged: BTreeMap<Vec<u8>, BlockEntryValue> = BTreeMap::new();
+        // Step 3: Stream every key from the participating SSTables. Earlier readers
+        // win (`L0` newest flush generation, then `L1..L3`). One data block per
+        // input file is resident; the output is flushed in `TARGET_L1_SST_BYTES` chunks.
         let mut max_raft_idx = 0u64;
         let mut max_hlc = metadb_core::HlcTimestamp::ZERO;
-        let mut input_tombstones_in_range = 0usize;
-
+        let mut readers = Vec::new();
         for sst in &participating[0] {
             max_raft_idx = max_raft_idx.max(sst.meta().max_raft_index);
             max_hlc = max_hlc.max(sst.meta().max_hlc);
-            for (k, v) in sst.read_all_entries()? {
-                merged.entry(k).or_insert(v);
-            }
+            readers.push(sst.clone());
         }
         for lvl in &participating[1..] {
             for sst in lvl {
                 max_raft_idx = max_raft_idx.max(sst.meta().max_raft_index);
                 max_hlc = max_hlc.max(sst.meta().max_hlc);
-                for (k, v) in sst.read_all_entries()? {
-                    merged.entry(k).or_insert(v);
-                }
+                readers.push(sst.clone());
             }
         }
+        let mut cursor = MergedCursor::open(readers, &[], None)?;
 
         // Step 4: Bottommost Tombstone Drop Invariant (`Resolution B4`):
         // Drop `PhysicalTombstone` iff zero non-participating SSTables in levels `> target_level`
         // overlap `K`. For `K ∈ [start_key, end_key)`, `target_level` already absorbed the deepest
         // overlapping SSTable so `has_overlap_above` is guaranteed `false`; for outer boundary keys,
         // `base_version.has_overlap_above(target_level, &k)` preserves tombstones whenever needed!
-        let mut output_entries: Vec<(Vec<u8>, BlockEntryValue)> = Vec::with_capacity(merged.len());
-        let mut purged_tombstones = 0usize;
-
-        for (k, v) in merged {
-            match v {
-                BlockEntryValue::Value(bytes) => {
-                    output_entries.push((k, BlockEntryValue::Value(bytes)));
-                }
-                BlockEntryValue::PhysicalTombstone => {
-                    let in_target_range = k.as_slice() >= start_key && k.as_slice() < end_key;
-                    if in_target_range {
-                        input_tombstones_in_range += 1;
-                    }
-                    if !base_version.has_overlap_above(target_level, &k) {
-                        purged_tombstones += 1;
-                    } else {
-                        output_entries.push((k, BlockEntryValue::PhysicalTombstone));
-                    }
-                }
-            }
-        }
-        let _ = input_tombstones_in_range;
-
-        // Partition output into <= TARGET_L1_SST_BYTES non-overlapping SSTables at `target_level`.
         let mut new_metas: Vec<SstFileMeta> = Vec::new();
         let mut new_readers: Vec<Arc<SstableReader>> = Vec::new();
-
         let mut chunk: Vec<(Vec<u8>, BlockEntryValue)> = Vec::new();
         let mut chunk_bytes = 0usize;
+        let mut purged_tombstones = 0usize;
 
         let write_chunk =
             |items: &[(Vec<u8>, BlockEntryValue)]| -> Result<(SstFileMeta, Arc<SstableReader>)> {
@@ -549,27 +522,41 @@ impl StorageBackend for LsmStorageBackend {
                 Ok((meta, reader))
             };
 
-        for (k, v) in output_entries {
+        while let Some((k, v)) = cursor.next_owned()? {
+            let emitted = match v {
+                BlockEntryValue::Value(bytes) => Some(BlockEntryValue::Value(bytes)),
+                BlockEntryValue::PhysicalTombstone => {
+                    if !base_version.has_overlap_above(target_level, &k) {
+                        purged_tombstones += 1;
+                        None
+                    } else {
+                        Some(BlockEntryValue::PhysicalTombstone)
+                    }
+                }
+            };
+            let Some(value) = emitted else {
+                continue;
+            };
             let sz = k.len()
-                + match &v {
-                    BlockEntryValue::Value(b) => b.len(),
+                + match &value {
+                    BlockEntryValue::Value(bytes) => bytes.len(),
                     BlockEntryValue::PhysicalTombstone => 0,
                 }
                 + 16;
-            chunk.push((k, v));
+            chunk.push((k, value));
             chunk_bytes += sz;
             if chunk_bytes >= TARGET_L1_SST_BYTES {
-                let (m, r) = write_chunk(&chunk)?;
-                new_metas.push(m);
-                new_readers.push(r);
+                let (meta, reader) = write_chunk(&chunk)?;
+                new_metas.push(meta);
+                new_readers.push(reader);
                 chunk.clear();
                 chunk_bytes = 0;
             }
         }
         if !chunk.is_empty() {
-            let (m, r) = write_chunk(&chunk)?;
-            new_metas.push(m);
-            new_readers.push(r);
+            let (meta, reader) = write_chunk(&chunk)?;
+            new_metas.push(meta);
+            new_readers.push(reader);
         }
 
         // Step 5: Atomically publish `VersionEdit` (taking care to retain any newer L0 files flushed
