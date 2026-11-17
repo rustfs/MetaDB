@@ -1,14 +1,16 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use metadb_core::schema::validate_user_entry_name;
 use metadb_core::{
-    EntryType, FileId, HlcTimestamp, InodeAttr, InodeId, MetaDbError, MetaEntry, MetaKey, Result,
-    UserId,
+    negate_accounted_size, validate_dir_inode_id, validate_file_size, EntryType, FileId,
+    HlcTimestamp, InodeAttr, InodeId, MetaDbError, MetaEntry, MetaKey, Result, UserId,
+    ATTR_ENTRY_NAME,
 };
 use metadb_storage::LifecycleStorageEngine;
 
 use crate::attr_aggregator::AsyncAttrAggregator;
 use crate::aux_sink::AsyncAuxiliarySink;
+use crate::rename_cycle::RenameCycleWalker;
 
 /// Single-Shard Transaction Logic Pushdown Executor (§4.2 of `arXiv:2610.32247v1`).
 ///
@@ -19,6 +21,8 @@ use crate::aux_sink::AsyncAuxiliarySink;
 pub struct PushdownExecutor {
     attr_aggregator: Arc<AsyncAttrAggregator>,
     aux_sink: Arc<AsyncAuxiliarySink>,
+    /// Serializes mkdir's inode claim and both namespace writes.
+    mkdir_gate: Mutex<()>,
 }
 
 impl PushdownExecutor {
@@ -29,6 +33,7 @@ impl PushdownExecutor {
         Self {
             attr_aggregator,
             aux_sink,
+            mkdir_gate: Mutex::new(()),
         }
     }
 
@@ -49,8 +54,15 @@ impl PushdownExecutor {
         uid: UserId,
         mode: u32,
         hlc: HlcTimestamp,
-    ) {
+    ) -> Result<()> {
+        validate_dir_inode_id(dir_id)?;
         let attr_key = MetaKey::dir_attr(dir_id).encode();
+        if engine.get(&attr_key, hlc)?.is_some() {
+            return Err(MetaDbError::AlreadyExists {
+                pid: dir_id,
+                name: ATTR_ENTRY_NAME.to_string(),
+            });
+        }
         let attr = InodeAttr {
             inode_id: dir_id,
             parent_pid,
@@ -66,6 +78,7 @@ impl PushdownExecutor {
             applied_lsn: 0,
         };
         engine.put(attr_key, attr.encode(), hlc);
+        Ok(())
     }
 
     /// Single-shard pushdown `create` operation (`1 RTT`):
@@ -88,6 +101,7 @@ impl PushdownExecutor {
         hlc: HlcTimestamp,
     ) -> Result<MetaEntry> {
         validate_user_entry_name(name)?;
+        validate_file_size(size_bytes)?;
 
         // Verify parent directory exists on this shard.
         let parent_attr_key = MetaKey::dir_attr(pid).encode();
@@ -151,11 +165,20 @@ impl PushdownExecutor {
         mode: u32,
         hlc: HlcTimestamp,
     ) -> Result<MetaEntry> {
+        let _gate = self.mkdir_gate.lock().unwrap();
         validate_user_entry_name(name)?;
+        validate_dir_inode_id(new_dir_id)?;
 
         let parent_attr_key = MetaKey::dir_attr(pid).encode();
         if parent_engine.get(&parent_attr_key, hlc)?.is_none() {
             return Err(MetaDbError::DirectoryNotFound(pid));
+        }
+        let new_attr_key = MetaKey::dir_attr(new_dir_id).encode();
+        if new_dir_engine.get(&new_attr_key, hlc)?.is_some() {
+            return Err(MetaDbError::AlreadyExists {
+                pid: new_dir_id,
+                name: ATTR_ENTRY_NAME.to_string(),
+            });
         }
 
         let child_key = MetaKey::child(pid, name);
@@ -182,8 +205,9 @@ impl PushdownExecutor {
             applied_lsn: 0,
         };
 
+        // Claim the inode before publishing the parent dentry. A failed claim leaves no alias.
+        self.init_directory_attr(new_dir_engine, new_dir_id, pid, uid, mode, hlc)?;
         parent_engine.put(child_key_bytes, dir_entry_attr.encode(), hlc);
-        self.init_directory_attr(new_dir_engine, new_dir_id, pid, uid, mode, hlc);
 
         self.attr_aggregator
             .record_delta(parent_engine, pid, 1, 0, hlc);
@@ -225,10 +249,11 @@ impl PushdownExecutor {
 
         engine.delete(child_key, hlc);
 
+        let released = negate_accounted_size(attr.size_bytes);
         self.attr_aggregator
-            .record_delta(engine, pid, -1, -attr.size_bytes, hlc);
+            .record_delta(engine, pid, -1, released, hlc);
         self.aux_sink
-            .enqueue_quota_delta(engine, attr.uid, -attr.size_bytes, -1, hlc);
+            .enqueue_quota_delta(engine, attr.uid, released, -1, hlc);
         if let Some(fid) = attr.fid {
             self.aux_sink.enqueue_index_delete(engine, fid, hlc);
         }
@@ -375,6 +400,7 @@ impl TwoPhaseCommitCoordinator {
         &self,
         src_engine: &LifecycleStorageEngine,
         dst_engine: &LifecycleStorageEngine,
+        inode_engine: &LifecycleStorageEngine,
         src_pid: InodeId,
         src_name: &str,
         dst_pid: InodeId,
@@ -408,26 +434,50 @@ impl TwoPhaseCommitCoordinator {
             });
         }
 
+        if attr.entry_type == EntryType::Directory && src_pid != dst_pid {
+            let lookup_engines = [inode_engine, dst_engine, src_engine];
+            RenameCycleWalker::new(attr.inode_id, dst_pid).walk(|cursor| {
+                let key = MetaKey::dir_attr(cursor).encode();
+                for engine in lookup_engines {
+                    if let Some(raw) = engine.get(&key, commit_hlc)? {
+                        return Ok(Some(InodeAttr::decode(&raw)?.parent_pid));
+                    }
+                }
+                Ok(None)
+            })?;
+        }
+
         // Phase 2 (Commit on source and destination shards at `commit_hlc`):
+        attr.parent_pid = dst_pid;
         attr.modify_time = commit_hlc;
+        let accounted = attr.size_bytes.max(0);
         src_engine.delete(src_key, commit_hlc);
         dst_engine.put(dst_key_bytes, attr.encode(), commit_hlc);
+
+        if attr.entry_type == EntryType::Directory && src_pid != dst_pid {
+            let dir_key = MetaKey::dir_attr(attr.inode_id).encode();
+            for engine in [inode_engine, dst_engine, src_engine] {
+                if let Some(raw) = engine.get(&dir_key, commit_hlc)? {
+                    let mut dir_self = InodeAttr::decode(&raw)?;
+                    dir_self.parent_pid = dst_pid;
+                    dir_self.modify_time = commit_hlc;
+                    engine.put(dir_key.clone(), dir_self.encode(), commit_hlc);
+                    break;
+                }
+            }
+        }
 
         if src_pid != dst_pid {
             self.pushdown.attr_aggregator().record_delta(
                 src_engine,
                 src_pid,
                 -1,
-                -attr.size_bytes,
+                negate_accounted_size(accounted),
                 commit_hlc,
             );
-            self.pushdown.attr_aggregator().record_delta(
-                dst_engine,
-                dst_pid,
-                1,
-                attr.size_bytes,
-                commit_hlc,
-            );
+            self.pushdown
+                .attr_aggregator()
+                .record_delta(dst_engine, dst_pid, 1, accounted, commit_hlc);
         }
 
         if let Some(fid) = attr.fid {
@@ -442,5 +492,63 @@ impl TwoPhaseCommitCoordinator {
         }
 
         Ok(MetaEntry { key: dst_key, attr })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use metadb_core::{EntryType, HlcTimestamp, InodeAttr, MetaKey};
+    use metadb_storage::LifecycleStorageEngine;
+
+    use super::*;
+
+    #[test]
+    fn rename_updates_directory_attr_on_its_own_shard() {
+        let src = LifecycleStorageEngine::new(1, 5_000, 128, false);
+        let dst = LifecycleStorageEngine::new(2, 5_000, 128, false);
+        let inode_engine = LifecycleStorageEngine::new(3, 5_000, 128, false);
+        let hlc = HlcTimestamp::new(10, 0);
+        let push = Arc::new(PushdownExecutor::new(
+            Arc::new(AsyncAttrAggregator::new()),
+            Arc::new(AsyncAuxiliarySink::new()),
+        ));
+        push.init_directory_attr(&src, 1, 1, 0, 0o755, hlc).unwrap();
+        push.init_directory_attr(&dst, 20, 1, 0, 0o755, hlc)
+            .unwrap();
+        push.init_directory_attr(&inode_engine, 30, 1, 1, 0o755, hlc)
+            .unwrap();
+        let dentry = InodeAttr {
+            inode_id: 30,
+            parent_pid: 1,
+            entry_type: EntryType::Directory,
+            uid: 1,
+            mode: 0o755,
+            link_count: 1,
+            num_children: 0,
+            size_bytes: 0,
+            create_time: hlc,
+            modify_time: hlc,
+            fid: None,
+            applied_lsn: 0,
+        };
+        src.put(MetaKey::child(1, "child").encode(), dentry.encode(), hlc);
+        TwoPhaseCommitCoordinator::new(push)
+            .rename(&src, &dst, &inode_engine, 1, "child", 20, "moved", hlc)
+            .unwrap();
+        let raw = inode_engine
+            .get(&MetaKey::dir_attr(30).encode(), hlc)
+            .unwrap()
+            .unwrap();
+        assert_eq!(InodeAttr::decode(&raw).unwrap().parent_pid, 20);
+        assert!(src
+            .get(&MetaKey::child(1, "child").encode(), hlc)
+            .unwrap()
+            .is_none());
+        assert!(dst
+            .get(&MetaKey::child(20, "moved").encode(), hlc)
+            .unwrap()
+            .is_some());
     }
 }

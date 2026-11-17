@@ -6,9 +6,9 @@ use std::fs;
 use std::sync::Arc;
 
 use metadb_core::{
-    affinity_key_for_raw_entry, CompositeKeyRange, DirShardDeltaKey, DirShardDeltaRecord,
-    EntryType, HlcTimestamp, InodeAttr, InodeId, MetaDbError, MetaKey, Result, ShardEpoch, ShardId,
-    WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME, TABLE_PREFIX_META,
+    affinity_key_for_raw_entry, saturating_add_i64, CompositeKeyRange, DirShardDeltaKey,
+    DirShardDeltaRecord, EntryType, HlcTimestamp, InodeAttr, InodeId, MetaDbError, MetaKey, Result,
+    ShardEpoch, ShardId, WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME, TABLE_PREFIX_META,
 };
 use metadb_raft::{
     RaftNodeOptions, RegistryShardState, ShardGroupHost, ShardRaftGroup, ShardWatermarkTracker,
@@ -337,12 +337,12 @@ impl RaftShardSplitWorker {
                 }
                 let entry_attr = InodeAttr::decode(raw_v)?;
                 if raw_k.as_slice() < split_key.as_slice() {
-                    left_children += 1;
-                    left_bytes += entry_attr.size_bytes;
+                    left_children = saturating_add_i64(left_children, 1);
+                    left_bytes = saturating_add_i64(left_bytes, entry_attr.size_bytes.max(0));
                     left_mtime = left_mtime.max(entry_attr.modify_time);
                 } else {
-                    right_children += 1;
-                    right_bytes += entry_attr.size_bytes;
+                    right_children = saturating_add_i64(right_children, 1);
+                    right_bytes = saturating_add_i64(right_bytes, entry_attr.size_bytes.max(0));
                     right_mtime = right_mtime.max(entry_attr.modify_time);
                 }
             }

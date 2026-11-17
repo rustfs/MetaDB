@@ -63,8 +63,8 @@ use metadb_cluster::{
     DurableIdAllocator, GlobalManager, LocalIdBuffer, MetaCache, ShardDescriptor,
 };
 use metadb_core::{
-    CompositeKeyRange, FileId, HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId, MetaEntry,
-    NodeId, QuotaRecord, Result, SecondaryIndexRecord, UserId, ROOT_INODE_ID,
+    CompositeKeyRange, EntryType, FileId, HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId,
+    MetaEntry, NodeId, QuotaRecord, Result, SecondaryIndexRecord, UserId, ROOT_INODE_ID,
 };
 use metadb_proto::control_plane_service_server::ControlPlaneServiceServer;
 use metadb_proto::metadata_service_server::MetadataServiceServer;
@@ -177,14 +177,10 @@ impl MetaDbEngine {
             .global_manager
             .route_pid(ROOT_INODE_ID)
             .expect("root shard must exist");
-        engine.pushdown.init_directory_attr(
-            &root_storage,
-            ROOT_INODE_ID,
-            ROOT_INODE_ID,
-            0,
-            0o755,
-            hlc,
-        );
+        engine
+            .pushdown
+            .init_directory_attr(&root_storage, ROOT_INODE_ID, ROOT_INODE_ID, 0, 0o755, hlc)
+            .expect("root directory attribute");
 
         engine
     }
@@ -285,9 +281,16 @@ impl MetaDbEngine {
         let hlc = self.clock.now();
         let (_, _, src_storage) = self.global_manager.route_pid(src_pid)?;
         let (_, _, dst_storage) = self.global_manager.route_pid(dst_pid)?;
+        let inode_storage = match self.pushdown.lookup(&src_storage, src_pid, src_name, hlc)? {
+            Some(entry) if entry.attr.entry_type == EntryType::Directory => {
+                self.global_manager.route_pid(entry.attr.inode_id)?.2
+            }
+            _ => src_storage.clone(),
+        };
         self.two_pc.rename(
             &src_storage,
             &dst_storage,
+            &inode_storage,
             src_pid,
             src_name,
             dst_pid,

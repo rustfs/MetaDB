@@ -137,7 +137,9 @@ async fn test_two_pc_crash_recovery_posix_overwrite_and_cycle_fencing() {
         fence_seq: AtomicU64::new(1),
         clock: clock.clone(),
     });
-    let tx = DistributedTxRouter::new(1, clock.clone(), cluster.clone()).with_ttl_ms(100);
+    // 2s covers a slow CI schedule between `start_hlc` and Prepare. Case A still
+    // waits past this TTL before recovery aborts the orphaned transaction.
+    let tx = DistributedTxRouter::new(1, clock.clone(), cluster.clone()).with_ttl_ms(2_000);
 
     tx.init_dir_attr(ROOT_INODE_ID, ROOT_INODE_ID, 0, 0o755)
         .await
@@ -168,8 +170,8 @@ async fn test_two_pc_crash_recovery_posix_overwrite_and_cycle_fencing() {
         .unwrap_err();
     assert!(matches!(err_a, MetaDbError::RpcError(_)));
 
-    // Sleep 150ms past the 100ms 2PC TTL so `TxnRecoveryWorker` aborts the orphaned pending transaction!
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Sleep past the 2s 2PC TTL so `TxnRecoveryWorker` aborts the orphaned pending transaction.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
     TxnRecoveryWorker::run_recovery_pass_on_shard(&shard1_grp, &shard1_h, cluster.as_ref(), &clock)
         .await
         .unwrap();

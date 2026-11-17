@@ -10,7 +10,7 @@ pub type Result<T> = std::result::Result<T, MetaDbError>;
 /// Canonical error variants across all MetaDB subsystems.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetaDbError {
-    /// Attempted to use the reserved `"_attr_"` name or illegal empty/null name for a user entry.
+    /// Attempted to use a reserved or illegal entry name (`"_attr_"`, `"."`, `".."`, empty, NUL, or a path separator).
     ReservedEntryName(String),
     /// Target file or directory entry already exists.
     AlreadyExists { pid: u64, name: String },
@@ -83,6 +83,10 @@ pub enum MetaDbError {
     ConsensusError(String),
     /// Lightweight SQL template parse error.
     SqlParseError(String),
+    /// Caller supplied a negative file size. Sizes are non-negative byte counts.
+    ///
+    /// Appended so existing bincode variant tags stay stable for `ErrorDetailProto`.
+    InvalidFileSize(i64),
 }
 
 impl fmt::Display for MetaDbError {
@@ -90,6 +94,9 @@ impl fmt::Display for MetaDbError {
         match self {
             MetaDbError::ReservedEntryName(name) => {
                 write!(f, "entry name '{}' is reserved or invalid", name)
+            }
+            MetaDbError::InvalidFileSize(size) => {
+                write!(f, "file size {} is invalid (sizes must be >= 0)", size)
             }
             MetaDbError::AlreadyExists { pid, name } => {
                 write!(f, "entry ({}, '{}') already exists", pid, name)

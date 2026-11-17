@@ -11,11 +11,12 @@ use serde::{Deserialize, Serialize};
 
 use metadb_core::schema::validate_user_entry_name;
 use metadb_core::{
+    negate_accounted_size, saturating_add_i64, validate_dir_inode_id, validate_file_size,
     AttrDeltaSpec, AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, CompositeKeyRange,
     DirShardDeltaKey, DirShardDeltaRecord, EntryType, FileId, HlcTimestamp, InodeAttr, InodeId,
     IntentOp, MetaDbError, MetaEntry, MetaKey, QuotaKey, QuotaRecord, Result, SecondaryIndexKey,
     SecondaryIndexRecord, ShardEpoch, ShardId, TxnId, TxnRecordKey, TxnState, TxnStatusRecord,
-    UserId, WriteIntentKey, WriteIntentRecord,
+    UserId, WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME,
 };
 use metadb_raft::{MetaDbRaftRequest, ShardApplyHandler, ShardWatermarkTracker};
 use metadb_storage::{
@@ -23,6 +24,7 @@ use metadb_storage::{
 };
 
 use crate::aux_outbox::{ReplicatedAttrAggregator, ShardAuxOutbox, DEFAULT_OUTBOX_SPILL_THRESHOLD};
+use crate::rename_cycle::RenameCycleWalker;
 
 /// Partial attribute mutation specification for `SetAttr`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +291,43 @@ impl TxStateMachineHandler {
         Err(MetaDbError::DirectoryNotFound(pid))
     }
 
+    /// `Ok(true)` when `incoming` is the next contiguous quota cursor and must be applied.
+    /// `Ok(false)` when it is a duplicate replay. A claimed predecessor that is not exactly
+    /// the stored cursor is a fork or a gap (`Resolution B8`) and is rejected.
+    fn check_quota_cursor(
+        origin_shard_id: u64,
+        uid: u64,
+        stored: (u64, u16),
+        claimed_prev: (u64, u16),
+        incoming: (u64, u16),
+    ) -> Result<bool> {
+        if incoming <= stored {
+            return Ok(false);
+        }
+        if claimed_prev != stored {
+            return Err(MetaDbError::AuxOutOfOrderGap {
+                origin_shard_id,
+                uid,
+                expected_after: stored,
+                got_prev: claimed_prev,
+            });
+        }
+        Ok(true)
+    }
+
+    fn already_exists_for_user_key(user_key: &[u8]) -> MetaDbError {
+        match MetaKey::decode(user_key) {
+            Ok(mk) => MetaDbError::AlreadyExists {
+                pid: mk.pid,
+                name: mk.name,
+            },
+            Err(_) => MetaDbError::AlreadyExists {
+                pid: 0,
+                name: String::new(),
+            },
+        }
+    }
+
     fn ensure_user_key_in_range(&self, user_key: &[u8]) -> Result<()> {
         let meta = self.meta.read().unwrap();
         if !meta.range.contains_key(user_key) {
@@ -315,8 +354,16 @@ impl TxStateMachineHandler {
                 uid,
                 mode,
             } => {
+                validate_dir_inode_id(dir_id)?;
                 let key = MetaKey::dir_attr(dir_id).encode();
                 self.ensure_user_key_in_range(&key)?;
+                Self::ensure_no_conflicting_intent(engine, &key, false)?;
+                if Self::read_latest_in_apply(engine, &key)?.is_some() {
+                    return Err(MetaDbError::AlreadyExists {
+                        pid: dir_id,
+                        name: ATTR_ENTRY_NAME.to_string(),
+                    });
+                }
                 let attr = InodeAttr {
                     inode_id: dir_id,
                     parent_pid,
@@ -357,6 +404,7 @@ impl TxStateMachineHandler {
                 size_bytes,
             } => {
                 validate_user_entry_name(&name)?;
+                validate_file_size(size_bytes)?;
                 let child_key = MetaKey::child(pid, &name);
                 let child_bytes = child_key.encode();
                 self.ensure_user_key_in_range(&child_bytes)?;
@@ -414,11 +462,18 @@ impl TxStateMachineHandler {
                 mode,
             } => {
                 validate_user_entry_name(&name)?;
+                validate_dir_inode_id(new_dir_id)?;
                 let child_key = MetaKey::child(pid, &name);
                 let child_bytes = child_key.encode();
                 let new_attr_bytes = MetaKey::dir_attr(new_dir_id).encode();
                 self.ensure_user_key_in_range(&child_bytes)?;
                 self.ensure_user_key_in_range(&new_attr_bytes)?;
+                if Self::read_latest_in_apply(engine, &new_attr_bytes)?.is_some() {
+                    return Err(MetaDbError::AlreadyExists {
+                        pid: new_dir_id,
+                        name: ATTR_ENTRY_NAME.to_string(),
+                    });
+                }
                 self.verify_parent_dir_ready(engine, pid)?;
                 Self::ensure_no_conflicting_intent(engine, &child_bytes, false)?;
                 Self::ensure_no_conflicting_intent(engine, &new_attr_bytes, false)?;
@@ -493,12 +548,13 @@ impl TxStateMachineHandler {
                 }
 
                 engine.apply_committed_delete(child_bytes, commit_hlc, raft_index);
+                let released = negate_accounted_size(attr.size_bytes);
                 self.attr_agg
-                    .record_delta(pid, raft_index, commit_hlc, -1, -attr.size_bytes);
+                    .record_delta(pid, raft_index, commit_hlc, -1, released);
 
                 let mut aux = vec![AuxIntentSpec::QuotaDelta {
                     uid: attr.uid,
-                    delta_bytes: -attr.size_bytes,
+                    delta_bytes: released,
                     delta_inodes: -1,
                 }];
                 if let Some(fid) = attr.fid {
@@ -592,6 +648,7 @@ impl TxStateMachineHandler {
                     attr.uid = u;
                 }
                 if let Some(sz) = patch.size_bytes {
+                    validate_file_size(sz)?;
                     attr.size_bytes = sz;
                 }
                 if let Some(fid) = patch.fid {
@@ -620,7 +677,8 @@ impl TxStateMachineHandler {
 
                 engine.apply_committed_put(child_bytes, attr.encode(), commit_hlc, raft_index);
 
-                let delta_bytes = attr.size_bytes - old_size;
+                let delta_bytes =
+                    saturating_add_i64(attr.size_bytes, negate_accounted_size(old_size));
                 if delta_bytes != 0 {
                     self.attr_agg
                         .record_delta(pid, raft_index, commit_hlc, 0, delta_bytes);
@@ -631,7 +689,7 @@ impl TxStateMachineHandler {
                     let inodes = 1;
                     aux.push(AuxIntentSpec::QuotaDelta {
                         uid: old_uid,
-                        delta_bytes: -old_size,
+                        delta_bytes: negate_accounted_size(old_size),
                         delta_inodes: -inodes,
                     });
                     aux.push(AuxIntentSpec::QuotaDelta {
@@ -706,24 +764,15 @@ impl TxStateMachineHandler {
                 let mut src_attr = InodeAttr::decode(&src_raw)?;
 
                 // Cycle check if moving a directory inside the single shard (`Resolution B13`).
+                // Fail closed on deep chains; a 1024-step cap used to allow the rename.
                 if src_attr.entry_type == EntryType::Directory && src_pid != dst_pid {
-                    let mut cursor = dst_pid;
-                    for _ in 0..1024 {
-                        if cursor == src_attr.inode_id {
-                            return Err(MetaDbError::InvalidRenameCycle {
-                                dir_id: src_attr.inode_id,
-                                dst_pid,
-                            });
-                        }
-                        if cursor <= metadb_core::ROOT_INODE_ID {
-                            break;
-                        }
+                    RenameCycleWalker::new(src_attr.inode_id, dst_pid).walk(|cursor| {
                         let anc_key = MetaKey::dir_attr(cursor).encode();
-                        let Some(anc_raw) = Self::read_latest_in_apply(engine, &anc_key)? else {
-                            break;
-                        };
-                        cursor = InodeAttr::decode(&anc_raw)?.parent_pid;
-                    }
+                        match Self::read_latest_in_apply(engine, &anc_key)? {
+                            Some(anc_raw) => Ok(Some(InodeAttr::decode(&anc_raw)?.parent_pid)),
+                            None => Ok(None),
+                        }
+                    })?;
                 }
 
                 let mut aux_specs = Vec::new();
@@ -748,7 +797,7 @@ impl TxStateMachineHandler {
                     // Resolution B11: Deterministic victim quota & FID cleanup on POSIX overwrite!
                     aux_specs.push(AuxIntentSpec::QuotaDelta {
                         uid: victim.uid,
-                        delta_bytes: -victim.size_bytes,
+                        delta_bytes: negate_accounted_size(victim.size_bytes),
                         delta_inodes: -1,
                     });
                     if let Some(vfid) = victim.fid {
@@ -779,6 +828,7 @@ impl TxStateMachineHandler {
                 engine.apply_committed_delete(src_bytes, commit_hlc, raft_index);
                 engine.apply_committed_put(dst_bytes, src_attr.encode(), commit_hlc, raft_index);
 
+                let src_accounted = src_attr.size_bytes.max(0);
                 match (src_pid == dst_pid, victim_opt) {
                     (true, Some(victim)) => {
                         self.attr_agg.record_delta(
@@ -786,7 +836,7 @@ impl TxStateMachineHandler {
                             raft_index,
                             commit_hlc,
                             -1,
-                            -victim.size_bytes,
+                            negate_accounted_size(victim.size_bytes),
                         );
                     }
                     (true, None) => {
@@ -799,14 +849,17 @@ impl TxStateMachineHandler {
                             raft_index,
                             commit_hlc,
                             -1,
-                            -src_attr.size_bytes,
+                            negate_accounted_size(src_accounted),
                         );
                         self.attr_agg.record_delta(
                             dst_pid,
                             raft_index,
                             commit_hlc,
                             0,
-                            src_attr.size_bytes - victim.size_bytes,
+                            saturating_add_i64(
+                                src_accounted,
+                                negate_accounted_size(victim.size_bytes),
+                            ),
                         );
                     }
                     (false, None) => {
@@ -815,14 +868,14 @@ impl TxStateMachineHandler {
                             raft_index,
                             commit_hlc,
                             -1,
-                            -src_attr.size_bytes,
+                            negate_accounted_size(src_accounted),
                         );
                         self.attr_agg.record_delta(
                             dst_pid,
                             raft_index,
                             commit_hlc,
                             1,
-                            src_attr.size_bytes,
+                            src_accounted,
                         );
                     }
                 }
@@ -886,18 +939,15 @@ impl TxStateMachineHandler {
                                 }
                             };
                             let cur_cursor = (item.origin_raft_index, item.task_ordinal);
-                            if cur_cursor <= prev {
-                                continue;
+                            if Self::check_quota_cursor(
+                                item.origin_shard_id,
+                                *uid,
+                                prev,
+                                *prev_uid_cursor,
+                                cur_cursor,
+                            )? {
+                                quota_cursor.insert(key, cur_cursor);
                             }
-                            if *prev_uid_cursor > prev {
-                                return Err(MetaDbError::AuxOutOfOrderGap {
-                                    origin_shard_id: item.origin_shard_id,
-                                    uid: *uid,
-                                    expected_after: prev,
-                                    got_prev: *prev_uid_cursor,
-                                });
-                            }
-                            quota_cursor.insert(key, cur_cursor);
                         }
                         AuxTaskPayload::IndexUpsert { fid, .. }
                         | AuxTaskPayload::IndexDelete { fid } => {
@@ -927,20 +977,18 @@ impl TxStateMachineHandler {
                                 .copied()
                                 .unwrap_or((0, 0));
                             let cur_cursor = (item.origin_raft_index, item.task_ordinal);
-                            if cur_cursor <= prev {
-                                continue; // Exact-once duplicate replay suppressed!
+                            if !Self::check_quota_cursor(
+                                item.origin_shard_id,
+                                uid,
+                                prev,
+                                prev_uid_cursor,
+                                cur_cursor,
+                            )? {
+                                continue; // Exact-once duplicate replay suppressed.
                             }
-                            if prev_uid_cursor > prev {
-                                // Resolution B8: Contiguous frontier gap rejected!
-                                return Err(MetaDbError::AuxOutOfOrderGap {
-                                    origin_shard_id: item.origin_shard_id,
-                                    uid,
-                                    expected_after: prev,
-                                    got_prev: prev_uid_cursor,
-                                });
-                            }
-                            rec.used_bytes = (rec.used_bytes + delta_bytes).max(0);
-                            rec.used_inodes = (rec.used_inodes + delta_inodes).max(0);
+                            rec.used_bytes = saturating_add_i64(rec.used_bytes, delta_bytes).max(0);
+                            rec.used_inodes =
+                                saturating_add_i64(rec.used_inodes, delta_inodes).max(0);
                             rec.last_applied_hlc = rec.last_applied_hlc.max(item.hlc);
                             rec.applied_by_shard
                                 .insert(item.origin_shard_id, cur_cursor);
@@ -1151,6 +1199,38 @@ impl TxStateMachineHandler {
                                 rename_fence_token,
                                 op: IntentOp::DeletingDir {
                                     dir_id,
+                                    attr_deltas,
+                                    aux_specs,
+                                },
+                            };
+                            encoded_writes.push((intent_raw_key, rec.encode()));
+                        }
+                        IntentOp::Insert {
+                            value,
+                            attr_deltas,
+                            aux_specs,
+                        } => {
+                            if let Some(ex) = &existing_intent {
+                                if ex.txn_id != txn_id {
+                                    return Err(MetaDbError::WriteIntentConflict {
+                                        conflicting_txn_id: ex.txn_id,
+                                        primary_key: ex.primary_key.clone(),
+                                        expire_hlc: ex.expire_hlc.0,
+                                    });
+                                }
+                            }
+                            if Self::read_latest_in_apply(engine, &user_key)?.is_some() {
+                                return Err(Self::already_exists_for_user_key(&user_key));
+                            }
+                            let rec = WriteIntentRecord {
+                                txn_id,
+                                primary_shard_hint: self.shard_id,
+                                primary_key: primary_key.clone(),
+                                start_hlc,
+                                expire_hlc,
+                                rename_fence_token,
+                                op: IntentOp::Insert {
+                                    value,
                                     attr_deltas,
                                     aux_specs,
                                 },
@@ -1469,6 +1549,7 @@ impl TxStateMachineHandler {
             return Ok(false); // Already materialized on an earlier retry!
         };
         let rec = WriteIntentRecord::decode(&raw)?;
+        let create_only = matches!(rec.op, IntentOp::Insert { .. });
         match rec.op {
             IntentOp::DirExistsFenceSet { mut holders } => {
                 let existed = holders.remove(&txn_id).is_some();
@@ -1488,7 +1569,15 @@ impl TxStateMachineHandler {
                 value,
                 attr_deltas,
                 aux_specs,
+            }
+            | IntentOp::Insert {
+                value,
+                attr_deltas,
+                aux_specs,
             } => {
+                if create_only && Self::read_latest_in_apply(engine, user_key)?.is_some() {
+                    return Err(Self::already_exists_for_user_key(user_key));
+                }
                 // Stamp `modify_time = commit_hlc` if `value` is an 88-byte `InodeAttr`.
                 let final_val = if let Ok(mut decoded_attr) = InodeAttr::decode(&value) {
                     decoded_attr.modify_time = commit_hlc;
@@ -1638,6 +1727,8 @@ impl ShardApplyHandler for TxStateMachineHandler {
         let cmd: TxRaftCmd = bincode::deserialize(&request.payload)
             .map_err(|e| MetaDbError::CodecError(e.to_string()))?;
         let out = self.apply_tx_cmd(raft_index, commit_hlc, cmd, engine)?;
+        self.outbox
+            .persist_quota_cursors(engine, commit_hlc, raft_index);
         bincode::serialize(&out).map_err(|e| MetaDbError::CodecError(e.to_string()))
     }
 
