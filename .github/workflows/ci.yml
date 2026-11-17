@@ -3,12 +3,17 @@ name: CI
 on:
   push:
     branches: ["main", "**"]
+    tags: ["v*"]
   pull_request:
     branches: ["main"]
 
+# Cancel a superseded run on the same ref (branch, PR merge ref, or tag).
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,11 +21,18 @@ env:
 jobs:
   rust-check-lint-test:
     name: Format, Clippy & Test (locked toolchain)
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
-    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Reject ignored tests that have no reason
+        run: python3 .github/scripts/reject-bare-ignore.py --self-test crates
 
       - name: Install Protobuf Compiler (protoc)
         run: |
@@ -34,6 +46,8 @@ jobs:
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.arch }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -42,13 +56,87 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run full workspace test suite
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
-      - name: Reject ignored tests that have no reason
+  package:
+    name: Package ${{ matrix.triple }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: write
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Protobuf Compiler (protoc)
         run: |
-          # Match a bare attribute only. Mentions inside comments, and
-          # #[ignore = "reason"], are allowed.
-          if grep -R -n -E '^[[:space:]]*#\[ignore\][[:space:]]*(//.*)?$' --include='*.rs' crates; then
-            echo 'bare #[ignore] is not allowed; use #[ignore = "why CI skips this test"]'
-            exit 1
-          fi
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler file
+
+      - name: Setup pinned Rust toolchain (rust-toolchain.toml, 1.100.0)
+        uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.arch }}
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p metadb-server --bins
+
+      - name: Smoke-check and package
+        id: package
+        env:
+          EXPECT_TRIPLE: ${{ matrix.triple }}
+        run: bash .github/scripts/package-binaries.sh
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [rust-check-lint-test, package]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: metadb-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/publish-release.sh

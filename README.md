@@ -95,6 +95,8 @@ Operator and developer guides in English, French, German, Japanese, and Simplifi
 
 `cargo test --workspace` includes the persistent topology suites and the stress smoke. T1–T6 still exercise the in-memory `MetaDbEngine::new_single_node` simulator. The persistent suites open a real `data_dir` through `PersistentMetaDbCluster` / `DurableCellManager`.
 
+CI runs those three commands from a clean tree with `--locked` (tests also pass `--no-fail-fast`). See [CI and release packages](#ci-and-release-packages).
+
 | Suite | Command |
 | :--- | :--- |
 | Single-node metadata, shutdown, and reopen | `cargo test -p metadb-server --test topology_single_node` |
@@ -128,6 +130,29 @@ cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile local
 `metadb-ctl bench --workload hotspot-create` and `--workload bulk-ttl-delete` still drive a remote gRPC endpoint and report throughput only. `--workload mixed` is the embedded harness.
 
 `metadbd` only runs `--role all-in-one`. `topology_distributed` still builds a 3-voter cell in-process. A second OS process can join that cell's Raft groups: `cargo test -p metadb-server --test join_existing_group`. `RegisterCell` does not create a second Cell. CI runs `cargo fmt`, `cargo clippy --locked`, and `cargo test --locked`, times the job out at 45 minutes, cancels a superseded run, and rejects a bare `#[ignore]` attribute.
+
+## CI and release packages
+
+[`.github/workflows/ci.yml`](./.github/workflows/ci.yml) is the only workflow.
+
+| Job | When it runs | What it does |
+| :--- | :--- | :--- |
+| Format, Clippy & Test | Every push, every pull request to `main`, and `v*` tags | `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked --no-fail-fast` on `ubuntu-24.04`. A bare `#[ignore]` with no reason string fails the job. |
+| Package `x86_64-unknown-linux-gnu` | Pull requests, pushes to `main`, and `v*` tags | Native `ubuntu-24.04` release build of `metadbd` and `metadb-ctl`. |
+| Package `aarch64-unknown-linux-gnu` | Same as the x86_64 package job | Native `ubuntu-24.04-arm` release build. No cross or musl toolchain. |
+| Publish GitHub Release | Push of a `v*` tag, after tests and both packages succeed | Uploads the archives and checksums. `contents: write` is granted only on this job. |
+
+A new push to the same ref cancels the in-progress run. Each job stops after 45 minutes (15 minutes for the release job).
+
+Package artifacts (also attached to the GitHub Release for a `v*` tag):
+
+- `metadb-<version>-x86_64-unknown-linux-gnu.tar.gz`
+- `metadb-<version>-aarch64-unknown-linux-gnu.tar.gz`
+- a `.sha256` sidecar for each archive
+
+`<version>` is `[workspace.package].version` in `Cargo.toml` (currently `0.1.0`). `metadbd --version` reports that same string. The Actions artifact name is the tarball basename, `metadb-<version>-<target>`. The tarball contains `metadbd`, `metadb-ctl`, `LICENSE`, and `SHA256SUMS` for those files. These are glibc builds. The workflow does not publish to crates.io. On a tag, the release also includes one `SHA256SUMS` covering both archives. A tag with a hyphen (for example `v0.1.0-rc.1`) is marked as a prerelease. The tag text is not required to equal the crate version; asset names follow `Cargo.toml`.
+
+`stress_local_mixed_workload` stays `#[ignore]` and is not part of this CI job. The 5-second `stress_smoke_mixed_workload` still runs.
 
 ## License
 
