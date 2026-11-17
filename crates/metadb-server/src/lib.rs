@@ -116,7 +116,7 @@ use metadb_proto::metadata_service_server::MetadataServiceServer;
 use metadb_proto::raft_transport_service_server::RaftTransportServiceServer;
 use metadb_proto::transaction_service_server::TransactionServiceServer;
 use metadb_proxy::{MetadataSqlCommand, SqlTemplateParser, StatelessProxyRouter};
-use metadb_raft::{MultiRaftTransportServer, ShardGroupHost};
+use metadb_raft::{MultiRaftTransportServer, ProposalShutdownGate, ShardGroupHost};
 use metadb_storage::mvcc::DEFAULT_MVCC_RETENTION_MS;
 use metadb_storage::{LifecycleStorageEngine, ShardedBlockCache};
 use metadb_tx::{
@@ -753,6 +753,30 @@ impl PersistentMetaDbCluster {
 
     /// Gracefully stops gRPC/background loops, flushes all shard state to disk, and stops OpenRaft groups.
     pub async fn shutdown(&self) -> Result<()> {
+        self.stop_tasks().await;
+        self.flush_all().await?;
+        self.host.shutdown_all().await
+    }
+
+    /// Installs `gate` on every local Raft group so a test can park `client_write`.
+    pub fn install_proposal_shutdown_gate(&self, gate: &Arc<ProposalShutdownGate>) {
+        for group in self.host.all_groups() {
+            group.set_proposal_shutdown_gate(Some(gate.clone()));
+        }
+    }
+
+    /// Stops gRPC and maintenance, then shuts Raft down without flushing memtables.
+    ///
+    /// Committed entries that have not reached an LSM checkpoint stay in `.raftlog` and are
+    /// replayed by the next [`open_and_serve`](Self::open_and_serve) on the same `data_dir`.
+    /// This is the in-process crash used by failure-under-load tests: the LSM `LOCK` is
+    /// released, but the memtable is not checkpointed first.
+    pub async fn shutdown_without_flush(&self) -> Result<()> {
+        self.stop_tasks().await;
+        self.host.shutdown_all_no_flush().await
+    }
+
+    async fn stop_tasks(&self) {
         let _ = self.shutdown_tx.send(true);
         let handles: Vec<_> = {
             let mut guard = self.task_handles.lock().await;
@@ -762,8 +786,6 @@ impl PersistentMetaDbCluster {
             // Do not abandon the task: it may still hold the shard LSM lock.
             let _ = h.await;
         }
-        self.flush_all().await?;
-        self.host.shutdown_all().await
     }
 }
 

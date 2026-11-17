@@ -93,6 +93,8 @@ cargo test --workspace
 | Single-node metadata, shutdown, and reopen | `cargo test -p metadb-server --test topology_single_node` |
 | Single-node shard split and keyspace coverage | `cargo test -p metadb-server --test topology_scale_out` |
 | 3-voter membership, metadata, leader change, and voter restart | `cargo test -p metadb-server --test topology_distributed` |
+| Unflushed restart overlapping in-flight creates | `cargo test -p metadb-server --test stress_crash_restart -- --nocapture` |
+| 3-voter leader loss and restart under create load | `cargo test -p metadb-server --test topology_distributed three_voter_leader_loss_under_load -- --nocapture` |
 | Stress smoke (5s mixed workload, correctness, latency) | `cargo test -p metadb-server --test stress_harness stress_smoke -- --nocapture` |
 
 ### Stress profiles
@@ -114,7 +116,9 @@ cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile local
 
 `METADB_STRESS_DURATION_SECS`, `METADB_STRESS_CONCURRENCY`, `METADB_STRESS_KEYSPACE`, and `METADB_STRESS_SEED` apply to the local profile and to `metadb-ctl bench --embedded --profile local`. Explicit `--duration-secs`, `--concurrency`, `--keyspace`, and `--seed` override the profile.
 
-`metadb-ctl bench --workload hotspot-create` and `--workload bulk-ttl-delete` still drive a remote gRPC endpoint and report throughput. `--workload mixed` is the embedded harness.
+`stress_crash_restart` stops a single-node process with `PersistentMetaDbCluster::shutdown_without_flush` while creates are still inside Raft propose, reopens the same `data_dir`, and checks listings, `dirstat`, quota, and a secondary index. A second stop covers a joined rename, unlink, and create tail. `three_voter_leader_loss_under_load` runs creates on a 3-voter cell, stops the leader without flushing, checks the new leader, and restarts the stopped voter while creates continue.
+
+`metadb-ctl bench --workload hotspot-create` and `--workload bulk-ttl-delete` still drive a remote gRPC endpoint and report throughput only. `--workload mixed` is the embedded harness.
 
 `metadbd` only runs `--role all-in-one`. The distributed test therefore builds a 3-voter cell in-process with localhost Raft ports via `DurableCellManager::scale_out_replicas`. It does not start three `metadbd` processes, and it does not cover a second Cell.
 

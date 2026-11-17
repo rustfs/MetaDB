@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -47,6 +48,76 @@ impl Default for RaftNodeOptions {
     }
 }
 
+/// Parks `client_write` callers inside `propose` until a failure test releases them.
+///
+/// Production leaves the gate unarmed, so `enter` returns immediately. A test arms it,
+/// waits until at least one proposal is blocked, and only then starts Raft shutdown.
+#[derive(Debug, Default)]
+pub struct ProposalShutdownGate {
+    armed: AtomicBool,
+    released: AtomicBool,
+    depth: AtomicUsize,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl ProposalShutdownGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    pub fn depth(&self) -> usize {
+        self.depth.load(Ordering::Acquire)
+    }
+
+    /// Blocks inside `ShardRaftGroup::propose` immediately before `client_write` when armed.
+    pub async fn enter(&self) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        self.depth.fetch_add(1, Ordering::AcqRel);
+        self.arrived.notify_waiters();
+        loop {
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_for_arrival(&self) {
+        loop {
+            if self.depth.load(Ordering::Acquire) >= 1 {
+                return;
+            }
+            let notified = self.arrived.notified();
+            tokio::pin!(notified);
+            if self.depth.load(Ordering::Acquire) >= 1 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Records that shutdown is starting while `depth >= 1`, then lets the parked
+    /// `client_write` run concurrently with Raft shutdown.
+    pub fn release_for_shutdown(&self) {
+        let depth = self.depth.load(Ordering::Acquire);
+        assert!(
+            depth >= 1,
+            "Raft shutdown started with no proposal waiting inside propose()"
+        );
+        self.released.store(true, Ordering::Release);
+        self.release.notify_waiters();
+    }
+}
+
 /// Active Multi-Raft group hosting one shard's consensus log, state machine, and `ReadIndexBatcher`.
 pub struct ShardRaftGroup {
     shard_id: ShardId,
@@ -57,6 +128,7 @@ pub struct ShardRaftGroup {
     read_batcher: Arc<ReadIndexBatcher>,
     watermarks: Arc<ShardWatermarkTracker>,
     clock: Arc<HybridLogicalClock>,
+    proposal_gate: RwLock<Option<Arc<ProposalShutdownGate>>>,
 }
 
 impl ShardRaftGroup {
@@ -134,7 +206,12 @@ impl ShardRaftGroup {
             read_batcher,
             watermarks,
             clock,
+            proposal_gate: RwLock::new(None),
         }))
+    }
+
+    pub fn set_proposal_shutdown_gate(&self, gate: Option<Arc<ProposalShutdownGate>>) {
+        *self.proposal_gate.write().unwrap() = gate;
     }
 
     /// Bootstraps initial cluster membership (e.g., `1-Voter` in Stage 1 or `3-Voter` on split child)
@@ -251,6 +328,11 @@ impl ShardRaftGroup {
             hlc: proposal_hlc,
             payload,
         };
+
+        let gate = self.proposal_gate.read().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.enter().await;
+        }
 
         let write_resp = match self.raft.client_write(req).await {
             Ok(r) => r,
