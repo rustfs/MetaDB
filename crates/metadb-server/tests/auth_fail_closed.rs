@@ -200,6 +200,7 @@ async fn configured_secret_rejects_missing_and_wrong_credentials() {
     let empty_metrics = http_exchange(&metrics_dial, Some("Bearer "), "/metrics").await;
     let wrong_metrics = http_exchange(&metrics_dial, Some("Bearer wrong-secret"), "/metrics").await;
     let status_path = http_exchange(&metrics_dial, None, "/status").await;
+    let authed_metrics = http_exchange(&metrics_dial, Some("Bearer test-secret"), "/metrics").await;
 
     cluster.shutdown().await.unwrap();
 
@@ -221,4 +222,15 @@ async fn configured_secret_rejects_missing_and_wrong_credentials() {
     assert_rejected_http(empty_metrics.0, &empty_metrics.1);
     assert_rejected_http(wrong_metrics.0, &wrong_metrics.1);
     assert_rejected_http(status_path.0, &status_path.1);
+    assert_eq!(authed_metrics.0, 200, "{}", authed_metrics.1);
+    assert!(
+        authed_metrics.1.contains("text/plain; version=0.0.4"),
+        "authenticated scrape missing Prometheus content type: {}",
+        authed_metrics.1
+    );
+    assert!(
+        authed_metrics.1.contains("metadb_shards_total"),
+        "authenticated scrape missing metric text: {}",
+        authed_metrics.1
+    );
 }
