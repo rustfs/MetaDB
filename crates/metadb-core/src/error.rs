@@ -87,6 +87,11 @@ pub enum MetaDbError {
     ///
     /// Appended so existing bincode variant tags stay stable for `ErrorDetailProto`.
     InvalidFileSize(i64),
+    /// The 48-bit physical field and 16-bit logical counter are both at their maximum.
+    /// Advancing further would wrap and break strict monotonicity.
+    ///
+    /// Appended after `InvalidFileSize` so that variant stays bincode index 23.
+    HlcSaturated,
 }
 
 impl fmt::Display for MetaDbError {
@@ -193,6 +198,10 @@ impl fmt::Display for MetaDbError {
             MetaDbError::RpcError(msg) => write!(f, "RPC error: {}", msg),
             MetaDbError::ConsensusError(msg) => write!(f, "consensus error: {}", msg),
             MetaDbError::SqlParseError(msg) => write!(f, "SQL template parse error: {}", msg),
+            MetaDbError::HlcSaturated => write!(
+                f,
+                "HLC saturated at the 48-bit physical ceiling; refusing to wrap the logical counter"
+            ),
         }
     }
 }

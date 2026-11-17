@@ -379,13 +379,26 @@ impl ShardAuxOutbox {
         hlc: HlcTimestamp,
         raft_index: u64,
     ) {
-        let guard = self.inner.read().unwrap();
-        for (&uid, &(idx, ord)) in &guard.last_uid_cursor {
-            if idx != raft_index {
-                continue;
-            }
-            let key = OriginQuotaCursorKey { uid }.encode().to_vec();
-            engine.apply_committed_put(key, encode_origin_quota_cursor(idx, ord), hlc, raft_index);
+        // Copy under the outbox lock, then write the engine after releasing it.
+        // `seal_active_memtable` holds the MVCC write lock and then takes this
+        // outbox lock to spill. Writing the memtable while this read lock is held
+        // deadlocks that flush against the apply that is persisting the cursor.
+        let writes: Vec<(Vec<u8>, Vec<u8>)> = {
+            let guard = self.inner.read().unwrap();
+            guard
+                .last_uid_cursor
+                .iter()
+                .filter(|(_, (idx, _))| *idx == raft_index)
+                .map(|(&uid, &(idx, ord))| {
+                    (
+                        OriginQuotaCursorKey { uid }.encode().to_vec(),
+                        encode_origin_quota_cursor(idx, ord),
+                    )
+                })
+                .collect()
+        };
+        for (key, value) in writes {
+            engine.apply_committed_put(key, value, hlc, raft_index);
         }
     }
 

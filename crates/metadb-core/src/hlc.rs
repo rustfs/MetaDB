@@ -54,16 +54,20 @@ impl HlcTimestamp {
         self.0
     }
 
-    /// Returns the smallest timestamp strictly greater than `self`, advancing `physical_ms + 1`
-    /// if `logical == u16::MAX` (never wrapping `u16` to `0` at the same physical millisecond).
+    /// Returns the smallest timestamp strictly greater than `self`.
+    ///
+    /// When `logical == u16::MAX`, advances `physical_ms` by 1. At the 48-bit physical
+    /// ceiling this returns `self` instead of wrapping `logical` back to 0.
     #[inline]
     pub const fn next_strict(self) -> Self {
         let phys = self.physical_ms();
         let log = self.logical();
         if log < u16::MAX {
             Self::new(phys, log + 1)
-        } else {
+        } else if phys < Self::MAX_PHYSICAL_MS {
             Self::new(phys + 1, 0)
+        } else {
+            self
         }
     }
 }
@@ -138,14 +142,17 @@ impl HybridLogicalClock {
             let current = self.state.load(Ordering::Acquire);
             let cur_phys = current >> 16;
             let cur_log = (current & 0xFFFF) as u16;
+            let wall_phys = wall_ms.min(HlcTimestamp::MAX_PHYSICAL_MS);
 
-            let next = if wall_ms > cur_phys {
-                HlcTimestamp::new(wall_ms, 0).0
+            let next = if wall_phys > cur_phys {
+                HlcTimestamp::new(wall_phys, 0).0
             } else if cur_log < u16::MAX {
                 HlcTimestamp::new(cur_phys, cur_log + 1).0
-            } else {
+            } else if cur_phys < HlcTimestamp::MAX_PHYSICAL_MS {
                 // Never wrap `u16` to 0 at the same physical_ms; advance physical_ms by 1.
                 HlcTimestamp::new(cur_phys + 1, 0).0
+            } else {
+                current
             };
 
             if self
@@ -192,6 +199,10 @@ impl HybridLogicalClock {
             } else {
                 max_ts.next_strict()
             };
+
+            if next <= max_ts {
+                return Err(MetaDbError::HlcSaturated);
+            }
 
             if next.physical_ms() > max_allowed {
                 return Err(MetaDbError::ClockSkewExceeded {
@@ -290,5 +301,41 @@ mod tests {
         let clamped = HlcTimestamp::new(u64::MAX, 42);
         assert_eq!(clamped.physical_ms(), HlcTimestamp::MAX_PHYSICAL_MS);
         assert_eq!(clamped.logical(), 42);
+
+        // A wall clock past the 48-bit ceiling must not reset a logical counter already at that ceiling.
+        let ceiling_clock = HybridLogicalClock::with_max_drift_ms(500);
+        let at_ceiling_phys = ceiling_clock.now_with_wall_ms(HlcTimestamp::MAX_PHYSICAL_MS);
+        assert_eq!(
+            at_ceiling_phys,
+            HlcTimestamp::new(HlcTimestamp::MAX_PHYSICAL_MS, 0)
+        );
+        let advanced = ceiling_clock.now_with_wall_ms(u64::MAX);
+        assert!(advanced > at_ceiling_phys);
+        assert_eq!(advanced.logical(), 1);
+
+        let mut prev = HlcTimestamp::ZERO;
+        let saturate = HybridLogicalClock::with_max_drift_ms(500);
+        for _ in 0..(u16::MAX as u32 + 2) {
+            let next = saturate.now_with_wall_ms(HlcTimestamp::MAX_PHYSICAL_MS);
+            assert!(
+                next >= prev,
+                "HLC moved backwards from {:?} to {:?}",
+                prev,
+                next
+            );
+            prev = next;
+        }
+        let saturated = HlcTimestamp::new(HlcTimestamp::MAX_PHYSICAL_MS, u16::MAX);
+        assert_eq!(prev, saturated);
+        assert_eq!(saturated.next_strict(), saturated);
+        assert_ne!(
+            saturated.next_strict(),
+            HlcTimestamp::new(HlcTimestamp::MAX_PHYSICAL_MS, 0)
+        );
+
+        let err = saturate
+            .update_checked_with_wall_ms(saturated, HlcTimestamp::MAX_PHYSICAL_MS)
+            .unwrap_err();
+        assert!(matches!(err, MetaDbError::HlcSaturated));
     }
 }

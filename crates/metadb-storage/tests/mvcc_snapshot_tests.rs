@@ -186,3 +186,81 @@ fn test_snapshot_guard_read_cut_safe_flush_gate_and_view_at_raft_index() {
         MetaKey::child(88, "item_0599.dat").encode()
     );
 }
+
+/// Sealed multiples of 10 and active odd keys interleave. Both layers contribute
+/// keys inside the first 256-key page and past it.
+#[test]
+fn test_paged_scan_keeps_interleaved_imm_and_active_keys() {
+    let engine = LifecycleStorageEngine::new(1, 60_000, 128, false);
+    let sealed_prefix: Vec<u32> = (10..=600).step_by(10).collect();
+    let active: Vec<u32> = (1..=599).step_by(2).collect();
+
+    let mut lsn = 0u64;
+    for &n in &sealed_prefix {
+        lsn += 1;
+        engine.apply_committed_put(
+            page_key(n),
+            b"imm".to_vec(),
+            HlcTimestamp::new(1_000, 1),
+            lsn,
+        );
+    }
+    // Hold a snapshot from before the last sealed key so the higher HLC keeps the
+    // sealed memtable queued instead of flushing it before the active writes.
+    let pin = engine.acquire_linearizable_snapshot(lsn).unwrap();
+    lsn += 1;
+    engine.apply_committed_put(
+        page_key(610),
+        b"imm".to_vec(),
+        HlcTimestamp::new(1_500, 1),
+        lsn,
+    );
+    engine
+        .seal_and_flush_with_hook(
+            DurableShardCheckpoint {
+                flushed_raft_index: lsn,
+                flushed_max_hlc: HlcTimestamp::new(1_500, 1),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+    for &n in &active {
+        lsn += 1;
+        engine.apply_committed_put(
+            page_key(n),
+            b"active".to_vec(),
+            HlcTimestamp::new(2_000, 1),
+            lsn,
+        );
+    }
+
+    let snap = engine.acquire_linearizable_snapshot(lsn).unwrap();
+    let rows = engine
+        .scan_with_snapshot(&page_key(0), &page_key(1_000), &snap)
+        .unwrap();
+    let got: Vec<u32> = rows
+        .iter()
+        .map(|(k, _)| u32::from_be_bytes(k[1..5].try_into().unwrap()))
+        .collect();
+    let mut expect = sealed_prefix.clone();
+    expect.push(610);
+    expect.extend(&active);
+    expect.sort_unstable();
+
+    assert_eq!(got, expect);
+    assert!(got.len() > 256);
+    assert_eq!(got.first().copied(), Some(active[0]));
+    assert!(active[0] < sealed_prefix[0]);
+    assert!(got.iter().take(256).any(|n| n % 10 == 0));
+    assert!(got.iter().skip(256).any(|n| n % 10 == 0));
+    assert!(got.iter().take(256).any(|n| n % 2 == 1));
+    drop(pin);
+}
+
+fn page_key(n: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(5);
+    key.push(b'k');
+    key.extend_from_slice(&n.to_be_bytes());
+    key
+}

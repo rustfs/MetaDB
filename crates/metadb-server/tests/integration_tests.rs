@@ -2,12 +2,19 @@ use std::sync::Arc;
 use std::thread;
 
 use metadb_cluster::{ShardHealthState, ShardSplitMode};
-use metadb_core::{HlcTimestamp, MetaDbError, MetaKey, ROOT_INODE_ID};
+use metadb_core::{
+    HlcTimestamp, IntentOp, MetaDbError, MetaKey, QuotaKey, WriteIntentKey, WriteIntentRecord,
+    ROOT_INODE_ID,
+};
+use metadb_proto::transaction_service_server::TransactionService;
+use metadb_proto::{Prepare2pcRequest, RequestRoutingHeader};
 use metadb_server::{
-    MetaDbConfig, MetaDbEngine, PersistentMetaDbCluster, ServerTomlConfig, SqlQueryResult,
+    MetaDbConfig, MetaDbEngine, MetaDbGrpcService, PersistentMetaDbCluster, ServerTomlConfig,
+    SqlQueryResult,
 };
 use metadb_tx::AuxUpdateTask;
 use tempfile::tempdir;
+use tonic::Request;
 
 // T1–T6 exercise `MetaDbEngine::new_single_node`, an in-memory simulator
 // (`InMemoryBackend` + `VecDeque` log). They are not crash-recovery proof of the
@@ -501,4 +508,112 @@ async fn test_maintenance_tick_purges_raft_log() {
         "reopen must restore last_snapshot_index from the MANIFEST flushed index"
     );
     cluster.shutdown().await.unwrap();
+}
+
+/// `Prepare2pc` must propose on `header.shard_id`, not on the shard that owns `primary_key`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_prepare2pc_uses_routing_header_shard() {
+    let dir = tempdir().unwrap();
+    let cfg = persistent_cfg(dir.path());
+    let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
+    let svc = MetaDbGrpcService::new(
+        cluster.global_manager().clone(),
+        cluster.tx_router().clone(),
+        cluster.proxy_router().clone(),
+    );
+
+    let primary_key = MetaKey::child(1, "primary.txt").encode();
+    let quota_key = QuotaKey { uid: 42 }.encode();
+    let (_, quota_grp, _) = cluster.cell_manager().lookup_local_handle(2).unwrap();
+    let (_, meta_grp, _) = cluster.cell_manager().lookup_local_handle(1).unwrap();
+    let epoch = quota_grp.current_epoch();
+
+    let quota_intent = WriteIntentKey::new(quota_key.clone()).encode();
+    let prepared = svc
+        .prepare2pc(Request::new(prepare_req(
+            11,
+            epoch,
+            primary_key.clone(),
+            quota_key,
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        prepared.error.is_none(),
+        "secondary prepare must land on the quota shard: {:?}",
+        prepared.error
+    );
+    let stored = quota_grp
+        .engine()
+        .get(&quota_intent, HlcTimestamp(u64::MAX))
+        .unwrap()
+        .expect("quota shard must store the intent");
+    assert_eq!(WriteIntentRecord::decode(&stored).unwrap().txn_id, 11);
+    assert!(meta_grp
+        .engine()
+        .get(&quota_intent, HlcTimestamp(u64::MAX))
+        .unwrap()
+        .is_none());
+
+    let meta_intent = WriteIntentKey::new(primary_key.clone()).encode();
+    let rejected = svc
+        .prepare2pc(Request::new(prepare_req(
+            12,
+            epoch,
+            primary_key.clone(),
+            primary_key,
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        rejected.error.is_some(),
+        "a meta-table intent is outside the quota shard"
+    );
+    assert!(meta_grp
+        .engine()
+        .get(&meta_intent, HlcTimestamp(u64::MAX))
+        .unwrap()
+        .is_none());
+
+    cluster.shutdown().await.unwrap();
+}
+
+fn prepare_req(
+    txn_id: u128,
+    epoch: metadb_core::ShardEpoch,
+    primary_key: Vec<u8>,
+    intent_user_key: Vec<u8>,
+) -> Prepare2pcRequest {
+    let record = WriteIntentRecord {
+        txn_id,
+        primary_shard_hint: 1,
+        primary_key: primary_key.clone(),
+        start_hlc: HlcTimestamp::ZERO,
+        expire_hlc: HlcTimestamp(u64::MAX),
+        rename_fence_token: None,
+        op: IntentOp::Put {
+            value: b"prepared".to_vec(),
+            attr_deltas: Vec::new(),
+            aux_specs: Vec::new(),
+        },
+    };
+    Prepare2pcRequest {
+        header: Some(RequestRoutingHeader {
+            shard_id: 2,
+            expected_epoch: Some(epoch.into()),
+            caller_hlc: 0,
+        }),
+        txn_id_be: txn_id.to_be_bytes().to_vec(),
+        is_primary: false,
+        primary_key: primary_key.clone(),
+        all_participant_keys: vec![primary_key, intent_user_key.clone()],
+        start_hlc: 0,
+        expire_hlc: u64::MAX,
+        has_rename_fence_token: false,
+        rename_fence_token: 0,
+        encoded_intent_keys: vec![WriteIntentKey::new(intent_user_key.clone()).encode()],
+        encoded_intent_records: vec![record.encode()],
+    }
 }

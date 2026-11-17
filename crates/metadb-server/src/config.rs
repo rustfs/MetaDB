@@ -139,15 +139,61 @@ impl ServerTomlConfig {
         Self::from_toml_str(&content)
     }
 
-    pub fn to_lsm_config(&self) -> LsmEngineConfig {
-        let ratio_permille =
-            ((self.storage.locality_tombstone_ratio * 1000.0) as usize).clamp(1, 1000);
-        LsmEngineConfig {
+    pub fn to_lsm_config(&self) -> Result<LsmEngineConfig> {
+        let ratio = self.storage.locality_tombstone_ratio;
+        if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+            return Err(MetaDbError::CodecError(format!(
+                "locality_tombstone_ratio must be a finite value in [0, 1], got {ratio}"
+            )));
+        }
+        let ratio_permille = ((ratio * 1000.0) as usize).clamp(1, 1000);
+        Ok(LsmEngineConfig {
             mvcc_retention_ms: self.storage.mvcc_retention_ms,
             tombstone_density_threshold: self.storage.locality_tombstone_threshold,
             tombstone_min_ratio_permille: ratio_permille,
             bloom_bits_per_key: self.storage.bloom_bits_per_key,
             auto_locality_compaction: true,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tombstone_ratio_is_validated_before_it_reaches_the_engine() {
+        let mut cfg = ServerTomlConfig::default();
+        cfg.storage.locality_tombstone_ratio = 0.5;
+        assert_eq!(
+            cfg.to_lsm_config().unwrap().tombstone_min_ratio_permille,
+            500
+        );
+        cfg.storage.locality_tombstone_ratio = 1.0;
+        assert_eq!(
+            cfg.to_lsm_config().unwrap().tombstone_min_ratio_permille,
+            1000
+        );
+        cfg.storage.locality_tombstone_ratio = 0.0;
+        assert_eq!(cfg.to_lsm_config().unwrap().tombstone_min_ratio_permille, 1);
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01, 1.01] {
+            cfg.storage.locality_tombstone_ratio = bad;
+            assert!(cfg.to_lsm_config().is_err(), "ratio {bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn toml_parses_storage_byte_sizes() {
+        let cfg = ServerTomlConfig::from_toml_str(
+            r#"
+            [storage]
+            memtable_size_bytes = 1024
+            block_cache_bytes = 65536
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.storage.memtable_size_bytes, 1024);
+        assert_eq!(cfg.storage.block_cache_bytes, 65536);
     }
 }
