@@ -363,6 +363,10 @@ impl ShardRaftGroup {
 
     /// Appends a blank entry, snapshots the state machine, and purges the log through that
     /// snapshot so a new replica must install the checkpoint instead of replaying an empty prefix.
+    ///
+    /// OpenRaft publishes the snapshot index before `purged` catches up, and the aux-outbox
+    /// watermark that gates the purge is advanced by the maintenance tick. Retry the flush
+    /// until those indexes meet instead of failing the first time they disagree.
     pub async fn prepare_learner_snapshot(&self) -> Result<u64> {
         self.raft.write_blank().await.map_err(|e| {
             MetaDbError::ConsensusError(format!(
@@ -370,18 +374,24 @@ impl ShardRaftGroup {
                 self.shard_id
             ))
         })?;
-        let _ = self.flush_snapshot_and_purge().await?;
-        let metrics = self.raft.metrics();
-        let snapshot = metrics.borrow_watched().clone();
-        let snap_idx = snapshot.snapshot.as_ref().map(|id| id.index).unwrap_or(0);
-        let purged = snapshot.purged.as_ref().map(|id| id.index).unwrap_or(0);
-        if snap_idx == 0 || purged < snap_idx {
-            return Err(MetaDbError::ConsensusError(format!(
-                "shard {} snapshot {snap_idx} was not purged (purged {purged}); refusing to promote a replica that could miss state seeded outside the log",
-                self.shard_id
-            )));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = self.flush_snapshot_and_purge().await?;
+            let metrics = self.raft.metrics();
+            let snapshot = metrics.borrow_watched().clone();
+            let snap_idx = snapshot.snapshot.as_ref().map(|id| id.index).unwrap_or(0);
+            let purged = snapshot.purged.as_ref().map(|id| id.index).unwrap_or(0);
+            if snap_idx > 0 && purged >= snap_idx {
+                return Ok(snap_idx);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(MetaDbError::ConsensusError(format!(
+                    "shard {} snapshot {snap_idx} was not purged (purged {purged}); refusing to promote a replica that could miss state seeded outside the log",
+                    self.shard_id
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        Ok(snap_idx)
     }
 
     /// Proposes a mutation to OpenRaft after pre-checking `expected_epoch` (`Resolution B16`)
