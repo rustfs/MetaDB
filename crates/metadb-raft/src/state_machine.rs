@@ -286,7 +286,7 @@ impl StateMachineShared {
             return Ok(());
         }
         let membership = self.last_membership.read().unwrap().clone();
-        let membership_bytes = bincode::serialize(&membership).unwrap_or_default();
+        let membership_bytes = codec::serialize_serde(&membership).unwrap_or_default();
         let descriptor = self.handler.encode_descriptor_bytes();
         let corrected = DurableShardCheckpoint {
             flushed_raft_term: log_id.committed_leader_id().term,
@@ -723,7 +723,7 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
                         engine.set_flush_identity(FlushIdentity {
                             term: log_id.committed_leader_id().term,
                             leader: log_id.committed_leader_id().node_id,
-                            membership: bincode::serialize(&membership).unwrap_or_default(),
+                            membership: codec::serialize_serde(&membership).unwrap_or_default(),
                             descriptor: self.shared.handler.encode_descriptor_bytes(),
                             aux_index: self.shared.watermarks.snapshot_values().1,
                         });
