@@ -1,0 +1,140 @@
+# Architecture as implemented
+
+[Overview](./README.md) · [Français](../fr/architecture.md) · [Deutsch](../de/architecture.md) · [日本語](../ja/architecture.md) · [简体中文](../zh/architecture.md)
+
+This page follows the code in `crates/`. It does not describe a multi-process Cell deployment. That deployment is not implemented. See [Operations](./operations.md#known-limitations).
+
+## Process shape
+
+`PersistentMetaDbCluster::open_and_serve` (`crates/metadb-server/src/lib.rs`):
+
+1. Rejects any `node.role` other than `all-in-one`.
+2. Binds `node.grpc_listen_addr` (default `127.0.0.1:7800`; `127.0.0.1:0` asks the OS for a port).
+3. Opens `DurableIdAllocator` at `<data_dir>/global_allocator`.
+4. Opens `ShardGroupHost` at `<data_dir>/be`.
+5. Opens or bootstraps `DurableCellManager` at `<data_dir>/cell_<cell_id>`.
+6. Registers that one cell on `DurableGlobalManager` for the key range `[0x01, 0x04)`.
+7. Ensures root directory inode `1` (`ROOT_INODE_ID`) has an attribute record.
+8. Serves four gRPC services on the same listener. Metadata, transaction, and control-plane services take an optional bearer interceptor. `RaftTransportService` does not.
+9. Spawns a maintenance task on a 250 ms interval.
+
+`metadbd` is a thin wrapper: it loads TOML, applies CLI overrides, calls `open_and_serve`, optionally calls `RegisterNode` on `--cell-manager`, optionally serves Prometheus text, and on Ctrl-C calls `shutdown`.
+
+## Keys and tables
+
+User-table prefixes (`crates/metadb-core/src/schema.rs`):
+
+| Prefix | Table | Bootstrap range when `bootstrap_table_shards = true` |
+| :--- | :--- | :--- |
+| `0x01` | `MetaTable` | shard 1, `[0x01, 0x02)` |
+| `0x02` | `QuotaTable` | shard 2, `[0x02, 0x03)` |
+| `0x03` | `SecondaryIndexTable` | shard 3, `[0x03, 0x04)` |
+
+`MetaTable` keys are `[0x01][pid: 8-byte big-endian][name UTF-8]`. The directory's own attributes are the reserved child `(pid, "_attr_")`, stored next to `(pid, child_name)`. User names that are empty, contain NUL, or equal `_attr_` are rejected (`ReservedEntryName`).
+
+Directory inode ids have bit 63 clear. File inode ids have bit 63 set (`FILE_INODE_TAG_BIT`). Root is inode `1`. The durable allocator starts new directory ids at `2`, file ids at `1`, and dynamic shard ids at `4` (1–3 are the bootstrap shards). `LocalIdBuffer` grants directory ids in blocks of 256 and file inode ids and file ids in blocks of 4,096, after the grant is written to `ID_ALLOCATOR_STATE`.
+
+Shard-local system prefixes:
+
+| Prefix | Record |
+| :--- | :--- |
+| `0x04` | `DirShardDelta` for a non-anchor dual-mode sub-shard |
+| `0x05` | 2PC `WriteIntent` |
+| `0x06` | 2PC `TxnRecord` |
+| `0x07` | spilled auxiliary outbox entries |
+
+When `bootstrap_table_shards = false`, bootstrap creates one shard, id `1`, covering `[0x01, 0x04)`.
+
+## Request path
+
+A metadata call enters either the embedded `DistributedTxRouter` (`cluster.tx_router()`) or gRPC `MetadataService` / `TransactionService`. `StatelessProxyRouter` compiles one of the 20 SQL templates and calls the same router. There is no general SQL engine. The parser accepts only the statements below (`crates/metadb-proxy/src/sql_templates.rs`). `?` placeholders bind `u64`, `i64`, or string parameters. A literal `name = '_attr_'` is directory stat. A bound parameter equal to `_attr_` is rejected.
+
+| # | Statement | Effect |
+| :--- | :--- | :--- |
+| 1 | `INSERT INTO MetaTable (pid, name, id, type, fid, uid, mode, size) VALUES (?, ?, ?, 'FILE', ?, ?, ?, ?)` | create file |
+| 2 | `INSERT INTO MetaTable (pid, name, id, type, uid, mode) VALUES (?, ?, ?, 'DIR', ?, ?)` | mkdir |
+| 3 | `DELETE FROM MetaTable WHERE pid = ? AND name = ?` | unlink |
+| 4 | `RMDIR FROM MetaTable WHERE pid = ? AND name = ?` | rmdir |
+| 5 | `UPDATE MetaTable SET pid = ?, name = ? WHERE pid = ? AND name = ?` | rename, no overwrite |
+| 6 | `REPLACE INTO MetaTable (pid, name) SELECT ?, ? FROM MetaTable WHERE pid = ? AND name = ?` | rename, overwrite |
+| 7 | `SELECT * FROM MetaTable WHERE pid = ? AND name = '_attr_'` | dirstat |
+| 8 | `SELECT * FROM MetaTable WHERE pid = ? AND name = ?` | lookup |
+| 9 | `SELECT * FROM MetaTable WHERE pid = ? ORDER BY name ASC` | listdir, hard-coded limit 10,000 |
+| 10 | `SELECT * FROM MetaTable WHERE pid = ? AND name > ? ORDER BY name ASC LIMIT ?` | listdir page |
+| 11 | `SELECT * FROM MetaTable WHERE pid = ? AND name LIKE ? ORDER BY name ASC LIMIT ?` | prefix listdir (`LIKE` is this prefix form only) |
+| 12 | `UPDATE MetaTable SET mode = ? WHERE pid = ? AND name = ?` | setattr mode |
+| 13 | `UPDATE MetaTable SET uid = ? WHERE pid = ? AND name = ?` | setattr uid |
+| 14 | `UPDATE MetaTable SET size = ?, fid = ? WHERE pid = ? AND name = ?` | setattr size and fid |
+| 15 | `UPDATE MetaTable SET modify_time = ? WHERE pid = ? AND name = ?` | setattr modify time |
+| 16 | `SELECT * FROM QuotaTable WHERE uid = ?` | get quota |
+| 17 | `INSERT INTO QuotaTable (uid, quota_limit_bytes) VALUES (?, ?) ON CONFLICT (uid) DO UPDATE SET quota_limit_bytes = ?` | set quota limit (the `ON CONFLICT` value is stored) |
+| 18 | `SELECT * FROM QuotaTable WHERE uid >= ? ORDER BY uid ASC LIMIT ?` | list quotas |
+| 19 | `SELECT * FROM SecondaryIndexTable WHERE fid = ?` | get secondary index |
+| 20 | `SELECT * FROM SecondaryIndexTable WHERE fid > ? ORDER BY fid ASC LIMIT ?` | scan secondary index |
+
+`metadb-ctl sql` sends `ExecuteSql` with an empty parameter list, so the statement must use literals.
+
+Routing uses `CompositeMetaCache`. On a miss or an epoch mismatch the cache is refreshed from the local cell and the call is retried against the local shard group. `DurableGlobalManager::route_user_key` looks up a **local** shard handle. It does not forward the user request to another process.
+
+## Storage
+
+Each shard's state machine opens a WAL-less LSM at `<data_dir>/be/shards/<shard_id 20 digits>/lsm`. SSTables use 4 KiB prefix-compressed data blocks (restart interval 16), a Bloom filter, and a `MANIFEST` with a `CURRENT` pointer. The block cache is a 16-way LRU. Its total budget is `storage.block_cache_bytes` (default 64 MiB). Each of the 16 cache shards gets at least 16 KiB.
+
+MVCC versions live in memory for `storage.mvcc_retention_ms` (default 5,000). A coordinated flush seals the memtable, runs the attribute-aggregation hook, and writes an L0 SSTable. There is no separate user KV WAL. Crash recovery is the Raft log plus the LSM manifest. `LocalityCompactor` tracks tombstones per 9-byte prefix bucket and compacts a hot deletion range when both `locality_tombstone_threshold` and `locality_tombstone_ratio` are crossed. `auto_locality_compaction` is always set to `true` by `ServerTomlConfig::to_lsm_config`; the TOML file cannot turn it off.
+
+`storage.memtable_size_bytes` is deserialized and never read. Flush size is not taken from that field.
+
+## Raft
+
+Each local shard is an `openraft` 0.10 group. The log is a segmented CRC32C file under `.../shards/<id>/raft`. Default options, which are **not** loaded from TOML (`raft_options` is `#[serde(skip)]`):
+
+| Field | Default |
+| :--- | :--- |
+| heartbeat | 150 ms |
+| election timeout | 450–900 ms |
+| `max_in_snapshot_log_to_keep` | 0 |
+| log segment size | 64 MiB |
+
+Log purge is gated by `min(state_flushed_index, aux_outbox_durable_index, last_snapshot_index)`. The 250 ms maintenance loop calls `flush_snapshot_and_purge` when a shard still retains log entries, unless a snapshot watermark is already at least `state_flushed_index` and fewer than 64 entries remain.
+
+`ConfChangeOrchestrator::add_learners_and_promote_voters` adds learners, waits until replication lag is at most 64 entries (default timeout 10 s, the value `scale_out_replicas` passes), then calls `change_membership`. The in-process test `test_online_1_to_3_voter_snapshot_promotion_and_leader_failover` does this with three tonic listeners and a basic KV state machine inside one OS process. It does not start `metadbd`.
+
+## Transactions and auxiliary work
+
+Single-directory create, unlink, setattr, lookup, dirstat, listdir, and same-shard mkdir/rmdir are proposed to the shard leader. Parent-directory counters are not locked on the foreground path: mutations record deltas, `ReplicatedAttrAggregator` folds them at the flush barrier, and dirstat reconciles unflushed deltas on the read path.
+
+Quota and `fid -> (pid, name)` updates go through a per-shard auxiliary outbox. `AuxDispatcher` applies them on the maintenance tick. If the outbox cannot be applied, entries can spill under prefix `0x07` so Raft compaction is not pinned forever by that queue. `TxnRecoveryWorker` scans `TxnRecord` / `WriteIntent` on the same tick.
+
+Cross-shard rename (and mkdir/rmdir that touch two shards) uses primary-anchored 2PC (`WriteIntent` + `TxnRecord`). Directory renames take a single active `DirRenameLease` from the ID allocator. A second lease is rejected until the first is released or its HLC expiry passes. The lease TTL is at least 100 ms.
+
+## Sharding inside the process
+
+`maybe_split_or_isolate_shard` runs when approximate shard size reaches `sharding.shard_split_threshold_bytes` (default 4 GiB), or when `TriggerShardSplit` forces a check.
+
+`RaftShardSplitWorker::discover_split_key`:
+
+- Needs at least two live keys.
+- Quota and secondary-index shards split at a byte midpoint.
+- `MetaTable` sums bytes per parent id. If one parent owns more than 85% of those bytes (`dominant_bytes * 100 > total_bytes * 85`), or the shard has a single parent, the candidate is `Jumbo`.
+- Otherwise it picks a parent-id boundary near half the bytes. The split key is a PID prefix, so `_attr_` and the direct children of one parent stay together.
+- If the route is already `DualModeFineGrained` for that parent, the split key is a `(pid, name)` midpoint, excluding `_attr_`.
+
+A jumbo candidate does **not** move the shard directory. `JumboIsolationPlanner` writes `ShardHealthState::JumboIsolated { dedicated_node, dominant_pid }` onto the route. The chosen node is the registered node with the fewest jumbo routes, then the fewest other routes. With only the bootstrap node registered, that node is this process.
+
+`enable_dual_mode_split` persists `split_mode = DualModeFineGrained` and `dual_mode_pid`. It does not itself copy keys. A later split uses the `(pid, name)` rule. The in-memory simulator (`CellLocalManager` in `control_plane.rs`) is a different type: its jumbo path returns `UnsplittableJumboShard` and its "scale to 3 voters" only edits a `BTreeMap`. Tests `T1`–`T6` exercise that simulator.
+
+Split plans are stored in `CELL_MANAGER_STATE`. Crash points covered by `split_crash_recovery_tests` resume or roll back a plan on the next `maybe_split_or_isolate_shard`. Child shard directories are created under the same `be/shards` tree.
+
+## Control-plane RPCs that do less than the name suggests
+
+| RPC | Behavior in this tree |
+| :--- | :--- |
+| `RegisterNode` | Inserts `(node_id, grpc_addr)` into this cell's `CELL_MANAGER_STATE` |
+| `StoreHeartbeat` | Does not install caller-supplied shard descriptors into the route cache. `metadbd` never sends this RPC |
+| `GetRoutes` | `cell_id = 0` lists every cached route. An unknown non-zero `cell_id` returns an error instead of an empty shard list |
+| `AllocateIdBlock` | Allocates from the local durable allocator |
+| `AllocSplitPlan` / `ActivateSplit` | Forwards to the local cell manager |
+| `TriggerShardSplit` | Forces `maybe_split_or_isolate_shard` on a local shard |
+| `EnableDualModeSplit` | Sets the local route flag. `split_name` in the request is ignored |
+| `ScaleShardReplicas` | Calls `scale_out_replicas` if this cell exists and enough nodes are registered |
+| `RegisterCell` | Returns an application error. This process still hosts one cell and does not store the requested cell |
