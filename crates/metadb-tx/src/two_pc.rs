@@ -25,10 +25,19 @@ use crate::state_machine_impl::{SetAttrPatch, TxRaftCmd, TxRaftOutput, TxStateMa
 
 pub const DEFAULT_2PC_TTL_MS: u64 = 3_000;
 
+fn publish_quota(mut record: QuotaRecord) -> QuotaRecord {
+    record.used_bytes = record.used_bytes.max(0);
+    record.used_inodes = record.used_inodes.max(0);
+    record
+}
+
 // A split fences its parent before booting and publishing its child. That
 // interval includes Raft recovery and can outlast a short count-based retry loop.
 const ROUTE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const ROUTE_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+/// A follower that already knows another leader must return `NotLeader` at once.
+/// Only an election with no hint is waited out, and only briefly.
+const ELECTION_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 
 async fn retry_routing<T, F, Fut>(operation: F) -> Result<T>
 where
@@ -47,12 +56,27 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
+    let election_deadline = tokio::time::Instant::now() + ELECTION_RETRY_TIMEOUT;
     loop {
         match operation().await {
+            // Split publication is local and can take the full routing budget.
+            // A known leader cannot appear by retrying on this follower.
             Err(
-                error @ (MetaDbError::EpochMismatch { .. }
-                | MetaDbError::NotLeader { .. }
-                | MetaDbError::ShardRoutingError(_)),
+                error @ MetaDbError::NotLeader {
+                    leader_hint: Some(_),
+                    ..
+                },
+            ) => return Err(error),
+            Err(error @ MetaDbError::NotLeader { .. }) => {
+                let now = tokio::time::Instant::now();
+                let limit = deadline.min(election_deadline);
+                if now >= limit {
+                    return Err(error);
+                }
+                tokio::time::sleep(ROUTE_RETRY_INTERVAL.min(limit - now)).await;
+            }
+            Err(
+                error @ (MetaDbError::EpochMismatch { .. } | MetaDbError::ShardRoutingError(_)),
             ) => {
                 let now = tokio::time::Instant::now();
                 if now >= deadline {
@@ -1430,7 +1454,7 @@ impl DistributedTxRouter {
         let Some(raw) = group.engine().get_with_snapshot(&qk, &snap)? else {
             return Ok(None);
         };
-        Ok(Some(QuotaRecord::decode(&raw)?))
+        Ok(Some(publish_quota(QuotaRecord::decode(&raw)?)))
     }
 
     pub async fn list_quotas(&self, start_uid: UserId, limit: usize) -> Result<Vec<QuotaRecord>> {
@@ -1453,7 +1477,7 @@ impl DistributedTxRouter {
             let (_, snap) = group.linearizable_read(epoch).await?;
             Self::validate_read_epoch(&group, epoch)?;
             for (_, v) in group.engine().scan_with_snapshot(s, e, &snap)? {
-                out.push(QuotaRecord::decode(&v)?);
+                out.push(publish_quota(QuotaRecord::decode(&v)?));
                 if out.len() >= lim {
                     return Ok(out);
                 }

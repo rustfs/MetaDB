@@ -86,22 +86,18 @@ impl DurableGlobalManager {
         let (_, group, handler) = cell.lookup_local_handle(route.shard_id)?;
         let actual = group.current_epoch();
         let actual_range = handler.key_range();
-        if actual != route.epoch
-            || actual_range != route.range
-            || !actual_range.contains_key(user_key)
-        {
-            // A parent is fenced before its child's route is published. Returning
-            // its current epoch here would let reads observe the deleted right
-            // half as absent instead of waiting for the child to become routable.
+        // A split fence updates the handler range and epoch together, before the
+        // child route is published. A range mismatch, or a key that the fenced
+        // parent no longer contains, must wait. Membership changes only the
+        // epoch and leaves the range in place; those reads stay on this shard.
+        if actual_range != route.range || !actual_range.contains_key(user_key) {
             return Err(MetaDbError::EpochMismatch {
                 shard_id: route.shard_id,
                 expected: route.epoch,
                 actual,
             });
         }
-        // Keep this descriptor's epoch: a later fence must invalidate a read
-        // barrier or proposal that races after this routing check.
-        Ok((route.epoch, group, handler))
+        Ok((actual, group, handler))
     }
 
     fn try_route_user_range(
@@ -121,7 +117,7 @@ impl DurableGlobalManager {
             })?;
             let (_, group, handler) = cell.lookup_local_handle(route.shard_id)?;
             let actual = group.current_epoch();
-            if actual != route.epoch || handler.key_range() != route.range {
+            if handler.key_range() != route.range {
                 return Err(MetaDbError::EpochMismatch {
                     shard_id: route.shard_id,
                     expected: route.epoch,
@@ -136,7 +132,7 @@ impl DurableGlobalManager {
                 ));
             }
             covered_until = overlap_end.to_vec();
-            out.push((route.epoch, group, handler));
+            out.push((actual, group, handler));
         }
         if covered_until.as_slice() != end_user_key {
             return Err(MetaDbError::ShardRoutingError(

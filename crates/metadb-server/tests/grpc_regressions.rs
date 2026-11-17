@@ -182,7 +182,12 @@ async fn unsupported_cell_registration_does_not_report_success() {
         .unwrap();
     let result = client
         .register_cell(metadb_proto::RegisterCellRequest::default())
-        .await;
+        .await
+        .unwrap()
+        .into_inner();
     cluster.shutdown().await.unwrap();
-    assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
+    assert!(
+        result.error.is_some(),
+        "RegisterCell must fail closed instead of reporting success"
+    );
 }

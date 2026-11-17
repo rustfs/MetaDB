@@ -99,16 +99,15 @@ cargo run -p metadb-server --bin metadb-ctl -- \
   bench --workload bulk-ttl-delete --concurrency 16 --ops 1000
 ```
 
-フラグ: `--workload` は `hotspot-create`（既定）または `bulk-ttl-delete` です。`--concurrency` の既定は 16 です。`--ops` の既定は 1000 です。それ以外のワークロード文字列はエラーです。
+フラグ: `--workload` は `hotspot-create`（既定）、`bulk-ttl-delete`、または `mixed` です。`--concurrency` を省略すると 16 です。`--ops` の既定は 1000 です。`--embedded` または `--workload mixed` は `--endpoint` を呼ばず、一時的な all-in-one ノードとプロセス内ストレステストを起動します。
 
-`crates/metadb-server/src/bin/metadb-ctl.rs` の挙動:
+遠隔ワークロードについて `crates/metadb-server/src/bin/metadb-ctl.rs` の挙動:
 
-- 各タスクは `ops / concurrency` 回、少なくとも 1 回実行します。除算の余りは捨てられるので、印字される数は `--ops` より小さくなり得ます。`--ops` が `--concurrency` より小さいときは、各タスクがそれでも 1 回動くため、数は `--ops` より大きくなり得ます。印字される数は試行回数であり、受理された変異の数ではありません。
-- `hotspot-create` は親 inode `1` の下に、名前 `bench_hotspot_create` の inode `999000` を mkdir し、4096 バイトのファイルに対して `CreateFile` を呼びます。mkdir の `Result` は捨てられます。`unwrap` がかかるのは tonic の `Result` だけなので、トランスポートまたはステータスの失敗がプロセスを中断します。`CreateFile` は `AlreadyExists` のようなアプリケーション失敗を、OK な `CreateFileResponse.error` の中に返します。クライアントはそのフィールドを捨てます。
-- `bulk-ttl-delete` は inode `999001`（`bench_bulk_ttl_delete`）の下で同じ作成を行い、同じやり方で `Unlink` を呼び（トランスポートの `unwrap`、アプリケーションの `error` は無視）、`limit = 1000` の `ListDir` を 1 回行います。
-- `hotspot-create` は試行のあと、アプリケーションエラーが無視された試行も含めて、`Completed <n> single-directory hotspot creates in <s>s (<ops/s> ops/s)` を印字します。
-- `bulk-ttl-delete` は unlink の試行数、秒、ops/s、その一覧が返した生存エントリ数、一覧の所要ミリ秒を印字します。一覧の呼び出しは確認されます。unlink は確認されません。
-- クライアントはレイテンシのパーセンタイルを計算せず、dirstat もクォータも確認しません。同じサーバへの 2 回目でも、すべての作成が `AlreadyExists` で拒否されても `Completed` とスループットを印字することがあります。
+- クライアントはディレクトリ ID を 1 つ取り、そのあと長さ `--ops` のファイル inode とファイル ID のブロックを取ります。個数や終端が不正な払い出しは拒否します。
+- `bench_pid`、`workload`、`requested_ops` を持つ JSON を 1 つ印字し、新しいディレクトリに 4096 バイトのファイルをその個数だけ作ります。
+- 各フェーズは `attempted`、`succeeded`、`failed`、`transport_failed`、`application_failed`、`errors_by_kind`、レイテンシのパーセンタイルを JSON で印字します。`succeeded` が `--ops` と等しくなければプロセスは非ゼロで終了します。
+- `bulk-ttl-delete` は作成した名前を削除し、`limit = 1` でディレクトリを一覧します。
+- 2 回目は新しい `bench_pid` を取ります。拒否された作成は成功に数えません。
 
 このコマンドの数値をリポジトリの結果として扱わないでください。マシン、ビルドプロファイル、向けたサーバに依存します。このツリーはサンプルを記録していません。
 

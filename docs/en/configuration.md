@@ -23,7 +23,7 @@
 | `storage.locality_tombstone_ratio` | `0.50` | Yes. Multiplied by 1000, clamped to 1..=1000, stored as `tombstone_min_ratio_permille` |
 | `sharding.bootstrap_table_shards` | `true` | Yes. `true` creates shards 1, 2, and 3. `false` creates shard 1 over `[0x01, 0x04)` |
 | `sharding.shard_split_threshold_bytes` | `4294967296` (4 GiB) | Yes. Split check uses approximate shard size |
-| `security.shared_secret` | `""` | Yes. Empty means metadata, transaction, and control-plane RPCs are unauthenticated |
+| `security.shared_secret` | `""` | Yes. Empty means all four gRPC services on this listener are unauthenticated |
 
 There is no `[raft]` table. `ServerTomlConfig.raft_options` is skipped by serde and stays at `RaftNodeOptions::default()` (heartbeat 150 ms, election 450–900 ms, snapshot log keep 0, segment 64 MiB).
 
@@ -69,11 +69,9 @@ CLI flags override the file after it is parsed: `--node-id`, `--cell-id`, `--rol
 
 The process does not terminate TLS.
 
-When `shared_secret` is non-empty, `MetadataService`, `TransactionService`, and `ControlPlaneService` require `authorization` to equal `Bearer <shared_secret>` exactly. Clients use a separate interceptor that attaches that header. `metadb-ctl --auth-token` (environment variable `METADB_AUTH_TOKEN`) and `metadbd --join` / `--cell-manager` send it. A prefix or a longer token is rejected. An empty secret still means those three services are unauthenticated.
+When `shared_secret` is non-empty, `MetadataService`, `TransactionService`, `ControlPlaneService`, and `RaftTransportService` require `authorization` to equal `Bearer <shared_secret>` exactly. Raft peers send the same bearer. `metadb-ctl --auth-token` (environment variable `METADB_AUTH_TOKEN`) and `metadbd --join` / `--cell-manager` send it. A prefix or a longer token is rejected. An empty secret leaves all four services unauthenticated.
 
-`RaftTransportService` is registered without the interceptor. A bearer token does not authenticate Raft RPCs on that port.
-
-An empty secret allows metadata, transaction, and control-plane RPCs. The code warns about this at startup. A bearer secret does not cover `RaftTransportService`, and a TLS terminator in front of the listener does not add that check: after termination, Raft RPCs are still unauthenticated. Before an untrusted client can reach the port, keep the bind on a trusted network such as `127.0.0.1`, or put every service behind a proxy that authenticates the client (for example mutual TLS) and block direct access to this process.
+An empty secret allows every RPC on the listener. The code warns about this at startup. The process still does not terminate TLS. Before an untrusted client can reach the port, keep the bind on a trusted network such as `127.0.0.1`, or put every service behind a proxy that authenticates the client (for example mutual TLS) and block direct access to this process.
 
 ## What you cannot configure
 

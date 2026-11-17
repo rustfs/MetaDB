@@ -15,7 +15,7 @@ Diese Seite folgt dem Code in `crates/`. Sie beschreibt keinen Mehrprozess-Zelle
 5. Öffnet oder bootstrapt `DurableCellManager` unter `<data_dir>/cell_<cell_id>`.
 6. Registriert diese eine Zelle bei `DurableGlobalManager` für den Schlüsselbereich `[0x01, 0x04)`.
 7. Stellt sicher, dass Wurzel-Inode `1` (`ROOT_INODE_ID`) einen Attributsatz hat.
-8. Bedient vier gRPC-Dienste auf demselben Listener. Metadaten-, Transaktions- und Control-Plane-Dienste nehmen einen optionalen Bearer-Interceptor. `RaftTransportService` nimmt keinen.
+8. Bedient vier gRPC-Dienste auf demselben Listener. Alle vier nehmen denselben optionalen Bearer-Interceptor. Ein leeres Geheimnis lässt jeden Aufruf zu.
 9. Startet eine Wartungsaufgabe im Abstand von 250 ms.
 
 `metadbd` ist eine dünne Hülle: Es lädt TOML, wendet CLI-Überschreibungen an, ruft `open_and_serve` auf, ruft optional `RegisterNode` an `--cell-manager` auf, liefert optional Prometheus-Text und ruft bei Strg-C `shutdown` auf.

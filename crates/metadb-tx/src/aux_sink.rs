@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::RwLock;
 
 use metadb_core::{
-    saturating_add_i64, FileId, HlcTimestamp, InodeId, MetaDbError, QuotaRecord, Result,
-    SecondaryIndexRecord, ShardId, UserId,
+    saturating_add_i64, FileId, HlcTimestamp, InodeId, QuotaRecord, Result, SecondaryIndexRecord,
+    ShardId, UserId,
 };
 use metadb_storage::{LifecycleStorageEngine, LogSequenceNumber, RaftLogPayload};
 

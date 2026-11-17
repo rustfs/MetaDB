@@ -534,16 +534,18 @@ impl PersistentMetaDbCluster {
         } else {
             config.node.grpc_listen_addr.clone()
         };
-        let listener = TcpListener::bind(&listen_addr).await?;
-        let bound_addr = listener.local_addr()?.to_string();
-        if let Some(prev) = &persisted_addr {
-            if &bound_addr != prev {
-                return Err(MetaDbError::ConsensusError(format!(
-                    "node {} is already a raft member at {prev}; refusing to listen on {bound_addr}",
-                    config.node.node_id
-                )));
+        let listener = match TcpListener::bind(&listen_addr).await {
+            Ok(listener) => listener,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse && persisted_addr.is_some() =>
+            {
+                // The saved port is busy. A sole voter can move; several voters cannot.
+                // `boot_local_shards` checks that after this bind.
+                TcpListener::bind(&config.node.grpc_listen_addr).await?
             }
-        }
+            Err(error) => return Err(error.into()),
+        };
+        let bound_addr = listener.local_addr()?.to_string();
 
         let clock = Arc::new(HybridLogicalClock::with_max_drift_ms(
             config.clock.max_clock_drift_ms,
@@ -563,6 +565,7 @@ impl PersistentMetaDbCluster {
             block_cache,
             clock.clone(),
         )?);
+        host.set_shared_secret(Some(config.security.shared_secret.clone()));
         let raft_router = host.router().clone();
         let directory_role = if cell_dir.join("CELL_MANAGER_STATE").exists() {
             DurableCellManager::inspect_directory(&cell_dir)?
@@ -637,7 +640,7 @@ impl PersistentMetaDbCluster {
                 "gRPC metadata, transaction, and control-plane services have no authentication or TLS. \
                  Default bind is 127.0.0.1. Do not expose this process to untrusted networks until \
                  [security].shared_secret or an external TLS terminator is configured. \
-                 RaftTransport on the same listener is also unauthenticated."
+                 RaftTransport on the same listener requires the same bearer when the secret is set."
             );
         }
         let grpc_handle =
@@ -863,9 +866,13 @@ fn spawn_grpc_server(
                 grpc_svc.clone(),
                 auth.clone(),
             ))
-            .add_service(ControlPlaneServiceServer::with_interceptor(grpc_svc, auth))
-            .add_service(RaftTransportServiceServer::new(
+            .add_service(ControlPlaneServiceServer::with_interceptor(
+                grpc_svc,
+                auth.clone(),
+            ))
+            .add_service(RaftTransportServiceServer::with_interceptor(
                 MultiRaftTransportServer::new(raft_router),
+                auth,
             ))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                 let _ = shutdown_rx.changed().await;

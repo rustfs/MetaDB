@@ -231,17 +231,6 @@ fn normalize_url(ep: &str) -> String {
     }
 }
 
-fn reject_app_error(
-    action: &str,
-    error: Option<metadb_proto::ErrorDetailProto>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(error) = error {
-        Err(format!("{action}: {}", error.message).into())
-    } else {
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     match run().await {
@@ -276,7 +265,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .get_routes(GetRoutesRequest { cell_id: 0 })
                 .await?
                 .into_inner();
-            reject_app_error("cluster status", resp.error)?;
+            check_error("get_routes", resp.error.as_ref())?;
             println!("Active Shards: {}", resp.shards.len());
             for s in resp.shards {
                 let ep = s.epoch.unwrap_or_default();
@@ -301,7 +290,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .get_routes(GetRoutesRequest { cell_id })
                         .await?
                         .into_inner();
-                    reject_app_error("shard list", resp.error)?;
+                    check_error("get_routes", resp.error.as_ref())?;
                     for s in resp.shards {
                         let ep = s.epoch.unwrap_or_default();
                         println!(
@@ -315,7 +304,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .trigger_shard_split(TriggerShardSplitRequest { shard_id })
                         .await?
                         .into_inner();
-                    reject_app_error("shard split", resp.error)?;
+                    if let Some(err) = resp.error {
+                        return Err(application_error("split", &err));
+                    }
                     println!(
                         "split_executed={} child_shard_id={}",
                         resp.split_executed, resp.child_shard_id
@@ -330,7 +321,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         })
                         .await?
                         .into_inner();
-                    reject_app_error("enable-dual-mode", resp.error)?;
+                    if let Some(err) = resp.error {
+                        return Err(application_error("enable_dual_mode", &err));
+                    }
                     println!(
                         "DualModeFineGrained enabled on shard {} (PID {})",
                         shard_id, pid
@@ -353,7 +346,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 })
                 .await?
                 .into_inner();
-            reject_app_error("scale-replicas", resp.error)?;
+            if let Some(err) = resp.error {
+                return Err(application_error("scale_replicas", &err));
+            }
             println!(
                 "Upgraded {} shard(s) to {}-Voter",
                 resp.upgraded_shards, target_voters
@@ -373,7 +368,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 })
                 .await?
                 .into_inner();
-            reject_app_error("cell register", resp.error)?;
+            if let Some(err) = resp.error {
+                return Err(application_error("register_cell", &err));
+            }
             println!("Registered Cell {}", cell_id);
         }
         Command::Sql { query } => {
@@ -386,24 +383,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 })
                 .await?
                 .into_inner();
-            reject_app_error("sql", resp.error)?;
-            if let Some(attr) = resp.single_attr {
-                println!(
-                    "InodeAttr(id={}, children={}, size_bytes={}, mode=0o{:o})",
-                    attr.inode_id, attr.num_children, attr.size_bytes, attr.mode
-                );
-            } else if !resp.entries.is_empty() {
-                for e in resp.entries {
-                    println!("Entry(pid={}, name='{}')", e.pid, e.name);
-                }
-            } else if let Some(q) = resp.single_quota {
-                println!(
-                    "Quota(uid={}, used_bytes={}, used_inodes={}, limit={})",
-                    q.uid, q.used_bytes, q.used_inodes, q.quota_limit_bytes
-                );
-            } else {
-                println!("OK");
-            }
+            check_error("sql", resp.error.as_ref())?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Command::Bench {
             workload,
@@ -417,118 +398,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } => {
             if embedded || workload == "mixed" {
                 run_embedded_bench(&profile, duration_secs, concurrency, keyspace, seed).await?;
-                return Ok(());
-            }
-            let concurrency = concurrency.unwrap_or(16);
-            if workload != "hotspot-create" && workload != "bulk-ttl-delete" {
-                return Err(format!(
-                    "unsupported --workload '{}': expected 'hotspot-create', 'bulk-ttl-delete', or 'mixed'",
-                    workload
-                )
-                .into());
-            }
-            let mut setup_client = open_meta(&url, &token).await?;
-            let bench_pid = if workload == "hotspot-create" {
-                999_000u64
             } else {
-                999_001u64
-            };
-            let _ = setup_client
-                .mkdir(MkdirRequest {
-                    header: None,
-                    pid: 1,
-                    name: format!("bench_{}", workload.replace('-', "_")),
-                    dir_id: bench_pid,
-                    uid: 1,
-                    mode: 0o755,
-                })
-                .await?;
-
-            let start = Instant::now();
-            let ops_per_task = (ops / concurrency.max(1)).max(1);
-            let mut handles = Vec::new();
-
-            for tid in 0..concurrency.max(1) {
-                let u = url.clone();
-                let token = token.clone();
-                handles.push(tokio::spawn(async move {
-                    let mut client = open_meta(&u, &token).await.unwrap();
-                    for i in 0..ops_per_task {
-                        let seq = (tid * ops_per_task + i) as u64;
-                        let _ = client
-                            .create_file(CreateFileRequest {
-                                header: None,
-                                pid: bench_pid,
-                                name: format!("f_{:04}_{:06}.dat", tid, i),
-                                inode_id: (1u64 << 63) | (100_000 + seq),
-                                fid: 500_000 + seq,
-                                uid: 1,
-                                mode: 0o644,
-                                size_bytes: 4096,
-                            })
-                            .await
-                            .unwrap();
-                    }
-                }));
-            }
-            for h in handles {
-                h.await?;
-            }
-            let total_done = concurrency.max(1) * ops_per_task;
-
-            if workload == "bulk-ttl-delete" {
-                let del_start = Instant::now();
-                let mut del_handles = Vec::new();
-                for tid in 0..concurrency.max(1) {
-                    let u = url.clone();
-                    let token = token.clone();
-                    del_handles.push(tokio::spawn(async move {
-                        let mut client = open_meta(&u, &token).await.unwrap();
-                        for i in 0..ops_per_task {
-                            let _ = client
-                                .unlink(UnlinkRequest {
-                                    header: None,
-                                    pid: bench_pid,
-                                    name: format!("f_{:04}_{:06}.dat", tid, i),
-                                })
-                                .await
-                                .unwrap();
-                        }
-                    }));
-                }
-                for h in del_handles {
-                    h.await?;
-                }
-                let scan_start = Instant::now();
-                let list_resp = setup_client
-                    .list_dir(ListDirRequest {
-                        header: None,
-                        pid: bench_pid,
-                        after_name: String::new(),
-                        name_prefix: String::new(),
-                        limit: 1000,
-                    })
-                    .await?
-                    .into_inner();
-                let scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
-                let del_elapsed = del_start.elapsed();
-                println!(
-                    "Completed {} bulk TTL deletes in {:.3}s ({:.0} ops/s); post-delete listdir ({} live) took {:.3} ms",
-                    total_done,
-                    del_elapsed.as_secs_f64(),
-                    total_done as f64 / del_elapsed.as_secs_f64(),
-                    list_resp.entries.len(),
-                    scan_ms
-                );
-            } else {
-                let elapsed = start.elapsed();
-                let qps = total_done as f64 / elapsed.as_secs_f64();
-                println!(
-                    "Completed {} single-directory hotspot creates in {:.3}s ({:.0} ops/s)",
-                    total_done,
-                    elapsed.as_secs_f64(),
-                    qps
-                );
+                run_benchmark(&url, &token, &workload, concurrency.unwrap_or(16), ops).await?;
             }
         }
     }

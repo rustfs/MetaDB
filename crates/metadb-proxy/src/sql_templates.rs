@@ -408,14 +408,12 @@ impl SqlTemplateParser {
                 c.expect_word("QUOTA_LIMIT_BYTES")?;
                 c.expect_token(&SqlToken::Eq)?;
                 let limit_2 = c.parse_u64_arg()?;
-                if limit_1 != limit_2 {
-                    return Err(MetaDbError::SqlParseError(
-                        "Template #17 requires VALUES quota_limit_bytes to equal the ON CONFLICT UPDATE value; SetQuotaLimit stores one absolute limit".to_string(),
-                    ));
-                }
-                Ok(MetadataSqlCommand::SetQuotaLimit {
+                // A missing row takes the INSERT value. An existing row takes the
+                // ON CONFLICT value. They are not collapsed into one absolute limit.
+                Ok(MetadataSqlCommand::UpsertQuotaLimit {
                     uid,
-                    quota_limit_bytes: limit_1,
+                    insert_quota_limit_bytes: limit_1,
+                    update_quota_limit_bytes: limit_2,
                 })
             }
             other => Err(MetaDbError::SqlParseError(format!(
@@ -757,25 +755,8 @@ mod tests {
          ON CONFLICT (uid) DO UPDATE SET quota_limit_bytes = ?";
 
     #[test]
-    fn template_17_requires_equal_insert_and_update_limits() {
+    fn template_17_keeps_distinct_insert_and_update_limits() {
         let cmd = SqlTemplateParser::parse_with_params(
-            SET_QUOTA,
-            &[
-                SqlParam::U64(77),
-                SqlParam::U64(9_000_000),
-                SqlParam::U64(9_000_000),
-            ],
-        )
-        .unwrap();
-        assert_eq!(
-            cmd,
-            MetadataSqlCommand::SetQuotaLimit {
-                uid: 77,
-                quota_limit_bytes: 9_000_000,
-            }
-        );
-
-        let err = SqlTemplateParser::parse_with_params(
             SET_QUOTA,
             &[
                 SqlParam::U64(77),
@@ -783,7 +764,14 @@ mod tests {
                 SqlParam::U64(1_000),
             ],
         )
-        .unwrap_err();
-        assert!(matches!(err, MetaDbError::SqlParseError(_)));
+        .unwrap();
+        assert_eq!(
+            cmd,
+            MetadataSqlCommand::UpsertQuotaLimit {
+                uid: 77,
+                insert_quota_limit_bytes: 9_000_000,
+                update_quota_limit_bytes: 1_000,
+            }
+        );
     }
 }

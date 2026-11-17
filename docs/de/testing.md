@@ -99,16 +99,15 @@ cargo run -p metadb-server --bin metadb-ctl -- \
   bench --workload bulk-ttl-delete --concurrency 16 --ops 1000
 ```
 
-Flags: `--workload` ist `hotspot-create` (die Vorgabe) oder `bulk-ttl-delete`. `--concurrency` ist Vorgabe 16. `--ops` ist Vorgabe 1000. Jede andere Workload-Zeichenkette ist ein Fehler.
+Flags: `--workload` ist `hotspot-create` (die Vorgabe), `bulk-ttl-delete` oder `mixed`. `--concurrency` ist 16, wenn es fehlt. `--ops` ist Vorgabe 1000. `--embedded` oder `--workload mixed` startet einen temporären All-in-one-Knoten und den prozessinternen Stress-Harness, statt `--endpoint` zu wählen.
 
-Verhalten aus `crates/metadb-server/src/bin/metadb-ctl.rs`:
+Verhalten aus `crates/metadb-server/src/bin/metadb-ctl.rs` für die entfernten Workloads:
 
-- Jede Aufgabe läuft `ops / concurrency` Iterationen, mindestens eine. Der Divisionsrest entfällt, daher kann die gedruckte Zahl kleiner als `--ops` sein. Ist `--ops` kleiner als `--concurrency`, kann die Zahl größer als `--ops` sein, weil jede Aufgabe trotzdem einmal läuft. Die gedruckte Zahl ist die Zahl der Versuche, nicht die Zahl angenommener Mutationen.
-- `hotspot-create` legt per mkdir Inode `999000` namens `bench_hotspot_create` unter Eltern-Inode `1` an und ruft dann `CreateFile` für Dateien von 4096 Bytes auf. Das mkdir-`Result` wird verworfen. `unwrap` gilt nur für das tonic-`Result`, daher beendet ein Transport- oder Statusfehler den Prozess. `CreateFile` liefert Anwendungsfehler wie `AlreadyExists` in einem OK-`CreateFileResponse.error`, und der Client verwirft dieses Feld.
-- `bulk-ttl-delete` tut dieselben Anlegevorgänge unter Inode `999001` (`bench_bulk_ttl_delete`), ruft `Unlink` auf dieselbe Weise auf (Transport-`unwrap`, Anwendungs-`error` ignoriert) und dann ein `ListDir` mit `limit = 1000`.
-- `hotspot-create` druckt `Completed <n> single-directory hotspot creates in <s>s (<ops/s> ops/s)` nach den Versuchen, auch nach Versuchen, deren Anwendungsfehler ignoriert wurde.
-- `bulk-ttl-delete` druckt die Zahl der Unlink-Versuche, Sekunden, ops/s, die von dieser Liste gelieferte Zahl lebender Einträge und die Listendauer in Millisekunden. Der Listenaufruf wird geprüft; die Unlinks nicht.
-- Der Client berechnet keine Latenzperzentile und prüft weder dirstat noch Quota. Ein zweiter Lauf gegen denselben Server kann weiter `Completed` und einen Durchsatz drucken, wenn jede Anlage mit `AlreadyExists` abgewiesen wird.
+- Der Client belegt eine Verzeichnis-ID und dann Datei-Inode- und Datei-ID-Blöcke der Länge `--ops`. Eine Zuteilung mit falscher Anzahl oder Überlauf wird abgelehnt.
+- Er druckt ein JSON-Objekt mit `bench_pid`, `workload` und `requested_ops` und legt danach so viele 4096-Byte-Dateien in einem neuen Verzeichnis an.
+- Jede Phase druckt JSON mit `attempted`, `succeeded`, `failed`, `transport_failed`, `application_failed`, `errors_by_kind` und Latenzperzentilen. Der Prozess endet mit einem Fehler, wenn `succeeded` nicht `--ops` ist.
+- `bulk-ttl-delete` entfernt die angelegten Namen und listet das Verzeichnis mit `limit = 1`.
+- Ein zweiter Lauf belegt eine neue `bench_pid`. Abgewiesene Anlegen gelten nicht als Erfolg.
 
 Eine Zahl aus diesem Befehl nicht als Repository-Ergebnis behandeln. Sie hängt von der Maschine, dem Build-Profil und dem angesprochenen Server ab. Dieser Baum zeichnet keine Stichprobe auf.
 

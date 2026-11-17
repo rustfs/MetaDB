@@ -277,7 +277,8 @@ impl DurableCellManager {
         let state_dir = state_dir.as_ref().to_path_buf();
         fs::create_dir_all(&state_dir)?;
         let state_path = state_dir.join("CELL_MANAGER_STATE");
-        let persisted = if state_path.exists() {
+        let state_existed = state_path.exists();
+        let persisted = if state_existed {
             let mut loaded = Self::load_state_file(&state_dir)?;
             loaded.nodes.insert(host.node_id(), local_addr);
             Self::write_state_file(&state_dir, &loaded)?;
@@ -288,6 +289,16 @@ impl DurableCellManager {
             Self::write_state_file(&state_dir, &init)?;
             init
         };
+        // Record the owner before membership adds peers. A later restart of this
+        // directory goes through `open_or_bootstrap`, which rejects a multi-peer
+        // cell directory that has no `CELL_OWNER`.
+        Self::verify_or_initialize_owner(
+            &state_dir,
+            host.node_id(),
+            cell_id,
+            &persisted,
+            state_existed,
+        )?;
         Ok(Arc::new(Self {
             cell_id,
             state_dir,

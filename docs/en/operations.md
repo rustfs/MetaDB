@@ -138,9 +138,9 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 - Quota cursor rows are written after the outbox lock is released, so a flush that already holds the memtable lock can still take the outbox lock.
 - Jumbo isolation is a route flag plus a node id chosen from the local node map. It does not evict other shards from a disk.
 - Heartbeats are an RPC with no sender in `metadbd`. `StoreHeartbeat` does not persist.
-- Raft on the public gRPC port is unauthenticated. The process does not terminate TLS.
+- A non-empty shared secret authenticates Raft on the public gRPC port with the same bearer as the other three services. An empty secret leaves Raft unauthenticated. The process does not terminate TLS.
 - `memtable_size_bytes` and all Raft timer fields do not change runtime behavior through TOML.
-- `metadb-ctl bench` reports throughput for attempts. `unwrap` catches transport or status failures only. Application errors such as `AlreadyExists` come back inside an OK response and are discarded, including on unlink, so a repeat run can still print a throughput. It does not check listing, dirstat, or quota after the run, and it does not print latency percentiles.
+- `metadb-ctl bench` for `hotspot-create` and `bulk-ttl-delete` prints JSON lines: a header with `bench_pid`, then phase reports with attempted, succeeded, failed, and latency percentiles. The process exits non-zero unless every requested operation succeeds. `--workload mixed` or `--embedded` runs the in-process stress harness. `sql` prints the response as JSON and exits non-zero on an application error.
 
 ## Documentation gaps
 

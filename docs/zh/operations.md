@@ -135,9 +135,9 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 - 未知且非零的 `cell_id` 上，`GetRoutes` 失败关闭。`StoreHeartbeat` 不会替换缓存路由。
 - 巨型隔离是路由标志加上从本地节点表选出的节点标识。它不会把其他分片从磁盘上赶走。
 - 心跳是一个 RPC，`metadbd` 里没有发送方。`StoreHeartbeat` 不持久化。
-- 公开 gRPC 端口上的 Raft 不认证。进程不终结 TLS。
+- 非空共享密钥用与另外三个服务相同的持有者令牌认证公开 gRPC 端口上的 Raft。空密钥下 Raft 仍然不认证。进程不终结 TLS。
 - `memtable_size_bytes` 和所有 Raft 计时字段不会通过 TOML 改变运行行为。
-- `metadb-ctl bench` 报告的是尝试的吞吐量。`unwrap` 只抓住传输或状态失败。`AlreadyExists` 这类应用错误放在 OK 响应里并被丢掉，unlink 也一样，因此再跑一次仍可能打印吞吐量。它不在运行后检查列举、dirstat 或配额，也不打印延迟分位数。
+- `hotspot-create` 和 `bulk-ttl-delete` 的 `metadb-ctl bench` 打印 JSON 行：先是带 `bench_pid` 的头，然后是包含 attempted、succeeded、failed 和延迟分位数的阶段报告。只要有一次请求的操作失败，进程就以非零状态退出。`--workload mixed` 或 `--embedded` 运行进程内的压力工具。`sql` 把响应打印成 JSON，遇到应用错误时以非零状态退出。
 
 ## 文档缺口
 

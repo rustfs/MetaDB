@@ -21,6 +21,8 @@ pub const CELL_FILE_ID_BLOCK_SIZE: u64 = 4_096;
 pub const CELL_DIR_AFFINITY_BLOCK_SIZE: u64 = 256;
 pub const GLOBAL_SHARD_ID_BLOCK_SIZE: u64 = 1_024;
 const MAX_CACHED_GRANT_UUIDS: usize = 4_096;
+const ALLOCATOR_FORMAT_MAGIC: &[u8; 8] = b"MIDA0002";
+const ALLOCATOR_HEADER_LEN: usize = 41;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AllocIdKind {
@@ -70,9 +72,69 @@ impl Default for PersistedAllocatorState {
     }
 }
 
+#[derive(Deserialize)]
+struct LegacyAllocatorState {
+    next_file_inode_seq: u64,
+    next_dir_inode_id: InodeId,
+    next_file_id: FileId,
+    next_shard_id: ShardId,
+    rename_fence_token: u64,
+    active_rename_lease: Option<(u64, HlcTimestamp)>,
+    recent_grants: BTreeMap<u128, (u64, u64)>,
+    grant_fifo: VecDeque<u128>,
+}
+
+fn decode_allocator_state(body: &[u8]) -> Result<PersistedAllocatorState> {
+    if body.starts_with(ALLOCATOR_FORMAT_MAGIC) {
+        if body.len() < ALLOCATOR_HEADER_LEN
+            || body[8..40].iter().any(|byte| *byte != 0)
+            || body[40] != 0xff
+        {
+            return Err(MetaDbError::CodecError(
+                "invalid allocator version 2 header".to_string(),
+            ));
+        }
+        return bincode::deserialize(&body[ALLOCATOR_HEADER_LEN..])
+            .map_err(|e| MetaDbError::CodecError(e.to_string()));
+    }
+    if let Ok(current) = bincode::deserialize::<PersistedAllocatorState>(body) {
+        return Ok(current);
+    }
+    let old: LegacyAllocatorState = bincode::deserialize(body)
+        .map_err(|e| MetaDbError::CodecError(format!("ID_ALLOCATOR_STATE: {e}")))?;
+    // Legacy tuples do not record the ID kind. Keep the UUID so a replay is
+    // rejected, and keep the counters so new grants do not reuse those IDs.
+    let recent_grants = old
+        .recent_grants
+        .into_iter()
+        .map(|(uuid, (start, _))| {
+            (
+                uuid,
+                CachedIdGrant {
+                    kind: AllocIdKind::FileId,
+                    start,
+                    count: 0,
+                },
+            )
+        })
+        .collect();
+    Ok(PersistedAllocatorState {
+        next_file_inode_seq: old.next_file_inode_seq,
+        next_dir_inode_id: old.next_dir_inode_id,
+        next_file_id: old.next_file_id,
+        next_shard_id: old.next_shard_id,
+        rename_fence_token: old.rename_fence_token,
+        active_rename_lease: old.active_rename_lease,
+        recent_grants,
+        grant_fifo: old.grant_fifo,
+        next_client_seq: 1,
+    })
+}
+
 /// Crash-safe persistent ID & lease allocator enforcing **Write-Before-Grant** (`Resolution B18`).
 pub struct DurableIdAllocator {
     state_dir: PathBuf,
+    _lock_file: File,
     state: Mutex<PersistedAllocatorState>,
     /// Test hook: the next `n` persists fail before any byte is written.
     fail_persists: AtomicU32,
@@ -82,12 +144,30 @@ impl DurableIdAllocator {
     pub fn open(state_dir: impl AsRef<Path>) -> Result<Self> {
         let state_dir = state_dir.as_ref().to_path_buf();
         fs::create_dir_all(&state_dir)?;
+        let had_existing_files = fs::read_dir(&state_dir)?.next().transpose()?.is_some();
+        let lock_path = state_dir.join("LOCK");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        lock_file.try_lock().map_err(|e| {
+            MetaDbError::StorageIoError(format!(
+                "failed to acquire exclusive allocator lock on {}: {e}",
+                lock_path.display()
+            ))
+        })?;
         let path = state_dir.join("ID_ALLOCATOR_STATE");
         let state = if path.exists() {
             let mut raw = Vec::new();
             File::open(&path)?.read_to_end(&mut raw)?;
             let body = verify_crc32c_le(&raw, "ID_ALLOCATOR_STATE")?;
-            bincode::deserialize(body).map_err(|e| MetaDbError::CodecError(e.to_string()))?
+            decode_allocator_state(body)?
+        } else if had_existing_files {
+            return Err(MetaDbError::StorageIoError(
+                "ID_ALLOCATOR_STATE is missing from an existing allocator directory".to_string(),
+            ));
         } else {
             let init = PersistedAllocatorState::default();
             Self::write_state_file(&state_dir, &init)?;
@@ -95,6 +175,7 @@ impl DurableIdAllocator {
         };
         Ok(Self {
             state_dir,
+            _lock_file: lock_file,
             state: Mutex::new(state),
             fail_persists: AtomicU32::new(0),
         })
@@ -114,8 +195,7 @@ impl DurableIdAllocator {
         let mut raw = Vec::new();
         File::open(&path)?.read_to_end(&mut raw)?;
         let body = verify_crc32c_le(&raw, "ID_ALLOCATOR_STATE")?;
-        let st: PersistedAllocatorState =
-            bincode::deserialize(body).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        let st = decode_allocator_state(body)?;
         Ok(st.recent_grants.contains_key(&request_uuid))
     }
 
@@ -138,6 +218,12 @@ impl DurableIdAllocator {
                         cached.kind
                     )));
                 }
+                if cached.count != count {
+                    return Err(MetaDbError::StorageIoError(format!(
+                        "request uuid {request_uuid:#x} already granted {} ids, refused for count {count}",
+                        cached.count
+                    )));
+                }
                 return Ok((cached.start, cached.count));
             }
         }
@@ -147,9 +233,12 @@ impl DurableIdAllocator {
             match kind {
                 AllocIdKind::FileInode => {
                     let s = next.next_file_inode_seq;
-                    next.next_file_inode_seq =
-                        next.next_file_inode_seq.checked_add(count).ok_or_else(|| {
-                            MetaDbError::StorageIoError("file inode seq overflow".to_string())
+                    next.next_file_inode_seq = next
+                        .next_file_inode_seq
+                        .checked_add(count)
+                        .filter(|end| *end <= metadb_core::FILE_INODE_TAG_BIT)
+                        .ok_or_else(|| {
+                            MetaDbError::StorageIoError("file inode bitspace exhausted".to_string())
                         })?;
                     make_file_inode_id(s)
                 }
@@ -233,7 +322,11 @@ impl DurableIdAllocator {
         let mut next = guard.clone();
         next.rename_fence_token = next.rename_fence_token.saturating_add(1);
         let token = next.rename_fence_token;
-        let expire_hlc = HlcTimestamp::new(now_hlc.physical_ms() + ttl_ms.max(100), 0);
+        let expire_ms = now_hlc
+            .physical_ms()
+            .checked_add(ttl_ms.max(100))
+            .ok_or_else(|| MetaDbError::StorageIoError("rename lease TTL overflow".to_string()))?;
+        let expire_hlc = HlcTimestamp::new(expire_ms, 0);
         next.active_rename_lease = Some((token, expire_hlc));
         self.persist_sync(&next)?;
         *guard = next;
@@ -264,7 +357,12 @@ impl DurableIdAllocator {
     }
 
     fn write_state_file(dir: &Path, st: &PersistedAllocatorState) -> Result<()> {
-        let mut raw = bincode::serialize(st).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        let payload = bincode::serialize(st).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        let mut raw = Vec::with_capacity(ALLOCATOR_HEADER_LEN + payload.len());
+        raw.extend_from_slice(ALLOCATOR_FORMAT_MAGIC);
+        raw.extend(std::iter::repeat_n(0u8, 32));
+        raw.push(0xff);
+        raw.extend_from_slice(&payload);
         append_crc32c_le(&mut raw);
         let tmp = dir.join("ID_ALLOCATOR_STATE.tmp");
         let dst = dir.join("ID_ALLOCATOR_STATE");
@@ -286,7 +384,7 @@ impl DurableIdAllocator {
 #[derive(Default)]
 struct LocalBlockCursor {
     next: u64,
-    end: u64,
+    remaining: u64,
 }
 
 /// Fast local consumer buffer leasing blocks from `DurableIdAllocator` with zero per-file disk I/O.
@@ -313,52 +411,57 @@ impl LocalIdBuffer {
         self.allocator.next_client_request_uuid(self.node_id)
     }
 
+    fn take_next(g: &mut LocalBlockCursor) -> Result<u64> {
+        let id = g.next;
+        g.remaining -= 1;
+        if g.remaining > 0 {
+            g.next = g.next.checked_add(1).ok_or_else(|| {
+                MetaDbError::StorageIoError("local ID cursor overflow".to_string())
+            })?;
+        }
+        Ok(id)
+    }
+
     pub fn next_file_inode_id(&self) -> Result<InodeId> {
         let mut g = self.file_inodes.lock().unwrap();
-        if g.next >= g.end {
+        if g.remaining == 0 {
             let (start, count) = self.allocator.allocate_block(
                 self.next_uuid()?,
                 AllocIdKind::FileInode,
                 CELL_FILE_ID_BLOCK_SIZE,
             )?;
             g.next = start;
-            g.end = start + count;
+            g.remaining = count;
         }
-        let id = g.next;
-        g.next += 1;
-        Ok(id)
+        Self::take_next(&mut g)
     }
 
     pub fn next_dir_inode_id(&self) -> Result<InodeId> {
         let mut g = self.dir_inodes.lock().unwrap();
-        if g.next >= g.end {
+        if g.remaining == 0 {
             let (start, count) = self.allocator.allocate_block(
                 self.next_uuid()?,
                 AllocIdKind::DirInode,
                 CELL_DIR_AFFINITY_BLOCK_SIZE,
             )?;
             g.next = start;
-            g.end = start + count;
+            g.remaining = count;
         }
-        let id = g.next;
-        g.next += 1;
-        Ok(id)
+        Self::take_next(&mut g)
     }
 
     pub fn next_file_id(&self) -> Result<FileId> {
         let mut g = self.file_ids.lock().unwrap();
-        if g.next >= g.end {
+        if g.remaining == 0 {
             let (start, count) = self.allocator.allocate_block(
                 self.next_uuid()?,
                 AllocIdKind::FileId,
                 CELL_FILE_ID_BLOCK_SIZE,
             )?;
             g.next = start;
-            g.end = start + count;
+            g.remaining = count;
         }
-        let id = g.next;
-        g.next += 1;
-        Ok(id)
+        Self::take_next(&mut g)
     }
 }
 

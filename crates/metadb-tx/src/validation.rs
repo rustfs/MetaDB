@@ -2,9 +2,7 @@ use metadb_core::{is_dir_inode_id, InodeId, MetaDbError, Result, ROOT_INODE_ID};
 
 pub(crate) fn validate_size(size: i64) -> Result<()> {
     if size < 0 {
-        return Err(MetaDbError::CodecError(
-            "size_bytes must be nonnegative".into(),
-        ));
+        return Err(MetaDbError::InvalidFileSize(size));
     }
     Ok(())
 }

@@ -71,9 +71,9 @@ Der Prozess beendet TLS nicht.
 
 Wenn `shared_secret` nicht leer ist, verlangen `MetadataService`, `TransactionService` und `ControlPlaneService`, dass der Metadatenwert `authorization` gleich `Bearer <shared_secret>` ist. `metadb-ctl --auth-token` (Umgebungsvariable `METADB_AUTH_TOKEN`) sendet diesen Header. `metadbd --cell-manager` sendet dasselbe Geheimnis, wenn es `RegisterNode` aufruft.
 
-`RaftTransportService` wird ohne den Interceptor registriert. Ein Bearer-Token authentifiziert Raft-RPCs auf diesem Port nicht.
+`RaftTransportService` verwendet denselben Interceptor. Ein nicht leeres Geheimnis verlangt auch für Raft-RPCs auf diesem Port `Bearer <shared_secret>`.
 
-Ein leeres Geheimnis lässt Metadaten-, Transaktions- und Control-Plane-RPCs zu. Der Code warnt beim Start davor. Ein Bearer-Geheimnis deckt `RaftTransportService` nicht ab, und ein TLS-Terminator vor dem Listener fügt diese Prüfung nicht hinzu: nach der Terminierung bleiben Raft-RPCs unauthentifiziert. Bevor ein nicht vertrauenswürdiger Client den Port erreichen kann, die Bindung auf einem vertrauenswürdigen Netz wie `127.0.0.1` lassen, oder jeden Dienst hinter einen Proxy setzen, der den Client authentifiziert (zum Beispiel gegenseitiges TLS), und den direkten Zugriff auf diesen Prozess sperren.
+Ein leeres Geheimnis lässt alle vier Dienste auf dem Listener zu. Der Code warnt beim Start davor. Der Prozess beendet TLS weiterhin nicht. Bevor ein nicht vertrauenswürdiger Client den Port erreichen kann, die Bindung auf einem vertrauenswürdigen Netz wie `127.0.0.1` lassen, oder jeden Dienst hinter einen Proxy setzen, der den Client authentifiziert (zum Beispiel gegenseitiges TLS), und den direkten Zugriff auf diesen Prozess sperren.
 
 ## Was sich nicht konfigurieren lässt
 

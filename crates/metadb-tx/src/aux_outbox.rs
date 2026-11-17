@@ -100,16 +100,12 @@ impl ReplicatedAttrAggregator {
                     && d.raft_index <= cut.max_raft_index
                     && d.hlc <= cut.max_hlc
                 {
-                    base.num_children = saturating_add_i64(
-                        base.num_children,
-                        clamp_delta_to_i64(d.delta_children),
-                    )
-                    .max(0);
-                    base.size_bytes = saturating_add_i64(
-                        base.size_bytes,
-                        clamp_delta_to_i64(d.delta_bytes),
-                    )
-                    .max(0);
+                    base.num_children =
+                        saturating_add_i64(base.num_children, clamp_delta_to_i64(d.delta_children))
+                            .max(0);
+                    base.size_bytes =
+                        saturating_add_i64(base.size_bytes, clamp_delta_to_i64(d.delta_bytes))
+                            .max(0);
                     if d.hlc > base.modify_time {
                         base.modify_time = d.hlc;
                     }
@@ -136,16 +132,12 @@ impl ReplicatedAttrAggregator {
                     && d.raft_index <= cut.max_raft_index
                     && d.hlc <= cut.max_hlc
                 {
-                    base.num_children = saturating_add_i64(
-                        base.num_children,
-                        clamp_delta_to_i64(d.delta_children),
-                    )
-                    .max(0);
-                    base.size_bytes = saturating_add_i64(
-                        base.size_bytes,
-                        clamp_delta_to_i64(d.delta_bytes),
-                    )
-                    .max(0);
+                    base.num_children =
+                        saturating_add_i64(base.num_children, clamp_delta_to_i64(d.delta_children))
+                            .max(0);
+                    base.size_bytes =
+                        saturating_add_i64(base.size_bytes, clamp_delta_to_i64(d.delta_bytes))
+                            .max(0);
                     if d.hlc > base.modify_time {
                         base.modify_time = d.hlc;
                     }
@@ -204,18 +196,15 @@ impl ReplicatedAttrAggregator {
                 let mut changed = false;
                 let baseline = attr.applied_lsn;
                 for d in queue {
-                    if d.raft_index > attr.applied_lsn && d.raft_index <= sealed_raft_index {
-                        attr.num_children =
-                            saturating_add_i64(
-                                attr.num_children,
-                                clamp_delta_to_i64(d.delta_children),
-                            )
-                            .max(0);
-                        attr.size_bytes = saturating_add_i64(
-                            attr.size_bytes,
-                            clamp_delta_to_i64(d.delta_bytes),
+                    if d.raft_index > baseline && d.raft_index <= sealed_raft_index {
+                        attr.num_children = saturating_add_i64(
+                            attr.num_children,
+                            clamp_delta_to_i64(d.delta_children),
                         )
                         .max(0);
+                        attr.size_bytes =
+                            saturating_add_i64(attr.size_bytes, clamp_delta_to_i64(d.delta_bytes))
+                                .max(0);
                         if d.hlc > attr.modify_time {
                             attr.modify_time = d.hlc;
                         }
@@ -236,18 +225,15 @@ impl ReplicatedAttrAggregator {
                 let mut changed = false;
                 let baseline = sub.applied_raft_index;
                 for d in queue {
-                    if d.raft_index > sub.applied_raft_index && d.raft_index <= sealed_raft_index {
-                        sub.num_children =
-                            saturating_add_i64(
-                                sub.num_children,
-                                clamp_delta_to_i64(d.delta_children),
-                            )
-                            .max(0);
-                        sub.size_bytes = saturating_add_i64(
-                            sub.size_bytes,
-                            clamp_delta_to_i64(d.delta_bytes),
+                    if d.raft_index > baseline && d.raft_index <= sealed_raft_index {
+                        sub.num_children = saturating_add_i64(
+                            sub.num_children,
+                            clamp_delta_to_i64(d.delta_children),
                         )
                         .max(0);
+                        sub.size_bytes =
+                            saturating_add_i64(sub.size_bytes, clamp_delta_to_i64(d.delta_bytes))
+                                .max(0);
                         if d.hlc > sub.modify_time {
                             sub.modify_time = d.hlc;
                         }

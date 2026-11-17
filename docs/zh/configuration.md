@@ -71,9 +71,9 @@ shared_secret = "replace-with-a-long-random-string"
 
 `shared_secret` 非空时，`MetadataService`、`TransactionService` 和 `ControlPlaneService` 要求元数据 `authorization` 等于 `Bearer <shared_secret>`。`metadb-ctl --auth-token`（环境变量 `METADB_AUTH_TOKEN`）发送这个头。`metadbd --cell-manager` 在调用 `RegisterNode` 时发送同一密钥。
 
-`RaftTransportService` 注册时没有拦截器。持有者令牌不能认证该端口上的 Raft RPC。
+`RaftTransportService` 使用同一个拦截器。密钥非空时，该端口上的 Raft RPC 同样要求 `Bearer <shared_secret>`。
 
-空密钥允许元数据、事务和控制面 RPC。代码在启动时对此发出警告。持有者密钥不覆盖 `RaftTransportService`，在监听器前面终结 TLS 也不会补上这项检查：终结之后，Raft RPC 仍然不认证。在不可信客户端能够到达该端口之前，把绑定留在 `127.0.0.1` 这类可信网络上，或把每个服务放到会认证客户端的代理后面（例如双向 TLS），并阻断对本进程的直接访问。
+空密钥允许该监听器上的四个服务。代码在启动时对此发出警告。进程仍然不终结 TLS。在不可信客户端能够到达该端口之前，把绑定留在 `127.0.0.1` 这类可信网络上，或把每个服务放到会认证客户端的代理后面（例如双向 TLS），并阻断对本进程的直接访问。
 
 ## 不能配置的内容
 

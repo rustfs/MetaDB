@@ -13,7 +13,8 @@ fn wire_identifier_lengths_and_key_prefixes_are_checked() {
         assert_eq!(decode_optional_u128_be(&bytes).is_ok(), n == 0 || n == 16);
         assert_eq!(ShardEpoch::decode(&bytes).is_ok(), n == 16);
     }
-    for prefix in [0x00, 0x08, 0xff] {
+    // 0x08 is the quota-origin cursor and stays on its origin shard (`Ok(None)`).
+    for prefix in [0x00, 0x09, 0xff] {
         let mut raw = vec![0; 9];
         raw[0] = prefix;
         assert!(MetaKey::decode(&raw).is_err());

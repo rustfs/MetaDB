@@ -64,7 +64,7 @@ cargo run -p metadb-server --bin metadbd -- --config ./standalone.toml
 
 Logs use `tracing-subscriber`'s `EnvFilter`. The default filter is `info`. Override it with the standard `RUST_LOG` variable, for example `RUST_LOG=debug`.
 
-On startup with an empty `security.shared_secret`, the process logs a warning that gRPC has no authentication and no TLS. The default bind is `127.0.0.1`. Do not publish that socket on an untrusted network. `[security].shared_secret` authenticates metadata, transaction, and control-plane RPCs only. `RaftTransportService` on the same port has no interceptor, so a bearer token does not cover it, and terminating TLS in front of the listener does not add that check. Keep the listener on a trusted network, or put every service, including Raft, behind a proxy that authenticates clients and block direct access to this process.
+On startup with an empty `security.shared_secret`, the process logs a warning that gRPC has no authentication and no TLS. The default bind is `127.0.0.1`. Do not publish that socket on an untrusted network. A non-empty `[security].shared_secret` requires the same bearer on metadata, transaction, control-plane, and Raft transport RPCs. The process still does not terminate TLS. Keep the listener on a trusted network, or put every service behind a proxy that authenticates clients and block direct access to this process.
 
 Ctrl-C flushes shard state and stops the OpenRaft groups (`cluster.shutdown()`).
 

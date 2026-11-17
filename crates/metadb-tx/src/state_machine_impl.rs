@@ -1359,9 +1359,24 @@ impl TxStateMachineHandler {
                             )? {
                                 continue; // Exact-once duplicate replay suppressed.
                             }
-                            rec.used_bytes = saturating_add_i64(rec.used_bytes, delta_bytes).max(0);
-                            rec.used_inodes =
-                                saturating_add_i64(rec.used_inodes, delta_inodes).max(0);
+                            // Keep the exact sum, including a temporary negative, so a
+                            // later delta from another origin can cancel it. Overflow
+                            // rejects the whole batch before anything in it is written.
+                            // Readers clamp a negative balance to zero.
+                            let new_bytes =
+                                rec.used_bytes.checked_add(delta_bytes).ok_or_else(|| {
+                                    MetaDbError::CodecError(format!(
+                                        "quota byte delta overflow for uid {uid}"
+                                    ))
+                                })?;
+                            let new_inodes =
+                                rec.used_inodes.checked_add(delta_inodes).ok_or_else(|| {
+                                    MetaDbError::CodecError(format!(
+                                        "quota inode delta overflow for uid {uid}"
+                                    ))
+                                })?;
+                            rec.used_bytes = new_bytes;
+                            rec.used_inodes = new_inodes;
                             rec.last_applied_hlc = rec.last_applied_hlc.max(item.hlc);
                             rec.applied_by_shard
                                 .insert(item.origin_shard_id, cur_cursor);
