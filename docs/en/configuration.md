@@ -2,7 +2,7 @@
 
 [Overview](./README.md) · [Français](../fr/configuration.md) · [Deutsch](../de/configuration.md) · [日本語](../ja/configuration.md) · [简体中文](../zh/configuration.md)
 
-`metadbd --config` and `ServerTomlConfig::from_toml_file` / `from_toml_str` read TOML (`crates/metadb-server/src/config.rs`). Unknown keys that do not name a secret or TLS setting are ignored. A misspelled `shared_secret`, a token or password key, or any TLS or certificate key is rejected and startup does not proceed. Every known section is optional. Omitted fields take the defaults below.
+`metadbd --config` and `ServerTomlConfig::from_toml_file` / `from_toml_str` read TOML (`crates/metadb-server/src/config.rs`). Unknown keys that do not name a secret or TLS setting are ignored. A misspelled `shared_secret`, a token or password key, or any TLS or certificate key is rejected and startup does not proceed, including those keys nested in tables or arrays. `[security].shared_secret` is accepted only as a direct key of the root `[security]` table. Every known section is optional. Omitted fields take the defaults below.
 
 ## Defaults
 

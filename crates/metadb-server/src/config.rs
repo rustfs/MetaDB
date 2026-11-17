@@ -268,36 +268,56 @@ fn security_key_error(key: &str) -> MetaDbError {
     }
 }
 
-const KNOWN_SECTIONS: &[&str] = &[
-    "node", "clock", "storage", "sharding", "security", "cluster",
-];
-
 fn reject_unsupported_security_keys(value: &toml::Value) -> Result<()> {
     let Some(root) = value.as_table() else {
         return Err(MetaDbError::CodecError(
             "TOML config must be a table".to_string(),
         ));
     };
+    if let Some(security) = root.get("security") {
+        let Some(table) = security.as_table() else {
+            return Err(MetaDbError::CodecError(
+                "refusing to start: [security] must be a table. The only accepted security key is [security].shared_secret".to_string(),
+            ));
+        };
+        for (key, child) in table {
+            if key != "shared_secret" {
+                return Err(security_key_error(key));
+            }
+            // The secret value itself must not smuggle a nested TLS or secret table.
+            reject_nested_security_keys(child)?;
+        }
+    }
     for (key, child) in root {
-        if !KNOWN_SECTIONS.contains(&key.as_str()) && (is_tls_key(key) || is_secret_key(key)) {
+        if key == "security" {
+            continue;
+        }
+        if is_tls_key(key) || is_secret_key(key) {
             return Err(security_key_error(key));
         }
-        let Some(table) = child.as_table() else {
-            continue;
-        };
-        if key == "security" {
-            for sub in table.keys() {
-                if sub != "shared_secret" {
-                    return Err(security_key_error(sub));
+        reject_nested_security_keys(child)?;
+    }
+    Ok(())
+}
+
+/// Rejects secret and TLS keys anywhere except the direct `[security].shared_secret` field.
+/// Tables and arrays are walked, including `[node.transport]` and `[[listeners]]`.
+fn reject_nested_security_keys(value: &toml::Value) -> Result<()> {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, child) in table {
+                if is_tls_key(key) || is_secret_key(key) {
+                    return Err(security_key_error(key));
                 }
-            }
-            continue;
-        }
-        for sub in table.keys() {
-            if is_tls_key(sub) || is_secret_key(sub) {
-                return Err(security_key_error(sub));
+                reject_nested_security_keys(child)?;
             }
         }
+        toml::Value::Array(items) => {
+            for item in items {
+                reject_nested_security_keys(item)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -412,6 +432,36 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("does not terminate TLS"));
+
+        let nested = ServerTomlConfig::from_toml_str(
+            r#"
+            [node]
+            grpc_listen_addr = "0.0.0.0:7800"
+            [node.transport]
+            tls_cert_file = "/tmp/cert.pem"
+            [security]
+            shared_secret = "secret"
+            "#,
+        );
+        let nested_err = nested.unwrap_err().to_string();
+        assert!(
+            nested_err.contains("does not terminate TLS"),
+            "{nested_err}"
+        );
+
+        let listeners = ServerTomlConfig::from_toml_str(
+            r#"
+            [[listeners]]
+            tls = true
+            [security]
+            shared_secret = "secret"
+            "#,
+        );
+        let listeners_err = listeners.unwrap_err().to_string();
+        assert!(
+            listeners_err.contains("does not terminate TLS"),
+            "{listeners_err}"
+        );
 
         let cfg = ServerTomlConfig::from_toml_str(
             r#"
