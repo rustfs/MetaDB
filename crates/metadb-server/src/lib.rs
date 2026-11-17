@@ -841,59 +841,6 @@ impl PersistentMetaDbCluster {
     }
 }
 
-#[cfg(test)]
-mod auth_tests {
-    use super::*;
-    use tonic::metadata::MetadataValue;
-
-    fn authorization(req: &Request<()>) -> Option<String> {
-        req.metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-    }
-
-    #[test]
-    fn server_requires_exact_bearer_and_client_attaches_it() {
-        let mut server = BearerAuth::new("s3cr3t");
-        assert!(server.call(Request::new(())).is_err());
-
-        let mut prefix = Request::new(());
-        prefix.metadata_mut().insert(
-            "authorization",
-            MetadataValue::try_from("Bearer s3cr3").unwrap(),
-        );
-        assert!(server.call(prefix).is_err());
-
-        let mut extra = Request::new(());
-        extra.metadata_mut().insert(
-            "authorization",
-            MetadataValue::try_from("Bearer s3cr3t-extra").unwrap(),
-        );
-        assert!(server.call(extra).is_err());
-
-        let mut client = BearerAuthClient::new("s3cr3t");
-        let outgoing = client.call(Request::new(())).unwrap();
-        assert_eq!(authorization(&outgoing).as_deref(), Some("Bearer s3cr3t"));
-
-        let mut inbound = Request::new(());
-        inbound.metadata_mut().insert(
-            "authorization",
-            outgoing.metadata().get("authorization").unwrap().clone(),
-        );
-        assert!(server.call(inbound).is_ok());
-    }
-
-    #[test]
-    fn empty_secret_allows_calls_and_adds_no_header() {
-        let mut server = BearerAuth::new("");
-        assert!(server.call(Request::new(())).is_ok());
-        let mut client = BearerAuthClient::new("");
-        let outgoing = client.call(Request::new(())).unwrap();
-        assert!(authorization(&outgoing).is_none());
-    }
-}
-
 fn spawn_grpc_server(
     listener: TcpListener,
     grpc_svc: MetaDbGrpcService,
@@ -1150,4 +1097,57 @@ async fn finish_resumed_join(
     }
     cell_manager.install_joined_membership(joined_routes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use tonic::metadata::MetadataValue;
+
+    fn authorization(req: &Request<()>) -> Option<String> {
+        req.metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn server_requires_exact_bearer_and_client_attaches_it() {
+        let mut server = BearerAuth::new("s3cr3t");
+        assert!(server.call(Request::new(())).is_err());
+
+        let mut prefix = Request::new(());
+        prefix.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from("Bearer s3cr3").unwrap(),
+        );
+        assert!(server.call(prefix).is_err());
+
+        let mut extra = Request::new(());
+        extra.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from("Bearer s3cr3t-extra").unwrap(),
+        );
+        assert!(server.call(extra).is_err());
+
+        let mut client = BearerAuthClient::new("s3cr3t");
+        let outgoing = client.call(Request::new(())).unwrap();
+        assert_eq!(authorization(&outgoing).as_deref(), Some("Bearer s3cr3t"));
+
+        let mut inbound = Request::new(());
+        inbound.metadata_mut().insert(
+            "authorization",
+            outgoing.metadata().get("authorization").unwrap().clone(),
+        );
+        assert!(server.call(inbound).is_ok());
+    }
+
+    #[test]
+    fn empty_secret_allows_calls_and_adds_no_header() {
+        let mut server = BearerAuth::new("");
+        assert!(server.call(Request::new(())).is_ok());
+        let mut client = BearerAuthClient::new("");
+        let outgoing = client.call(Request::new(())).unwrap();
+        assert!(authorization(&outgoing).is_none());
+    }
 }
