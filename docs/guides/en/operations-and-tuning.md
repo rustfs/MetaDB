@@ -68,7 +68,7 @@ cargo test -p metadb-server --test topology_distributed three_voter_leader_loss_
 | Parameter | Default | Tuning Guidance |
 | :--- | :--- | :--- |
 | `mvcc_retention_ms` | `5000` (`5s`) | Controls how long in-memory MVCC versions are retained for active `SnapshotGuard`s and write coalescing. Keep at `3000–5000ms`; never run multi-second scans in a single snapshot—use cursor-paginated `ListDir` (SQL Template #10). |
-| `memtable_size_bytes` | `32 MiB` | Reserved compatibility setting; changing it does not currently control sealing or backpressure. |
+| `memtable_size_bytes` | `32 MiB` | Active memtable budget. Crossing it seals and flushes. `max_imm_memtables` (default 4) makes writers wait instead of queueing more immutable tables. |
 | `block_cache_bytes` | `64 MiB` | Set to `25%–40%` of host RAM on dedicated BE nodes so SSTable `IndexBlock`, `FilterBlock`, and hot directory `DataBlock`s stay memory-resident across the 16 LRU cache shards. |
 | `locality_tombstone_threshold` | `128` | Number of physical LSM tombstones in a single 9-byte `[table_prefix][PID]` bucket (combined with `locality_tombstone_ratio >= 0.50`) that triggers targeted bottommost range compaction. Lower to `64` for latency-sensitive `listdir` workloads under heavy TTL deletion. |
 

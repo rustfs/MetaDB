@@ -229,6 +229,40 @@ impl DataBlock {
         Ok(())
     }
 
+    /// Byte offset of the restart point that may contain `start_key`.
+    /// An empty `start_key` selects the first restart.
+    pub(crate) fn restart_offset_for(&self, start_key: &[u8]) -> Result<usize> {
+        if start_key.is_empty() || self.restarts.is_empty() {
+            return Ok(self.restarts.first().copied().unwrap_or(0) as usize);
+        }
+        let mut left = 0usize;
+        let mut right = self.restarts.len();
+        while left + 1 < right {
+            let mid = left + (right - left) / 2;
+            let restart_key = self.decode_restart_key(self.restarts[mid] as usize)?;
+            if restart_key.as_slice() <= start_key {
+                left = mid;
+            } else {
+                right = mid;
+            }
+        }
+        Ok(self.restarts[left] as usize)
+    }
+
+    /// Decodes the entry at `offset`, advancing `offset` and `key`.
+    /// Returns `None` at the end of the block.
+    pub(crate) fn read_entry(
+        &self,
+        offset: &mut usize,
+        key: &mut Vec<u8>,
+    ) -> Result<Option<BlockEntryValue>> {
+        if *offset >= self.entries_end {
+            return Ok(None);
+        }
+        let value = self.decode_next_entry(offset, key)?;
+        Ok(Some(value))
+    }
+
     /// Decodes every entry in the block (used by compaction iterators).
     pub fn iter_all(&self) -> Result<Vec<(Vec<u8>, BlockEntryValue)>> {
         let mut offset = 0usize;

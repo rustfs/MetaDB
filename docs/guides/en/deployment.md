@@ -26,7 +26,8 @@ metrics_listen_addr = "127.0.0.1:9100"
 max_clock_drift_ms = 500
 
 [storage]
-memtable_size_bytes = 33554432          # Reserved; not an active flush threshold
+memtable_size_bytes = 33554432          # Flush the active memtable at 32 MiB
+max_imm_memtables = 4                   # Immutable-table backpressure cap
 block_cache_bytes = 536870912           # 512 MiB (16-shard LRU)
 mvcc_retention_ms = 5000                # 5s In-Memory MVCC window
 bloom_bits_per_key = 10

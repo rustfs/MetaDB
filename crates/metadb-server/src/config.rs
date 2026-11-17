@@ -76,6 +76,9 @@ pub struct StorageSection {
     pub bloom_bits_per_key: usize,
     pub locality_tombstone_threshold: usize,
     pub locality_tombstone_ratio: f64,
+    /// Queued immutable memtables allowed before writers wait for a flush.
+    /// The storage design documents a backpressure limit of four.
+    pub max_imm_memtables: usize,
 }
 
 impl Default for StorageSection {
@@ -87,6 +90,7 @@ impl Default for StorageSection {
             bloom_bits_per_key: 10,
             locality_tombstone_threshold: 128,
             locality_tombstone_ratio: 0.50,
+            max_imm_memtables: 4,
         }
     }
 }
@@ -174,6 +178,8 @@ impl ServerTomlConfig {
             tombstone_min_ratio_permille: ratio_permille,
             bloom_bits_per_key: self.storage.bloom_bits_per_key,
             auto_locality_compaction: true,
+            memtable_size_bytes: self.storage.memtable_size_bytes.max(1),
+            max_imm_memtables: self.storage.max_imm_memtables.max(1),
         })
     }
 
@@ -360,6 +366,10 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.storage.memtable_size_bytes, 1024);
         assert_eq!(cfg.storage.block_cache_bytes, 65536);
+        assert_eq!(cfg.storage.max_imm_memtables, 4);
+        let lsm = cfg.to_lsm_config().unwrap();
+        assert_eq!(lsm.memtable_size_bytes, 1024);
+        assert_eq!(lsm.max_imm_memtables, 4);
     }
 
     #[test]

@@ -1,13 +1,14 @@
 //! Immutable `Version` views and deterministic `MergingIterator` across `L0..L3` SSTables.
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
 
 use metadb_core::Result;
 
 use crate::block::BlockEntryValue;
 use crate::manifest::DurableShardCheckpoint;
-use crate::sstable::{SstFileMeta, SstableReader};
+use crate::sstable::{SstCursor, SstFileMeta, SstableReader};
 
 pub const NUM_LSM_LEVELS: usize = 4;
 
@@ -198,5 +199,213 @@ impl Version {
             }
         }
         samples
+    }
+
+    /// Streaming merge of the newest value of each key in `[start, end)`.
+    /// `end == None` reads through the last key of every selected SSTable.
+    pub(crate) fn merged_cursor(&self, start: &[u8], end: Option<&[u8]>) -> Result<MergedCursor> {
+        let mut readers = Vec::new();
+        for sst in &self.levels[0] {
+            readers.push(sst.clone());
+        }
+        for level in &self.levels[1..] {
+            let first = if start.is_empty() {
+                0
+            } else {
+                level.partition_point(|sst| sst.meta().max_key.as_slice() < start)
+            };
+            for sst in &level[first..] {
+                if end.is_some_and(|bound| sst.meta().min_key.as_slice() >= bound) {
+                    break;
+                }
+                readers.push(sst.clone());
+            }
+        }
+        MergedCursor::open(readers, start, end)
+    }
+}
+
+/// K-way merge. Earlier readers win on equal keys (`L0` newest-first, then `L1..L3`).
+pub(crate) struct MergedCursor {
+    sources: Vec<MergeSource>,
+    heap: BinaryHeap<HeapNode>,
+    staged: Option<StagedEntry>,
+    exhausted: bool,
+}
+
+struct MergeSource {
+    cursor: SstCursor,
+    precedence: u32,
+    generation: u64,
+    needs_reheap: bool,
+}
+
+struct StagedEntry {
+    key: Vec<u8>,
+    value: BlockEntryValue,
+    source_ids: Vec<u32>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct HeapNode {
+    key: Vec<u8>,
+    precedence: u32,
+    cursor_id: u32,
+    generation: u64,
+}
+
+impl PartialOrd for HeapNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // `BinaryHeap` pops the greatest node. Invert key order so the smallest key wins.
+        other
+            .key
+            .cmp(&self.key)
+            .then_with(|| other.precedence.cmp(&self.precedence))
+            .then_with(|| self.cursor_id.cmp(&other.cursor_id))
+            .then_with(|| self.generation.cmp(&other.generation))
+    }
+}
+
+impl MergedCursor {
+    pub(crate) fn open(
+        readers: Vec<Arc<SstableReader>>,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Self> {
+        let mut sources = Vec::with_capacity(readers.len());
+        let mut heap = BinaryHeap::new();
+        for (index, reader) in readers.into_iter().enumerate() {
+            let mut cursor = SstCursor::open(reader, start, end)?;
+            let cursor_id = index as u32;
+            if let Some((key, _)) = cursor.peek()? {
+                heap.push(HeapNode {
+                    key,
+                    precedence: cursor_id,
+                    cursor_id,
+                    generation: 0,
+                });
+            }
+            sources.push(MergeSource {
+                cursor,
+                precedence: cursor_id,
+                generation: 0,
+                needs_reheap: false,
+            });
+        }
+        Ok(Self {
+            sources,
+            heap,
+            staged: None,
+            exhausted: false,
+        })
+    }
+
+    pub(crate) fn peek(&mut self) -> Result<Option<(Vec<u8>, BlockEntryValue)>> {
+        self.ensure_staged()?;
+        Ok(self
+            .staged
+            .as_ref()
+            .map(|entry| (entry.key.clone(), entry.value.clone())))
+    }
+
+    /// Drops the current winner. The successor is not decoded until the next peek.
+    pub(crate) fn advance(&mut self) -> Result<()> {
+        self.ensure_staged()?;
+        let Some(staged) = self.staged.take() else {
+            return Ok(());
+        };
+        for source_id in staged.source_ids {
+            let source = &mut self.sources[source_id as usize];
+            source.cursor.advance();
+            source.generation = source.generation.wrapping_add(1);
+            source.needs_reheap = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn next_owned(&mut self) -> Result<Option<(Vec<u8>, BlockEntryValue)>> {
+        let Some((key, value)) = self.peek()? else {
+            return Ok(None);
+        };
+        self.advance()?;
+        Ok(Some((key, value)))
+    }
+
+    fn ensure_staged(&mut self) -> Result<()> {
+        if self.staged.is_some() || self.exhausted {
+            return Ok(());
+        }
+        self.reheap_pending()?;
+        loop {
+            let Some(node) = self.heap.pop() else {
+                self.exhausted = true;
+                return Ok(());
+            };
+            let cursor_id = node.cursor_id as usize;
+            if self.sources[cursor_id].generation != node.generation {
+                continue;
+            }
+            let Some((key, value)) = self.sources[cursor_id].cursor.peek()? else {
+                continue;
+            };
+            if key != node.key {
+                continue;
+            }
+            let mut best_precedence = node.precedence;
+            let mut best_value = value;
+            let mut source_ids = vec![node.cursor_id];
+            while self.heap.peek().is_some_and(|next| next.key == node.key) {
+                let other = self.heap.pop().unwrap();
+                let other_index = other.cursor_id as usize;
+                if self.sources[other_index].generation != other.generation {
+                    continue;
+                }
+                let Some((other_key, other_value)) = self.sources[other_index].cursor.peek()?
+                else {
+                    continue;
+                };
+                if other_key != node.key {
+                    continue;
+                }
+                source_ids.push(other.cursor_id);
+                if other.precedence < best_precedence {
+                    best_precedence = other.precedence;
+                    best_value = other_value;
+                }
+            }
+            self.staged = Some(StagedEntry {
+                key: node.key,
+                value: best_value,
+                source_ids,
+            });
+            return Ok(());
+        }
+    }
+
+    fn reheap_pending(&mut self) -> Result<()> {
+        for cursor_id in 0..self.sources.len() {
+            if !self.sources[cursor_id].needs_reheap {
+                continue;
+            }
+            self.sources[cursor_id].needs_reheap = false;
+            let generation = self.sources[cursor_id].generation;
+            let precedence = self.sources[cursor_id].precedence;
+            let Some((key, _)) = self.sources[cursor_id].cursor.peek()? else {
+                continue;
+            };
+            self.heap.push(HeapNode {
+                key,
+                precedence,
+                cursor_id: cursor_id as u32,
+                generation,
+            });
+        }
+        Ok(())
     }
 }

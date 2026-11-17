@@ -1,16 +1,40 @@
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
-use metadb_core::{HlcTimestamp, Result, ShardId};
+use metadb_core::{HlcTimestamp, MetaDbError, Result, ShardId};
 
 pub use crate::backend::PersistentEntry;
 use crate::backend::{InMemoryBackend, LsmStorageBackend, StorageBackend};
+use crate::block::BlockEntryValue;
 use crate::bloom::DEFAULT_BLOOM_BITS_PER_KEY;
 use crate::cache::ShardedBlockCache;
-use crate::compaction::{CompactionStats, LocalityCompactor};
+use crate::compaction::{CompactionStats, LocalityCompactor, RangeBucketPrefix};
 use crate::manifest::DurableShardCheckpoint;
-use crate::mvcc::{MemMvccStore, MvccValue, PreFlushHook, SnapshotGuard};
+use crate::mvcc::{
+    MemMvccStore, MvccValue, PinnedSnapshotData, PreFlushHook, ReadCut, SnapshotGuard,
+};
 use crate::raft_log::{LogSequenceNumber, RaftLog, RaftLogPayload};
+use crate::version_set::Version;
+
+/// Caller of [`LifecycleStorageEngine::scan_live_until`] stops or keeps scanning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanControl {
+    Continue,
+    Stop,
+}
+
+/// Raft identity stamped onto a size-triggered flush checkpoint.
+#[derive(Debug, Clone)]
+pub struct FlushIdentity {
+    pub term: u64,
+    pub leader: u64,
+    pub membership: Vec<u8>,
+    pub descriptor: Vec<u8>,
+    pub aux_index: u64,
+}
 
 /// Operational metrics demonstrating the benefits of In-Memory MVCC and Locality-Aware Compaction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -20,6 +44,8 @@ pub struct StorageMetrics {
     pub persistent_kv_writes: u64,
     pub active_physical_tombstones: usize,
     pub tombstones_traversed_on_scans: u64,
+    /// Keys the limited scanner actually stepped to, including physical tombstones.
+    pub entries_examined_on_scans: u64,
     pub compaction_stats: CompactionStats,
 }
 
@@ -31,6 +57,10 @@ pub struct LsmEngineConfig {
     pub tombstone_min_ratio_permille: usize,
     pub bloom_bits_per_key: usize,
     pub auto_locality_compaction: bool,
+    /// Seal and flush the active memtable once its accounted bytes reach this size.
+    pub memtable_size_bytes: usize,
+    /// Immutable memtables queued above this cap block writers until one flushes.
+    pub max_imm_memtables: usize,
 }
 
 impl Default for LsmEngineConfig {
@@ -41,6 +71,8 @@ impl Default for LsmEngineConfig {
             tombstone_min_ratio_permille: 500,
             bloom_bits_per_key: DEFAULT_BLOOM_BITS_PER_KEY,
             auto_locality_compaction: true,
+            memtable_size_bytes: 32 * 1024 * 1024,
+            max_imm_memtables: 4,
         }
     }
 }
@@ -56,6 +88,13 @@ pub struct LifecycleStorageEngine {
     compactor: Arc<LocalityCompactor>,
     backend: Arc<dyn StorageBackend>,
     auto_locality_compaction: bool,
+    memtable_size_bytes: usize,
+    max_imm_memtables: usize,
+    budget_mu: Mutex<()>,
+    flush_hook: RwLock<Option<Arc<dyn PreFlushHook>>>,
+    flush_identity: RwLock<Option<FlushIdentity>>,
+    entries_examined: AtomicU64,
+    last_aux_frontier: AtomicU64,
 }
 
 impl LifecycleStorageEngine {
@@ -73,6 +112,13 @@ impl LifecycleStorageEngine {
             compactor: Arc::new(LocalityCompactor::new(tombstone_density_threshold)),
             backend: Arc::new(InMemoryBackend::new()),
             auto_locality_compaction,
+            memtable_size_bytes: 32 * 1024 * 1024,
+            max_imm_memtables: 4,
+            budget_mu: Mutex::new(()),
+            flush_hook: RwLock::new(None),
+            flush_identity: RwLock::new(None),
+            entries_examined: AtomicU64::new(0),
+            last_aux_frontier: AtomicU64::new(0),
         }
     }
 
@@ -85,7 +131,7 @@ impl LifecycleStorageEngine {
     ) -> Result<Self> {
         let lsm =
             LsmStorageBackend::open(shard_id, lsm_dir, block_cache, config.bloom_bits_per_key)?;
-        Ok(Self::with_lsm_backend(shard_id, lsm, config))
+        Self::with_lsm_backend(shard_id, lsm, config)
     }
 
     /// Opens a complete existing checkpoint without creating or repairing its manifest.
@@ -101,14 +147,14 @@ impl LifecycleStorageEngine {
             block_cache,
             config.bloom_bits_per_key,
         )?;
-        Ok(Self::with_lsm_backend(shard_id, lsm, config))
+        Self::with_lsm_backend(shard_id, lsm, config)
     }
 
     fn with_lsm_backend(
         shard_id: ShardId,
         lsm: LsmStorageBackend,
         config: LsmEngineConfig,
-    ) -> Self {
+    ) -> Result<Self> {
         let lsm = Arc::new(lsm);
         let cp = lsm.current_version().checkpoint.clone();
         let mvcc = Arc::new(MemMvccStore::with_recovered_watermarks(
@@ -120,14 +166,42 @@ impl LifecycleStorageEngine {
             config.tombstone_density_threshold,
             config.tombstone_min_ratio_permille,
         ));
-        Self {
+        rebuild_density(&compactor, &lsm.current_version())?;
+        Ok(Self {
             shard_id,
             raft_log: Arc::new(RaftLog::new(shard_id)),
             mvcc,
             compactor,
             backend: lsm,
             auto_locality_compaction: config.auto_locality_compaction,
-        }
+            memtable_size_bytes: config.memtable_size_bytes.max(1),
+            max_imm_memtables: config.max_imm_memtables.max(1),
+            budget_mu: Mutex::new(()),
+            flush_hook: RwLock::new(None),
+            flush_identity: RwLock::new(None),
+            entries_examined: AtomicU64::new(0),
+            last_aux_frontier: AtomicU64::new(0),
+        })
+    }
+
+    /// Installs the Raft pre-flush hook used by size-triggered seals.
+    pub fn set_pre_flush_hook(&self, hook: Arc<dyn PreFlushHook>) {
+        *self.flush_hook.write().unwrap() = Some(hook);
+    }
+
+    /// Records the Raft log identity to stamp on the next size-triggered checkpoint.
+    pub fn set_flush_identity(&self, identity: FlushIdentity) {
+        *self.flush_identity.write().unwrap() = Some(identity);
+    }
+
+    pub fn last_aux_frontier(&self) -> u64 {
+        self.last_aux_frontier.load(Ordering::Acquire)
+    }
+
+    /// Rewrites only the durable checkpoint. SSTables are left in place.
+    pub fn persist_checkpoint(&self, checkpoint: DurableShardCheckpoint) -> Result<()> {
+        self.backend.persist_checkpoint_only(checkpoint)?;
+        Ok(())
     }
 
     pub fn shard_id(&self) -> ShardId {
@@ -163,6 +237,7 @@ impl LifecycleStorageEngine {
         raft_index: LogSequenceNumber,
     ) {
         self.mvcc.put(key, value, hlc, raft_index);
+        self.maintain_memtables().expect("memtable size flush");
     }
 
     /// Applies an externally Raft-logged `Delete` at `(raft_index, hlc)` directly into `MemMvccStore`.
@@ -173,6 +248,7 @@ impl LifecycleStorageEngine {
         raft_index: LogSequenceNumber,
     ) {
         self.mvcc.delete(key, hlc, raft_index);
+        self.maintain_memtables().expect("memtable size flush");
     }
 
     /// Appends a `Put` to the internal `RaftLog` and applies it to `MemMvccStore`.
@@ -185,6 +261,7 @@ impl LifecycleStorageEngine {
             },
         );
         self.mvcc.put(key, value, hlc, lsn);
+        self.maintain_memtables().expect("memtable size flush");
         lsn
     }
 
@@ -194,6 +271,7 @@ impl LifecycleStorageEngine {
             .raft_log
             .append(hlc, RaftLogPayload::Delete { key: key.clone() });
         self.mvcc.delete(key, hlc, lsn);
+        self.maintain_memtables().expect("memtable size flush");
         lsn
     }
 
@@ -322,6 +400,99 @@ impl LifecycleStorageEngine {
         Ok(out)
     }
 
+    /// Visits live keys in `[start_key, end_key)` in order and stops when `visit` returns
+    /// [`ScanControl::Stop`]. Physical tombstones before that point are counted; keys after
+    /// the stop are not read.
+    pub fn scan_live_until(
+        &self,
+        start_key: &[u8],
+        end_key: &[u8],
+        snap: &SnapshotGuard,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<ScanControl>,
+    ) -> Result<()> {
+        if start_key >= end_key {
+            return Ok(());
+        }
+        let mut disk_from = start_key.to_vec();
+        let mut mvcc_from = start_key.to_vec();
+        let cut = snap.cut();
+        loop {
+            let pulled = snap.with_step_lease(|pinned| {
+                self.pull_next(pinned, cut, &mut disk_from, &mut mvcc_from, end_key)
+            })?;
+            match pulled {
+                Pulled::Done => break,
+                Pulled::MvccTombstone => {
+                    self.entries_examined.fetch_add(1, Ordering::Relaxed);
+                }
+                Pulled::PhysicalTombstone => {
+                    self.entries_examined.fetch_add(1, Ordering::Relaxed);
+                    self.backend.record_scanned_tombstones(1);
+                }
+                Pulled::Live(key, value) => {
+                    self.entries_examined.fetch_add(1, Ordering::Relaxed);
+                    if visit(&key, &value)? == ScanControl::Stop {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn pull_next(
+        &self,
+        pinned: &PinnedSnapshotData,
+        cut: ReadCut,
+        disk_from: &mut Vec<u8>,
+        mvcc_from: &mut Vec<u8>,
+        end_key: &[u8],
+    ) -> Result<Pulled> {
+        if mvcc_from.as_slice() >= end_key && disk_from.as_slice() >= end_key {
+            return Ok(Pulled::Done);
+        }
+        let mvcc_item = if mvcc_from.as_slice() >= end_key {
+            None
+        } else {
+            self.mvcc
+                .range_page_with_pinned(mvcc_from, end_key, cut, pinned, 1)
+                .into_iter()
+                .next()
+        };
+        let disk_item = if disk_from.as_slice() >= end_key {
+            None
+        } else {
+            let (page, _) =
+                self.backend
+                    .scan_in_version_page(&pinned.version, disk_from, end_key, 1)?;
+            page.into_iter().next()
+        };
+        match (mvcc_item, disk_item) {
+            (None, None) => Ok(Pulled::Done),
+            (Some((key, value)), None) => {
+                *mvcc_from = key_successor(&key);
+                Ok(pulled_from_mvcc(key, value))
+            }
+            (None, Some((key, value))) => {
+                *disk_from = key_successor(&key);
+                Ok(pulled_from_disk(key, value))
+            }
+            (Some((mvcc_key, mvcc_value)), Some((disk_key, disk_value))) => {
+                if mvcc_key < disk_key {
+                    *mvcc_from = key_successor(&mvcc_key);
+                    Ok(pulled_from_mvcc(mvcc_key, mvcc_value))
+                } else if disk_key < mvcc_key {
+                    *disk_from = key_successor(&disk_key);
+                    Ok(pulled_from_disk(disk_key, disk_value))
+                } else {
+                    *mvcc_from = key_successor(&mvcc_key);
+                    *disk_from = key_successor(&disk_key);
+                    Ok(pulled_from_mvcc(mvcc_key, mvcc_value))
+                }
+            }
+        }
+    }
+
     /// Point lookup at `read_hlc` consulting `MemMvccStore` first and falling back to persistent storage.
     pub fn get(&self, key: &[u8], read_hlc: HlcTimestamp) -> Result<Option<Vec<u8>>> {
         if let Some(mvcc_val) = self.mvcc.get_at(key, read_hlc)? {
@@ -380,9 +551,8 @@ impl LifecycleStorageEngine {
         checkpoint: DurableShardCheckpoint,
         hook: Option<&dyn PreFlushHook>,
     ) -> Result<(LogSequenceNumber, LogSequenceNumber)> {
-        self.mvcc
-            .seal_active_memtable(self.backend.as_ref(), checkpoint, hook)?;
-        self.flush_queued_imms_with_hook(hook)
+        let _budget = self.budget_mu.lock().unwrap();
+        self.seal_and_flush_locked(checkpoint, hook)
     }
 
     /// Flushes already-sealed `ImmMemTable`s that pass the `ActiveSnapshotRegistry` Safe-Flush Gate.
@@ -471,7 +641,127 @@ impl LifecycleStorageEngine {
             persistent_kv_writes: kv_writes,
             active_physical_tombstones: active_tombs,
             tombstones_traversed_on_scans: tombs_scanned,
+            entries_examined_on_scans: self.entries_examined.load(Ordering::Relaxed),
             compaction_stats: self.compactor.stats(),
         }
     }
+
+    fn maintain_memtables(&self) -> Result<()> {
+        if self.mvcc.active_memtable_bytes() < self.memtable_size_bytes {
+            return Ok(());
+        }
+        let _budget = self.budget_mu.lock().unwrap();
+        if self.mvcc.active_memtable_bytes() < self.memtable_size_bytes {
+            return Ok(());
+        }
+        let (lsn, hlc, _, _) = self.mvcc.latest_watermarks();
+        let checkpoint = self.checkpoint_for_flush(lsn, hlc);
+        let hook = self.flush_hook.read().unwrap().clone();
+        let hook_ref = hook.as_ref().map(|installed| installed.as_ref());
+        self.seal_and_flush_locked(checkpoint, hook_ref)?;
+        Ok(())
+    }
+
+    fn seal_and_flush_locked(
+        &self,
+        checkpoint: DurableShardCheckpoint,
+        hook: Option<&dyn PreFlushHook>,
+    ) -> Result<(LogSequenceNumber, LogSequenceNumber)> {
+        self.ensure_imm_capacity(hook)?;
+        self.mvcc
+            .seal_active_memtable(self.backend.as_ref(), checkpoint, hook)?;
+        let flushed = self.flush_queued_imms_with_hook(hook)?;
+        self.last_aux_frontier.store(flushed.1, Ordering::Release);
+        Ok(flushed)
+    }
+
+    fn ensure_imm_capacity(&self, hook: Option<&dyn PreFlushHook>) -> Result<()> {
+        let started = Instant::now();
+        let limit = Duration::from_millis(self.mvcc.retention_ms().saturating_add(1_000));
+        while self.mvcc.imm_queue_len() >= self.max_imm_memtables {
+            self.flush_queued_imms_with_hook(hook)?;
+            if self.mvcc.imm_queue_len() < self.max_imm_memtables {
+                return Ok(());
+            }
+            if started.elapsed() > limit {
+                self.mvcc.snapshot_registry().expire_stale_and_min_bounds();
+                self.flush_queued_imms_with_hook(hook)?;
+                if self.mvcc.imm_queue_len() >= self.max_imm_memtables {
+                    return Err(MetaDbError::StorageIoError(format!(
+                        "immutable memtable cap {} is pinned past the MVCC retention window",
+                        self.max_imm_memtables
+                    )));
+                }
+                return Ok(());
+            }
+            self.mvcc
+                .snapshot_registry()
+                .wait_for_flush_progress(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
+    fn checkpoint_for_flush(&self, lsn: u64, hlc: HlcTimestamp) -> DurableShardCheckpoint {
+        let current = self.durable_checkpoint();
+        match self.flush_identity.read().unwrap().clone() {
+            Some(identity) => DurableShardCheckpoint {
+                flushed_raft_term: identity.term,
+                flushed_raft_leader: identity.leader,
+                flushed_raft_index: lsn,
+                flushed_max_hlc: hlc,
+                contiguous_aux_acked_index: identity.aux_index,
+                membership_bytes: identity.membership,
+                descriptor_bytes: identity.descriptor,
+            },
+            None => DurableShardCheckpoint {
+                flushed_raft_index: lsn,
+                flushed_max_hlc: hlc,
+                ..current
+            },
+        }
+    }
+}
+
+enum Pulled {
+    Done,
+    MvccTombstone,
+    PhysicalTombstone,
+    Live(Vec<u8>, Vec<u8>),
+}
+
+fn pulled_from_mvcc(key: Vec<u8>, value: MvccValue) -> Pulled {
+    match value {
+        MvccValue::Value(bytes) => Pulled::Live(key, bytes),
+        MvccValue::Tombstone => Pulled::MvccTombstone,
+    }
+}
+
+fn pulled_from_disk(key: Vec<u8>, value: PersistentEntry) -> Pulled {
+    match value {
+        PersistentEntry::Value(bytes) => Pulled::Live(key, bytes),
+        PersistentEntry::PhysicalTombstone => Pulled::PhysicalTombstone,
+    }
+}
+
+fn key_successor(key: &[u8]) -> Vec<u8> {
+    let mut next = key.to_vec();
+    next.push(0x00);
+    next
+}
+
+fn rebuild_density(compactor: &LocalityCompactor, version: &Version) -> Result<()> {
+    let mut cursor = version.merged_cursor(&[], None)?;
+    let mut counts: BTreeMap<RangeBucketPrefix, (usize, usize)> = BTreeMap::new();
+    while let Some((key, value)) = cursor.next_owned()? {
+        let Some(bucket) = LocalityCompactor::bucket_for_key(&key) else {
+            continue;
+        };
+        let slot = counts.entry(bucket).or_insert((0, 0));
+        match value {
+            BlockEntryValue::PhysicalTombstone => slot.0 += 1,
+            BlockEntryValue::Value(_) => slot.1 += 1,
+        }
+    }
+    compactor.restore_counts(counts);
+    Ok(())
 }

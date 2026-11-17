@@ -369,9 +369,21 @@ impl MetaDbEngine {
 
     /// Lists all live child entries in directory `pid`.
     pub fn listdir(&self, pid: InodeId) -> Result<Vec<MetaEntry>> {
+        self.listdir_limited(pid, None, None, usize::MAX)
+    }
+
+    /// Pinned directory page. `limit == usize::MAX` reads the whole directory.
+    pub fn listdir_limited(
+        &self,
+        pid: InodeId,
+        after_name: Option<&str>,
+        name_prefix: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MetaEntry>> {
         let hlc = self.clock.now();
         let (_, _, storage) = self.global_manager.route_pid(pid)?;
-        self.pushdown.listdir(&storage, pid, hlc)
+        self.pushdown
+            .listdir_limited(&storage, pid, after_name, name_prefix, limit, hlc)
     }
 
     /// Executes a lightweight metadata SQL template statement directly without full SQL optimizer overhead.
@@ -413,16 +425,13 @@ impl MetaDbEngine {
                 name_prefix,
                 limit,
             } => {
-                let mut rows = self.listdir(pid)?;
-                if let Some(after) = after_name {
-                    rows.retain(|e| e.key.name > after);
-                }
-                if let Some(pfx) = name_prefix {
-                    rows.retain(|e| e.key.name.starts_with(&pfx));
-                }
-                if limit > 0 && rows.len() > limit {
-                    rows.truncate(limit);
-                }
+                let page_limit = if limit == 0 { usize::MAX } else { limit };
+                let rows = self.listdir_limited(
+                    pid,
+                    after_name.as_deref(),
+                    name_prefix.as_deref(),
+                    page_limit,
+                )?;
                 Ok(SqlQueryResult::Entries(rows))
             }
             MetadataSqlCommand::Rename {

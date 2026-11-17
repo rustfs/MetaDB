@@ -1,11 +1,41 @@
 //! Immutable SSTable builder and reader (`<file_id:020>.sst`) with 64-byte magic/CRC32C footer.
 
+use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+thread_local! {
+    static FULL_RANGE_MATERIALIZATIONS: Cell<u64> = const { Cell::new(0) };
+    static DATA_BLOCKS_TOUCHED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Test probe: how many times `read_all_entries` ran on this thread.
+pub fn full_range_materializations() -> u64 {
+    FULL_RANGE_MATERIALIZATIONS.with(|counter| counter.get())
+}
+
+/// Test probe: how many data blocks this thread has loaded or cache-hit.
+pub fn data_blocks_touched() -> u64 {
+    DATA_BLOCKS_TOUCHED.with(|counter| counter.get())
+}
+
+/// Clears the thread-local compaction and scan probes.
+pub fn reset_scan_probes() {
+    FULL_RANGE_MATERIALIZATIONS.with(|counter| counter.set(0));
+    DATA_BLOCKS_TOUCHED.with(|counter| counter.set(0));
+}
+
+fn note_full_range_materialization() {
+    FULL_RANGE_MATERIALIZATIONS.with(|counter| counter.set(counter.get().saturating_add(1)));
+}
+
+fn note_data_block_touch() {
+    DATA_BLOCKS_TOUCHED.with(|counter| counter.set(counter.get().saturating_add(1)));
+}
 
 use serde::{Deserialize, Serialize};
 
@@ -475,8 +505,11 @@ impl SstableReader {
         Ok(out)
     }
 
-    /// Reads every entry across all data blocks in this SSTable (used during compaction).
+    /// Reads every entry across all data blocks in this SSTable.
+    ///
+    /// Compaction must not call this: it materializes the whole file before merge.
     pub fn read_all_entries(&self) -> Result<Vec<(Vec<u8>, BlockEntryValue)>> {
+        note_full_range_materialization();
         let mut out = Vec::new();
         for ie in &self.index {
             let block = self.load_data_block(ie)?;
@@ -531,6 +564,7 @@ impl SstableReader {
     }
 
     fn load_data_block(&self, ie: &IndexBlockEntry) -> Result<Arc<DataBlock>> {
+        note_data_block_touch();
         let cache_key = BlockCacheKey {
             shard_id: self.shard_id,
             sst_file_id: self.meta.file_id,
@@ -664,5 +698,110 @@ impl SstableReader {
         stem.parse::<u64>().map_err(|e| {
             MetaDbError::CodecError(format!("invalid SSTable file_id '{}': {}", stem, e))
         })
+    }
+}
+
+/// Forward cursor over one SSTable. Decodes a single entry at a time and loads
+/// the next data block only when the current block is exhausted.
+pub(crate) struct SstCursor {
+    reader: Arc<SstableReader>,
+    start_key: Vec<u8>,
+    end_key: Option<Vec<u8>>,
+    block_idx: usize,
+    block: Option<Arc<DataBlock>>,
+    offset: usize,
+    key: Vec<u8>,
+    pending: Option<(Vec<u8>, BlockEntryValue)>,
+    needs_fill: bool,
+    exhausted: bool,
+}
+
+impl SstCursor {
+    pub(crate) fn open(
+        reader: Arc<SstableReader>,
+        start_key: &[u8],
+        end_key: Option<&[u8]>,
+    ) -> Result<Self> {
+        let block_idx = reader
+            .index
+            .partition_point(|entry| entry.last_key.as_slice() < start_key);
+        Ok(Self {
+            reader,
+            start_key: start_key.to_vec(),
+            end_key: end_key.map(|key| key.to_vec()),
+            block_idx,
+            block: None,
+            offset: 0,
+            key: Vec::new(),
+            pending: None,
+            needs_fill: true,
+            exhausted: false,
+        })
+    }
+
+    pub(crate) fn peek(&mut self) -> Result<Option<(Vec<u8>, BlockEntryValue)>> {
+        if self.needs_fill {
+            self.fill_one()?;
+            self.needs_fill = false;
+        }
+        Ok(self.pending.clone())
+    }
+
+    /// Drops the current entry without decoding the successor.
+    pub(crate) fn advance(&mut self) {
+        self.pending = None;
+        self.needs_fill = !self.exhausted;
+    }
+
+    fn fill_one(&mut self) -> Result<()> {
+        if self.exhausted {
+            self.pending = None;
+            return Ok(());
+        }
+        loop {
+            if self.block.is_none() {
+                if self.block_idx >= self.reader.index.len() {
+                    self.exhausted = true;
+                    self.pending = None;
+                    return Ok(());
+                }
+                let index_entry = &self.reader.index[self.block_idx];
+                if index_entry.last_key.as_slice() < self.start_key.as_slice() {
+                    self.block_idx += 1;
+                    continue;
+                }
+                let block = self.reader.load_data_block(index_entry)?;
+                self.offset = block.restart_offset_for(&self.start_key)?;
+                self.key.clear();
+                self.block = Some(block);
+            }
+            let block = self.block.as_ref().unwrap().clone();
+            match block.read_entry(&mut self.offset, &mut self.key)? {
+                None => {
+                    self.block = None;
+                    self.block_idx += 1;
+                    self.key.clear();
+                    self.offset = 0;
+                    continue;
+                }
+                Some(value) => {
+                    if self.key.as_slice() < self.start_key.as_slice() {
+                        continue;
+                    }
+                    if self
+                        .end_key
+                        .as_ref()
+                        .is_some_and(|end| self.key.as_slice() >= end.as_slice())
+                    {
+                        self.exhausted = true;
+                        self.pending = None;
+                        self.block = None;
+                        return Ok(());
+                    }
+                    self.pending = Some((self.key.clone(), value));
+                    return Ok(());
+                }
+            }
+        }
     }
 }
