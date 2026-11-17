@@ -6,6 +6,7 @@
 //! (arXiv:2610.32247v1).
 
 pub mod checksum;
+pub mod codec;
 pub mod epoch;
 pub mod error;
 pub mod hlc;

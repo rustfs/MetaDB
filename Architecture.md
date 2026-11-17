@@ -59,6 +59,8 @@ Following the empirical findings of the Baidu MetaDB paper (`arXiv:2610.32247v1`
 
 ## 4. Binary Data Model & Keyspace Layout (`metadb-core`)
 
+Checksums use crc-fast CRC-32/ISCSI. Persisted and Raft payloads use wincode with the existing bincode 1.x byte grammar and a Serde bridge for OpenRaft types. The [codec dependency analysis](docs/designs/codec_dependencies.md) records compatibility constraints and validation.
+
 Every shard hosts a single sorted key-value keyspace partitioned into seven disjoint 1-byte prefixes (`0x01`–`0x07`) encoded in big-endian lexicographical byte order so integer numeric order matches `memcmp` byte order:
 
 | Prefix | Table / Keyspace | Binary Key Layout | Binary Value Summary | Purpose |

@@ -1,3 +1,4 @@
+use metadb_core::codec;
 use metadb_core::{AuxOutboxEntry, AuxTaskPayload, HlcTimestamp};
 use metadb_server::{PersistentMetaDbCluster, ServerTomlConfig};
 use metadb_tx::TxRaftCmd;
@@ -42,7 +43,7 @@ async fn cross_origin_quota_deltas_must_conserve_totals_under_reordered_delivery
             .propose(
                 quota_group.current_epoch(),
                 cluster.tx_router().clock().now(),
-                bincode::serialize(&TxRaftCmd::ApplyAuxBatch {
+                codec::serialize(&TxRaftCmd::ApplyAuxBatch {
                     entries: vec![entry],
                 })
                 .unwrap(),

@@ -15,3 +15,5 @@ This directory contains the living design specifications and adversarial zero-co
 | [`sharding_and_control_plane.md`](./sharding_and_control_plane.md) | Subsystem Spec 3 (`Draft`) | `metadb-proto`, `metadb-cluster` & `metadb-proxy`: Unified `[0x01, 0x04)` composite sharding, `ShardEpoch` fencing, Jumbo `DualModeFineGrained` scatter-gather, `GlobalManager`/`CellLocalManager`/`MetaCache`, `IdRangeAllocator`, 20 SQL templates, and Protobuf v1 contracts. | Phase 0 Approved |
 | [`review_report.md`](./review_report.md) | Adversarial Audit (`Review & Resolve`) | Independent zero-context Goldfish subagent review findings and specification resolutions. | Phase 0 Approved & Goldfish-Verified |
 | [`../README.md`](../README.md) | Multilingual Usage Hub | User and operator documentation index across English (`en`), Japanese (`ja`), French (`fr`), Simplified Chinese (`zh`), and German (`de`). | Phase 0 Active |
+
+The [codec dependency analysis](codec_dependencies.md) records CRC and serialization dependency selection, storage-format compatibility, and review coverage.

@@ -20,10 +20,11 @@ authors = ["The RustFS Authors"]
 
 [workspace.dependencies]
 bytes = "1"
-crc32c = "0.6"
+crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
 prost = "0.14.6"
 serde = { version = "1", features = ["derive"] }
-bincode = "1"
+wincode = { version = "0.6.3", features = ["derive"] }
+serde-wincode = "0.1.2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14.9"

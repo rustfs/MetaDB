@@ -8,7 +8,9 @@ use crate::epoch::{ShardEpoch, TxnId};
 pub type Result<T> = std::result::Result<T, MetaDbError>;
 
 /// Canonical error variants across all MetaDB subsystems.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub enum MetaDbError {
     /// Attempted to use a reserved or illegal entry name (`"_attr_"`, `"."`, `".."`, empty, NUL, or a path separator).
     ReservedEntryName(String),

@@ -13,6 +13,7 @@ use openraft::entry::RaftEntry;
 use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
 use openraft::type_config::alias::{EntryOf, LogIdOf, VoteOf};
 
+use metadb_core::codec;
 use metadb_core::{append_crc32c_le, checksum_crc32c, verify_crc32c_le};
 use metadb_storage::sstable::sync_dir;
 
@@ -21,10 +22,21 @@ use crate::types::{MetaDbTypeConfig, ShardWatermarkTracker};
 pub const RAFT_SEGMENT_MAGIC: &[u8; 8] = b"MRAFTLO1";
 pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 struct PersistedHardState {
+    #[wincode(with = "metadb_core::codec::SerdeCompat<Option<VoteOf<MetaDbTypeConfig>>>")]
     vote: Option<VoteOf<MetaDbTypeConfig>>,
+    #[wincode(with = "metadb_core::codec::SerdeCompat<Option<LogIdOf<MetaDbTypeConfig>>>")]
     committed: Option<LogIdOf<MetaDbTypeConfig>>,
+    #[wincode(with = "metadb_core::codec::SerdeCompat<Option<LogIdOf<MetaDbTypeConfig>>>")]
     last_purged_log_id: Option<LogIdOf<MetaDbTypeConfig>>,
 }
 
@@ -164,8 +176,9 @@ impl LogStoreInner {
                 }
 
                 let log_index = u64::from_le_bytes(frame_body[0..8].try_into().unwrap());
-                let entry: EntryOf<MetaDbTypeConfig> = bincode::deserialize(&frame_body[8..])
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                let entry: EntryOf<MetaDbTypeConfig> =
+                    codec::deserialize_serde(&frame_body[8..])
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 if entry.log_id().index != log_index
                     || previous_index.is_some_and(|prev| log_index <= prev)
                     || (entry_end_offsets.is_empty() && log_index != first_index)
@@ -299,7 +312,7 @@ impl LogStoreInner {
         File::open(&path)?.read_to_end(&mut raw)?;
         let body = verify_crc32c_le(&raw, "Raft HARD_STATE")
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        bincode::deserialize(body)
+        codec::deserialize(body)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
@@ -322,7 +335,7 @@ impl LogStoreInner {
         raft_dir: &Path,
         hard_state: &PersistedHardState,
     ) -> io::Result<()> {
-        let mut raw = bincode::serialize(hard_state)
+        let mut raw = codec::serialize(hard_state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         append_crc32c_le(&mut raw);
         let tmp = raft_dir.join("HARD_STATE.tmp");
@@ -401,7 +414,7 @@ impl LogStoreInner {
                 self.rotate_new_segment(log_idx)?;
             }
 
-            let serialized = bincode::serialize(&entry)
+            let serialized = codec::serialize_serde(&entry)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             let frame_len = (8 + serialized.len()) as u32;
             let mut body = Vec::with_capacity(8 + serialized.len());

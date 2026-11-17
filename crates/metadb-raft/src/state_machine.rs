@@ -17,6 +17,7 @@ use openraft::{EntryPayload, OptionalSend, Snapshot, SnapshotMeta, StoredMembers
 use tokio::sync::watch;
 use tokio_stream::StreamExt;
 
+use metadb_core::codec;
 use metadb_core::{
     append_crc32c_le, checksum_crc32c, verify_crc32c_le, HlcTimestamp, MetaDbError, Result,
     ShardEpoch, ShardId,
@@ -99,7 +100,7 @@ impl ShardApplyHandler for BasicKvApplyHandler {
         request: &MetaDbRaftRequest,
         engine: &LifecycleStorageEngine,
     ) -> Result<Vec<u8>> {
-        let cmd: BasicKvCommand = bincode::deserialize(&request.payload)
+        let cmd: BasicKvCommand = codec::deserialize(&request.payload)
             .map_err(|e| MetaDbError::CodecError(e.to_string()))?;
         match cmd {
             BasicKvCommand::Put { key, value } => {
@@ -130,8 +131,11 @@ impl ShardApplyHandler for BasicKvApplyHandler {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 struct PersistedSnapshotMeta {
+    #[wincode(with = "metadb_core::codec::SerdeCompat<SnapshotMetaOf<MetaDbTypeConfig>>")]
     meta: SnapshotMetaOf<MetaDbTypeConfig>,
     checkpoint: DurableShardCheckpoint,
     file_specs: Vec<(String, u64, u32)>,
@@ -188,7 +192,7 @@ impl StateMachineShared {
         let last_log = *self.last_applied_log_id.read().unwrap();
         let last_hlc = *self.last_applied_hlc.read().unwrap();
         let membership = self.last_membership.read().unwrap().clone();
-        let membership_bytes = bincode::serialize(&membership).unwrap_or_default();
+        let membership_bytes = codec::serialize_serde(&membership).unwrap_or_default();
 
         let (term, leader_node, index) = match last_log {
             Some(lid) => (
@@ -260,7 +264,7 @@ impl StateMachineShared {
             if checkpoint.membership_bytes.is_empty() {
                 StoredMembership::default()
             } else {
-                bincode::deserialize(&checkpoint.membership_bytes)
+                codec::deserialize_serde(&checkpoint.membership_bytes)
                     .unwrap_or_else(|_| self.last_membership.read().unwrap().clone())
             };
 
@@ -297,7 +301,7 @@ impl StateMachineShared {
             checkpoint: checkpoint.clone(),
             file_specs,
         };
-        let mut meta_bytes = bincode::serialize(&persisted_meta)
+        let mut meta_bytes = codec::serialize(&persisted_meta)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         append_crc32c_le(&mut meta_bytes);
         {
@@ -363,7 +367,7 @@ impl StateMachineShared {
         File::open(snap_dir.join("SNAPSHOT_META"))?.read_to_end(&mut raw_meta)?;
         let body = verify_crc32c_le(&raw_meta, "SNAPSHOT_META")
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let pmeta: PersistedSnapshotMeta = bincode::deserialize(body)
+        let pmeta: PersistedSnapshotMeta = codec::deserialize(body)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         let lsm_dir = snap_dir.join("lsm");
@@ -459,7 +463,7 @@ impl ShardStateMachine {
             if cp.membership_bytes.is_empty() {
                 StoredMembership::default()
             } else {
-                bincode::deserialize(&cp.membership_bytes).unwrap_or_default()
+                codec::deserialize_serde(&cp.membership_bytes).unwrap_or_default()
             };
 
         watermarks.advance_state_flushed(cp.flushed_raft_index);
@@ -692,7 +696,7 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
             if snapshot.checkpoint.membership_bytes.is_empty() {
                 StoredMembership::default()
             } else {
-                bincode::deserialize(&snapshot.checkpoint.membership_bytes)
+                codec::deserialize_serde(&snapshot.checkpoint.membership_bytes)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
             };
         if membership != meta.last_membership {
@@ -882,7 +886,7 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
             checkpoint: snapshot.checkpoint.clone(),
             file_specs,
         };
-        let mut meta_bytes = bincode::serialize(&pmeta)
+        let mut meta_bytes = codec::serialize(&pmeta)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         append_crc32c_le(&mut meta_bytes);
         {

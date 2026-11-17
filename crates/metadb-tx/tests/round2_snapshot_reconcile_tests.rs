@@ -1,6 +1,7 @@
 //! Deterministic interleaving of a pinned read cut and the attr-delta flush hook.
 use std::sync::Arc;
 
+use metadb_core::codec;
 use metadb_core::{
     CompositeKeyRange, DirShardDeltaKey, DirShardDeltaRecord, HlcTimestamp, InodeAttr, MetaKey,
     ShardEpoch,
@@ -25,7 +26,7 @@ fn apply(
             &MetaDbRaftRequest {
                 expected_epoch: handler.current_epoch(),
                 hlc,
-                payload: bincode::serialize(&cmd).unwrap(),
+                payload: codec::serialize(&cmd).unwrap(),
             },
             engine,
         )

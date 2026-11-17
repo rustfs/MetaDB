@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use metadb_core::codec;
 use metadb_core::{
     EntryType, HlcTimestamp, InodeAttr, MetaDbError, MetaEntry, MetaKey, QuotaRecord, Result,
     SecondaryIndexRecord, ShardEpoch,
@@ -248,7 +249,7 @@ impl TryFrom<SecondaryIndexRecordProto> for SecondaryIndexRecord {
 
 impl From<&MetaDbError> for ErrorDetailProto {
     fn from(err: &MetaDbError) -> Self {
-        let serialized_core_error = bincode::serialize(err).unwrap_or_default();
+        let serialized_core_error = codec::serialize(err).unwrap_or_default();
         match err {
             MetaDbError::EpochMismatch {
                 shard_id,
@@ -300,7 +301,7 @@ impl From<&MetaDbError> for ErrorDetailProto {
 impl From<ErrorDetailProto> for MetaDbError {
     fn from(p: ErrorDetailProto) -> Self {
         if !p.serialized_core_error.is_empty() {
-            if let Ok(decoded) = bincode::deserialize::<MetaDbError>(&p.serialized_core_error) {
+            if let Ok(decoded) = codec::deserialize::<MetaDbError>(&p.serialized_core_error) {
                 return decoded;
             }
         }
@@ -323,6 +324,18 @@ impl From<ErrorDetailProto> for MetaDbError {
 mod tests {
     use super::*;
     use metadb_core::ROOT_INODE_ID;
+
+    #[test]
+    fn transaction_conflict_error_preserves_full_u128_id() {
+        let error = MetaDbError::WriteIntentConflict {
+            conflicting_txn_id: u128::MAX,
+            primary_key: vec![1, 2, 3],
+            expire_hlc: 42,
+        };
+        let proto = ErrorDetailProto::from(&error);
+        assert!(!proto.serialized_core_error.is_empty());
+        assert_eq!(MetaDbError::from(proto), error);
+    }
 
     #[test]
     fn test_proto_domain_roundtrips() {

@@ -7,6 +7,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use metadb_core::codec;
 use metadb_core::schema::validate_user_entry_name;
 use metadb_core::{
     negate_accounted_size, saturating_add_i64, validate_dir_inode_id, validate_file_size,
@@ -228,12 +229,11 @@ impl DistributedTxRouter {
         hlc: HlcTimestamp,
         cmd: &TxRaftCmd,
     ) -> Result<(HlcTimestamp, TxRaftOutput)> {
-        let payload =
-            bincode::serialize(cmd).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        let payload = codec::serialize(cmd).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
         let resp = group.propose(epoch, hlc, payload).await?;
         let bytes = resp.result?;
         let decoded: TxRaftOutput =
-            bincode::deserialize(&bytes).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+            codec::deserialize(&bytes).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
         Ok((resp.applied_hlc, decoded))
     }
 

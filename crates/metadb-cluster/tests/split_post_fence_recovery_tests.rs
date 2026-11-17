@@ -5,6 +5,7 @@ use metadb_cluster::{
     CompositeMetaCache, DurableCellManager, DurableGlobalManager, DurableIdAllocator,
     RaftShardSplitWorker, SplitCrashPoint,
 };
+use metadb_core::codec;
 use metadb_core::{
     AttrDeltaSpec, CompositeKeyRange, HlcTimestamp, HybridLogicalClock, IntentOp, MetaDbError,
     MetaKey, TxnRecordKey, TxnState, TxnStatusRecord, WriteIntentKey, WriteIntentRecord,
@@ -158,7 +159,7 @@ async fn fenced_split_finishes_on_restart_with_new_retained_range_transaction() 
             .propose(
                 parent.current_epoch(),
                 fixture.clock.now(),
-                bincode::serialize(&prepare).unwrap(),
+                codec::serialize(&prepare).unwrap(),
             )
             .await
             .unwrap();
@@ -227,7 +228,7 @@ async fn fenced_split_finishes_on_restart_with_new_retained_range_transaction() 
         .propose(
             parent.current_epoch(),
             fixture.clock.now(),
-            bincode::serialize(&abort).unwrap(),
+            codec::serialize(&abort).unwrap(),
         )
         .await
         .unwrap();

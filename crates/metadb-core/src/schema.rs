@@ -129,7 +129,19 @@ pub fn negate_accounted_size(size_bytes: i64) -> i64 {
 /// Encoded as `[0x01][pid: 8-byte big-endian][name UTF-8 bytes]` so that all entries
 /// sharing the same parent directory `pid`—including the special `(pid, "_attr_")`
 /// record—are lexicographically contiguous.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub struct MetaKey {
     pub pid: InodeId,
     pub name: String,
@@ -211,7 +223,18 @@ impl MetaKey {
 }
 
 /// Entry type stored in `MetaTable`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 #[repr(u8)]
 pub enum EntryType {
     File = 1,
@@ -238,7 +261,9 @@ impl EntryType {
 /// Encoded into an exact 88-byte versioned + CRC32C-protected payload (`consensus_and_transactions.md` §7.1):
 /// includes `parent_pid` for directory-rename cycle detection and `applied_lsn` (`applied_raft_index`)
 /// for race-free `AsyncAttrAggregator` reconciliation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct InodeAttr {
     pub inode_id: InodeId,
     pub parent_pid: InodeId,
@@ -255,7 +280,9 @@ pub struct InodeAttr {
 }
 
 /// A full row in `MetaTable` keyed by `(PID, name)`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct MetaEntry {
     pub key: MetaKey,
     pub attr: InodeAttr,
@@ -356,7 +383,20 @@ impl InodeAttr {
 }
 
 /// Primary key of `QuotaTable`: `(UID)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub struct QuotaKey {
     pub uid: UserId,
 }
@@ -380,7 +420,9 @@ impl QuotaKey {
 
 /// Row in `QuotaTable` tracking per-user resource consumption and per-origin-shard
 /// contiguous `(origin_raft_index, task_ordinal)` cursors for exact-once accounting.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct QuotaRecord {
     pub uid: UserId,
     pub used_bytes: i64,
@@ -462,7 +504,20 @@ impl QuotaRecord {
 }
 
 /// Primary key of `SecondaryIndexTable`: `(FID)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub struct SecondaryIndexKey {
     pub fid: FileId,
 }
@@ -488,7 +543,9 @@ impl SecondaryIndexKey {
 
 /// Row in `SecondaryIndexTable` mapping a data-plane `FID` back to its `(PID, name)`
 /// primary metadata entry (`arXiv:2610.32247v1`, Figure 5) with total-order tie-breaking.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct SecondaryIndexRecord {
     pub fid: FileId,
     pub pid: InodeId,
@@ -776,7 +833,7 @@ mod tests {
             name: "a".to_string(),
         };
         assert_eq!(
-            &bincode::serialize(&not_found).unwrap()[..4],
+            &crate::codec::serialize(&not_found).unwrap()[..4],
             &2u32.to_le_bytes()
         );
         let already = MetaDbError::AlreadyExists {
@@ -784,11 +841,11 @@ mod tests {
             name: "a".to_string(),
         };
         assert_eq!(
-            &bincode::serialize(&already).unwrap()[..4],
+            &crate::codec::serialize(&already).unwrap()[..4],
             &1u32.to_le_bytes()
         );
         assert_eq!(
-            &bincode::serialize(&MetaDbError::InvalidFileSize(-1)).unwrap()[..4],
+            &crate::codec::serialize(&MetaDbError::InvalidFileSize(-1)).unwrap()[..4],
             &23u32.to_le_bytes()
         );
 
@@ -797,7 +854,7 @@ mod tests {
             aux_specs: vec![],
         };
         assert_eq!(
-            &bincode::serialize(&delete).unwrap()[..4],
+            &crate::codec::serialize(&delete).unwrap()[..4],
             &1u32.to_le_bytes()
         );
         let insert = IntentOp::Insert {
@@ -806,7 +863,7 @@ mod tests {
             aux_specs: vec![],
         };
         assert_eq!(
-            &bincode::serialize(&insert).unwrap()[..4],
+            &crate::codec::serialize(&insert).unwrap()[..4],
             &4u32.to_le_bytes()
         );
     }

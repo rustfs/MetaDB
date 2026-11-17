@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use metadb_core::codec;
 use metadb_core::{
     AuxOutboxEntry, AuxTaskPayload, CompositeKeyRange, HlcTimestamp, HybridLogicalClock, InodeId,
     MetaDbError, Result, ShardEpoch, ROOT_INODE_ID,
@@ -153,7 +154,7 @@ async fn replicated_apply_rejects_forged_commands_and_keeps_prefix_pages() {
         .propose(
             group.current_epoch(),
             clock.now(),
-            bincode::serialize(&neg).unwrap(),
+            codec::serialize(&neg).unwrap(),
         )
         .await
         .unwrap_err();
@@ -199,7 +200,7 @@ async fn replicated_apply_rejects_forged_commands_and_keeps_prefix_pages() {
         .propose(
             group.current_epoch(),
             clock.now(),
-            bincode::serialize(&clobber).unwrap(),
+            codec::serialize(&clobber).unwrap(),
         )
         .await
         .unwrap_err();
@@ -241,7 +242,7 @@ async fn replicated_apply_rejects_forged_commands_and_keeps_prefix_pages() {
         .propose(
             group.current_epoch(),
             clock.now(),
-            bincode::serialize(&first).unwrap(),
+            codec::serialize(&first).unwrap(),
         )
         .await
         .unwrap();
@@ -254,7 +255,7 @@ async fn replicated_apply_rejects_forged_commands_and_keeps_prefix_pages() {
         .propose(
             group.current_epoch(),
             clock.now(),
-            bincode::serialize(&fork).unwrap(),
+            codec::serialize(&fork).unwrap(),
         )
         .await
         .unwrap_err();
@@ -268,7 +269,7 @@ async fn replicated_apply_rejects_forged_commands_and_keeps_prefix_pages() {
         .propose(
             group.current_epoch(),
             clock.now(),
-            bincode::serialize(&next).unwrap(),
+            codec::serialize(&next).unwrap(),
         )
         .await
         .unwrap();

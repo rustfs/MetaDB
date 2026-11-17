@@ -13,7 +13,7 @@ metadb-proto = { path = "../metadb-proto" }
 metadb-storage = { path = "../metadb-storage" }
 metadb-raft = { path = "../metadb-raft" }
 metadb-tx = { path = "../metadb-tx" }
-bincode = { workspace = true }
+wincode = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

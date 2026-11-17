@@ -13,6 +13,7 @@ use openraft::async_runtime::watch::WatchReceiver;
 use openraft::{BasicNode, ChangeMembers, Precondition};
 use serde::{Deserialize, Serialize};
 
+use metadb_core::codec;
 use metadb_core::{
     append_crc32c_le, verify_crc32c_le, CellId, CompositeKeyRange, InodeId, MetaDbError, NodeId,
     Result, ShardEpoch, ShardId,
@@ -31,13 +32,17 @@ use crate::meta_cache::{CompositeMetaCache, CompositeShardRoute};
 use crate::shard::{ShardHealthState, ShardSplitMode};
 use crate::split_worker::{RaftShardSplitWorker, SplitCandidate, SplitCrashPoint};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub enum SplitPlanState {
     Planned,
     Activated,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct SplitPlanRecord {
     pub parent_shard_id: ShardId,
     pub child_shard_id: ShardId,
@@ -47,7 +52,9 @@ pub struct SplitPlanRecord {
     pub dual_mode_pid: Option<InodeId>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 struct PersistedCellState {
     nodes: BTreeMap<NodeId, String>,
     routes: BTreeMap<ShardId, CompositeShardRoute>,
@@ -63,7 +70,7 @@ struct PersistedCellState {
 }
 
 /// On-disk layout after `joined_existing` and before `join_pending`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, wincode::SchemaRead)]
 struct CellStateJoinedOnly {
     nodes: BTreeMap<NodeId, String>,
     routes: BTreeMap<ShardId, CompositeShardRoute>,
@@ -72,7 +79,7 @@ struct CellStateJoinedOnly {
 }
 
 /// On-disk layout before `joined_existing` was stored in the same record.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, wincode::SchemaRead)]
 struct CellStateBeforeJoinFlag {
     nodes: BTreeMap<NodeId, String>,
     routes: BTreeMap<ShardId, CompositeShardRoute>,
@@ -1391,7 +1398,7 @@ impl DurableCellManager {
                 new_epoch: epoch,
             };
             let payload =
-                bincode::serialize(&cmd).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+                codec::serialize(&cmd).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
             group
                 .propose(epoch, self.host.clock().now(), payload)
                 .await?;
@@ -1492,7 +1499,7 @@ impl DurableCellManager {
     }
 
     fn write_state_file(dir: &Path, st: &PersistedCellState) -> Result<()> {
-        let mut raw = bincode::serialize(st).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        let mut raw = codec::serialize(st).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
         append_crc32c_le(&mut raw);
         let tmp = dir.join("CELL_MANAGER_STATE.tmp");
         let dst = dir.join("CELL_MANAGER_STATE");
@@ -1564,7 +1571,7 @@ impl DurableCellManager {
 
 /// `SplitPlanRecord` gained `dual_mode_pid` after the first on-disk layout.
 /// Old `CELL_MANAGER_STATE` files still decode; missing mode is `None`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, wincode::SchemaRead)]
 struct LegacySplitPlanRecord {
     parent_shard_id: ShardId,
     child_shard_id: ShardId,
@@ -1573,7 +1580,7 @@ struct LegacySplitPlanRecord {
     state: SplitPlanState,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, wincode::SchemaRead)]
 struct LegacyPersistedCellState {
     nodes: BTreeMap<NodeId, String>,
     routes: BTreeMap<ShardId, CompositeShardRoute>,
@@ -1581,10 +1588,10 @@ struct LegacyPersistedCellState {
 }
 
 fn decode_cell_state(body: &[u8]) -> Result<PersistedCellState> {
-    if let Ok(state) = bincode::deserialize::<PersistedCellState>(body) {
+    if let Ok(state) = codec::deserialize::<PersistedCellState>(body) {
         return Ok(state);
     }
-    if let Ok(prior) = bincode::deserialize::<CellStateJoinedOnly>(body) {
+    if let Ok(prior) = codec::deserialize::<CellStateJoinedOnly>(body) {
         return Ok(PersistedCellState {
             nodes: prior.nodes,
             routes: prior.routes,
@@ -1593,7 +1600,7 @@ fn decode_cell_state(body: &[u8]) -> Result<PersistedCellState> {
             join_pending: false,
         });
     }
-    if let Ok(prior) = bincode::deserialize::<CellStateBeforeJoinFlag>(body) {
+    if let Ok(prior) = codec::deserialize::<CellStateBeforeJoinFlag>(body) {
         return Ok(PersistedCellState {
             nodes: prior.nodes,
             routes: prior.routes,
@@ -1602,7 +1609,7 @@ fn decode_cell_state(body: &[u8]) -> Result<PersistedCellState> {
             join_pending: false,
         });
     }
-    let legacy: LegacyPersistedCellState = bincode::deserialize(body)
+    let legacy: LegacyPersistedCellState = codec::deserialize(body)
         .map_err(|e| MetaDbError::CodecError(format!("CELL_MANAGER_STATE: {e}")))?;
     Ok(PersistedCellState {
         nodes: legacy.nodes,

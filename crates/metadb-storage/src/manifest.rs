@@ -14,7 +14,17 @@ use crate::sstable::{sst_file_name, sync_dir, SstFileMeta};
 const EDIT_FORMAT_VERSION: u8 = 1;
 
 /// Durable Raft + shard state checkpoint persisted atomically inside `MANIFEST` (`Resolution B5`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub struct DurableShardCheckpoint {
     pub flushed_raft_term: u64,
     pub flushed_raft_leader: u64,

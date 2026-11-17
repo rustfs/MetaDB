@@ -6,6 +6,7 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
+use metadb_core::codec;
 use metadb_core::{HlcTimestamp, HybridLogicalClock, MetaKey, ShardEpoch};
 use metadb_proto::raft_transport_service_server::RaftTransportServiceServer;
 use metadb_raft::{
@@ -122,7 +123,7 @@ async fn run_promotion_and_failover(authenticated: bool) {
             value: format!("val_{}", i).into_bytes(),
         };
         node1
-            .propose(ep1, HlcTimestamp::ZERO, bincode::serialize(&cmd).unwrap())
+            .propose(ep1, HlcTimestamp::ZERO, codec::serialize(&cmd).unwrap())
             .await
             .unwrap();
     }
@@ -135,7 +136,7 @@ async fn run_promotion_and_failover(authenticated: bool) {
             value: format!("val_{}", i).into_bytes(),
         };
         node1
-            .propose(ep1, HlcTimestamp::ZERO, bincode::serialize(&cmd).unwrap())
+            .propose(ep1, HlcTimestamp::ZERO, codec::serialize(&cmd).unwrap())
             .await
             .unwrap();
     }
@@ -166,7 +167,7 @@ async fn run_promotion_and_failover(authenticated: bool) {
         .propose(
             ep_3voter,
             HlcTimestamp::ZERO,
-            bincode::serialize(&post_promote_cmd).unwrap(),
+            codec::serialize(&post_promote_cmd).unwrap(),
         )
         .await
         .unwrap();

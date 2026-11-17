@@ -19,6 +19,7 @@ use tokio_stream::StreamExt;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status, Streaming};
 
+use metadb_core::codec;
 use metadb_core::ShardId;
 use metadb_proto::raft_transport_service_client::RaftTransportServiceClient;
 use metadb_proto::raft_transport_service_server::RaftTransportService;
@@ -164,7 +165,7 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
             .map_err(Self::unreachable)?;
         let mut client = RaftTransportServiceClient::new(ch);
 
-        let bincode_payload = bincode::serialize(&rpc).map_err(Self::unreachable)?;
+        let bincode_payload = codec::serialize_serde(&rpc).map_err(Self::unreachable)?;
         let reply = client
             .append_entries(
                 self.pool
@@ -183,7 +184,7 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
         }
 
         let wire_resp: AppendEntriesResponse<MetaDbTypeConfig> =
-            bincode::deserialize(&reply.bincode_payload).map_err(Self::unreachable)?;
+            codec::deserialize_serde(&reply.bincode_payload).map_err(Self::unreachable)?;
         Ok(wire_resp.into_append_result(prev_log_id, last_log_id))
     }
 
@@ -199,7 +200,7 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
             .map_err(Self::unreachable)?;
         let mut client = RaftTransportServiceClient::new(ch);
 
-        let bincode_payload = bincode::serialize(&rpc).map_err(Self::unreachable)?;
+        let bincode_payload = codec::serialize_serde(&rpc).map_err(Self::unreachable)?;
         let reply = client
             .vote(
                 self.pool
@@ -216,7 +217,7 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
         if !reply.error_message.is_empty() {
             return Err(Self::unreachable(reply.error_message));
         }
-        bincode::deserialize(&reply.bincode_payload).map_err(Self::unreachable)
+        codec::deserialize_serde(&reply.bincode_payload).map_err(Self::unreachable)
     }
 
     async fn full_snapshot(
@@ -233,11 +234,11 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
             .map_err(Self::streaming_unreachable)?;
         let mut client = RaftTransportServiceClient::new(ch);
 
-        let vote_bincode = bincode::serialize(&vote).map_err(Self::streaming_unreachable)?;
+        let vote_bincode = codec::serialize_serde(&vote).map_err(Self::streaming_unreachable)?;
         let meta_bincode =
-            bincode::serialize(&snapshot.meta).map_err(Self::streaming_unreachable)?;
+            codec::serialize_serde(&snapshot.meta).map_err(Self::streaming_unreachable)?;
         let archive_bytes =
-            bincode::serialize(&snapshot.snapshot).map_err(Self::streaming_unreachable)?;
+            codec::serialize(&snapshot.snapshot).map_err(Self::streaming_unreachable)?;
 
         let mut chunks: Vec<SnapshotChunkRequest> = Vec::new();
         if archive_bytes.is_empty() {
@@ -292,7 +293,7 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
             return Err(Self::streaming_unreachable(reply.error_message));
         }
 
-        bincode::deserialize(&reply.bincode_payload).map_err(Self::streaming_unreachable)
+        codec::deserialize_serde(&reply.bincode_payload).map_err(Self::streaming_unreachable)
     }
 }
 
@@ -324,14 +325,14 @@ impl RaftTransportService for MultiRaftTransportServer {
         };
 
         let req: AppendEntriesRequest<MetaDbTypeConfig> =
-            bincode::deserialize(&env.bincode_payload)
+            codec::deserialize_serde(&env.bincode_payload)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         match raft.append_entries(req).await {
             Ok(res) => {
                 let wire = AppendEntriesResponse::<MetaDbTypeConfig>::from(res);
                 let bincode_payload =
-                    bincode::serialize(&wire).map_err(|e| Status::internal(e.to_string()))?;
+                    codec::serialize_serde(&wire).map_err(|e| Status::internal(e.to_string()))?;
                 Ok(Response::new(RaftRpcReply {
                     bincode_payload,
                     error_message: String::new(),
@@ -356,13 +357,13 @@ impl RaftTransportService for MultiRaftTransportServer {
             }));
         };
 
-        let req: VoteRequest<MetaDbTypeConfig> = bincode::deserialize(&env.bincode_payload)
+        let req: VoteRequest<MetaDbTypeConfig> = codec::deserialize_serde(&env.bincode_payload)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         match raft.vote(req).await {
             Ok(res) => {
                 let bincode_payload =
-                    bincode::serialize(&res).map_err(|e| Status::internal(e.to_string()))?;
+                    codec::serialize_serde(&res).map_err(|e| Status::internal(e.to_string()))?;
                 Ok(Response::new(RaftRpcReply {
                     bincode_payload,
                     error_message: String::new(),
@@ -407,11 +408,11 @@ impl RaftTransportService for MultiRaftTransportServer {
             }));
         };
 
-        let vote: VoteOf<MetaDbTypeConfig> = bincode::deserialize(&vote_bytes)
+        let vote: VoteOf<MetaDbTypeConfig> = codec::deserialize_serde(&vote_bytes)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let meta: SnapshotMetaOf<MetaDbTypeConfig> = bincode::deserialize(&meta_bytes)
+        let meta: SnapshotMetaOf<MetaDbTypeConfig> = codec::deserialize_serde(&meta_bytes)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let archive: SnapshotArchive = bincode::deserialize(&archive_buf)
+        let archive: SnapshotArchive = codec::deserialize(&archive_buf)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         let snap = Snapshot {
@@ -421,7 +422,7 @@ impl RaftTransportService for MultiRaftTransportServer {
         match raft.install_full_snapshot(vote, snap).await {
             Ok(resp) => {
                 let bincode_payload =
-                    bincode::serialize(&resp).map_err(|e| Status::internal(e.to_string()))?;
+                    codec::serialize_serde(&resp).map_err(|e| Status::internal(e.to_string()))?;
                 Ok(Response::new(SnapshotChunkResponse {
                     bincode_payload,
                     error_message: String::new(),

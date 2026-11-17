@@ -24,7 +24,20 @@ use crate::schema::{
 const SYSTEM_CODEC_V1: u8 = 1;
 
 /// Key of `DirShardDelta` (`[0x04][pid: 8B BE]`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub struct DirShardDeltaKey {
     pub pid: InodeId,
 }
@@ -50,7 +63,9 @@ impl DirShardDeltaKey {
 }
 
 /// Value of `DirShardDelta` stored on non-anchor `DualModeFineGrained` sub-shards of `pid`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct DirShardDeltaRecord {
     pub inode_id: InodeId,
     pub parent_pid: InodeId,
@@ -66,7 +81,7 @@ pub struct DirShardDeltaRecord {
 
 impl DirShardDeltaRecord {
     pub fn encode(&self) -> Vec<u8> {
-        let payload = bincode::serialize(self).expect("DirShardDeltaRecord serialize");
+        let payload = crate::codec::serialize(self).expect("DirShardDeltaRecord serialize");
         let mut out = Vec::with_capacity(1 + payload.len() + 4);
         out.push(SYSTEM_CODEC_V1);
         out.extend_from_slice(&payload);
@@ -81,12 +96,14 @@ impl DirShardDeltaRecord {
                 "unsupported DirShardDeltaRecord codec version".to_string(),
             ));
         }
-        bincode::deserialize(&body[1..]).map_err(|e| MetaDbError::CodecError(e.to_string()))
+        crate::codec::deserialize(&body[1..]).map_err(|e| MetaDbError::CodecError(e.to_string()))
     }
 }
 
 /// Parent directory attribute delta embedded in a 2PC `WriteIntent`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct AttrDeltaSpec {
     pub pid: InodeId,
     pub delta_children: i64,
@@ -94,7 +111,9 @@ pub struct AttrDeltaSpec {
 }
 
 /// Auxiliary update payload emitted into `AuxOutbox` / `[0x07] SpilledAuxOutbox`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub enum AuxTaskPayload {
     QuotaDelta {
         uid: UserId,
@@ -115,7 +134,9 @@ pub enum AuxTaskPayload {
 }
 
 /// Auxiliary task blueprint carried inside a 2PC `WriteIntent` before `commit_hlc` is assigned.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub enum AuxIntentSpec {
     QuotaDelta {
         uid: UserId,
@@ -134,7 +155,9 @@ pub enum AuxIntentSpec {
 }
 
 /// Lock operation stored inside `[0x05][target_user_key]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub enum IntentOp {
     /// Exclusive write lock proposing a key upsert. Overwrites an existing value.
     Put {
@@ -169,7 +192,19 @@ pub enum IntentOp {
 }
 
 /// Key of `WriteIntent`: `[0x05][target_user_key]`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub struct WriteIntentKey {
     pub target_user_key: Vec<u8>,
 }
@@ -207,7 +242,9 @@ impl WriteIntentKey {
 }
 
 /// Value stored at `[0x05][target_user_key]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct WriteIntentRecord {
     pub txn_id: TxnId,
     pub primary_shard_hint: ShardId,
@@ -220,7 +257,7 @@ pub struct WriteIntentRecord {
 
 impl WriteIntentRecord {
     pub fn encode(&self) -> Vec<u8> {
-        let payload = bincode::serialize(self).expect("WriteIntentRecord serialize");
+        let payload = crate::codec::serialize(self).expect("WriteIntentRecord serialize");
         let mut out = Vec::with_capacity(1 + payload.len() + 4);
         out.push(SYSTEM_CODEC_V1);
         out.extend_from_slice(&payload);
@@ -235,12 +272,25 @@ impl WriteIntentRecord {
                 "unsupported WriteIntentRecord codec version".to_string(),
             ));
         }
-        bincode::deserialize(&body[1..]).map_err(|e| MetaDbError::CodecError(e.to_string()))
+        crate::codec::deserialize(&body[1..]).map_err(|e| MetaDbError::CodecError(e.to_string()))
     }
 }
 
 /// Key of `TxnRecord` on the Primary Shard: `[0x06][txn_id: 16B BE]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub struct TxnRecordKey {
     pub txn_id: TxnId,
 }
@@ -264,7 +314,17 @@ impl TxnRecordKey {
 }
 
 /// Durable decision state of a Primary-Anchored 2PC transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub enum TxnState {
     Pending,
     Committed { commit_hlc: HlcTimestamp },
@@ -273,7 +333,9 @@ pub enum TxnState {
 
 /// Value stored at `[0x06][txn_id: 16B BE]`.
 /// Retained until `pending_ack_keys` becomes empty (Resolution B12).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct TxnStatusRecord {
     pub txn_id: TxnId,
     pub primary_key: Vec<u8>,
@@ -287,7 +349,7 @@ pub struct TxnStatusRecord {
 
 impl TxnStatusRecord {
     pub fn encode(&self) -> Vec<u8> {
-        let payload = bincode::serialize(self).expect("TxnStatusRecord serialize");
+        let payload = crate::codec::serialize(self).expect("TxnStatusRecord serialize");
         let mut out = Vec::with_capacity(1 + payload.len() + 4);
         out.push(SYSTEM_CODEC_V1);
         out.extend_from_slice(&payload);
@@ -302,12 +364,25 @@ impl TxnStatusRecord {
                 "unsupported TxnStatusRecord codec version".to_string(),
             ));
         }
-        bincode::deserialize(&body[1..]).map_err(|e| MetaDbError::CodecError(e.to_string()))
+        crate::codec::deserialize(&body[1..]).map_err(|e| MetaDbError::CodecError(e.to_string()))
     }
 }
 
 /// Key of `SpilledAuxOutbox`: `[0x07][origin_raft_index: 8B BE][task_ordinal: 2B BE]` (11 bytes, Resolution B7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub struct SpilledAuxOutboxKey {
     pub origin_raft_index: u64,
     pub task_ordinal: u16,
@@ -413,7 +488,9 @@ pub fn decode_origin_quota_cursor(bytes: &[u8]) -> Result<(u64, u16)> {
 }
 
 /// Persisted auxiliary outbox entry stored in `[0x07]` or dispatched via `ApplyAuxBatchRpc`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct AuxOutboxEntry {
     pub origin_shard_id: ShardId,
     pub origin_raft_index: u64,
@@ -424,7 +501,7 @@ pub struct AuxOutboxEntry {
 
 impl AuxOutboxEntry {
     pub fn encode(&self) -> Vec<u8> {
-        let payload = bincode::serialize(self).expect("AuxOutboxEntry serialize");
+        let payload = crate::codec::serialize(self).expect("AuxOutboxEntry serialize");
         let mut out = Vec::with_capacity(1 + payload.len() + 4);
         out.push(SYSTEM_CODEC_V1);
         out.extend_from_slice(&payload);
@@ -439,7 +516,7 @@ impl AuxOutboxEntry {
                 "unsupported AuxOutboxEntry codec version".to_string(),
             ));
         }
-        bincode::deserialize(&body[1..]).map_err(|e| MetaDbError::CodecError(e.to_string()))
+        crate::codec::deserialize(&body[1..]).map_err(|e| MetaDbError::CodecError(e.to_string()))
     }
 }
 

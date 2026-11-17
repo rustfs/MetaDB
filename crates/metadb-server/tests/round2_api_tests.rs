@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use metadb_core::codec;
 use metadb_core::{CompositeKeyRange, HlcTimestamp, MetaKey, ShardEpoch};
 use metadb_proto::metadata_service_client::MetadataServiceClient;
 use metadb_proto::{
@@ -190,7 +191,7 @@ fn apply(
         &MetaDbRaftRequest {
             expected_epoch: handler.current_epoch(),
             hlc,
-            payload: bincode::serialize(&command).unwrap(),
+            payload: codec::serialize(&command).unwrap(),
         },
         engine,
     )

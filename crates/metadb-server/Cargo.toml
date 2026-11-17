@@ -24,7 +24,6 @@ metadb-raft = { path = "../metadb-raft" }
 metadb-tx = { path = "../metadb-tx" }
 metadb-cluster = { path = "../metadb-cluster" }
 metadb-proxy = { path = "../metadb-proxy" }
-bincode = { workspace = true }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

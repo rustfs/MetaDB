@@ -9,7 +9,9 @@ use metadb_core::{HlcTimestamp, MetaDbError, ShardEpoch};
 use metadb_storage::DurableShardCheckpoint;
 
 /// Application request replicated through a shard's OpenRaft group.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct MetaDbRaftRequest {
     pub expected_epoch: ShardEpoch,
     pub hlc: HlcTimestamp,
@@ -29,7 +31,9 @@ impl std::fmt::Display for MetaDbRaftRequest {
 }
 
 /// Response returned after `RaftStateMachine::apply` commits a `MetaDbRaftRequest`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct MetaDbRaftResponse {
     pub applied_raft_index: u64,
     pub applied_hlc: HlcTimestamp,
@@ -48,7 +52,9 @@ impl std::fmt::Display for MetaDbRaftResponse {
 }
 
 /// Built-in KV payload used by standalone `metadb-raft` tests (`BasicKvApplyHandler`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub enum BasicKvCommand {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
@@ -56,7 +62,9 @@ pub enum BasicKvCommand {
 }
 
 /// Verified per-file payload inside a `SnapshotArchive` with explicit `(expected_len, crc32c)` metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct SnapshotFileEntry {
     pub name: String,
     pub expected_len: u64,
@@ -66,7 +74,17 @@ pub struct SnapshotFileEntry {
 
 /// Portable snapshot bundle containing verified hard-linked `.sst` and `MANIFEST` files
 /// pinned strictly at `checkpoint.flushed_raft_index` (`Resolution B6` / `G-S5`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub struct SnapshotArchive {
     pub checkpoint: DurableShardCheckpoint,
     /// Verified files inside the shard `lsm/` directory.

@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use metadb_core::codec;
 use metadb_core::{
     AuxOutboxEntry, AuxTaskPayload, CompositeKeyRange, HlcTimestamp, HybridLogicalClock, InodeId,
     MetaDbError, Result, ShardEpoch, SpilledAuxOutboxKey, ROOT_INODE_ID,
@@ -217,7 +218,7 @@ async fn test_aux_outbox_spill_contiguous_frontiers_gap_rejection_and_cleanup() 
         .propose(
             quota_grp.current_epoch(),
             clock.now(),
-            bincode::serialize(&gapped_cmd).unwrap(),
+            codec::serialize(&gapped_cmd).unwrap(),
         )
         .await
         .unwrap_err();
@@ -256,7 +257,7 @@ async fn test_aux_outbox_spill_contiguous_frontiers_gap_rejection_and_cleanup() 
         .propose(
             quota_grp.current_epoch(),
             clock.now(),
-            bincode::serialize(&prefix_gap).unwrap(),
+            codec::serialize(&prefix_gap).unwrap(),
         )
         .await
         .unwrap_err();
@@ -285,7 +286,7 @@ async fn test_aux_outbox_spill_contiguous_frontiers_gap_rejection_and_cleanup() 
         .propose(
             quota_grp.current_epoch(),
             clock.now(),
-            bincode::serialize(&TxRaftCmd::ApplyAuxBatch {
+            codec::serialize(&TxRaftCmd::ApplyAuxBatch {
                 entries: quota_only,
             })
             .unwrap(),
@@ -328,7 +329,7 @@ async fn test_aux_outbox_spill_contiguous_frontiers_gap_rejection_and_cleanup() 
         .propose(
             idx_grp.current_epoch(),
             clock.now(),
-            bincode::serialize(&TxRaftCmd::ApplyAuxBatch {
+            codec::serialize(&TxRaftCmd::ApplyAuxBatch {
                 entries: vec![AuxOutboxEntry {
                     origin_shard_id: 1,
                     origin_raft_index: 1,
@@ -358,7 +359,7 @@ async fn test_aux_outbox_spill_contiguous_frontiers_gap_rejection_and_cleanup() 
         .propose(
             idx_grp.current_epoch(),
             clock.now(),
-            bincode::serialize(&TxRaftCmd::ApplyAuxBatch {
+            codec::serialize(&TxRaftCmd::ApplyAuxBatch {
                 entries: vec![AuxOutboxEntry {
                     origin_shard_id: 1,
                     origin_raft_index: 50,
@@ -375,7 +376,7 @@ async fn test_aux_outbox_spill_contiguous_frontiers_gap_rejection_and_cleanup() 
         .propose(
             idx_grp.current_epoch(),
             clock.now(),
-            bincode::serialize(&TxRaftCmd::ApplyAuxBatch {
+            codec::serialize(&TxRaftCmd::ApplyAuxBatch {
                 entries: vec![AuxOutboxEntry {
                     origin_shard_id: 1,
                     origin_raft_index: 50,

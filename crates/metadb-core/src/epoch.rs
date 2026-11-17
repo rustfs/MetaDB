@@ -17,7 +17,20 @@ pub type TxnId = u128;
 ///
 /// Per Goldfish Review Resolution B16, all shard data/consensus/read RPCs enforce strict
 /// equality `expected_epoch == current_epoch` (`conf_ver` AND `version`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub struct ShardEpoch {
     /// Incremented by 1 on every Raft membership change (`AddLearner`, `ChangeMembership`).
     pub conf_ver: u64,
@@ -84,7 +97,19 @@ impl ShardEpoch {
 /// - Table-aligned root ranges (`[0x01, 0x02)`, `[0x02, 0x03)`, `[0x03, 0x04)`),
 /// - `DirectoryColocated` `PID`-boundary intervals (`[[0x01][start_pid], [0x01][end_pid])`),
 /// - `DualModeFineGrained` composite `(PID, name)` sub-ranges (`[[0x01][pid][start_name], ...)`).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub struct CompositeKeyRange {
     pub start_key: Vec<u8>,
     pub end_key: Vec<u8>,

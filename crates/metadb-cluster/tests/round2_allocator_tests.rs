@@ -1,4 +1,5 @@
 use metadb_cluster::{AllocIdKind, DurableIdAllocator};
+use metadb_core::codec;
 use metadb_core::HlcTimestamp;
 
 #[test]
@@ -92,7 +93,7 @@ fn write_legacy_state(dir: &std::path::Path, file_sequence: u64) {
         std::collections::BTreeMap::from([(123u128, (1u64, 8u64))]),
         std::collections::VecDeque::from([123u128]),
     );
-    let mut raw = bincode::serialize(&state).unwrap();
+    let mut raw = codec::serialize(&state).unwrap();
     metadb_core::append_crc32c_le(&mut raw);
     std::fs::write(dir.join("ID_ALLOCATOR_STATE"), raw).unwrap();
 }
@@ -174,7 +175,7 @@ fn version_two_allocator_cannot_be_misread_as_legacy_counters() {
     let raw = std::fs::read(dir.path().join("ID_ALLOCATOR_STATE")).unwrap();
     let body = metadb_core::verify_crc32c_le(&raw, "allocator").unwrap();
     assert!(
-        bincode::deserialize::<LegacyState>(body).is_err(),
+        codec::deserialize::<LegacyState>(body).is_err(),
         "an old decoder could reinterpret the versioned counters and reissue IDs"
     );
     let allocator = DurableIdAllocator::open(dir.path()).unwrap();

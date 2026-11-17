@@ -13,6 +13,7 @@ use openraft::errors::{ClientWriteError, RaftError};
 use openraft::{BasicNode, Config};
 use serde::{Deserialize, Serialize};
 
+use metadb_core::codec;
 use metadb_core::{
     append_crc32c_le, verify_crc32c_le, HlcTimestamp, HybridLogicalClock, MetaDbError, NodeId,
     Result, ShardEpoch, ShardId,
@@ -512,7 +513,9 @@ impl ShardRaftGroup {
 }
 
 /// Durable entry in `<data_dir>/NODE_SHARD_REGISTRY` tracking split child bootstrap (`Resolution B15`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub enum RegistryShardState {
     /// Child shard materialized for a split that has not yet published routes.
     /// Consumed by `DurableCellManager` on startup so a crash after the parent fence
@@ -665,8 +668,7 @@ impl ShardGroupHost {
         data_dir: &Path,
         reg: &BTreeMap<ShardId, RegistryShardState>,
     ) -> Result<()> {
-        let mut raw =
-            bincode::serialize(reg).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        let mut raw = codec::serialize(reg).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
         append_crc32c_le(&mut raw);
         let tmp = data_dir.join("NODE_SHARD_REGISTRY.tmp");
         let dst = data_dir.join("NODE_SHARD_REGISTRY");
@@ -686,7 +688,7 @@ impl ShardGroupHost {
 }
 
 /// `PendingChildBoot` originally stored only the parent id and peer map.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, wincode::SchemaRead)]
 enum LegacyRegistryShardState {
     PendingChildBoot {
         parent_shard_id: ShardId,
@@ -698,10 +700,10 @@ enum LegacyRegistryShardState {
 }
 
 fn decode_registry(body: &[u8]) -> Result<BTreeMap<ShardId, RegistryShardState>> {
-    if let Ok(reg) = bincode::deserialize::<BTreeMap<ShardId, RegistryShardState>>(body) {
+    if let Ok(reg) = codec::deserialize::<BTreeMap<ShardId, RegistryShardState>>(body) {
         return Ok(reg);
     }
-    let legacy: BTreeMap<ShardId, LegacyRegistryShardState> = bincode::deserialize(body)
+    let legacy: BTreeMap<ShardId, LegacyRegistryShardState> = codec::deserialize(body)
         .map_err(|e| MetaDbError::CodecError(format!("NODE_SHARD_REGISTRY: {e}")))?;
     Ok(legacy
         .into_iter()

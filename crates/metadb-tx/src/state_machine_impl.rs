@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+use metadb_core::codec;
 use metadb_core::schema::validate_user_entry_name;
 use metadb_core::{
     negate_accounted_size, saturating_add_i64, validate_dir_inode_id, validate_file_size,
@@ -27,7 +28,17 @@ use crate::aux_outbox::{ReplicatedAttrAggregator, ShardAuxOutbox, DEFAULT_OUTBOX
 use crate::rename_cycle::RenameCycleWalker;
 
 /// Partial attribute mutation specification for `SetAttr`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub struct SetAttrPatch {
     pub mode: Option<u32>,
     pub uid: Option<UserId>,
@@ -37,7 +48,9 @@ pub struct SetAttrPatch {
 }
 
 /// Deterministic command replicated through a shard's OpenRaft log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub enum TxRaftCmd {
     InitDirAttr {
         dir_id: InodeId,
@@ -164,7 +177,9 @@ pub enum TxRaftCmd {
 }
 
 /// Typed output serialized inside `MetaDbRaftResponse.result`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub enum TxRaftOutput {
     Unit,
     Entry(MetaEntry),
@@ -182,7 +197,7 @@ pub enum TxRaftOutput {
     TxnStatus(Option<TxnState>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]
 struct PersistedShardRouteMeta {
     epoch: ShardEpoch,
     range: CompositeKeyRange,
@@ -2206,7 +2221,7 @@ impl ShardApplyHandler for TxStateMachineHandler {
     }
 
     fn encode_descriptor_bytes(&self) -> Vec<u8> {
-        bincode::serialize(&*self.meta.read().unwrap()).unwrap_or_default()
+        codec::serialize(&*self.meta.read().unwrap()).unwrap_or_default()
     }
 
     fn apply_command(
@@ -2216,12 +2231,12 @@ impl ShardApplyHandler for TxStateMachineHandler {
         request: &MetaDbRaftRequest,
         engine: &LifecycleStorageEngine,
     ) -> Result<Vec<u8>> {
-        let cmd: TxRaftCmd = bincode::deserialize(&request.payload)
+        let cmd: TxRaftCmd = codec::deserialize(&request.payload)
             .map_err(|e| MetaDbError::CodecError(e.to_string()))?;
         let out = self.apply_tx_cmd(raft_index, commit_hlc, cmd, engine)?;
         self.outbox
             .persist_quota_cursors(engine, commit_hlc, raft_index);
-        bincode::serialize(&out).map_err(|e| MetaDbError::CodecError(e.to_string()))
+        codec::serialize(&out).map_err(|e| MetaDbError::CodecError(e.to_string()))
     }
 
     fn pre_flush_hook(&self) -> Option<&dyn PreFlushHook> {
@@ -2239,7 +2254,7 @@ impl ShardApplyHandler for TxStateMachineHandler {
     ) {
         if !checkpoint.descriptor_bytes.is_empty() {
             if let Ok(decoded) =
-                bincode::deserialize::<PersistedShardRouteMeta>(&checkpoint.descriptor_bytes)
+                codec::deserialize::<PersistedShardRouteMeta>(&checkpoint.descriptor_bytes)
             {
                 *self.meta.write().unwrap() = decoded;
             }

@@ -16,7 +16,19 @@ pub const DEFAULT_MAX_CLOCK_DRIFT_MS: u64 = 500;
 /// centralized Timestamp Oracle (TSO) with a decentralized HLC removes a cluster-wide
 /// write availability bottleneck while preserving causal ordering across nodes.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
 )]
 pub struct HlcTimestamp(pub u64);
 

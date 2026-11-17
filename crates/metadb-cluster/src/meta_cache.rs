@@ -11,7 +11,9 @@ use metadb_core::{CellId, CompositeKeyRange, InodeId, NodeId, ShardEpoch, ShardI
 use crate::shard::{ShardHealthState, ShardSplitMode};
 
 /// Complete shard routing descriptor stored in `CompositeMetaCache` and persisted by `DurableCellManager`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct CompositeShardRoute {
     pub cell_id: CellId,
     pub shard_id: ShardId,

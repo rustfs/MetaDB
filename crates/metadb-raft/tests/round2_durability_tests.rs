@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
 
+use metadb_core::codec;
 use metadb_core::{HlcTimestamp, HybridLogicalClock, ShardEpoch};
 use metadb_raft::{
     BasicKvApplyHandler, BasicKvCommand, ChannelPool, MetaDbRaftRequest, MetaDbTypeConfig,
@@ -29,7 +30,7 @@ fn put_entry(index: u64, key: &[u8]) -> EntryOf<MetaDbTypeConfig> {
         payload: EntryPayload::Normal(MetaDbRaftRequest {
             expected_epoch: ShardEpoch::initial(),
             hlc: HlcTimestamp(index),
-            payload: bincode::serialize(&BasicKvCommand::Put {
+            payload: codec::serialize(&BasicKvCommand::Put {
                 key: key.to_vec(),
                 value: b"present".to_vec(),
             })
@@ -97,9 +98,9 @@ async fn committed_frame_gaps_duplicates_and_identity_mismatches_are_fatal() {
             "identity" => {
                 // Preserve the framing index and CRC while changing the serialized LogId.
                 let mut entry: EntryOf<MetaDbTypeConfig> =
-                    bincode::deserialize(&frames[1][16..]).unwrap();
+                    codec::deserialize_serde(&frames[1][16..]).unwrap();
                 entry.log_id = log_id(9);
-                frames[1].splice(16.., bincode::serialize(&entry).unwrap());
+                frames[1].splice(16.., codec::serialize_serde(&entry).unwrap());
                 let crc = metadb_core::checksum_crc32c(&frames[1][8..]);
                 frames[1][4..8].copy_from_slice(&crc.to_le_bytes());
             }
@@ -274,7 +275,7 @@ async fn recovery_never_reports_missing_interior_write_as_applied() {
             .propose(
                 group.current_epoch(),
                 HlcTimestamp::ZERO,
-                bincode::serialize(&BasicKvCommand::Put {
+                codec::serialize(&BasicKvCommand::Put {
                     key: vec![index],
                     value: b"acknowledged".to_vec(),
                 })

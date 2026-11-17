@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use metadb_core::codec;
 use metadb_core::{
     append_crc32c_le, make_file_inode_id, verify_crc32c_le, FileId, HlcTimestamp, InodeId,
     MetaDbError, Result, ShardId,
@@ -24,7 +25,17 @@ const MAX_CACHED_GRANT_UUIDS: usize = 4_096;
 const ALLOCATOR_FORMAT_MAGIC: &[u8; 8] = b"MIDA0002";
 const ALLOCATOR_HEADER_LEN: usize = 41;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub enum AllocIdKind {
     FileInode = 1,
     DirInode = 2,
@@ -32,7 +43,7 @@ pub enum AllocIdKind {
     ShardId = 4,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]
 struct PersistedAllocatorState {
     next_file_inode_seq: u64,
     next_dir_inode_id: InodeId,
@@ -47,7 +58,17 @@ struct PersistedAllocatorState {
     next_client_seq: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 struct CachedIdGrant {
     kind: AllocIdKind,
     start: u64,
@@ -72,7 +93,7 @@ impl Default for PersistedAllocatorState {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, wincode::SchemaRead)]
 struct LegacyAllocatorState {
     next_file_inode_seq: u64,
     next_dir_inode_id: InodeId,
@@ -94,13 +115,13 @@ fn decode_allocator_state(body: &[u8]) -> Result<PersistedAllocatorState> {
                 "invalid allocator version 2 header".to_string(),
             ));
         }
-        return bincode::deserialize(&body[ALLOCATOR_HEADER_LEN..])
+        return codec::deserialize(&body[ALLOCATOR_HEADER_LEN..])
             .map_err(|e| MetaDbError::CodecError(e.to_string()));
     }
-    if let Ok(current) = bincode::deserialize::<PersistedAllocatorState>(body) {
+    if let Ok(current) = codec::deserialize::<PersistedAllocatorState>(body) {
         return Ok(current);
     }
-    let old: LegacyAllocatorState = bincode::deserialize(body)
+    let old: LegacyAllocatorState = codec::deserialize(body)
         .map_err(|e| MetaDbError::CodecError(format!("ID_ALLOCATOR_STATE: {e}")))?;
     // Legacy tuples do not record the ID kind. Keep the UUID so a replay is
     // rejected, and keep the counters so new grants do not reuse those IDs.
@@ -357,7 +378,7 @@ impl DurableIdAllocator {
     }
 
     fn write_state_file(dir: &Path, st: &PersistedAllocatorState) -> Result<()> {
-        let payload = bincode::serialize(st).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        let payload = codec::serialize(st).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
         let mut raw = Vec::with_capacity(ALLOCATOR_HEADER_LEN + payload.len());
         raw.extend_from_slice(ALLOCATOR_FORMAT_MAGIC);
         raw.extend(std::iter::repeat_n(0u8, 32));

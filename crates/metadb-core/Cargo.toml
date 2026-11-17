@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-crc32c = { workspace = true }
+crc-fast = { workspace = true }
 serde = { workspace = true }
-bincode = { workspace = true }
+wincode = { workspace = true }
+serde-wincode = { workspace = true }

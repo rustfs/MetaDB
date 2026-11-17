@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use metadb_core::codec;
 use metadb_core::{
     AttrDeltaSpec, AuxOutboxEntry, AuxTaskPayload, CompositeKeyRange, HlcTimestamp, InodeAttr,
     IntentOp, MetaDbError, MetaKey, QuotaKey, QuotaRecord, ShardEpoch, WriteIntentKey,
@@ -21,7 +22,7 @@ fn apply(
         &MetaDbRaftRequest {
             expected_epoch: handler.current_epoch(),
             hlc,
-            payload: bincode::serialize(&cmd).unwrap(),
+            payload: codec::serialize(&cmd).unwrap(),
         },
         engine,
     )
@@ -410,7 +411,7 @@ fn fence_rechecks_intents_at_the_serialized_apply_boundary() {
         &MetaDbRaftRequest {
             expected_epoch: handler.current_epoch(),
             hlc,
-            payload: bincode::serialize(&fence).unwrap(),
+            payload: codec::serialize(&fence).unwrap(),
         },
         &engine,
     );

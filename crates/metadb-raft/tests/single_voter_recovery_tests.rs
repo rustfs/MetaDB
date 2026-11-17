@@ -3,6 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::sync::Arc;
 
+use metadb_core::codec;
 use metadb_core::{HlcTimestamp, HybridLogicalClock, MetaDbError, MetaKey, ShardEpoch};
 use metadb_raft::{
     BasicKvApplyHandler, BasicKvCommand, ChannelPool, MultiRaftRouter, RaftNodeOptions,
@@ -62,7 +63,7 @@ async fn test_single_voter_walless_crash_recovery_and_three_watermark_pinning() 
                 value: format!("payload_{}", i).into_bytes(),
             };
             group
-                .propose(epoch, HlcTimestamp::ZERO, bincode::serialize(&cmd).unwrap())
+                .propose(epoch, HlcTimestamp::ZERO, codec::serialize(&cmd).unwrap())
                 .await
                 .unwrap();
         }
@@ -209,7 +210,7 @@ async fn test_suffix_only_truncate_final_crc_rejection_and_snapshot_verification
             key: MetaKey::child(1, format!("k_{:02}", i)).encode(),
             value: vec![i as u8; 64],
         };
-        grp.propose(ep, HlcTimestamp::ZERO, bincode::serialize(&cmd).unwrap())
+        grp.propose(ep, HlcTimestamp::ZERO, codec::serialize(&cmd).unwrap())
             .await
             .unwrap();
     }

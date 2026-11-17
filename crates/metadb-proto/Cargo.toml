@@ -9,7 +9,6 @@ authors.workspace = true
 
 [dependencies]
 metadb-core = { path = "../metadb-core" }
-bincode = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 tonic = { workspace = true }

@@ -27,7 +27,9 @@ pub const SSTABLE_FOOTER_LEN: usize = 64;
 static NEXT_READER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Durable metadata describing an SSTable file in `MetaBlock` and `MANIFEST`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
 pub struct SstFileMeta {
     pub level: u8,
     pub file_id: u64,
