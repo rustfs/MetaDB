@@ -17,19 +17,19 @@ name = "metadb-ctl"
 path = "src/bin/metadb-ctl.rs"
 
 [dependencies]
-metadb-core = { path = "../metadb-core" }
-metadb-proto = { path = "../metadb-proto" }
-metadb-storage = { path = "../metadb-storage" }
-metadb-raft = { path = "../metadb-raft" }
-metadb-tx = { path = "../metadb-tx" }
-metadb-cluster = { path = "../metadb-cluster" }
-metadb-proxy = { path = "../metadb-proxy" }
-http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+metadb-core = { workspace = true }
+metadb-proto = { workspace = true }
+metadb-storage = { workspace = true }
+metadb-raft = { workspace = true }
+metadb-tx = { workspace = true }
+metadb-cluster = { workspace = true }
+metadb-proxy = { workspace = true }
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 clap = { workspace = true }
 serde = { workspace = true }
-serde_json = "1"
+serde_json = "1.0.154"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 toml = { workspace = true }
@@ -40,12 +40,12 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 openraft = { workspace = true }
-metadb-core = { path = "../metadb-core" }
-metadb-cluster = { path = "../metadb-cluster" }
-metadb-tx = { path = "../metadb-tx" }
-metadb-raft = { path = "../metadb-raft" }
-metadb-storage = { path = "../metadb-storage" }
-metadb-proto = { path = "../metadb-proto" }
-metadb-proxy = { path = "../metadb-proxy" }
+metadb-core = { workspace = true }
+metadb-cluster = { workspace = true }
+metadb-tx = { workspace = true }
+metadb-raft = { workspace = true }
+metadb-storage = { workspace = true }
+metadb-proto = { workspace = true }
+metadb-proxy = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }

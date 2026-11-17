@@ -4,7 +4,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os("PROTOC").is_none() {
         let homebrew_protoc = Path::new("/opt/homebrew/bin/protoc");
         if homebrew_protoc.exists() {
-            std::env::set_var("PROTOC", homebrew_protoc);
+            unsafe {
+                std::env::set_var("PROTOC", homebrew_protoc);
+            }
         }
     }
 

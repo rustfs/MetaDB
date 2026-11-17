@@ -8,9 +8,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-metadb-core = { path = "../metadb-core" }
-metadb-proto = { path = "../metadb-proto" }
-metadb-storage = { path = "../metadb-storage" }
+metadb-core = { workspace = true }
+metadb-proto = { workspace = true }
+metadb-storage = { workspace = true }
 wincode = { workspace = true }
 bytes = { workspace = true }
 openraft = { workspace = true }

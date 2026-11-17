@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-metadb-core = { path = "../metadb-core" }
+metadb-core = { workspace = true }
 serde = { workspace = true }
 wincode = { workspace = true }
 

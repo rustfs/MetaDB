@@ -19,20 +19,28 @@ repository = "https://github.com/rustfs/MetaDB"
 authors = ["The RustFS Authors"]
 
 [workspace.dependencies]
-bytes = "1"
+metadb-core = { path = "crates/metadb-core", version = "0.1.0" }
+metadb-proto = { path = "crates/metadb-proto", version = "0.1.0" }
+metadb-storage = { path = "crates/metadb-storage", version = "0.1.0" }
+metadb-raft = { path = "crates/metadb-raft", version = "0.1.0" }
+metadb-tx = { path = "crates/metadb-tx", version = "0.1.0" }
+metadb-cluster = { path = "crates/metadb-cluster", version = "0.1.0" }
+metadb-proxy = { path = "crates/metadb-proxy", version = "0.1.0" }
+metadb-server = { path = "crates/metadb-server", version = "0.1.0" }
+bytes = "1.12.1"
 crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
 prost = "0.14.6"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 wincode = { version = "0.6.3", features = ["derive"] }
 serde-wincode = "0.1.2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14.9"
 tonic-prost = "0.14.9"
 tonic-prost-build = "0.14.9"
 openraft = { version = "0.10.0", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
-toml = "0.8"
+clap = { version = "4.6.8", features = ["derive"] }
+toml = "1.2.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tempfile = "3"
+tempfile = "3.27.0"
