@@ -15,7 +15,7 @@ Cette page suit le code de `crates/`. Elle ne décrit pas un déploiement de cel
 5. Ouvre ou amorce `DurableCellManager` dans `<data_dir>/cell_<cell_id>`.
 6. Enregistre cette unique cellule sur `DurableGlobalManager` pour l'intervalle de clés `[0x01, 0x04)`.
 7. Garantit que l'inode racine `1` (`ROOT_INODE_ID`) possède un enregistrement d'attributs.
-8. Sert quatre services gRPC sur le même écouteur. Les services de métadonnées, de transaction et de plan de contrôle prennent un intercepteur bearer facultatif. `RaftTransportService` n'en prend pas.
+8. Sert quatre services gRPC sur le même écouteur. Les quatre prennent le même intercepteur bearer facultatif. Un secret vide autorise chaque appel.
 9. Lance une tâche de maintenance toutes les 250 ms.
 
 `metadbd` est une fine enveloppe : il charge le TOML, applique les remplacements CLI, appelle `open_and_serve`, appelle éventuellement `RegisterNode` sur `--cell-manager`, sert éventuellement le texte Prometheus, et sur Ctrl-C appelle `shutdown`.

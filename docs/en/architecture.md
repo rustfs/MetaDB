@@ -15,7 +15,7 @@ This page follows the code in `crates/`. It does not describe a multi-process Ce
 5. Opens or bootstraps `DurableCellManager` at `<data_dir>/cell_<cell_id>`.
 6. Registers that one cell on `DurableGlobalManager` for the key range `[0x01, 0x04)`.
 7. Ensures root directory inode `1` (`ROOT_INODE_ID`) has an attribute record.
-8. Serves four gRPC services on the same listener. Metadata, transaction, and control-plane services take an optional bearer interceptor. `RaftTransportService` does not.
+8. Serves four gRPC services on the same listener. All four take the same optional bearer interceptor. An empty secret allows every call.
 9. Spawns a maintenance task on a 250 ms interval.
 
 `metadbd` is a thin wrapper: it loads TOML, applies CLI overrides, calls `open_and_serve`, optionally calls `RegisterNode` on `--cell-manager`, optionally serves Prometheus text, and on Ctrl-C calls `shutdown`.

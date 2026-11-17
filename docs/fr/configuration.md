@@ -71,9 +71,9 @@ Le processus ne termine pas TLS.
 
 Lorsque `shared_secret` n'est pas vide, `MetadataService`, `TransactionService` et `ControlPlaneService` exigent que la valeur de métadonnée `authorization` soit égale à `Bearer <shared_secret>`. `metadb-ctl --auth-token` (variable d'environnement `METADB_AUTH_TOKEN`) envoie cet en-tête. `metadbd --cell-manager` envoie le même secret lorsqu'il appelle `RegisterNode`.
 
-`RaftTransportService` est enregistré sans l'intercepteur. Un jeton bearer n'authentifie pas les RPC Raft sur ce port.
+`RaftTransportService` utilise le même intercepteur. Un secret non vide exige aussi `Bearer <shared_secret>` pour les RPC Raft sur ce port.
 
-Un secret vide autorise les RPC de métadonnées, de transaction et de plan de contrôle. Le code avertit de cela au démarrage. Un secret bearer ne couvre pas `RaftTransportService`, et un terminateur TLS devant l'écouteur n'ajoute pas ce contrôle : après terminaison, les RPC Raft restent non authentifiés. Avant qu'un client non fiable puisse atteindre le port, garder la liaison sur un réseau de confiance tel que `127.0.0.1`, ou placer chaque service derrière un proxy qui authentifie le client (par exemple TLS mutuel) et bloquer l'accès direct à ce processus.
+Un secret vide autorise les quatre services de l'écouteur. Le code avertit de cela au démarrage. Le processus ne termine toujours pas TLS. Avant qu'un client non fiable puisse atteindre le port, garder la liaison sur un réseau de confiance tel que `127.0.0.1`, ou placer chaque service derrière un proxy qui authentifie le client (par exemple TLS mutuel) et bloquer l'accès direct à ce processus.
 
 ## Ce que l'on ne peut pas configurer
 

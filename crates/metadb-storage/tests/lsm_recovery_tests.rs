@@ -169,7 +169,9 @@ fn test_manifest_torn_eof_recovery_and_non_final_corruption_rejection() {
         );
     }
 
-    // A complete but CRC-invalid record at EOF is a torn tail and must be truncated.
+    // A complete but CRC-invalid record at EOF is corruption. Rolling it back
+    // could resurrect compacted inputs that have already been unlinked.
+    let valid_manifest_len = fs::metadata(&manifest_path).unwrap().len();
     {
         let mut mf = OpenOptions::new()
             .append(true)
@@ -182,9 +184,19 @@ fn test_manifest_torn_eof_recovery_and_non_final_corruption_rejection() {
         mf.sync_all().unwrap();
     }
     {
-        let recovered =
-            LifecycleStorageEngine::open_lsm(2, &lsm_dir, cache.clone(), cfg.clone()).unwrap();
-        assert_eq!(recovered.durable_checkpoint().flushed_raft_index, 5);
+        let corrupt_len = fs::metadata(&manifest_path).unwrap().len();
+        assert!(matches!(
+            LifecycleStorageEngine::open_lsm(2, &lsm_dir, cache.clone(), cfg.clone()),
+            Err(MetaDbError::ManifestCorrupted(_))
+        ));
+        assert_eq!(fs::metadata(&manifest_path).unwrap().len(), corrupt_len);
+        // Restore the known-good bytes for the independent non-final case.
+        OpenOptions::new()
+            .write(true)
+            .open(&manifest_path)
+            .unwrap()
+            .set_len(valid_manifest_len)
+            .unwrap();
     }
 
     // Now corrupt a NON-FINAL record inside MANIFEST-000001 and verify strict `ManifestCorrupted` error!

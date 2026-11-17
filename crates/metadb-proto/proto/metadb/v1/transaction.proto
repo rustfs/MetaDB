@@ -20,6 +20,13 @@ message RenameResponse {
   uint64 commit_hlc = 3;
 }
 
+// Compare against the exact committed bytes read by the coordinator. An absent
+// value requires that the key does not exist when Prepare is applied.
+message PrepareExpectedValue {
+  bytes user_key = 1;
+  optional bytes value = 2;
+}
+
 message Prepare2pcRequest {
   RequestRoutingHeader header = 1;
   bytes txn_id_be = 2;
@@ -32,6 +39,7 @@ message Prepare2pcRequest {
   uint64 rename_fence_token = 9;
   repeated bytes encoded_intent_keys = 10;
   repeated bytes encoded_intent_records = 11;
+  repeated PrepareExpectedValue expected_values = 12;
 }
 
 message Prepare2pcResponse {

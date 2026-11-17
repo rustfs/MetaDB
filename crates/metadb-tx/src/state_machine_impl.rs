@@ -143,6 +143,24 @@ pub enum TxRaftCmd {
         restored_range: CompositeKeyRange,
         new_epoch: ShardEpoch,
     },
+    /// Prepare with compare-and-set predicates for the coordinator's committed reads.
+    /// Append new variants to preserve the bincode tags of existing Raft log entries.
+    Prepare2pcChecked {
+        txn_id: TxnId,
+        is_primary: bool,
+        primary_key: Vec<u8>,
+        participant_keys: Vec<Vec<u8>>,
+        start_hlc: HlcTimestamp,
+        expire_hlc: HlcTimestamp,
+        rename_fence_token: Option<u64>,
+        intents: Vec<(Vec<u8>, IntentOp)>,
+        expected_values: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    },
+    UpsertQuotaLimit {
+        uid: UserId,
+        insert_quota_limit_bytes: u64,
+        update_quota_limit_bytes: u64,
+    },
 }
 
 /// Typed output serialized inside `MetaDbRaftResponse.result`.
@@ -340,6 +358,293 @@ impl TxStateMachineHandler {
         Ok(())
     }
 
+    fn intent_deltas(op: &IntentOp) -> &[AttrDeltaSpec] {
+        match op {
+            IntentOp::Put { attr_deltas, .. }
+            | IntentOp::Insert { attr_deltas, .. }
+            | IntentOp::Delete { attr_deltas, .. }
+            | IntentOp::DeletingDir { attr_deltas, .. } => attr_deltas,
+            IntentOp::DirExistsFenceSet { .. } => &[],
+        }
+    }
+
+    /// Reserve positive capacity for prepared transactions. A pending deletion
+    /// cannot release capacity until it commits, so other writers cannot overbook
+    /// the directory while its transaction is waiting for a decision.
+    fn validate_accounting(
+        &self,
+        engine: &LifecycleStorageEngine,
+        deltas: &[AttrDeltaSpec],
+        own_txn: Option<TxnId>,
+    ) -> Result<()> {
+        use crate::validation::checked_count;
+        let mut sums: BTreeMap<InodeId, (i128, i128)> = BTreeMap::new();
+        for delta in deltas {
+            let sum = sums.entry(delta.pid).or_default();
+            sum.0 += i128::from(delta.delta_children);
+            sum.1 += i128::from(delta.delta_bytes);
+        }
+        if sums.is_empty() {
+            return Ok(());
+        }
+        let mut reserved: BTreeMap<InodeId, (i128, i128)> = BTreeMap::new();
+        for (_, raw) in Self::scan_latest_in_apply(engine, &[0x05], &[0x06])? {
+            let rec = WriteIntentRecord::decode(&raw)?;
+            if Some(rec.txn_id) == own_txn {
+                continue;
+            }
+            for delta in Self::intent_deltas(&rec.op) {
+                let sum = reserved.entry(delta.pid).or_default();
+                sum.0 += i128::from(delta.delta_children.max(0));
+                sum.1 += i128::from(delta.delta_bytes.max(0));
+            }
+        }
+        for (pid, delta) in sums {
+            let (children, bytes, baseline) = if let Some(raw) =
+                Self::read_latest_in_apply(engine, &MetaKey::dir_attr(pid).encode())?
+            {
+                let attr = InodeAttr::decode(&raw)?;
+                (attr.num_children, attr.size_bytes, attr.applied_lsn)
+            } else if let Some(raw) =
+                Self::read_latest_in_apply(engine, &DirShardDeltaKey { pid }.encode())?
+            {
+                let sub = DirShardDeltaRecord::decode(&raw)?;
+                (sub.num_children, sub.size_bytes, sub.applied_raft_index)
+            } else {
+                return Err(MetaDbError::DirectoryNotFound(pid));
+            };
+            let pending = self.attr_agg.pending_totals_since(pid, baseline);
+            let children = i128::from(children) + pending.0 + delta.0;
+            let bytes = i128::from(bytes) + pending.1 + delta.1;
+            checked_count(children)?;
+            checked_count(bytes)?;
+            let reserve = reserved.get(&pid).copied().unwrap_or_default();
+            checked_count(children + reserve.0)?;
+            checked_count(bytes + reserve.1)?;
+        }
+        Ok(())
+    }
+
+    fn validate_intent_value(
+        &self,
+        engine: &LifecycleStorageEngine,
+        key: &[u8],
+        op: &IntentOp,
+    ) -> Result<()> {
+        use crate::validation::{validate_new_directory, validate_size};
+        if key.first().copied() != Some(metadb_core::TABLE_PREFIX_META) {
+            return Ok(());
+        }
+        let mk = MetaKey::decode(key)?;
+        if !mk.is_attr_key() {
+            validate_user_entry_name(&mk.name)?;
+        }
+        if let IntentOp::Put { value, .. } = op {
+            let attr = InodeAttr::decode(value)?;
+            validate_size(attr.size_bytes)?;
+            crate::validation::checked_count(i128::from(attr.num_children))?;
+            if attr.entry_type == EntryType::Directory {
+                validate_new_directory(mk.pid, attr.inode_id)?;
+            } else if attr.entry_type == EntryType::DirectoryAttr {
+                if mk.pid != attr.inode_id || !metadb_core::is_dir_inode_id(attr.inode_id) {
+                    return Err(MetaDbError::CodecError(
+                        "directory anchor inode mismatch".into(),
+                    ));
+                }
+                if Self::read_latest_in_apply(engine, key)?.is_none() {
+                    validate_new_directory(attr.parent_pid, attr.inode_id)?;
+                    if Self::read_latest_in_apply(
+                        engine,
+                        &DirShardDeltaKey { pid: attr.inode_id }.encode(),
+                    )?
+                    .is_some()
+                    {
+                        return Err(MetaDbError::AlreadyExists {
+                            pid: attr.inode_id,
+                            name: metadb_core::ATTR_ENTRY_NAME.into(),
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(raw) = Self::read_latest_in_apply(engine, key)? {
+            validate_size(InodeAttr::decode(&raw)?.size_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Validate values and every derived counter before changing keys, deltas or
+    /// the outbox. This also protects deterministic replay from malformed input.
+    fn validate_command(&self, engine: &LifecycleStorageEngine, cmd: &TxRaftCmd) -> Result<()> {
+        use crate::validation::{validate_new_directory, validate_size};
+        let read_child = |pid, name: &str| -> Result<Option<InodeAttr>> {
+            Self::read_latest_in_apply(engine, &MetaKey::child(pid, name).encode())?
+                .map(|raw| InodeAttr::decode(&raw))
+                .transpose()
+        };
+        let mut deltas = Vec::new();
+        let mut own_txn = None;
+        match cmd {
+            TxRaftCmd::InitDirAttr {
+                dir_id, parent_pid, ..
+            } => {
+                if !metadb_core::is_dir_inode_id(*dir_id)
+                    || !metadb_core::is_dir_inode_id(*parent_pid)
+                {
+                    return Err(MetaDbError::CodecError("invalid directory inode".into()));
+                }
+            }
+            TxRaftCmd::InitDirShardDelta { record } => {
+                if !metadb_core::is_dir_inode_id(record.inode_id) {
+                    return Err(MetaDbError::CodecError("invalid directory inode".into()));
+                }
+                validate_size(record.size_bytes)?;
+                crate::validation::checked_count(i128::from(record.num_children))?;
+            }
+            TxRaftCmd::CreateFile {
+                pid, size_bytes, ..
+            } => {
+                validate_size(*size_bytes)?;
+                deltas.push(AttrDeltaSpec {
+                    pid: *pid,
+                    delta_children: 1,
+                    delta_bytes: *size_bytes,
+                });
+            }
+            TxRaftCmd::MkdirSingleShard {
+                pid, new_dir_id, ..
+            } => {
+                validate_new_directory(*pid, *new_dir_id)?;
+                let key = MetaKey::dir_attr(*new_dir_id).encode();
+                if Self::read_latest_in_apply(engine, &key)?.is_some()
+                    || Self::read_latest_in_apply(
+                        engine,
+                        &DirShardDeltaKey { pid: *new_dir_id }.encode(),
+                    )?
+                    .is_some()
+                {
+                    return Err(MetaDbError::AlreadyExists {
+                        pid: *new_dir_id,
+                        name: metadb_core::ATTR_ENTRY_NAME.into(),
+                    });
+                }
+                deltas.push(AttrDeltaSpec {
+                    pid: *pid,
+                    delta_children: 1,
+                    delta_bytes: 0,
+                });
+            }
+            TxRaftCmd::Unlink { pid, name } => {
+                if let Some(attr) = read_child(*pid, name)? {
+                    validate_size(attr.size_bytes)?;
+                    deltas.push(AttrDeltaSpec {
+                        pid: *pid,
+                        delta_children: -1,
+                        delta_bytes: -attr.size_bytes,
+                    });
+                }
+            }
+            TxRaftCmd::RmdirSingleShard { pid, name } => {
+                if read_child(*pid, name)?.is_some() {
+                    deltas.push(AttrDeltaSpec {
+                        pid: *pid,
+                        delta_children: -1,
+                        delta_bytes: 0,
+                    });
+                }
+            }
+            TxRaftCmd::SetAttrSingleShard { pid, name, patch } => {
+                if let Some(size) = patch.size_bytes {
+                    validate_size(size)?;
+                }
+                if let Some(attr) = read_child(*pid, name)? {
+                    validate_size(attr.size_bytes)?;
+                    if attr.entry_type != EntryType::File
+                        && (patch.size_bytes.is_some() || patch.fid.is_some())
+                    {
+                        return Err(MetaDbError::CodecError(
+                            "directory size and fid are derived attributes".into(),
+                        ));
+                    }
+                    deltas.push(AttrDeltaSpec {
+                        pid: *pid,
+                        delta_children: 0,
+                        delta_bytes: patch.size_bytes.unwrap_or(attr.size_bytes) - attr.size_bytes,
+                    });
+                }
+            }
+            TxRaftCmd::RenameSingleShard {
+                src_pid,
+                src_name,
+                dst_pid,
+                dst_name,
+                ..
+            } => {
+                if let Some(attr) = read_child(*src_pid, src_name)? {
+                    validate_size(attr.size_bytes)?;
+                    if src_pid == dst_pid && src_name == dst_name {
+                        return Ok(());
+                    }
+                    let victim = read_child(*dst_pid, dst_name)?;
+                    if let Some(victim) = &victim {
+                        validate_size(victim.size_bytes)?;
+                    }
+                    deltas.push(AttrDeltaSpec {
+                        pid: *src_pid,
+                        delta_children: -1,
+                        delta_bytes: -attr.size_bytes,
+                    });
+                    deltas.push(AttrDeltaSpec {
+                        pid: *dst_pid,
+                        delta_children: i64::from(victim.is_none()),
+                        delta_bytes: attr.size_bytes - victim.map(|v| v.size_bytes).unwrap_or(0),
+                    });
+                }
+            }
+            TxRaftCmd::Prepare2pc {
+                txn_id, intents, ..
+            } => {
+                own_txn = Some(*txn_id);
+                for (key, op) in intents {
+                    self.validate_intent_value(engine, key, op)?;
+                    deltas.extend_from_slice(Self::intent_deltas(op));
+                }
+            }
+            TxRaftCmd::CommitSecondary2pc {
+                txn_id,
+                target_user_keys,
+                ..
+            } => {
+                own_txn = Some(*txn_id);
+                for key in target_user_keys {
+                    if let Some(raw) = Self::read_latest_in_apply(
+                        engine,
+                        &WriteIntentKey::new(key.clone()).encode(),
+                    )? {
+                        let rec = WriteIntentRecord::decode(&raw)?;
+                        if rec.txn_id == *txn_id {
+                            self.validate_intent_value(engine, key, &rec.op)?;
+                            deltas.extend_from_slice(Self::intent_deltas(&rec.op));
+                        }
+                    }
+                }
+            }
+            TxRaftCmd::CommitPrimary2pc { txn_id, .. } => {
+                own_txn = Some(*txn_id);
+                for (ik, raw) in Self::scan_latest_in_apply(engine, &[0x05], &[0x06])? {
+                    let rec = WriteIntentRecord::decode(&raw)?;
+                    if rec.txn_id == *txn_id {
+                        let key = WriteIntentKey::decode(&ik)?.target_user_key;
+                        self.validate_intent_value(engine, &key, &rec.op)?;
+                        deltas.extend_from_slice(Self::intent_deltas(&rec.op));
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.validate_accounting(engine, &deltas, own_txn)
+    }
+
     fn apply_tx_cmd(
         &self,
         raft_index: u64,
@@ -347,7 +652,50 @@ impl TxStateMachineHandler {
         cmd: TxRaftCmd,
         engine: &LifecycleStorageEngine,
     ) -> Result<TxRaftOutput> {
+        self.validate_command(engine, &cmd)?;
         match cmd {
+            TxRaftCmd::Prepare2pcChecked {
+                txn_id,
+                is_primary,
+                primary_key,
+                participant_keys,
+                start_hlc,
+                expire_hlc,
+                rename_fence_token,
+                intents,
+                expected_values,
+            } => {
+                // Check every read before installing any intent or transaction record.
+                // The intent then excludes mutations until commit or abort.
+                for (user_key, expected) in expected_values {
+                    self.ensure_user_key_in_range(&user_key)?;
+                    if !intents.iter().any(|(key, _)| *key == user_key) {
+                        return Err(MetaDbError::CodecError(
+                            "2PC expected value must have a matching local intent".to_string(),
+                        ));
+                    }
+                    if Self::read_latest_in_apply(engine, &user_key)? != expected {
+                        return Err(MetaDbError::TransactionAborted(
+                            "2PC value changed after coordinator read".to_string(),
+                        ));
+                    }
+                }
+                self.apply_tx_cmd(
+                    raft_index,
+                    commit_hlc,
+                    TxRaftCmd::Prepare2pc {
+                        txn_id,
+                        is_primary,
+                        primary_key,
+                        participant_keys,
+                        start_hlc,
+                        expire_hlc,
+                        rename_fence_token,
+                        intents,
+                    },
+                    engine,
+                )
+            }
             TxRaftCmd::InitDirAttr {
                 dir_id,
                 parent_pid,
@@ -895,6 +1243,27 @@ impl TxStateMachineHandler {
                     attr: src_attr,
                 }))
             }
+            TxRaftCmd::UpsertQuotaLimit {
+                uid,
+                insert_quota_limit_bytes,
+                update_quota_limit_bytes,
+            } => {
+                let qk = QuotaKey { uid }.encode();
+                self.ensure_user_key_in_range(&qk)?;
+                let mut rec = match Self::read_latest_in_apply(engine, &qk)? {
+                    Some(raw) => {
+                        let mut rec = QuotaRecord::decode(&raw)?;
+                        rec.quota_limit_bytes = update_quota_limit_bytes;
+                        rec
+                    }
+                    None => QuotaRecord::new(uid, insert_quota_limit_bytes),
+                };
+                rec.last_applied_hlc = rec.last_applied_hlc.max(commit_hlc);
+                engine.apply_committed_put(qk, rec.encode(), commit_hlc, raft_index);
+                self.outbox
+                    .record_entry_specs(raft_index, commit_hlc, vec![]);
+                Ok(TxRaftOutput::Quota(rec))
+            }
             TxRaftCmd::SetQuotaLimit {
                 uid,
                 quota_limit_bytes,
@@ -956,6 +1325,7 @@ impl TxStateMachineHandler {
                         }
                     }
                 }
+                let mut staged: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
                 let mut applied_count = 0usize;
                 for item in entries {
                     match item.payload {
@@ -967,7 +1337,10 @@ impl TxStateMachineHandler {
                         } => {
                             let qk = QuotaKey { uid }.encode();
                             self.ensure_user_key_in_range(&qk)?;
-                            let mut rec = match Self::read_latest_in_apply(engine, &qk)? {
+                            let mut rec = match staged.get(&qk).cloned().map_or_else(
+                                || Self::read_latest_in_apply(engine, &qk),
+                                |raw| Ok(Some(raw)),
+                            )? {
                                 Some(raw) => QuotaRecord::decode(&raw)?,
                                 None => QuotaRecord::new(uid, u64::MAX),
                             };
@@ -986,13 +1359,28 @@ impl TxStateMachineHandler {
                             )? {
                                 continue; // Exact-once duplicate replay suppressed.
                             }
-                            rec.used_bytes = saturating_add_i64(rec.used_bytes, delta_bytes).max(0);
-                            rec.used_inodes =
-                                saturating_add_i64(rec.used_inodes, delta_inodes).max(0);
+                            // Keep the exact sum, including a temporary negative, so a
+                            // later delta from another origin can cancel it. Overflow
+                            // rejects the whole batch before anything in it is written.
+                            // Readers clamp a negative balance to zero.
+                            let new_bytes =
+                                rec.used_bytes.checked_add(delta_bytes).ok_or_else(|| {
+                                    MetaDbError::CodecError(format!(
+                                        "quota byte delta overflow for uid {uid}"
+                                    ))
+                                })?;
+                            let new_inodes =
+                                rec.used_inodes.checked_add(delta_inodes).ok_or_else(|| {
+                                    MetaDbError::CodecError(format!(
+                                        "quota inode delta overflow for uid {uid}"
+                                    ))
+                                })?;
+                            rec.used_bytes = new_bytes;
+                            rec.used_inodes = new_inodes;
                             rec.last_applied_hlc = rec.last_applied_hlc.max(item.hlc);
                             rec.applied_by_shard
                                 .insert(item.origin_shard_id, cur_cursor);
-                            engine.apply_committed_put(qk, rec.encode(), commit_hlc, raft_index);
+                            staged.insert(qk, rec.encode());
                             applied_count += 1;
                         }
                         AuxTaskPayload::IndexUpsert {
@@ -1009,7 +1397,10 @@ impl TxStateMachineHandler {
                                 item.origin_raft_index,
                                 item.task_ordinal,
                             );
-                            let existing_opt = match Self::read_latest_in_apply(engine, &ik)? {
+                            let existing_opt = match staged.get(&ik).cloned().map_or_else(
+                                || Self::read_latest_in_apply(engine, &ik),
+                                |raw| Ok(Some(raw)),
+                            )? {
                                 Some(raw) => Some(SecondaryIndexRecord::decode(&raw)?),
                                 None => None,
                             };
@@ -1030,12 +1421,7 @@ impl TxStateMachineHandler {
                                         .unwrap_or((HlcTimestamp::ZERO, 0, 0, 0)),
                                     is_deleted: false,
                                 };
-                            engine.apply_committed_put(
-                                ik,
-                                new_rec.encode(),
-                                commit_hlc,
-                                raft_index,
-                            );
+                            staged.insert(ik, new_rec.encode());
                             applied_count += 1;
                         }
                         AuxTaskPayload::IndexDelete { fid } => {
@@ -1047,7 +1433,10 @@ impl TxStateMachineHandler {
                                 item.origin_raft_index,
                                 item.task_ordinal,
                             );
-                            let mut rec = match Self::read_latest_in_apply(engine, &ik)? {
+                            let mut rec = match staged.get(&ik).cloned().map_or_else(
+                                || Self::read_latest_in_apply(engine, &ik),
+                                |raw| Ok(Some(raw)),
+                            )? {
                                 Some(raw) => SecondaryIndexRecord::decode(&raw)?,
                                 None => SecondaryIndexRecord {
                                     fid,
@@ -1064,10 +1453,13 @@ impl TxStateMachineHandler {
                             }
                             rec.tombstone_ver = incoming_ver;
                             rec.is_deleted = true;
-                            engine.apply_committed_put(ik, rec.encode(), commit_hlc, raft_index);
+                            staged.insert(ik, rec.encode());
                             applied_count += 1;
                         }
                     }
+                }
+                for (key, value) in staged {
+                    engine.apply_committed_put(key, value, commit_hlc, raft_index);
                 }
                 self.outbox
                     .record_entry_specs(raft_index, commit_hlc, vec![]);
@@ -1375,6 +1767,9 @@ impl TxStateMachineHandler {
                 commit_hlc: tx_commit_hlc,
                 target_user_keys,
             } => {
+                for key in &target_user_keys {
+                    self.ensure_user_key_in_range(key)?;
+                }
                 let mut any_applied = false;
                 let mut aux_specs = Vec::new();
                 for uk in &target_user_keys {
@@ -1400,6 +1795,9 @@ impl TxStateMachineHandler {
                 txn_id,
                 target_user_keys,
             } => {
+                for key in &target_user_keys {
+                    self.ensure_user_key_in_range(key)?;
+                }
                 for uk in &target_user_keys {
                     self.abort_intent_for_key(engine, txn_id, uk, raft_index, commit_hlc)?;
                 }
@@ -1476,6 +1874,13 @@ impl TxStateMachineHandler {
                 new_range,
                 new_epoch,
             } => {
+                // This check shares Raft's serialized apply boundary with the
+                // fence. Prepare cannot race between the worker's scan and fence.
+                if !Self::scan_latest_in_apply(engine, &[0x05], &[0x07])?.is_empty() {
+                    return Err(MetaDbError::SplitDeferred(
+                        "all intents and decisions must be drained before fencing".into(),
+                    ));
+                }
                 {
                     let mut m = self.meta.write().unwrap();
                     m.range = new_range;
@@ -1492,6 +1897,52 @@ impl TxStateMachineHandler {
                 updated_anchor_attr,
                 updated_shard_delta,
             } => {
+                // The worker's partition snapshot can precede further writes on
+                // the retained range. Rebuild its accounting from the serialized
+                // apply view, and preserve current metadata before any mutation.
+                let updated_anchor_attr = updated_anchor_attr
+                    .map(|(pid, supplied)| {
+                        let key = MetaKey::dir_attr(pid).encode();
+                        let mut attr = Self::read_latest_in_apply(engine, &key)?
+                            .map(|raw| InodeAttr::decode(&raw))
+                            .transpose()?
+                            .unwrap_or(supplied);
+                        let (children, bytes, mtime) = self.retained_dir_stats(
+                            engine,
+                            &new_range,
+                            pid,
+                            attr.modify_time,
+                            raft_index,
+                        )?;
+                        attr.num_children = children;
+                        attr.size_bytes = bytes;
+                        attr.modify_time = mtime;
+                        Ok::<_, MetaDbError>((pid, attr))
+                    })
+                    .transpose()?;
+                let updated_shard_delta = updated_shard_delta
+                    .map(|supplied| {
+                        let key = DirShardDeltaKey {
+                            pid: supplied.inode_id,
+                        }
+                        .encode();
+                        let mut sub = Self::read_latest_in_apply(engine, &key)?
+                            .map(|raw| DirShardDeltaRecord::decode(&raw))
+                            .transpose()?
+                            .unwrap_or(supplied);
+                        let (children, bytes, mtime) = self.retained_dir_stats(
+                            engine,
+                            &new_range,
+                            sub.inode_id,
+                            sub.modify_time,
+                            raft_index,
+                        )?;
+                        sub.num_children = children;
+                        sub.size_bytes = bytes;
+                        sub.modify_time = mtime;
+                        Ok::<_, MetaDbError>(sub)
+                    })
+                    .transpose()?;
                 for k in keys_to_delete {
                     engine.apply_committed_delete(k, commit_hlc, raft_index);
                 }
@@ -1532,6 +1983,37 @@ impl TxStateMachineHandler {
                 Ok(TxRaftOutput::Unit)
             }
         }
+    }
+
+    fn retained_dir_stats(
+        &self,
+        engine: &LifecycleStorageEngine,
+        range: &CompositeKeyRange,
+        pid: InodeId,
+        base_mtime: HlcTimestamp,
+        raft_index: u64,
+    ) -> Result<(i64, i64, HlcTimestamp)> {
+        let mut children = 0i64;
+        let mut bytes = 0i64;
+        let mut mtime = base_mtime.max(self.attr_agg.latest_delta_hlc(pid, raft_index));
+        for (key, raw) in Self::scan_latest_in_apply(
+            engine,
+            &MetaKey::encode_pid_prefix_start(pid),
+            &MetaKey::encode_pid_prefix_end(pid),
+        )? {
+            if !range.contains_key(&key) || MetaKey::decode(&key)?.is_attr_key() {
+                continue;
+            }
+            let child = InodeAttr::decode(&raw)?;
+            children = children.checked_add(1).ok_or_else(|| {
+                MetaDbError::CodecError("directory child count overflow during split".into())
+            })?;
+            bytes = bytes.checked_add(child.size_bytes).ok_or_else(|| {
+                MetaDbError::CodecError("directory byte count overflow during split".into())
+            })?;
+            mtime = mtime.max(child.modify_time);
+        }
+        Ok((children, bytes, mtime))
     }
 
     /// Materializes `[0x05][user_key]` if held by `txn_id` (`Resolution B12` exact-once check).
@@ -1582,7 +2064,17 @@ impl TxStateMachineHandler {
                 let final_val = if let Ok(mut decoded_attr) = InodeAttr::decode(&value) {
                     decoded_attr.modify_time = commit_hlc;
                     if decoded_attr.entry_type == EntryType::DirectoryAttr {
-                        decoded_attr.applied_lsn = raft_index;
+                        if let Some(raw) = Self::read_latest_in_apply(engine, user_key)? {
+                            let current = InodeAttr::decode(&raw)?;
+                            // Metadata-only 2PC must retain the current aggregation
+                            // baseline, including flushes since Prepare. Pending
+                            // deltas remain above this frontier for read/flush folding.
+                            decoded_attr.num_children = current.num_children;
+                            decoded_attr.size_bytes = current.size_bytes;
+                            decoded_attr.applied_lsn = current.applied_lsn;
+                        } else {
+                            decoded_attr.applied_lsn = raft_index;
+                        }
                     }
                     decoded_attr.encode()
                 } else {

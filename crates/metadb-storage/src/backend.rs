@@ -125,8 +125,41 @@ impl LsmStorageBackend {
         block_cache: Arc<ShardedBlockCache>,
         bloom_bits_per_key: usize,
     ) -> Result<Self> {
-        let lsm_dir = lsm_dir.as_ref().to_path_buf();
-        fs::create_dir_all(&lsm_dir)?;
+        Self::open_internal(
+            shard_id,
+            lsm_dir.as_ref(),
+            block_cache,
+            bloom_bits_per_key,
+            true,
+        )
+    }
+
+    pub fn open_existing(
+        shard_id: ShardId,
+        lsm_dir: impl AsRef<Path>,
+        block_cache: Arc<ShardedBlockCache>,
+        bloom_bits_per_key: usize,
+    ) -> Result<Self> {
+        Self::open_internal(
+            shard_id,
+            lsm_dir.as_ref(),
+            block_cache,
+            bloom_bits_per_key,
+            false,
+        )
+    }
+
+    fn open_internal(
+        shard_id: ShardId,
+        lsm_dir: &Path,
+        block_cache: Arc<ShardedBlockCache>,
+        bloom_bits_per_key: usize,
+        recover: bool,
+    ) -> Result<Self> {
+        let lsm_dir = lsm_dir.to_path_buf();
+        if recover {
+            fs::create_dir_all(&lsm_dir)?;
+        }
         let lock_path = lsm_dir.join("LOCK");
         let lock_file = OpenOptions::new()
             .read(true)
@@ -140,12 +173,24 @@ impl LsmStorageBackend {
                 lock_path, e
             ))
         })?;
-        let (manifest, recovered) = ManifestLog::open_or_create(&lsm_dir)?;
+        let (manifest, recovered) = if recover {
+            ManifestLog::open_or_create(&lsm_dir)?
+        } else {
+            ManifestLog::open_existing(&lsm_dir)?
+        };
 
         let mut readers = Vec::with_capacity(recovered.live_files.len());
         for meta in recovered.live_files.values() {
             let sst_path = lsm_dir.join(sst_file_name(meta.file_id));
             let reader = SstableReader::open(shard_id, sst_path, block_cache.clone())?;
+            if reader.meta() != meta {
+                return Err(MetaDbError::ManifestCorrupted(format!(
+                    "SST {} metadata differs from its MANIFEST record: expected {:?}, found {:?}",
+                    meta.file_id,
+                    meta,
+                    reader.meta()
+                )));
+            }
             readers.push(Arc::new(reader));
         }
 
@@ -563,6 +608,9 @@ impl StorageBackend for LsmStorageBackend {
     }
 
     fn create_checkpoint(&self, dest_dir: &Path) -> Result<DurableShardCheckpoint> {
+        // Pinned readers keep file handles alive, but compaction unlinks their
+        // paths. Hold the same lock until all checkpoint links are durable.
+        let _comp_guard = self.compaction_lock.lock().unwrap();
         if dest_dir.exists() {
             return Err(MetaDbError::StorageIoError(format!(
                 "checkpoint destination {:?} already exists",

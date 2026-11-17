@@ -135,9 +135,9 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 - 未知で非ゼロの `cell_id` に対する `GetRoutes` は失敗して閉じる。`StoreHeartbeat` はキャッシュ済みルートを置き換えない。
 - ジャンボ隔離はルートフラグと、ローカルノード表から選んだノード ID である。他のシャードをディスクから追い出すことはしない。
 - ハートビートは RPC であり、`metadbd` に送信側はない。`StoreHeartbeat` は永続化しない。
-- 公開 gRPC ポート上の Raft は無認証である。プロセスは TLS を終端しない。
+- 空でない共有シークレットは、公開 gRPC ポート上の Raft を他の 3 サービスと同じベアラで認証する。空のシークレットでは Raft は無認証のままである。プロセスは TLS を終端しない。
 - `memtable_size_bytes` とすべての Raft タイマ項目は、TOML 経由で実行時の挙動を変えない。
-- `metadb-ctl bench` が報告するスループットは試行に対するものである。`unwrap` が捉えるのはトランスポートまたはステータスの失敗だけである。`AlreadyExists` のようなアプリケーションエラーは OK 応答の中に戻り、unlink を含めて捨てられる。したがって再実行でもスループットを印字し得る。実行後の一覧、dirstat、クォータは確認せず、レイテンシのパーセンタイルも印字しない。
+- `hotspot-create` と `bulk-ttl-delete` の `metadb-ctl bench` は JSON 行を印字する。`bench_pid` を含むヘッダのあと、attempted、succeeded、failed とレイテンシのパーセンタイルを持つフェーズ報告が続く。要求した操作がすべて成功しない限り、プロセスは非ゼロで終了する。`--workload mixed` または `--embedded` はプロセス内のストレステストを実行する。`sql` は応答を JSON で印字し、アプリケーションエラーでは非ゼロで終了する。
 
 ## 文書化できない欠落
 

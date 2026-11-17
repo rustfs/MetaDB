@@ -15,10 +15,27 @@ use metadb_raft::{
 use metadb_storage::{LsmEngineConfig, ShardedBlockCache};
 use tempfile::tempdir;
 
-async fn spawn_raft_grpc_server(router: MultiRaftRouter) -> (String, tokio::task::JoinHandle<()>) {
+async fn spawn_raft_grpc_server(
+    router: MultiRaftRouter,
+    authenticated: bool,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let svc = RaftTransportServiceServer::new(MultiRaftTransportServer::new(router));
+    let svc = RaftTransportServiceServer::with_interceptor(
+        MultiRaftTransportServer::new(router),
+        move |req: tonic::Request<()>| {
+            if authenticated
+                && req
+                    .metadata()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    != Some("Bearer raft-regression-secret")
+            {
+                return Err(tonic::Status::unauthenticated("missing shared secret"));
+            }
+            Ok(req)
+        },
+    );
     let handle = tokio::spawn(async move {
         let _ = Server::builder()
             .add_service(svc)
@@ -33,6 +50,16 @@ async fn spawn_raft_grpc_server(router: MultiRaftRouter) -> (String, tokio::task
 /// kills original Node 1 leader, and verifies failover election + `ReadIndex` linearizable reads!
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_online_1_to_3_voter_snapshot_promotion_and_leader_failover() {
+    run_promotion_and_failover(false).await;
+}
+
+/// Exercise authenticated Vote, AppendEntries and InstallSnapshot over real TCP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_authenticated_raft_snapshot_promotion_and_leader_failover() {
+    run_promotion_and_failover(true).await;
+}
+
+async fn run_promotion_and_failover(authenticated: bool) {
     let dir = tempdir().unwrap();
     let cache = Arc::new(ShardedBlockCache::new(8 * 1024 * 1024));
     let opts = RaftNodeOptions {
@@ -47,9 +74,9 @@ async fn test_online_1_to_3_voter_snapshot_promotion_and_leader_failover() {
     let router1 = MultiRaftRouter::new();
     let router2 = MultiRaftRouter::new();
     let router3 = MultiRaftRouter::new();
-    let (addr1, srv1) = spawn_raft_grpc_server(router1.clone()).await;
-    let (addr2, srv2) = spawn_raft_grpc_server(router2.clone()).await;
-    let (addr3, srv3) = spawn_raft_grpc_server(router3.clone()).await;
+    let (addr1, srv1) = spawn_raft_grpc_server(router1.clone(), authenticated).await;
+    let (addr2, srv2) = spawn_raft_grpc_server(router2.clone(), authenticated).await;
+    let (addr3, srv3) = spawn_raft_grpc_server(router3.clone(), authenticated).await;
 
     let start_node = |nid: u64, rtr: MultiRaftRouter| {
         let base = dir.path().join(format!("node_{}/shard_1", nid));
@@ -58,6 +85,10 @@ async fn test_online_1_to_3_voter_snapshot_promotion_and_leader_failover() {
         async move {
             let wm = Arc::new(ShardWatermarkTracker::new(0, 0, 0));
             let handler = Arc::new(BasicKvApplyHandler::new(ShardEpoch::initial(), wm.clone()));
+            let pool = ChannelPool::default();
+            if authenticated {
+                pool.set_shared_secret(Some("raft-regression-secret".to_string()));
+            }
             ShardRaftGroup::start(
                 1,
                 nid,
@@ -69,7 +100,7 @@ async fn test_online_1_to_3_voter_snapshot_promotion_and_leader_failover() {
                 wm,
                 Arc::new(HybridLogicalClock::new()),
                 &rtr,
-                ChannelPool::default(),
+                pool,
             )
             .await
             .unwrap()

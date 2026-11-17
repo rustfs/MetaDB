@@ -225,7 +225,14 @@ async fn second_process_joins_existing_raft_group_fails_over_and_reopens() {
         Arc::clone(&node2)
     };
     leader.shutdown().await.unwrap();
+    drop(survivors);
     drop(leader);
+    // The exclusive allocator lock lives until this process drops the old server.
+    if leader_id == 2 {
+        drop(node2);
+    } else {
+        drop(node3);
+    }
 
     let (reopened, reopened_addr) = PersistentMetaDbCluster::open_and_serve(leader_dir_cfg)
         .await

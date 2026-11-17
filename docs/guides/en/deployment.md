@@ -2,9 +2,9 @@
 
 * **Back to Guide Index**: [English Overview](./README.md) | [Hub](../../README.md)
 
-MetaDB runs the **exact same WAL-less LSM storage engine and OpenRaft state machine** across all three operational stages, allowing deployments to start on a single machine and expand online to a multi-Cell cluster without offline migration.
+MetaDB uses a WAL-less LSM storage engine and OpenRaft state machine for persistent all-in-one deployments. Multi-node Raft is exercised by integration tests; the disaggregated and multi-Cell daemon topology remains a design target.
 
-> **Implementation Status**: Persistent WAL-less SSTable LSM, `openraft` Multi-Raft (`1-Voter -> 3-Voter`), Epoch-fenced `PID` & `DualModeFineGrained` shard splitting, Jumbo isolation, `metadbd`, and `metadb-ctl` are implemented and verified across the 8-crate workspace.
+> **Implementation Status**: Persistent LSM, Raft replication, local shard splitting, and all-in-one gRPC/CLI operations have regression coverage. Only `all-in-one` starts a daemon. Other roles and remote Cell registration are rejected. See [correctness and compatibility notes](../../designs/correctness_hardening.md) before upgrading.
 
 ---
 
@@ -26,7 +26,7 @@ metrics_listen_addr = "127.0.0.1:9100"
 max_clock_drift_ms = 500
 
 [storage]
-memtable_size_bytes = 33554432          # 32 MiB
+memtable_size_bytes = 33554432          # Reserved; not an active flush threshold
 block_cache_bytes = 536870912           # 512 MiB (16-shard LRU)
 mvcc_retention_ms = 5000                # 5s In-Memory MVCC window
 bloom_bits_per_key = 10
@@ -50,7 +50,7 @@ metadbd --config /etc/metadb/standalone.toml
 
 `MetadataService`, `TransactionService`, `ControlPlaneService`, and `RaftTransportService` do **not** terminate TLS. With an empty `[security].shared_secret` (the default) they also perform no application authentication. The default `grpc_listen_addr` is `127.0.0.1:7800`. Do not publish that socket on an untrusted network.
 
-Set a shared secret to require `authorization: Bearer <secret>` on metadata, transaction, and control-plane RPCs (Raft transport on the same port stays unauthenticated). `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --cell-manager` send that header:
+Set a shared secret to require `authorization: Bearer <secret>` on metadata, transaction, control-plane, and Raft transport RPCs. Peer Raft clients propagate the same token. `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --cell-manager` send that header:
 
 ```toml
 [security]
@@ -67,7 +67,7 @@ As metadata grows past `shard_split_threshold_bytes`, `CellLocalManager` and `Po
 
 ---
 
-## Stage 3: Online Scale-Out to `3-Voter` Multi-Raft & Multi-Cell Clusters `[Implemented]`
+## Stage 3: Multi-Node Raft Tests and Intended Multi-Cell Topology
 
 ### Step 3.1: Zero-Downtime Upgrade from `1-Voter` to `3-Voter` HA
 
@@ -89,7 +89,7 @@ As metadata grows past `shard_split_threshold_bytes`, `CellLocalManager` and `Po
 
 ### Step 3.2: Disaggregated Multi-Cell Topology (`100B – 10T+` Records)
 
-For clusters exceeding `~50,000` shards (`~200` BE nodes), deploy disaggregated roles across independent **Cells**:
+The following table describes an intended topology, not runnable role-trimmed daemon deployments:
 
 | Role | `--role` Flag | Recommended Deployment | Responsibility |
 | :--- | :--- | :--- | :--- |

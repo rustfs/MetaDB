@@ -534,16 +534,18 @@ impl PersistentMetaDbCluster {
         } else {
             config.node.grpc_listen_addr.clone()
         };
-        let listener = TcpListener::bind(&listen_addr).await?;
-        let bound_addr = listener.local_addr()?.to_string();
-        if let Some(prev) = &persisted_addr {
-            if &bound_addr != prev {
-                return Err(MetaDbError::ConsensusError(format!(
-                    "node {} is already a raft member at {prev}; refusing to listen on {bound_addr}",
-                    config.node.node_id
-                )));
+        let listener = match TcpListener::bind(&listen_addr).await {
+            Ok(listener) => listener,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse && persisted_addr.is_some() =>
+            {
+                // The saved port is busy. A sole voter can move; several voters cannot.
+                // `boot_local_shards` checks that after this bind.
+                TcpListener::bind(&config.node.grpc_listen_addr).await?
             }
-        }
+            Err(error) => return Err(error.into()),
+        };
+        let bound_addr = listener.local_addr()?.to_string();
 
         let clock = Arc::new(HybridLogicalClock::with_max_drift_ms(
             config.clock.max_clock_drift_ms,
@@ -563,6 +565,7 @@ impl PersistentMetaDbCluster {
             block_cache,
             clock.clone(),
         )?);
+        host.set_shared_secret(Some(config.security.shared_secret.clone()));
         let raft_router = host.router().clone();
         let directory_role = if cell_dir.join("CELL_MANAGER_STATE").exists() {
             DurableCellManager::inspect_directory(&cell_dir)?
@@ -637,7 +640,7 @@ impl PersistentMetaDbCluster {
                 "gRPC metadata, transaction, and control-plane services have no authentication or TLS. \
                  Default bind is 127.0.0.1. Do not expose this process to untrusted networks until \
                  [security].shared_secret or an external TLS terminator is configured. \
-                 RaftTransport on the same listener is also unauthenticated."
+                 RaftTransport on the same listener requires the same bearer when the secret is set."
             );
         }
         let grpc_handle =
@@ -678,7 +681,7 @@ impl PersistentMetaDbCluster {
                     _ = bg_rx.changed() => break,
                     _ = tokio::time::sleep(Duration::from_millis(250)) => {
                         let Some(c) = bg_cluster.upgrade() else { break; };
-                        let _ = c.run_maintenance_tick().await;
+                        let _ = c.run_maintenance_tick_inner(false).await;
                     }
                 }
             }
@@ -747,6 +750,10 @@ impl PersistentMetaDbCluster {
 
     /// Runs one deterministic pass of `AuxDispatcher`, `TxnRecoveryWorker`, and split checks.
     pub async fn run_maintenance_tick(&self) -> Result<()> {
+        self.run_maintenance_tick_inner(true).await
+    }
+
+    async fn run_maintenance_tick_inner(&self, force_snapshot: bool) -> Result<()> {
         for cell in self.global_manager.all_cells() {
             for (_, grp, handler) in cell.local_shard_handles() {
                 let _ = AuxDispatcher::drain_shard_outbox(
@@ -779,7 +786,7 @@ impl PersistentMetaDbCluster {
                 let (state_flushed, _, last_snap) = grp.watermarks().snapshot_values();
                 // First snapshot (watermark still 0) or a large unpurged tail. Skip the
                 // full-dataset snapshot on every 250ms tick while the log is still small.
-                if last_snap > 0 && last_snap >= state_flushed && retained < 64 {
+                if !force_snapshot && last_snap > 0 && last_snap >= state_flushed && retained < 64 {
                     continue;
                 }
                 grp.flush_snapshot_and_purge().await?;
@@ -859,9 +866,13 @@ fn spawn_grpc_server(
                 grpc_svc.clone(),
                 auth.clone(),
             ))
-            .add_service(ControlPlaneServiceServer::with_interceptor(grpc_svc, auth))
-            .add_service(RaftTransportServiceServer::new(
+            .add_service(ControlPlaneServiceServer::with_interceptor(
+                grpc_svc,
+                auth.clone(),
+            ))
+            .add_service(RaftTransportServiceServer::with_interceptor(
                 MultiRaftTransportServer::new(raft_router),
+                auth,
             ))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                 let _ = shutdown_rx.changed().await;

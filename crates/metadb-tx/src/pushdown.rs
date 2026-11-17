@@ -45,6 +45,21 @@ impl PushdownExecutor {
         &self.aux_sink
     }
 
+    fn validate_parent_delta(
+        &self,
+        engine: &LifecycleStorageEngine,
+        pid: InodeId,
+        children: i64,
+        bytes: i64,
+        hlc: HlcTimestamp,
+    ) -> Result<()> {
+        let raw = engine
+            .get(&MetaKey::dir_attr(pid).encode(), hlc)?
+            .ok_or(MetaDbError::DirectoryNotFound(pid))?;
+        self.attr_aggregator
+            .validate_delta(pid, &InodeAttr::decode(&raw)?, children, bytes)
+    }
+
     /// Initializes the root directory `(ROOT_INODE_ID, "_attr_")` on the shard owning `ROOT_INODE_ID`.
     pub fn init_directory_attr(
         &self,
@@ -247,6 +262,9 @@ impl PushdownExecutor {
             });
         }
 
+        crate::validation::validate_size(attr.size_bytes)?;
+        self.validate_parent_delta(engine, pid, -1, -attr.size_bytes, hlc)?;
+
         engine.delete(child_key, hlc);
 
         let released = negate_accounted_size(attr.size_bytes);
@@ -308,6 +326,8 @@ impl PushdownExecutor {
                 child_count: live_children,
             });
         }
+
+        self.validate_parent_delta(parent_engine, pid, -1, 0, hlc)?;
 
         parent_engine.delete(child_key, hlc);
         let target_attr_key = MetaKey::dir_attr(target_dir_id).encode();

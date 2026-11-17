@@ -12,7 +12,8 @@ use metadb_server::{
     MetaDbConfig, MetaDbEngine, MetaDbGrpcService, PersistentMetaDbCluster, ServerTomlConfig,
     SqlQueryResult,
 };
-use metadb_tx::AuxUpdateTask;
+use metadb_tx::{AuxUpdateTask, ShardDirectory};
+use openraft::storage::{RaftLogReader, RaftLogStorage};
 use tempfile::tempdir;
 use tonic::Request;
 
@@ -454,7 +455,7 @@ async fn test_persistent_restart_lookup_dirstat_quota() {
     cluster.shutdown().await.unwrap();
 }
 
-/// After many committed writes, one maintenance tick must drop retained Raft entries.
+/// Maintenance must purge a confirmed write prefix and recover it from a snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_maintenance_tick_purges_raft_log() {
     let dir = tempdir().unwrap();
@@ -462,51 +463,90 @@ async fn test_maintenance_tick_purges_raft_log() {
     let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg.clone())
         .await
         .unwrap();
+    let (_, group, _) = cluster
+        .global_manager()
+        .route_user_key(&MetaKey::dir_attr(ROOT_INODE_ID).encode())
+        .unwrap();
+    let baseline = group
+        .linearizable_read(group.current_epoch())
+        .await
+        .unwrap()
+        .0
+        .read_index;
     for i in 0..24 {
         cluster
             .create_file_auto_id(ROOT_INODE_ID, &format!("f{i:02}.dat"), 3, 0o644, 64)
             .await
             .unwrap();
     }
-    let before: usize = cluster
-        .cell_manager()
-        .host()
-        .all_groups()
-        .iter()
-        .map(|g| g.log_store().retained_entry_count())
-        .sum();
+    let confirmed = group
+        .linearizable_read(group.current_epoch())
+        .await
+        .unwrap()
+        .0
+        .read_index;
     assert!(
-        before > 8,
-        "expected a non-trivial raft log, retained {before}"
+        confirmed >= baseline + 24,
+        "the committed frontier must include all 24 creates"
     );
+
+    // The 250 ms background task may already have purged these writes. Verify
+    // the durable prefix instead of assuming an initial retained-entry count.
     cluster.run_maintenance_tick().await.unwrap();
-    let after: usize = cluster
-        .cell_manager()
-        .host()
-        .all_groups()
-        .iter()
-        .map(|g| g.log_store().retained_entry_count())
-        .sum();
+    let mut log = group.log_store().clone();
+    let purged = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let purged = log
+                .get_log_state()
+                .await
+                .unwrap()
+                .last_purged_log_id
+                .map_or(0, |id| id.index);
+            if purged >= confirmed {
+                break purged;
+            }
+            // OpenRaft executes the requested prefix purge asynchronously.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("maintenance did not purge the confirmed write prefix");
+    let (state_flushed, aux_durable, last_snapshot) = group.watermarks().snapshot_values();
     assert!(
-        after < before,
-        "maintenance must purge raft logs: before {before} after {after}"
+        purged <= state_flushed.min(aux_durable).min(last_snapshot),
+        "purging must respect all three durability watermarks"
     );
+    assert!(log
+        .try_get_log_entries(..=confirmed)
+        .await
+        .unwrap()
+        .is_empty());
     cluster.shutdown().await.unwrap();
+    drop(log);
+    drop(group);
     drop(cluster);
 
     let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
-    let snapshot_floor: u64 = cluster
-        .cell_manager()
-        .host()
-        .all_groups()
-        .iter()
-        .map(|g| g.watermarks().snapshot_values().2)
-        .max()
-        .unwrap_or(0);
+    let (_, group, _) = cluster
+        .global_manager()
+        .route_user_key(&MetaKey::dir_attr(ROOT_INODE_ID).encode())
+        .unwrap();
     assert!(
-        snapshot_floor > 0,
-        "reopen must restore last_snapshot_index from the MANIFEST flushed index"
+        group.watermarks().snapshot_values().2 >= confirmed,
+        "reopen must restore the snapshot covering the purged write prefix"
     );
+    for i in 0..24 {
+        let entry = cluster
+            .tx_router()
+            .lookup(ROOT_INODE_ID, &format!("f{i:02}.dat"))
+            .await
+            .unwrap()
+            .expect("a purged write must survive snapshot recovery");
+        assert_eq!(entry.attr.size_bytes, 64);
+    }
+    let stat = cluster.tx_router().dirstat(ROOT_INODE_ID).await.unwrap();
+    assert_eq!(stat.num_children, 24);
+    assert_eq!(stat.size_bytes, 24 * 64);
     cluster.shutdown().await.unwrap();
 }
 
@@ -615,5 +655,6 @@ fn prepare_req(
         rename_fence_token: 0,
         encoded_intent_keys: vec![WriteIntentKey::new(intent_user_key.clone()).encode()],
         encoded_intent_records: vec![record.encode()],
+        expected_values: vec![],
     }
 }

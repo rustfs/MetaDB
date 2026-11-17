@@ -1,10 +1,19 @@
 //! `metadbd` — Standalone Single-Node & Distributed Multi-Role MetaDB Server Daemon.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::RegisterNodeRequest;
@@ -135,27 +144,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(cell_manager = %cm_url, node_id, cell_id, "registered node with cell manager");
     }
 
-    if let Some(m_addr) = metrics_addr_opt {
-        let m_cluster = cluster.clone();
+    let metrics_task = if let Some(m_addr) = metrics_addr_opt {
         let m_listener = TcpListener::bind(&m_addr).await?;
-        tracing::info!(metrics_addr = %m_addr, "Prometheus metrics endpoint listening");
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = m_listener.accept().await {
-                let mut req_buf = [0u8; 512];
-                let _ = sock.read(&mut req_buf).await;
-                let body = render_prometheus_metrics(&m_cluster.metrics_snapshot());
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-            }
-        });
-    }
+        tracing::info!(metrics_addr = %m_listener.local_addr()?, "Prometheus metrics endpoint listening");
+        let (stop, stopped) = oneshot::channel();
+        let m_cluster = cluster.clone();
+        Some((
+            stop,
+            tokio::spawn(serve_metrics(m_listener, m_cluster, stopped)),
+        ))
+    } else {
+        None
+    };
 
     tokio::signal::ctrl_c().await?;
     tracing::info!("received shutdown signal; flushing state and stopping OpenRaft groups");
+    if let Some((stop, task)) = metrics_task {
+        let _ = stop.send(());
+        task.await?;
+    }
     cluster.shutdown().await?;
     Ok(())
+}
+
+// Bound both connection count and request lifetime, including slow readers/writers.
+const METRICS_MAX_CONNECTIONS: usize = 64;
+const METRICS_MAX_HEADER_BYTES: usize = 8192;
+const METRICS_IO_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn serve_metrics(
+    listener: TcpListener,
+    cluster: Arc<PersistentMetaDbCluster>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            Some(_) = connections.join_next(), if !connections.is_empty() => {},
+            accepted = listener.accept(), if connections.len() < METRICS_MAX_CONNECTIONS => {
+                let Ok((socket, _)) = accepted else { break; };
+                let cluster = cluster.clone();
+                connections.spawn(async move {
+                    let _ = tokio::time::timeout(METRICS_IO_TIMEOUT, metrics_connection(socket, cluster)).await;
+                });
+            }
+        }
+    }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+}
+
+async fn metrics_connection(
+    socket: TcpStream,
+    cluster: Arc<PersistentMetaDbCluster>,
+) -> Result<(), hyper::Error> {
+    let service = service_fn(move |request: Request<Incoming>| {
+        let cluster = cluster.clone();
+        async move {
+            let (status, body) = if request.method() != Method::GET {
+                (
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "method not allowed\n".to_owned(),
+                )
+            } else if request.uri().path() != "/metrics" {
+                (StatusCode::NOT_FOUND, "not found\n".to_owned())
+            } else {
+                (
+                    StatusCode::OK,
+                    render_prometheus_metrics(&cluster.metrics_snapshot()),
+                )
+            };
+            let mut response = Response::new(Full::new(Bytes::from(body)));
+            *response.status_mut() = status;
+            response.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_static("text/plain; version=0.0.4"),
+            );
+            response.headers_mut().insert(
+                hyper::header::CONNECTION,
+                hyper::header::HeaderValue::from_static("close"),
+            );
+            Ok::<_, std::convert::Infallible>(response)
+        }
+    });
+    http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(METRICS_IO_TIMEOUT)
+        .max_headers(64)
+        .max_buf_size(METRICS_MAX_HEADER_BYTES)
+        .keep_alive(false)
+        .serve_connection(TokioIo::new(socket), service)
+        .await
 }

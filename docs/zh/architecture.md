@@ -15,7 +15,7 @@
 5. 在 `<data_dir>/cell_<cell_id>` 打开或引导 `DurableCellManager`。
 6. 把这一个单元以键范围 `[0x01, 0x04)` 注册到 `DurableGlobalManager`。
 7. 保证根 inode `1`（`ROOT_INODE_ID`）有属性记录。
-8. 在同一监听器上提供四个 gRPC 服务。元数据、事务和控制面服务接受可选的持有者拦截器。`RaftTransportService` 不接受。
+8. 在同一监听器上提供四个 gRPC 服务。四个服务使用同一个可选的持有者拦截器。密钥为空时，所有调用都放行。
 9. 启动间隔 250 ms 的维护任务。
 
 `metadbd` 是薄封装：加载 TOML，应用命令行覆盖，调用 `open_and_serve`，可选地对 `--cell-manager` 调用 `RegisterNode`，可选地提供 Prometheus 文本，并在 Ctrl-C 时调用 `shutdown`。

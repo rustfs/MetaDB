@@ -75,39 +75,93 @@ impl DurableGlobalManager {
             }
         }
     }
+
+    fn try_route_user_key(&self, user_key: &[u8]) -> Result<RoutedShardHandle> {
+        let route = self.meta_cache.lookup_key(user_key).ok_or_else(|| {
+            MetaDbError::ShardRoutingError("no published route covering key".to_string())
+        })?;
+        let cell = self.get_cell(route.cell_id).ok_or_else(|| {
+            MetaDbError::ShardRoutingError(format!("unknown cell {}", route.cell_id))
+        })?;
+        let (_, group, handler) = cell.lookup_local_handle(route.shard_id)?;
+        let actual = group.current_epoch();
+        let actual_range = handler.key_range();
+        // A split fence updates the handler range and epoch together, before the
+        // child route is published. A range mismatch, or a key that the fenced
+        // parent no longer contains, must wait. Membership changes only the
+        // epoch and leaves the range in place; those reads stay on this shard.
+        if actual_range != route.range || !actual_range.contains_key(user_key) {
+            return Err(MetaDbError::EpochMismatch {
+                shard_id: route.shard_id,
+                expected: route.epoch,
+                actual,
+            });
+        }
+        Ok((actual, group, handler))
+    }
+
+    fn try_route_user_range(
+        &self,
+        start_user_key: &[u8],
+        end_user_key: &[u8],
+    ) -> Result<Vec<RoutedShardHandle>> {
+        if start_user_key >= end_user_key {
+            return Ok(Vec::new());
+        }
+        let routes = self.meta_cache.lookup_range(start_user_key, end_user_key);
+        let mut covered_until = start_user_key.to_vec();
+        let mut out = Vec::with_capacity(routes.len());
+        for route in routes {
+            let cell = self.get_cell(route.cell_id).ok_or_else(|| {
+                MetaDbError::ShardRoutingError(format!("unknown cell {}", route.cell_id))
+            })?;
+            let (_, group, handler) = cell.lookup_local_handle(route.shard_id)?;
+            let actual = group.current_epoch();
+            if handler.key_range() != route.range {
+                return Err(MetaDbError::EpochMismatch {
+                    shard_id: route.shard_id,
+                    expected: route.epoch,
+                    actual,
+                });
+            }
+            let overlap_start = route.range.start_key.as_slice().max(start_user_key);
+            let overlap_end = route.range.end_key.as_slice().min(end_user_key);
+            if overlap_start != covered_until.as_slice() || overlap_end <= overlap_start {
+                return Err(MetaDbError::ShardRoutingError(
+                    "published routes do not provide contiguous range coverage".to_string(),
+                ));
+            }
+            covered_until = overlap_end.to_vec();
+            out.push((actual, group, handler));
+        }
+        if covered_until.as_slice() != end_user_key {
+            return Err(MetaDbError::ShardRoutingError(
+                "published routes do not cover the complete requested range".to_string(),
+            ));
+        }
+        Ok(out)
+    }
 }
 
 #[tonic::async_trait]
 impl ShardDirectory for DurableGlobalManager {
+    fn allocate_txn_id(&self, coordinator_node_id: u64) -> Result<metadb_core::TxnId> {
+        // Share the persisted sequence with FileId grants. Gaps in that sequence
+        // are harmless; resetting a process-local counter can alias live 2PC records.
+        let (seq, _) =
+            self.id_allocator
+                .allocate_block(0, crate::id_allocator::AllocIdKind::FileId, 1)?;
+        Ok(((coordinator_node_id as u128) << 64) | seq as u128)
+    }
+
     fn route_user_key(&self, user_key: &[u8]) -> Result<RoutedShardHandle> {
-        let route = match self.meta_cache.lookup_key(user_key) {
-            Some(r) => r,
-            None => {
+        match self.try_route_user_key(user_key) {
+            Ok(handle) => Ok(handle),
+            Err(_) => {
                 self.refresh_meta_cache();
-                self.meta_cache.lookup_key(user_key).ok_or_else(|| {
-                    MetaDbError::ShardRoutingError("no route covering key".to_string())
-                })?
+                self.try_route_user_key(user_key)
             }
-        };
-        let cell = self.get_cell(route.cell_id).ok_or_else(|| {
-            MetaDbError::ShardRoutingError(format!("unknown cell {}", route.cell_id))
-        })?;
-        let (_, grp, handler) = cell.lookup_local_handle(route.shard_id)?;
-        // Return the route's cached epoch so if a caller had a stale `MetaCache` entry,
-        // `grp.propose(route.epoch, ...)` fences it via `EpochMismatch` (`Resolution B16`)
-        // and self-heals on retry!
-        if !handler.key_range().contains_key(user_key) || grp.current_epoch() != route.epoch {
-            self.refresh_meta_cache();
-            let refreshed = self.meta_cache.lookup_key(user_key).ok_or_else(|| {
-                MetaDbError::ShardRoutingError("no route after refresh".to_string())
-            })?;
-            let r_cell = self.get_cell(refreshed.cell_id).ok_or_else(|| {
-                MetaDbError::ShardRoutingError(format!("unknown cell {}", refreshed.cell_id))
-            })?;
-            let (ep, g2, h2) = r_cell.lookup_local_handle(refreshed.shard_id)?;
-            return Ok((ep, g2, h2));
         }
-        Ok((route.epoch, grp, handler))
     }
 
     fn route_user_range(
@@ -115,20 +169,13 @@ impl ShardDirectory for DurableGlobalManager {
         start_user_key: &[u8],
         end_user_key: &[u8],
     ) -> Result<Vec<RoutedShardHandle>> {
-        let mut routes = self.meta_cache.lookup_range(start_user_key, end_user_key);
-        if routes.is_empty() {
-            self.refresh_meta_cache();
-            routes = self.meta_cache.lookup_range(start_user_key, end_user_key);
+        match self.try_route_user_range(start_user_key, end_user_key) {
+            Ok(handles) => Ok(handles),
+            Err(_) => {
+                self.refresh_meta_cache();
+                self.try_route_user_range(start_user_key, end_user_key)
+            }
         }
-        let mut out = Vec::with_capacity(routes.len());
-        for r in routes {
-            let cell = self.get_cell(r.cell_id).ok_or_else(|| {
-                MetaDbError::ShardRoutingError(format!("unknown cell {}", r.cell_id))
-            })?;
-            let (ep, grp, handler) = cell.lookup_local_handle(r.shard_id)?;
-            out.push((ep, grp, handler));
-        }
-        Ok(out)
     }
 
     async fn acquire_dir_rename_lease(

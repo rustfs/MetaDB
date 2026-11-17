@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::RwLock;
 
 use metadb_core::{
-    saturating_add_i64, FileId, HlcTimestamp, InodeId, QuotaRecord, SecondaryIndexRecord, ShardId,
-    UserId,
+    saturating_add_i64, FileId, HlcTimestamp, InodeId, QuotaRecord, Result, SecondaryIndexRecord,
+    ShardId, UserId,
 };
 use metadb_storage::{LifecycleStorageEngine, LogSequenceNumber, RaftLogPayload};
 
@@ -180,10 +180,11 @@ impl AsyncAuxiliarySink {
             guard.queue.drain(..).collect()
         };
 
-        let count = tasks.len();
+        let mut count = 0;
         let mut max_lsn_by_shard: BTreeMap<ShardId, LogSequenceNumber> = BTreeMap::new();
 
-        for task in tasks {
+        let mut tasks = tasks.into_iter();
+        while let Some(task) = tasks.next() {
             let (shard_id, lsn) = match &task {
                 AuxUpdateTask::QuotaDelta {
                     origin_shard_id,
@@ -201,11 +202,20 @@ impl AsyncAuxiliarySink {
                     ..
                 } => (*origin_shard_id, *lsn),
             };
+            if self.try_apply_task_idempotent(task.clone()).is_err() {
+                let mut guard = self.inner.write().unwrap();
+                for pending in tasks.rev() {
+                    guard.queue.push_front(pending);
+                }
+                guard.queue.push_front(task);
+                // No watermark may pass a task that remains unapplied.
+                return count;
+            }
+            count += 1;
             max_lsn_by_shard
                 .entry(shard_id)
                 .and_modify(|cur| *cur = (*cur).max(lsn))
                 .or_insert(lsn);
-            self.apply_task_idempotent(task);
         }
 
         for engine in engines {
@@ -222,8 +232,12 @@ impl AsyncAuxiliarySink {
     /// Applies an `AuxUpdateTask` with exact-once idempotency guarantees.
     /// Returns `true` if applied, or `false` if suppressed as a duplicate/stale replay.
     pub fn apply_task_idempotent(&self, task: AuxUpdateTask) -> bool {
+        self.try_apply_task_idempotent(task).unwrap_or(false)
+    }
+
+    pub fn try_apply_task_idempotent(&self, task: AuxUpdateTask) -> Result<bool> {
         let mut guard = self.inner.write().unwrap();
-        match task {
+        Ok(match task {
             AuxUpdateTask::QuotaDelta {
                 origin_shard_id,
                 lsn,
@@ -242,7 +256,7 @@ impl AsyncAuxiliarySink {
                     .copied()
                     .unwrap_or((0, 0));
                 if (lsn, 0u16) <= prev_cursor {
-                    return false; // Duplicate replay from Raft log recovery suppressed!
+                    return Ok(false); // Duplicate replay from Raft log recovery suppressed!
                 }
                 record.used_bytes = saturating_add_i64(record.used_bytes, delta_bytes).max(0);
                 record.used_inodes = saturating_add_i64(record.used_inodes, delta_inodes).max(0);
@@ -262,12 +276,12 @@ impl AsyncAuxiliarySink {
                 let incoming_ver = (hlc, origin_shard_id, lsn, 0u16);
                 if let Some(&del_hlc) = guard.deleted_fid_hlc.get(&fid) {
                     if hlc <= del_hlc {
-                        return false;
+                        return Ok(false);
                     }
                 }
                 if let Some(existing) = guard.secondary_index_table.get(&fid) {
                     if incoming_ver <= existing.last_ver.max(existing.tombstone_ver) {
-                        return false;
+                        return Ok(false);
                     }
                 }
                 guard.secondary_index_table.insert(
@@ -293,19 +307,19 @@ impl AsyncAuxiliarySink {
                 let incoming_ver = (hlc, origin_shard_id, lsn, 0u16);
                 if let Some(&del_hlc) = guard.deleted_fid_hlc.get(&fid) {
                     if hlc <= del_hlc {
-                        return false;
+                        return Ok(false);
                     }
                 }
                 if let Some(existing) = guard.secondary_index_table.get(&fid) {
                     if incoming_ver <= existing.last_ver && hlc < existing.last_applied_hlc() {
-                        return false;
+                        return Ok(false);
                     }
                 }
                 guard.secondary_index_table.remove(&fid);
                 guard.deleted_fid_hlc.insert(fid, hlc);
                 true
             }
-        }
+        })
     }
 
     pub fn get_quota(&self, uid: UserId) -> Option<QuotaRecord> {

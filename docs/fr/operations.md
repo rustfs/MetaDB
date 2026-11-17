@@ -135,9 +135,9 @@ Les variantes sont définies dans `crates/metadb-core/src/error.rs`. Les méthod
 - `GetRoutes` échoue fermé pour un `cell_id` non nul inconnu. `StoreHeartbeat` ne remplace pas les routes en cache.
 - L'isolation jumbo est un indicateur de route plus un identifiant de nœud choisi dans la table locale. Elle n'évince pas d'autres shards d'un disque.
 - Les battements de cœur sont un RPC sans émetteur dans `metadbd`. `StoreHeartbeat` ne persiste pas.
-- Raft sur le port gRPC public n'est pas authentifié. Le processus ne termine pas TLS.
+- Un secret partagé non vide authentifie Raft sur le port gRPC public avec le même bearer que les trois autres services. Un secret vide laisse Raft non authentifié. Le processus ne termine pas TLS.
 - `memtable_size_bytes` et tous les champs de temporisation Raft ne changent pas le comportement d'exécution via le TOML.
-- `metadb-ctl bench` rapporte un débit sur des tentatives. `unwrap` ne prend que les échecs de transport ou de statut. Les erreurs d'application telles que `AlreadyExists` reviennent dans une réponse OK et sont abandonnées, y compris pour unlink, donc une seconde exécution peut encore imprimer un débit. Il ne vérifie ni le listage, ni dirstat, ni le quota après l'exécution, et il n'imprime pas de percentiles de latence.
+- `metadb-ctl bench` pour `hotspot-create` et `bulk-ttl-delete` imprime des lignes JSON : un en-tête avec `bench_pid`, puis des rapports de phase avec attempted, succeeded, failed et des percentiles de latence. Le processus se termine en erreur si une opération demandée échoue. `--workload mixed` ou `--embedded` lance le harnais de stress dans le processus. `sql` imprime la réponse en JSON et se termine en erreur sur une erreur d'application.
 
 ## Lacunes de documentation
 

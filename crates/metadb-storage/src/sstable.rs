@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,11 @@ use crate::cache::{BlockCacheKey, ShardedBlockCache};
 pub const SSTABLE_MAGIC: u64 = 0x4D45_5441_5353_5431; // "METASST1"
 pub const SSTABLE_FORMAT_VERSION: u32 = 1;
 pub const SSTABLE_FOOTER_LEN: usize = 64;
+
+// File IDs are local to a database history and may be reused after snapshot
+// installation. Give each opened immutable file its own cache namespace, also
+// isolating old readers that remain pinned during a replacement.
+static NEXT_READER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Durable metadata describing an SSTable file in `MetaBlock` and `MANIFEST`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +249,7 @@ pub struct SstableReader {
     bloom: BloomFilter,
     index: Vec<IndexBlockEntry>,
     block_cache: Arc<ShardedBlockCache>,
+    cache_reader_id: u64,
 }
 
 impl SstableReader {
@@ -292,24 +299,74 @@ impl SstableReader {
         }
 
         let filter_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
-        let filter_len = u64::from_le_bytes(footer[8..16].try_into().unwrap()) as usize;
+        let filter_len = u64::from_le_bytes(footer[8..16].try_into().unwrap());
         let index_offset = u64::from_le_bytes(footer[16..24].try_into().unwrap());
-        let index_len = u64::from_le_bytes(footer[24..32].try_into().unwrap()) as usize;
+        let index_len = u64::from_le_bytes(footer[24..32].try_into().unwrap());
         let meta_offset = u64::from_le_bytes(footer[32..40].try_into().unwrap());
-        let meta_len = u64::from_le_bytes(footer[40..48].try_into().unwrap()) as usize;
+        let meta_len = u64::from_le_bytes(footer[40..48].try_into().unwrap());
 
-        let mut filter_buf = vec![0u8; filter_len];
-        file.read_exact_at(&mut filter_buf, filter_offset)?;
+        // Validate all footer extents before converting lengths or allocating.
+        let data_end = file_size - SSTABLE_FOOTER_LEN as u64;
+        if filter_offset == 0
+            || filter_len < 6
+            || index_len < 8
+            || meta_len < 53
+            || filter_offset.checked_add(filter_len) != Some(index_offset)
+            || index_offset.checked_add(index_len) != Some(meta_offset)
+            || meta_offset.checked_add(meta_len) != Some(data_end)
+        {
+            return Err(MetaDbError::ManifestCorrupted(
+                "invalid SSTable section bounds".to_string(),
+            ));
+        }
+
+        let filter_buf = Self::read_section(&file, filter_offset, filter_len)?;
         let bloom = BloomFilter::from_raw_checked(&filter_buf)?;
 
-        let mut index_buf = vec![0u8; index_len];
-        file.read_exact_at(&mut index_buf, index_offset)?;
+        let index_buf = Self::read_section(&file, index_offset, index_len)?;
         let index = Self::decode_index_block(&index_buf)?;
+        for entry in &index {
+            if entry.block_len < 8
+                || entry
+                    .block_offset
+                    .checked_add(u64::from(entry.block_len))
+                    .is_none_or(|end| end > filter_offset)
+            {
+                return Err(MetaDbError::ManifestCorrupted(
+                    "SSTable data block exceeds data section".to_string(),
+                ));
+            }
+        }
 
-        let mut meta_buf = vec![0u8; meta_len];
-        file.read_exact_at(&mut meta_buf, meta_offset)?;
+        let meta_buf = Self::read_section(&file, meta_offset, meta_len)?;
         let file_id = Self::parse_file_id_from_path(&path)?;
         let meta = Self::decode_meta_block(&meta_buf, file_id, file_size)?;
+        if meta.level as usize >= crate::version_set::NUM_LSM_LEVELS
+            || meta.min_key > meta.max_key
+            || meta.num_entries == 0
+            || meta.num_tombstones > meta.num_entries
+            || meta.num_entries > filter_offset / 9
+            || index.is_empty()
+        {
+            return Err(MetaDbError::ManifestCorrupted(
+                "invalid SSTable metadata".to_string(),
+            ));
+        }
+        let mut cache_reader_id = NEXT_READER_ID.load(Ordering::Relaxed);
+        loop {
+            let next_id = cache_reader_id.checked_add(1).ok_or_else(|| {
+                MetaDbError::StorageIoError("SSTable cache reader IDs exhausted".to_string())
+            })?;
+            match NEXT_READER_ID.compare_exchange_weak(
+                cache_reader_id,
+                next_id,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cache_reader_id = observed,
+            }
+        }
 
         Ok(Self {
             shard_id,
@@ -319,6 +376,7 @@ impl SstableReader {
             bloom,
             index,
             block_cache,
+            cache_reader_id,
         })
     }
 
@@ -417,12 +475,57 @@ impl SstableReader {
 
     /// Reads every entry across all data blocks in this SSTable (used during compaction).
     pub fn read_all_entries(&self) -> Result<Vec<(Vec<u8>, BlockEntryValue)>> {
-        let mut out = Vec::with_capacity(self.meta.num_entries as usize);
+        let mut out = Vec::new();
         for ie in &self.index {
             let block = self.load_data_block(ie)?;
             out.extend(block.iter_all()?);
         }
         Ok(out)
+    }
+
+    /// Verifies every data block before accepting a transferred checkpoint.
+    /// Work is bounded to one block at a time rather than materializing the entire SST.
+    pub fn verify_all_data_blocks(&self) -> Result<()> {
+        let mut entries = 0u64;
+        let mut tombstones = 0u64;
+        let mut first_key = None;
+        let mut last_key = None;
+        let mut next_offset = 0;
+        for index_entry in &self.index {
+            if index_entry.block_offset != next_offset {
+                return Err(MetaDbError::ManifestCorrupted(
+                    "noncontiguous SST data blocks".to_string(),
+                ));
+            }
+            let block = self.load_data_block(index_entry)?;
+            for (key, value) in block.iter_all()? {
+                if last_key.as_ref().is_some_and(|previous| previous >= &key) {
+                    return Err(MetaDbError::ManifestCorrupted(
+                        "unordered SST data keys".to_string(),
+                    ));
+                }
+                entries += 1;
+                tombstones += u64::from(matches!(value, BlockEntryValue::PhysicalTombstone));
+                first_key.get_or_insert_with(|| key.clone());
+                last_key = Some(key);
+            }
+            if last_key.as_deref() != Some(index_entry.last_key.as_slice()) {
+                return Err(MetaDbError::ManifestCorrupted(
+                    "SST index key differs from data block".to_string(),
+                ));
+            }
+            next_offset += u64::from(index_entry.block_len);
+        }
+        if entries != self.meta.num_entries
+            || tombstones != self.meta.num_tombstones
+            || first_key.as_deref() != Some(self.meta.min_key.as_slice())
+            || last_key.as_deref() != Some(self.meta.max_key.as_slice())
+        {
+            return Err(MetaDbError::ManifestCorrupted(
+                "SST data differs from file metadata".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn load_data_block(&self, ie: &IndexBlockEntry) -> Result<Arc<DataBlock>> {
@@ -431,14 +534,30 @@ impl SstableReader {
             sst_file_id: self.meta.file_id,
             block_offset: ie.block_offset,
         };
-        if let Some(cached) = self.block_cache.get(&cache_key) {
+        if let Some(cached) = self
+            .block_cache
+            .get_for_reader(self.cache_reader_id, &cache_key)
+        {
             return Ok(cached);
         }
-        let mut raw = vec![0u8; ie.block_len as usize];
-        self.file.read_exact_at(&mut raw, ie.block_offset)?;
+        let raw = Self::read_section(&self.file, ie.block_offset, u64::from(ie.block_len))?;
         let parsed = Arc::new(DataBlock::from_raw_checked(&raw)?);
-        self.block_cache.insert(cache_key, parsed.clone());
+        self.block_cache
+            .insert_for_reader(self.cache_reader_id, cache_key, parsed.clone());
         Ok(parsed)
+    }
+
+    fn read_section(file: &File, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let len = usize::try_from(len).map_err(|_| {
+            MetaDbError::CodecError("SSTable section length exceeds address space".to_string())
+        })?;
+        let mut raw = Vec::new();
+        raw.try_reserve_exact(len).map_err(|_| {
+            MetaDbError::CodecError("SSTable section allocation failed".to_string())
+        })?;
+        raw.resize(len, 0);
+        file.read_exact_at(&mut raw, offset)?;
+        Ok(raw)
     }
 
     fn decode_index_block(raw: &[u8]) -> Result<Vec<IndexBlockEntry>> {
@@ -449,6 +568,11 @@ impl SstableReader {
             ));
         }
         let count = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+        if count > (body.len() - 4) / 16 {
+            return Err(MetaDbError::CodecError(
+                "IndexBlock count exceeds available bytes".to_string(),
+            ));
+        }
         let mut pos = 4usize;
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {

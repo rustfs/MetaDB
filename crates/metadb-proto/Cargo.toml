@@ -11,6 +11,7 @@ authors.workspace = true
 metadb-core = { path = "../metadb-core" }
 bincode = { workspace = true }
 prost = { workspace = true }
+serde = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 

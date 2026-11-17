@@ -15,7 +15,7 @@
 5. `<data_dir>/cell_<cell_id>` で `DurableCellManager` を開くかブートストラップする。
 6. その 1 つのセルを、キー範囲 `[0x01, 0x04)` で `DurableGlobalManager` に登録する。
 7. ルートの inode `1`（`ROOT_INODE_ID`）に属性レコードがあることを保証する。
-8. 同じリスナーで 4 つの gRPC サービスを提供する。メタデータ、トランザクション、コントロールプレーンは任意のベアラインターセプタを取る。`RaftTransportService` は取らない。
+8. 同じリスナーで 4 つの gRPC サービスを提供する。4 つとも同じ任意のベアラインターセプタを取る。シークレットが空ならすべての呼び出しを通す。
 9. 250 ms 間隔のメンテナンスタスクを起動する。
 
 `metadbd` は薄いラッパです。TOML を読み、CLI の上書きを適用し、`open_and_serve` を呼び、任意で `--cell-manager` へ `RegisterNode` を呼び、任意で Prometheus テキストを提供し、Ctrl-C で `shutdown` を呼びます。

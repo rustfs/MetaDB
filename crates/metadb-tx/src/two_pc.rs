@@ -3,8 +3,9 @@
 //! Primary-Anchored Two-Phase Commit (`2PC`) Coordinator.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use metadb_core::schema::validate_user_entry_name;
 use metadb_core::{
@@ -16,12 +17,77 @@ use metadb_core::{
     TABLE_PREFIX_SECONDARY_INDEX,
 };
 use metadb_raft::ShardRaftGroup;
+use metadb_storage::SnapshotGuard;
 
 use crate::recovery_worker::TxnRecoveryWorker;
 use crate::rename_cycle::RenameCycleWalker;
 use crate::state_machine_impl::{SetAttrPatch, TxRaftCmd, TxRaftOutput, TxStateMachineHandler};
 
 pub const DEFAULT_2PC_TTL_MS: u64 = 3_000;
+
+fn publish_quota(mut record: QuotaRecord) -> QuotaRecord {
+    record.used_bytes = record.used_bytes.max(0);
+    record.used_inodes = record.used_inodes.max(0);
+    record
+}
+
+// A split fences its parent before booting and publishing its child. That
+// interval includes Raft recovery and can outlast a short count-based retry loop.
+const ROUTE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+const ROUTE_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+/// A follower that already knows another leader must return `NotLeader` at once.
+/// Only an election with no hint is waited out, and only briefly.
+const ELECTION_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn retry_routing<T, F, Fut>(operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let deadline = tokio::time::Instant::now() + ROUTE_RETRY_TIMEOUT;
+    retry_routing_until(deadline, operation).await
+}
+
+async fn retry_routing_until<T, F, Fut>(
+    deadline: tokio::time::Instant,
+    mut operation: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let election_deadline = tokio::time::Instant::now() + ELECTION_RETRY_TIMEOUT;
+    loop {
+        match operation().await {
+            // Split publication is local and can take the full routing budget.
+            // A known leader cannot appear by retrying on this follower.
+            Err(
+                error @ MetaDbError::NotLeader {
+                    leader_hint: Some(_),
+                    ..
+                },
+            ) => return Err(error),
+            Err(error @ MetaDbError::NotLeader { .. }) => {
+                let now = tokio::time::Instant::now();
+                let limit = deadline.min(election_deadline);
+                if now >= limit {
+                    return Err(error);
+                }
+                tokio::time::sleep(ROUTE_RETRY_INTERVAL.min(limit - now)).await;
+            }
+            Err(
+                error @ (MetaDbError::EpochMismatch { .. } | MetaDbError::ShardRoutingError(_)),
+            ) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(error);
+                }
+                tokio::time::sleep(ROUTE_RETRY_INTERVAL.min(deadline - now)).await;
+            }
+            result => return result,
+        }
+    }
+}
 
 /// Fault-injection hook allowing tests to simulate coordinator crashes mid-2PC (`T-2PC-1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +114,14 @@ pub trait ShardDirectory: Send + Sync + 'static {
     /// Resolves `(ShardEpoch, Arc<ShardRaftGroup>, Arc<TxStateMachineHandler>)` for `user_key`.
     fn route_user_key(&self, user_key: &[u8]) -> Result<RoutedShardHandle>;
 
+    /// Allocates an identity that must never be reused, including after coordinator restart.
+    /// Implementations must reserve the sequence durably before returning it.
+    fn allocate_txn_id(&self, _coord_node_id: u64) -> Result<TxnId> {
+        Err(MetaDbError::TransactionAborted(
+            "ShardDirectory does not provide durable transaction IDs".to_string(),
+        ))
+    }
+
     /// Resolves all shards intersecting `[start_user_key, end_user_key)` in ascending key order.
     fn route_user_range(
         &self,
@@ -69,7 +143,6 @@ pub trait ShardDirectory: Send + Sync + 'static {
 /// Executes both `1-RTT` single-shard pushdown and Primary-Anchored `2PC` across `ShardRaftGroup`s.
 pub struct DistributedTxRouter {
     coord_node_id: u64,
-    next_txn_seq: AtomicU64,
     clock: Arc<HybridLogicalClock>,
     directory: Arc<dyn ShardDirectory>,
     ttl_ms: u64,
@@ -83,7 +156,6 @@ impl DistributedTxRouter {
     ) -> Self {
         Self {
             coord_node_id,
-            next_txn_seq: AtomicU64::new(1),
             clock,
             directory,
             ttl_ms: DEFAULT_2PC_TTL_MS,
@@ -103,9 +175,51 @@ impl DistributedTxRouter {
         &self.clock
     }
 
-    fn alloc_txn_id(&self) -> TxnId {
-        let seq = self.next_txn_seq.fetch_add(1, Ordering::Relaxed);
-        ((self.coord_node_id as u128) << 64) | (seq as u128)
+    fn route_user_key_once(&self, user_key: &[u8]) -> Result<RoutedShardHandle> {
+        let (epoch, group, handler) = self.directory.route_user_key(user_key)?;
+        if group.current_epoch() != epoch || !handler.key_range().contains_key(user_key) {
+            return Err(MetaDbError::EpochMismatch {
+                shard_id: group.shard_id(),
+                expected: epoch,
+                actual: group.current_epoch(),
+            });
+        }
+        Ok((epoch, group, handler))
+    }
+
+    async fn route_user_key(&self, user_key: &[u8]) -> Result<RoutedShardHandle> {
+        retry_routing(|| std::future::ready(self.route_user_key_once(user_key))).await
+    }
+
+    async fn route_user_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<RoutedShardHandle>> {
+        retry_routing(|| std::future::ready(self.directory.route_user_range(start, end))).await
+    }
+
+    fn validate_read_epoch(group: &ShardRaftGroup, epoch: ShardEpoch) -> Result<()> {
+        let actual = group.current_epoch();
+        if actual != epoch {
+            return Err(MetaDbError::EpochMismatch {
+                shard_id: group.shard_id(),
+                expected: epoch,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    async fn read_user_key(&self, user_key: &[u8]) -> Result<(Arc<ShardRaftGroup>, SnapshotGuard)> {
+        let (epoch, group, handler) = self.route_user_key_once(user_key)?;
+        let (_, snapshot) = group.linearizable_read(epoch).await?;
+        // A range change can occur after routing and before the read cut.
+        // Never turn a fenced parent's missing key into a successful miss.
+        if group.current_epoch() != epoch || !handler.key_range().contains_key(user_key) {
+            return Err(MetaDbError::EpochMismatch {
+                shard_id: group.shard_id(),
+                expected: epoch,
+                actual: group.current_epoch(),
+            });
+        }
+        Ok((group, snapshot))
     }
 
     async fn propose_cmd(
@@ -128,18 +242,15 @@ impl DistributedTxRouter {
         user_key: &[u8],
         cmd: &TxRaftCmd,
     ) -> Result<TxRaftOutput> {
+        let deadline = tokio::time::Instant::now() + ROUTE_RETRY_TIMEOUT;
         for attempt in 0..12usize {
-            let (epoch, group, _) = self.directory.route_user_key(user_key)?;
-            match Self::propose_cmd(&group, epoch, self.clock.now(), cmd).await {
+            let result = retry_routing_until(deadline, || async {
+                let (epoch, group, _) = self.route_user_key_once(user_key)?;
+                Self::propose_cmd(&group, epoch, self.clock.now(), cmd).await
+            })
+            .await;
+            match result {
                 Ok((_, out)) => return Ok(out),
-                Err(
-                    MetaDbError::EpochMismatch { .. }
-                    | MetaDbError::NotLeader { .. }
-                    | MetaDbError::ShardRoutingError(_),
-                ) if attempt < 11 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(15 * (attempt as u64 + 1)))
-                        .await;
-                }
                 Err(MetaDbError::WriteIntentConflict {
                     conflicting_txn_id,
                     primary_key,
@@ -263,8 +374,8 @@ impl DistributedTxRouter {
         let child_bytes = child_meta_key.encode();
         let new_attr_bytes = MetaKey::dir_attr(new_dir_id).encode();
 
-        let (_, g_parent, _) = self.directory.route_user_key(&child_bytes)?;
-        let (_, g_new_dir, _) = self.directory.route_user_key(&new_attr_bytes)?;
+        let (_, g_parent, _) = self.route_user_key(&child_bytes).await?;
+        let (_, g_new_dir, _) = self.route_user_key(&new_attr_bytes).await?;
 
         if g_parent.shard_id() == g_new_dir.shard_id() {
             let cmd = TxRaftCmd::MkdirSingleShard {
@@ -335,7 +446,7 @@ impl DistributedTxRouter {
                 },
             ),
             (
-                new_attr_bytes,
+                new_attr_bytes.clone(),
                 IntentOp::Insert {
                     value: self_attr.encode(),
                     attr_deltas: vec![],
@@ -345,7 +456,13 @@ impl DistributedTxRouter {
         ];
 
         let commit_hlc = self
-            .execute_two_pc(&child_bytes, intents_by_key, None, TwoPcCrashStage::None)
+            .execute_two_pc(
+                &child_bytes,
+                intents_by_key,
+                vec![(child_bytes.clone(), None), (new_attr_bytes, None)],
+                None,
+                TwoPcCrashStage::None,
+            )
             .await?;
 
         let mut committed_attr = dentry_attr;
@@ -378,8 +495,8 @@ impl DistributedTxRouter {
         let dir_start = MetaKey::encode_pid_prefix_start(target_dir_id);
         let dir_end = MetaKey::encode_pid_prefix_end(target_dir_id);
 
-        let (_, g_parent, _) = self.directory.route_user_key(&child_bytes)?;
-        let dir_shards = self.directory.route_user_range(&dir_start, &dir_end)?;
+        let (_, g_parent, _) = self.route_user_key(&child_bytes).await?;
+        let dir_shards = self.route_user_range(&dir_start, &dir_end).await?;
 
         if dir_shards.len() == 1 && dir_shards[0].1.shard_id() == g_parent.shard_id() {
             let cmd = TxRaftCmd::RmdirSingleShard {
@@ -430,8 +547,14 @@ impl DistributedTxRouter {
             ));
         }
 
-        self.execute_two_pc(&child_bytes, intents_by_key, None, TwoPcCrashStage::None)
-            .await?;
+        self.execute_two_pc(
+            &child_bytes,
+            intents_by_key,
+            vec![(child_bytes.clone(), Some(entry.attr.encode()))],
+            None,
+            TwoPcCrashStage::None,
+        )
+        .await?;
         Ok(entry.attr)
     }
 
@@ -469,12 +592,18 @@ impl DistributedTxRouter {
             };
         }
 
+        if patch.size_bytes.is_some() || patch.fid.is_some() {
+            return Err(MetaDbError::CodecError(
+                "directory size and fid are derived attributes".into(),
+            ));
+        }
+
         // Directory `SetAttr`: check if single-shard colocated or multi-shard (`Resolution B10`).
         let dir_id = existing.attr.inode_id;
         let dir_start = MetaKey::encode_pid_prefix_start(dir_id);
         let dir_end = MetaKey::encode_pid_prefix_end(dir_id);
-        let (_, g_parent, _) = self.directory.route_user_key(&child_bytes)?;
-        let dir_shards = self.directory.route_user_range(&dir_start, &dir_end)?;
+        let (_, g_parent, _) = self.route_user_key(&child_bytes).await?;
+        let dir_shards = self.route_user_range(&dir_start, &dir_end).await?;
 
         if dir_shards.len() == 1 && dir_shards[0].1.shard_id() == g_parent.shard_id() {
             let cmd = TxRaftCmd::SetAttrSingleShard {
@@ -513,7 +642,11 @@ impl DistributedTxRouter {
         }
 
         let dir_attr_key = MetaKey::dir_attr(dir_id).encode();
-        let mut dir_self = self.dirstat(dir_id).await?;
+        let dir_self_raw = self
+            .read_raw_user_value(&dir_attr_key)
+            .await?
+            .ok_or(MetaDbError::DirectoryNotFound(dir_id))?;
+        let mut dir_self = InodeAttr::decode(&dir_self_raw)?;
         dir_self.mode = new_dentry.mode;
         dir_self.uid = new_dentry.uid;
 
@@ -527,7 +660,7 @@ impl DistributedTxRouter {
                 },
             ),
             (
-                dir_attr_key,
+                dir_attr_key.clone(),
                 IntentOp::Put {
                     value: dir_self.encode(),
                     attr_deltas: vec![],
@@ -536,7 +669,16 @@ impl DistributedTxRouter {
             ),
         ];
         let commit_hlc = self
-            .execute_two_pc(&child_bytes, intents, None, TwoPcCrashStage::None)
+            .execute_two_pc(
+                &child_bytes,
+                intents,
+                vec![
+                    (child_bytes.clone(), Some(existing.attr.encode())),
+                    (dir_attr_key, Some(dir_self_raw)),
+                ],
+                None,
+                TwoPcCrashStage::None,
+            )
             .await?;
         new_dentry.modify_time = commit_hlc;
         Ok(MetaEntry {
@@ -604,13 +746,13 @@ impl DistributedTxRouter {
             });
         };
 
-        let (_, g_src, _) = self.directory.route_user_key(&src_bytes)?;
-        let (_, g_dst, _) = self.directory.route_user_key(&dst_bytes)?;
+        let (_, g_src, _) = self.route_user_key(&src_bytes).await?;
+        let (_, g_dst, _) = self.route_user_key(&dst_bytes).await?;
 
         let single_shard_eligible = if src_entry.attr.entry_type == EntryType::Directory {
             let d_start = MetaKey::encode_pid_prefix_start(src_entry.attr.inode_id);
             let d_end = MetaKey::encode_pid_prefix_end(src_entry.attr.inode_id);
-            let d_shards = self.directory.route_user_range(&d_start, &d_end)?;
+            let d_shards = self.route_user_range(&d_start, &d_end).await?;
             g_src.shard_id() == g_dst.shard_id()
                 && d_shards.len() == 1
                 && d_shards[0].1.shard_id() == g_src.shard_id()
@@ -635,6 +777,7 @@ impl DistributedTxRouter {
             };
         }
 
+        crate::validation::validate_size(src_entry.attr.size_bytes)?;
         // Cross-shard 2PC `Rename`:
         let lease_opt = if src_entry.attr.entry_type == EntryType::Directory && src_pid != dst_pid {
             let lease = self
@@ -658,12 +801,20 @@ impl DistributedTxRouter {
 
         // Check destination existence & victim accounting (`Resolution B11`).
         let dst_existing = self.lookup(dst_pid, dst_name).await?;
+        let mut expected_values = vec![
+            (src_bytes.clone(), Some(src_entry.attr.encode())),
+            (
+                dst_bytes.clone(),
+                dst_existing.as_ref().map(|entry| entry.attr.encode()),
+            ),
+        ];
         let mut dst_aux_specs = Vec::new();
         let src_accounted = src_entry.attr.size_bytes.max(0);
         let mut dst_delta_children = 1i64;
         let mut dst_delta_bytes = src_accounted;
 
         if let Some(victim_entry) = dst_existing {
+            crate::validation::validate_size(victim_entry.attr.size_bytes)?;
             if !overwrite {
                 if let Some(l) = lease_opt {
                     self.directory
@@ -763,10 +914,16 @@ impl DistributedTxRouter {
         ));
 
         if moved_attr.entry_type == EntryType::Directory && src_pid != dst_pid {
-            let mut dir_self = self.dirstat(moved_attr.inode_id).await?;
+            let dir_self_key = MetaKey::dir_attr(moved_attr.inode_id).encode();
+            let dir_self_raw = self
+                .read_raw_user_value(&dir_self_key)
+                .await?
+                .ok_or(MetaDbError::DirectoryNotFound(moved_attr.inode_id))?;
+            let mut dir_self = InodeAttr::decode(&dir_self_raw)?;
             dir_self.parent_pid = dst_pid;
+            expected_values.push((dir_self_key.clone(), Some(dir_self_raw)));
             intents.push((
-                MetaKey::dir_attr(moved_attr.inode_id).encode(),
+                dir_self_key,
                 IntentOp::Put {
                     value: dir_self.encode(),
                     attr_deltas: vec![],
@@ -776,7 +933,7 @@ impl DistributedTxRouter {
         }
 
         let res = self
-            .execute_two_pc(&src_bytes, intents, lease_opt, crash_stage)
+            .execute_two_pc(&src_bytes, intents, expected_values, lease_opt, crash_stage)
             .await;
 
         if let Some(l) = lease_opt {
@@ -797,31 +954,40 @@ impl DistributedTxRouter {
         &self,
         primary_key: &[u8],
         intents: Vec<(Vec<u8>, IntentOp)>,
+        expected_values: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         lease_opt: Option<DirRenameLease>,
         crash_stage: TwoPcCrashStage,
     ) -> Result<HlcTimestamp> {
-        let txn_id = self.alloc_txn_id();
-        let start_hlc = self.clock.now();
-        let expire_hlc = lease_opt
-            .map(|l| l.expire_hlc)
-            .unwrap_or_else(|| HlcTimestamp::new(start_hlc.physical_ms() + self.ttl_ms, 0));
-        let rename_fence_token = lease_opt.map(|l| l.rename_fence_token);
-
+        let txn_id = self.directory.allocate_txn_id(self.coord_node_id)?;
         let all_participant_keys: Vec<Vec<u8>> = intents.iter().map(|(k, _)| k.clone()).collect();
 
         // Group intents by routed `ShardId`.
-        let (primary_epoch, primary_group, _) = self.directory.route_user_key(primary_key)?;
+        let (primary_epoch, primary_group, _) = self.route_user_key(primary_key).await?;
         let primary_shard_id = primary_group.shard_id();
 
         let mut grouped: HashMap<ShardId, ShardIntentGroup> = HashMap::new();
         for (uk, op) in intents {
-            let (ep, grp, _) = self.directory.route_user_key(&uk)?;
+            let (ep, grp, _) = self.route_user_key(&uk).await?;
             grouped
                 .entry(grp.shard_id())
                 .or_insert_with(|| (ep, grp, Vec::new()))
                 .2
                 .push((uk, op));
         }
+
+        // Waiting for split publication must not consume a transaction's lease
+        // before its first prepare. An external rename lease cannot be extended
+        // here, so fail explicitly if that lease expired while routing.
+        let start_hlc = self.clock.now();
+        let expire_hlc = lease_opt
+            .map(|l| l.expire_hlc)
+            .unwrap_or_else(|| HlcTimestamp::new(start_hlc.physical_ms() + self.ttl_ms, 0));
+        if expire_hlc <= start_hlc {
+            return Err(MetaDbError::TransactionAborted(
+                "directory rename lease expired while waiting for shard routing".into(),
+            ));
+        }
+        let rename_fence_token = lease_opt.map(|l| l.rename_fence_token);
 
         // Phase 1: Prepare on Secondary Shards then Primary Shard (or parallel).
         let mut prepared_shards: Vec<PreparedShardBatch> = Vec::new();
@@ -833,7 +999,12 @@ impl DistributedTxRouter {
 
         for (sid, (ep, grp, shard_intents)) in ordered_groups {
             let shard_keys: Vec<Vec<u8>> = shard_intents.iter().map(|(k, _)| k.clone()).collect();
-            let prep_cmd = TxRaftCmd::Prepare2pc {
+            let shard_expected_values = expected_values
+                .iter()
+                .filter(|(key, _)| shard_keys.contains(key))
+                .cloned()
+                .collect();
+            let prep_cmd = TxRaftCmd::Prepare2pcChecked {
                 txn_id,
                 is_primary: sid == primary_shard_id,
                 primary_key: primary_key.to_vec(),
@@ -842,6 +1013,7 @@ impl DistributedTxRouter {
                 expire_hlc,
                 rename_fence_token,
                 intents: shard_intents,
+                expected_values: shard_expected_values,
             };
             match Self::propose_cmd(&grp, ep, start_hlc, &prep_cmd).await {
                 Ok((_, TxRaftOutput::Prepared { prepared_hlc })) => {
@@ -940,20 +1112,16 @@ impl DistributedTxRouter {
 
     /// Linearizable point `Lookup(pid, name)` resolving any encountered `[0x05]` `WriteIntent`s.
     pub async fn lookup(&self, pid: InodeId, name: &str) -> Result<Option<MetaEntry>> {
+        retry_routing(|| self.lookup_once(pid, name)).await
+    }
+
+    async fn lookup_once(&self, pid: InodeId, name: &str) -> Result<Option<MetaEntry>> {
         validate_user_entry_name(name)?;
         let mk = MetaKey::child(pid, name);
         let key_bytes = mk.encode();
 
         for _ in 0..8 {
-            let (epoch, group, _) = self.directory.route_user_key(&key_bytes)?;
-            let (_, snap) = match group.linearizable_read(epoch).await {
-                Ok(pair) => pair,
-                Err(MetaDbError::EpochMismatch { .. } | MetaDbError::NotLeader { .. }) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
+            let (group, snap) = self.read_user_key(&key_bytes).await?;
             let engine = group.engine();
 
             // Check `[0x05]` intent at `snap.cut()`.
@@ -988,11 +1156,46 @@ impl DistributedTxRouter {
         ))
     }
 
+    /// Reads committed bytes used as the predicate for an anchor attribute mutation.
+    async fn read_raw_user_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        retry_routing(|| self.read_raw_user_value_once(key)).await
+    }
+
+    async fn read_raw_user_value_once(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        for _ in 0..12 {
+            let (group, snap) = self.read_user_key(key).await?;
+            let engine = group.engine();
+            let intent_key = WriteIntentKey::new(key.to_vec()).encode();
+            if let Some(raw) = engine.get_with_snapshot(&intent_key, &snap)? {
+                let intent = WriteIntentRecord::decode(&raw)?;
+                if !matches!(intent.op, IntentOp::DirExistsFenceSet { .. }) {
+                    drop(snap);
+                    TxnRecoveryWorker::resolve_single_txn(
+                        self.directory.as_ref(),
+                        &self.clock,
+                        intent.txn_id,
+                        &intent.primary_key,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+            return engine.get_with_snapshot(key, &snap);
+        }
+        Err(MetaDbError::ShardRoutingError(
+            "anchor read exceeded max intent/route retries".to_string(),
+        ))
+    }
+
     /// Linearizable `DirStat(pid)`:
     /// - Fast path (`1` shard covers `[pid, pid+1)`): single `ReadIndex` + `reconcile_inode_attr`.
     /// - `DualModeFineGrained` (`K` sub-shards): parallel `ReadIndex` + shared `barrier_hlc`
     ///   scatter-gather across `S_1 .. S_K` (`Resolution B1` / `G-P1`).
     pub async fn dirstat(&self, pid: InodeId) -> Result<InodeAttr> {
+        retry_routing(|| self.dirstat_once(pid)).await
+    }
+
+    async fn dirstat_once(&self, pid: InodeId) -> Result<InodeAttr> {
         let start = MetaKey::encode_pid_prefix_start(pid);
         let end = MetaKey::encode_pid_prefix_end(pid);
 
@@ -1008,14 +1211,17 @@ impl DistributedTxRouter {
                     }
                     Err(e) => return Err(e),
                 };
+                Self::validate_read_epoch(group, *epoch)?;
                 let attr_key = MetaKey::dir_attr(pid).encode();
                 let Some(raw) = group.engine().get_with_snapshot(&attr_key, &snap)? else {
                     return Err(MetaDbError::DirectoryNotFound(pid));
                 };
                 let persisted = InodeAttr::decode(&raw)?;
-                return Ok(handler
+                let reconciled = handler
                     .attr_aggregator()
-                    .reconcile_inode_attr(pid, persisted, &snap));
+                    .reconcile_inode_attr(pid, persisted, &snap);
+                Self::validate_read_epoch(group, *epoch)?;
+                return Ok(reconciled);
             }
 
             // `DualModeFineGrained` multi-shard scatter-gather with shared `barrier_hlc`:
@@ -1046,6 +1252,7 @@ impl DistributedTxRouter {
             let mut latest_mtime = HlcTimestamp::ZERO;
 
             for (epoch, group, handler) in &shards {
+                let range = handler.key_range();
                 let (_, snap) = match group.fixed_barrier_read(*epoch, barrier_hlc).await {
                     Ok(p) => p,
                     Err(MetaDbError::EpochMismatch { .. } | MetaDbError::NotLeader { .. }) => {
@@ -1054,8 +1261,9 @@ impl DistributedTxRouter {
                     }
                     Err(e) => return Err(e),
                 };
+                Self::validate_read_epoch(group, *epoch)?;
                 let eng = group.engine();
-                if handler.key_range().contains_key(&attr_key) {
+                if range.contains_key(&attr_key) {
                     let Some(raw) = eng.get_with_snapshot(&attr_key, &snap)? else {
                         return Err(MetaDbError::DirectoryNotFound(pid));
                     };
@@ -1084,6 +1292,10 @@ impl DistributedTxRouter {
                 continue;
             }
 
+            for (epoch, group, _) in &shards {
+                Self::validate_read_epoch(group, *epoch)?;
+            }
+
             let mut canonical = anchor_attr.ok_or(MetaDbError::DirectoryNotFound(pid))?;
             canonical.num_children = total_children.max(0);
             canonical.size_bytes = total_bytes.max(0);
@@ -1098,6 +1310,16 @@ impl DistributedTxRouter {
 
     /// Keyset-paginated `ListDir(pid, after_name, prefix, limit)` unconditionally excluding `"_attr_"`.
     pub async fn listdir_paginated(
+        &self,
+        pid: InodeId,
+        after_name: Option<&str>,
+        name_prefix: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<MetaEntry>, Option<String>)> {
+        retry_routing(|| self.listdir_paginated_once(pid, after_name, name_prefix, limit)).await
+    }
+
+    async fn listdir_paginated_once(
         &self,
         pid: InodeId,
         after_name: Option<&str>,
@@ -1126,6 +1348,7 @@ impl DistributedTxRouter {
             }
 
             let (_, snap) = group.linearizable_read(epoch).await?;
+            Self::validate_read_epoch(&group, epoch)?;
             let eng = group.engine();
 
             // Resolve any visible active `[0x05]` child write intents in `[sub_start, sub_end)`.
@@ -1155,6 +1378,7 @@ impl DistributedTxRouter {
             } else {
                 snap
             };
+            Self::validate_read_epoch(&group, epoch)?;
 
             let rows = eng.scan_with_snapshot(sub_start, sub_end, &final_snap)?;
             for (k_bytes, v_bytes) in rows {
@@ -1200,17 +1424,44 @@ impl DistributedTxRouter {
         }
     }
 
-    pub async fn get_quota(&self, uid: UserId) -> Result<Option<QuotaRecord>> {
+    pub async fn upsert_quota_limit(
+        &self,
+        uid: UserId,
+        insert_quota_limit_bytes: u64,
+        update_quota_limit_bytes: u64,
+    ) -> Result<QuotaRecord> {
         let qk = QuotaKey { uid }.encode();
-        let (epoch, group, _) = self.directory.route_user_key(&qk)?;
-        let (_, snap) = group.linearizable_read(epoch).await?;
+        let cmd = TxRaftCmd::UpsertQuotaLimit {
+            uid,
+            insert_quota_limit_bytes,
+            update_quota_limit_bytes,
+        };
+        match self.propose_key_with_retry(&qk, &cmd).await? {
+            TxRaftOutput::Quota(q) => Ok(q),
+            _ => Err(MetaDbError::CodecError(
+                "unexpected UpsertQuotaLimit output".into(),
+            )),
+        }
+    }
+
+    pub async fn get_quota(&self, uid: UserId) -> Result<Option<QuotaRecord>> {
+        retry_routing(|| self.get_quota_once(uid)).await
+    }
+
+    async fn get_quota_once(&self, uid: UserId) -> Result<Option<QuotaRecord>> {
+        let qk = QuotaKey { uid }.encode();
+        let (group, snap) = self.read_user_key(&qk).await?;
         let Some(raw) = group.engine().get_with_snapshot(&qk, &snap)? else {
             return Ok(None);
         };
-        Ok(Some(QuotaRecord::decode(&raw)?))
+        Ok(Some(publish_quota(QuotaRecord::decode(&raw)?)))
     }
 
     pub async fn list_quotas(&self, start_uid: UserId, limit: usize) -> Result<Vec<QuotaRecord>> {
+        retry_routing(|| self.list_quotas_once(start_uid, limit)).await
+    }
+
+    async fn list_quotas_once(&self, start_uid: UserId, limit: usize) -> Result<Vec<QuotaRecord>> {
         let lim = if limit == 0 { 1000 } else { limit };
         let start = QuotaKey { uid: start_uid }.encode();
         let end = vec![TABLE_PREFIX_SECONDARY_INDEX];
@@ -1224,8 +1475,9 @@ impl DistributedTxRouter {
                 continue;
             }
             let (_, snap) = group.linearizable_read(epoch).await?;
+            Self::validate_read_epoch(&group, epoch)?;
             for (_, v) in group.engine().scan_with_snapshot(s, e, &snap)? {
-                out.push(QuotaRecord::decode(&v)?);
+                out.push(publish_quota(QuotaRecord::decode(&v)?));
                 if out.len() >= lim {
                     return Ok(out);
                 }
@@ -1235,9 +1487,12 @@ impl DistributedTxRouter {
     }
 
     pub async fn get_secondary_index(&self, fid: FileId) -> Result<Option<SecondaryIndexRecord>> {
+        retry_routing(|| self.get_secondary_index_once(fid)).await
+    }
+
+    async fn get_secondary_index_once(&self, fid: FileId) -> Result<Option<SecondaryIndexRecord>> {
         let ik = SecondaryIndexKey { fid }.encode();
-        let (epoch, group, _) = self.directory.route_user_key(&ik)?;
-        let (_, snap) = group.linearizable_read(epoch).await?;
+        let (group, snap) = self.read_user_key(&ik).await?;
         let Some(raw) = group.engine().get_with_snapshot(&ik, &snap)? else {
             return Ok(None);
         };
@@ -1250,6 +1505,14 @@ impl DistributedTxRouter {
     }
 
     pub async fn scan_secondary_index(
+        &self,
+        after_fid: FileId,
+        limit: usize,
+    ) -> Result<Vec<SecondaryIndexRecord>> {
+        retry_routing(|| self.scan_secondary_index_once(after_fid, limit)).await
+    }
+
+    async fn scan_secondary_index_once(
         &self,
         after_fid: FileId,
         limit: usize,
@@ -1270,6 +1533,7 @@ impl DistributedTxRouter {
                 continue;
             }
             let (_, snap) = group.linearizable_read(epoch).await?;
+            Self::validate_read_epoch(&group, epoch)?;
             for (_, v) in group.engine().scan_with_snapshot(s, e, &snap)? {
                 let rec = SecondaryIndexRecord::decode(&v)?;
                 if !rec.is_deleted {

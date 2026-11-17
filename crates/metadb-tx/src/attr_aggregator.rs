@@ -77,6 +77,27 @@ impl AsyncAttrAggregator {
         lsn
     }
 
+    pub(crate) fn validate_delta(
+        &self,
+        pid: InodeId,
+        base: &InodeAttr,
+        children: i64,
+        bytes: i64,
+    ) -> Result<()> {
+        let guard = self.pending_by_pid.read().unwrap();
+        let mut total_children = i128::from(base.num_children) + i128::from(children);
+        let mut total_bytes = i128::from(base.size_bytes) + i128::from(bytes);
+        for delta in guard.get(&pid).into_iter().flat_map(|queue| queue.iter()) {
+            if delta.seq > base.applied_lsn {
+                total_children += i128::from(delta.delta_children);
+                total_bytes += i128::from(delta.delta_bytes);
+            }
+        }
+        crate::validation::checked_count(total_children)?;
+        crate::validation::checked_count(total_bytes)?;
+        Ok(())
+    }
+
     /// Reconciles a persisted `InodeAttr` (`_attr_`) with all un-flushed in-memory deltas
     /// whose `seq > persisted.applied_lsn` (§5.2 Read-Path Reconciliation).
     pub fn reconcile_attr(&self, pid: InodeId, mut persisted: InodeAttr) -> InodeAttr {

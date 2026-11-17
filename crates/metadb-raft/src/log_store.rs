@@ -54,16 +54,6 @@ impl LogStoreInner {
         fs::create_dir_all(raft_dir)?;
         let hard_state = Self::load_hard_state(raft_dir)?;
 
-        // Clean up any leftover `.tmp` files from interrupted atomic renames.
-        for d in fs::read_dir(raft_dir)? {
-            let d = d?;
-            if let Some(name) = d.file_name().to_str() {
-                if name.ends_with(".tmp") {
-                    let _ = fs::remove_file(d.path());
-                }
-            }
-        }
-
         let mut seg_paths: Vec<(u64, PathBuf)> = Vec::new();
         for d in fs::read_dir(raft_dir)? {
             let d = d?;
@@ -87,6 +77,8 @@ impl LogStoreInner {
         let mut entries: BTreeMap<u64, EntryOf<MetaDbTypeConfig>> = BTreeMap::new();
         let mut segments: Vec<SegmentFile> = Vec::new();
         let total_segs = seg_paths.len();
+        let mut previous_index = None;
+        let mut tail_repairs = Vec::new();
 
         for (seg_pos, (first_index, path)) in seg_paths.into_iter().enumerate() {
             let is_last_segment = seg_pos + 1 == total_segs;
@@ -95,7 +87,7 @@ impl LogStoreInner {
 
             if raw.len() < 8 {
                 if is_last_segment {
-                    let _ = fs::remove_file(&path);
+                    tail_repairs.push((path, None));
                     continue;
                 } else {
                     return Err(io::Error::new(
@@ -174,6 +166,18 @@ impl LogStoreInner {
                 let log_index = u64::from_le_bytes(frame_body[0..8].try_into().unwrap());
                 let entry: EntryOf<MetaDbTypeConfig> = bincode::deserialize(&frame_body[8..])
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                if entry.log_id().index != log_index
+                    || previous_index.is_some_and(|prev| log_index <= prev)
+                    || (entry_end_offsets.is_empty() && log_index != first_index)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "inconsistent or duplicate raft frame index {log_index} in {path:?}"
+                        ),
+                    ));
+                }
+                previous_index = Some(log_index);
 
                 last_idx_in_seg = log_index;
                 entry_end_offsets.insert(log_index, frame_end as u64);
@@ -188,9 +192,7 @@ impl LogStoreInner {
             }
 
             let final_len = if let Some(valid_len) = truncate_tail {
-                let wf = OpenOptions::new().write(true).open(&path)?;
-                wf.set_len(valid_len as u64)?;
-                wf.sync_data()?;
+                tail_repairs.push((path.clone(), Some(valid_len as u64)));
                 valid_len as u64
             } else {
                 raw.len() as u64
@@ -205,6 +207,27 @@ impl LogStoreInner {
             });
         }
 
+        Self::ensure_committed_recovered(&hard_state, &entries)?;
+        // Validate the entire history before changing any recovery evidence.
+        for (path, valid_len) in tail_repairs {
+            if let Some(valid_len) = valid_len {
+                let wf = OpenOptions::new().write(true).open(path)?;
+                wf.set_len(valid_len)?;
+                wf.sync_data()?;
+            } else {
+                fs::remove_file(path)?;
+            }
+        }
+        for d in fs::read_dir(raft_dir)? {
+            let d = d?;
+            if d.file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".tmp"))
+            {
+                fs::remove_file(d.path())?;
+            }
+        }
+        Self::persist_initialization_marker(raft_dir)?;
         let active_file = if let Some(last_seg) = segments.last() {
             Some(OpenOptions::new().append(true).open(&last_seg.path)?)
         } else {
@@ -222,10 +245,55 @@ impl LogStoreInner {
         })
     }
 
+    fn ensure_committed_recovered(
+        hard_state: &PersistedHardState,
+        entries: &BTreeMap<u64, EntryOf<MetaDbTypeConfig>>,
+    ) -> io::Result<()> {
+        let Some(committed) = hard_state.committed else {
+            return Ok(());
+        };
+        if hard_state
+            .last_purged_log_id
+            .is_some_and(|p| p.index >= committed.index)
+        {
+            return Ok(());
+        }
+        let first = hard_state.last_purged_log_id.map_or(0, |p| p.index + 1);
+        let mut expected = first;
+        for (&index, entry) in entries.range(first..=committed.index) {
+            if index != expected || entry.log_id().index != index {
+                break;
+            }
+            if index == committed.index {
+                if entry.log_id() == committed {
+                    return Ok(());
+                }
+                break;
+            }
+            expected = index + 1;
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "committed raft prefix {first}..={} is missing or corrupt at index {expected}",
+                committed.index,
+            ),
+        ))
+    }
+
     fn load_hard_state(raft_dir: &Path) -> io::Result<PersistedHardState> {
         let path = raft_dir.join("HARD_STATE");
-        if !path.exists() {
-            return Ok(PersistedHardState::default());
+        if !path.try_exists()? {
+            if fs::read_dir(raft_dir)?.next().is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HARD_STATE is missing from an initialized or nonempty raft directory",
+                ));
+            }
+            let initial = PersistedHardState::default();
+            Self::persist_hard_state_value(raft_dir, &initial)?;
+            Self::persist_initialization_marker(raft_dir)?;
+            return Ok(initial);
         }
         let mut raw = Vec::new();
         File::open(&path)?.read_to_end(&mut raw)?;
@@ -236,11 +304,29 @@ impl LogStoreInner {
     }
 
     fn persist_hard_state(&self) -> io::Result<()> {
-        let mut raw = bincode::serialize(&self.hard_state)
+        Self::persist_hard_state_value(&self.raft_dir, &self.hard_state)
+    }
+
+    fn persist_initialization_marker(raft_dir: &Path) -> io::Result<()> {
+        let path = raft_dir.join("INITIALIZED");
+        if !path.try_exists()? {
+            let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+            file.write_all(b"MRAFTIN1")?;
+            file.sync_data()?;
+            sync_dir(raft_dir).map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn persist_hard_state_value(
+        raft_dir: &Path,
+        hard_state: &PersistedHardState,
+    ) -> io::Result<()> {
+        let mut raw = bincode::serialize(hard_state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         append_crc32c_le(&mut raw);
-        let tmp = self.raft_dir.join("HARD_STATE.tmp");
-        let dst = self.raft_dir.join("HARD_STATE");
+        let tmp = raft_dir.join("HARD_STATE.tmp");
+        let dst = raft_dir.join("HARD_STATE");
         {
             let mut f = OpenOptions::new()
                 .create(true)
@@ -251,7 +337,7 @@ impl LogStoreInner {
             f.sync_data()?;
         }
         fs::rename(&tmp, &dst)?;
-        sync_dir(&self.raft_dir).map_err(|e| io::Error::other(e.to_string()))?;
+        sync_dir(raft_dir).map_err(|e| io::Error::other(e.to_string()))?;
         Ok(())
     }
 
@@ -307,6 +393,11 @@ impl LogStoreInner {
                 Some(seg) => seg.byte_len >= self.max_segment_bytes,
             };
             if need_new_seg {
+                // One append batch can cross segment boundaries. Closing the old file
+                // does not make its frames durable; sync it before replacing the handle.
+                if let Some(active) = self.active_file.as_mut() {
+                    active.sync_data()?;
+                }
                 self.rotate_new_segment(log_idx)?;
             }
 
@@ -390,7 +481,11 @@ impl LogStoreInner {
             self.entries.clear();
             let mut removed_any = false;
             for seg in self.segments.drain(..) {
-                let _ = fs::remove_file(seg.path);
+                match fs::remove_file(seg.path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
                 removed_any = true;
             }
             if removed_any {
@@ -406,7 +501,11 @@ impl LogStoreInner {
         while let Some(last_seg) = self.segments.last() {
             if last_seg.first_index > keep_upto {
                 let seg = self.segments.pop().unwrap();
-                let _ = fs::remove_file(&seg.path);
+                match fs::remove_file(&seg.path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
                 removed_trailing = true;
             } else {
                 break;
@@ -706,5 +805,99 @@ impl RaftLogStorage<MetaDbTypeConfig> for SegmentedRaftLogStore {
         }
         guard.segments = keep;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use openraft::type_config::alias::CommittedLeaderIdOf;
+    use openraft::vote::RaftLeaderId;
+    use openraft::EntryPayload;
+
+    fn committed_log() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut inner = LogStoreInner::open_or_recover(dir.path(), 1024).unwrap();
+        let log_id =
+            LogIdOf::<MetaDbTypeConfig>::new(CommittedLeaderIdOf::<MetaDbTypeConfig>::new(1, 1), 1);
+        inner
+            .append_entries_sync(
+                (0..=1)
+                    .map(|index| EntryOf::<MetaDbTypeConfig> {
+                        log_id: LogIdOf::<MetaDbTypeConfig>::new(
+                            CommittedLeaderIdOf::<MetaDbTypeConfig>::new(1, 1),
+                            index,
+                        ),
+                        payload: EntryPayload::Blank,
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        inner.hard_state.committed = Some(log_id);
+        inner.persist_hard_state().unwrap();
+        let segment = inner.segments[0].path.clone();
+        drop(inner);
+        (dir, segment)
+    }
+
+    #[test]
+    fn truncation_never_acknowledges_failed_segment_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut inner = LogStoreInner::open_or_recover(dir.path(), 1024).unwrap();
+        inner
+            .append_entries_sync(vec![EntryOf::<MetaDbTypeConfig> {
+                log_id: LogIdOf::<MetaDbTypeConfig>::new(
+                    CommittedLeaderIdOf::<MetaDbTypeConfig>::new(1, 1),
+                    1,
+                ),
+                payload: EntryPayload::Blank,
+            }])
+            .unwrap();
+        let segment = inner.segments[0].path.clone();
+        fs::rename(&segment, segment.with_extension("saved")).unwrap();
+        fs::create_dir(&segment).unwrap();
+        assert!(
+            inner.truncate_suffix_after(None).is_err(),
+            "failed unlink was reported as durable truncation"
+        );
+    }
+
+    #[test]
+    fn committed_final_frame_crc_corruption_is_fatal() {
+        let (dir, segment) = committed_log();
+        let mut raw = fs::read(&segment).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 1;
+        fs::write(&segment, &raw).unwrap();
+        let result = LogStoreInner::open_or_recover(dir.path(), 1024);
+        assert!(
+            matches!(&result, Err(e) if e.kind() == io::ErrorKind::InvalidData),
+            "committed final frame must not be silently removed; remaining entries: {:?}",
+            result.as_ref().ok().map(|s| s.entries.len())
+        );
+        assert_eq!(
+            fs::read(segment).unwrap(),
+            raw,
+            "corruption detection must preserve evidence"
+        );
+    }
+
+    #[test]
+    fn committed_final_frame_truncation_is_fatal() {
+        for removed in 1..=40 {
+            let (dir, segment) = committed_log();
+            let mut raw = fs::read(&segment).unwrap();
+            if removed >= raw.len() {
+                break;
+            }
+            raw.truncate(raw.len() - removed);
+            fs::write(&segment, &raw).unwrap();
+            let result = LogStoreInner::open_or_recover(dir.path(), 1024);
+            assert!(
+                matches!(&result, Err(e) if e.kind() == io::ErrorKind::InvalidData),
+                "truncating {removed} bytes discarded committed index 1; remaining entries: {:?}",
+                result.as_ref().ok().map(|s| s.entries.len())
+            );
+        }
     }
 }

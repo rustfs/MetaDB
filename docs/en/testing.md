@@ -99,16 +99,15 @@ cargo run -p metadb-server --bin metadb-ctl -- \
   bench --workload bulk-ttl-delete --concurrency 16 --ops 1000
 ```
 
-Flags: `--workload` is `hotspot-create` (the default) or `bulk-ttl-delete`. `--concurrency` defaults to 16. `--ops` defaults to 1000. Any other workload string is an error.
+Flags: `--workload` is `hotspot-create` (the default), `bulk-ttl-delete`, or `mixed`. `--concurrency` defaults to 16 when omitted. `--ops` defaults to 1000. `--embedded` or `--workload mixed` starts a temporary all-in-one node and runs the in-process stress harness instead of dialing `--endpoint`.
 
-Behavior from `crates/metadb-server/src/bin/metadb-ctl.rs`:
+Behavior from `crates/metadb-server/src/bin/metadb-ctl.rs` for the remote workloads:
 
-- Each task runs `ops / concurrency` iterations, and at least one. The remainder of the division is dropped, so the printed count can be smaller than `--ops`. If `--ops` is smaller than `--concurrency`, the count can be larger than `--ops` because each task still runs once. The printed count is the number of attempts, not the number of accepted mutations.
-- `hotspot-create` mkdirs inode `999000` named `bench_hotspot_create` under parent inode `1`, then calls `CreateFile` for 4096-byte files. The mkdir `Result` is discarded. `unwrap` runs on the tonic `Result` only, so a transport or status failure aborts the process. `CreateFile` returns application failures such as `AlreadyExists` inside an OK `CreateFileResponse.error`, and the client drops that field.
-- `bulk-ttl-delete` does the same creates under inode `999001` (`bench_bulk_ttl_delete`), then calls `Unlink` the same way (transport `unwrap`, application `error` ignored), then one `ListDir` with `limit = 1000`.
-- `hotspot-create` prints `Completed <n> single-directory hotspot creates in <s>s (<ops/s> ops/s)` after the attempts, including attempts whose application error was ignored.
-- `bulk-ttl-delete` prints the unlink attempt count, seconds, ops/s, the live entry count returned by that list, and the list duration in milliseconds. The list call is checked; the unlinks are not.
-- The client does not compute latency percentiles and does not check dirstat or quota. A second run against the same server can still print `Completed` and a throughput when every create is rejected with `AlreadyExists`.
+- The client allocates one directory id, then file-inode and file-id blocks of length `--ops`, and refuses a grant whose count or end overflows.
+- It prints one JSON object with `bench_pid`, `workload`, and `requested_ops`, then creates that many 4096-byte files under a new directory.
+- Each phase prints JSON with `attempted`, `succeeded`, `failed`, `transport_failed`, `application_failed`, `errors_by_kind`, and latency percentiles (`p50_ms`, `p99_ms`, `p999_ms`). The process exits non-zero unless `succeeded` equals `--ops`.
+- `bulk-ttl-delete` unlinks the names that were created, then lists the directory with `limit = 1` and prints whether that page is empty.
+- A second run allocates a new `bench_pid`. It does not reuse a fixed inode, and it does not report rejected creates as successes.
 
 Do not treat a number from this command as a repository result. It depends on the machine, the build profile, and the server you pointed at. This tree does not record a sample.
 
@@ -123,4 +122,4 @@ These commands are in this tree. CI runs them with `cargo test --workspace --loc
 - `cargo test -p metadb-server --test join_existing_group` starts a second `metadbd` and joins the first process's Raft group, including a shared-secret case.
 - `open_and_serve` still rejects every role except `all-in-one`. A second Cell stays unimplemented. `RegisterCell` returns an error.
 
-`stress_smoke_mixed_workload` runs in that same workspace test. It prints one line for the machine that ran it. This repository does not check in a service-level target, and `metadb-ctl bench` still does not record percentiles or application errors for `hotspot-create`.
+`stress_smoke_mixed_workload` runs in that same workspace test. It prints one line for the machine that ran it. This repository does not check in a service-level target. Remote `metadb-ctl bench` records attempt counts and latency percentiles in JSON and fails the process when an application or transport error occurs.

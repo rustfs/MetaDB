@@ -6,7 +6,7 @@
 
 ## 1. `metadb-ctl` Administration CLI `[Implemented]`
 
-`metadb-ctl` connects to `ControlPlaneService` and `MetadataService` over gRPC to inspect cluster topology, manage shards, execute SQL templates, and run synthetic benchmarks:
+`metadb-ctl` connects to gRPC services to inspect local cluster state, manage shards, execute SQL templates, and run synthetic benchmarks. SQL results are complete JSON responses; command failures exit nonzero. Benchmark JSONL reports an allocated `bench_pid`, exact attempts, successes, failures, and latency statistics. See [upgrade and compatibility notes](../../designs/correctness_hardening.md).
 
 ```bash
 # Inspect Cells, BE node health, shard counts, and 3-watermark Raft log lag
@@ -56,10 +56,10 @@ cargo test -p metadb-server --test topology_distributed three_voter_leader_loss_
 
 1. **Automatic Dedicated-Node Isolation (`JumboIsolated`)**:
    * When a single directory (`PID`) exceeds `shard_split_threshold_bytes` (`4 GiB` default) and represents `>80%` of shard bytes, `PolicyShardSplitter` raises `UnsplittableJumboShard`.
-   * `CellLocalManager` marks the shard `JumboIsolated` and migrates peer shard leaders/replicas off that BE host so the jumbo directory gets uncontended NVMe and CPU resources.
+   * `CellLocalManager` records `JumboIsolated` scheduling metadata. Physical migration to another daemon is not implemented.
 2. **Dual-Mode `(PID, name)` Splitting (`DualModeFineGrained`)**:
    * Only if a single directory grows beyond a dedicated host's capacity (e.g., `>500M` files / `>100 GiB`), enable `DualModeFineGrained` via `metadb-ctl shard enable-dual-mode`.
-   * Non-anchor sub-shards maintain shard-local `[0x04] DirShardDelta` counters: `create_file` and `unlink` remain `1-RTT` single-shard operations, while `dirstat` switches automatically to `1-hop` parallel scatter-gather.
+   * Non-anchor sub-shards maintain shard-local `[0x04] DirShardDelta` counters: `create_file` and `unlink` remain `1-RTT` single-shard operations, while `dirstat` switches automatically to shared-barrier scatter-gather (currently issued serially).
 
 ---
 
@@ -68,8 +68,8 @@ cargo test -p metadb-server --test topology_distributed three_voter_leader_loss_
 | Parameter | Default | Tuning Guidance |
 | :--- | :--- | :--- |
 | `mvcc_retention_ms` | `5000` (`5s`) | Controls how long in-memory MVCC versions are retained for active `SnapshotGuard`s and write coalescing. Keep at `3000–5000ms`; never run multi-second scans in a single snapshot—use cursor-paginated `ListDir` (SQL Template #10). |
-| `memtable_size_bytes` | `32 MiB` | Increase to `64 MiB` on write-heavy AI checkpoint clusters with `>= 64 GiB` RAM per BE node to maximize in-memory MVCC version pruning before L0 flush. |
-| `block_cache_bytes` | `512 MiB` | Set to `25%–40%` of host RAM on dedicated BE nodes so SSTable `IndexBlock`, `FilterBlock`, and hot directory `DataBlock`s stay memory-resident across the 16 LRU cache shards. |
+| `memtable_size_bytes` | `32 MiB` | Reserved compatibility setting; changing it does not currently control sealing or backpressure. |
+| `block_cache_bytes` | `64 MiB` | Set to `25%–40%` of host RAM on dedicated BE nodes so SSTable `IndexBlock`, `FilterBlock`, and hot directory `DataBlock`s stay memory-resident across the 16 LRU cache shards. |
 | `locality_tombstone_threshold` | `128` | Number of physical LSM tombstones in a single 9-byte `[table_prefix][PID]` bucket (combined with `locality_tombstone_ratio >= 0.50`) that triggers targeted bottommost range compaction. Lower to `64` for latency-sensitive `listdir` workloads under heavy TTL deletion. |
 
 ---
@@ -87,4 +87,4 @@ cargo test -p metadb-server --test topology_distributed three_voter_leader_loss_
   * *Fix*: Handled automatically by `metadb-proxy` and the Rust SDK via `MetaCache` refresh + retry. Persistent occurrences indicate an unreachable `CellLocalManager`.
 * **Growing `.raftlog` Disk Usage**:
   * *Cause*: `safe_purge_index = min(state_flushed_index, aux_outbox_durable_index, last_snapshot_index)` is pinned by stalled L0 disk I/O or a blocked snapshot transfer. (Note: unreachable remote `QuotaTable` shards do **not** pin `.raftlog` indefinitely because overdue `AuxOutbox` tasks spill to local `[0x07]` SSTables on L0 flush.)
-  * *Fix*: Inspect NVMe write latency and `metadb_raft_watermark_lag_entries` in Prometheus metrics (`:9100/metrics`).
+  * *Fix*: Inspect NVMe write latency and the exposed `metadb_min_raft_safe_purge_index` metric (`:9100/metrics`). Compare per-shard logs during diagnosis; no per-shard watermark-lag metric is currently exported.

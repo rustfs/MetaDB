@@ -59,9 +59,28 @@ impl MultiRaftRouter {
 #[derive(Clone, Default)]
 pub struct ChannelPool {
     channels: Arc<AsyncMutex<HashMap<String, Channel>>>,
+    shared_secret: Arc<RwLock<Option<String>>>,
 }
 
 impl ChannelPool {
+    /// Configures authentication for all Raft clients sharing this pool.
+    pub fn set_shared_secret(&self, secret: Option<String>) {
+        *self.shared_secret.write().unwrap() = secret.filter(|s| !s.is_empty());
+    }
+
+    fn authenticate<T>(&self, mut request: Request<T>) -> Result<Request<T>, io::Error> {
+        if let Some(secret) = self.shared_secret.read().unwrap().as_ref() {
+            let value = format!("Bearer {secret}").parse().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid Raft shared secret metadata",
+                )
+            })?;
+            request.metadata_mut().insert("authorization", value);
+        }
+        Ok(request)
+    }
+
     pub async fn connect(&self, addr: &str) -> Result<Channel, io::Error> {
         let url = if addr.starts_with("http://") || addr.starts_with("https://") {
             addr.to_string()
@@ -147,10 +166,14 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
 
         let bincode_payload = bincode::serialize(&rpc).map_err(Self::unreachable)?;
         let reply = client
-            .append_entries(Request::new(RaftRpcEnvelope {
-                shard_id: self.shard_id,
-                bincode_payload,
-            }))
+            .append_entries(
+                self.pool
+                    .authenticate(Request::new(RaftRpcEnvelope {
+                        shard_id: self.shard_id,
+                        bincode_payload,
+                    }))
+                    .map_err(Self::unreachable)?,
+            )
             .await
             .map_err(Self::unreachable)?
             .into_inner();
@@ -178,10 +201,14 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
 
         let bincode_payload = bincode::serialize(&rpc).map_err(Self::unreachable)?;
         let reply = client
-            .vote(Request::new(RaftRpcEnvelope {
-                shard_id: self.shard_id,
-                bincode_payload,
-            }))
+            .vote(
+                self.pool
+                    .authenticate(Request::new(RaftRpcEnvelope {
+                        shard_id: self.shard_id,
+                        bincode_payload,
+                    }))
+                    .map_err(Self::unreachable)?,
+            )
             .await
             .map_err(Self::unreachable)?
             .into_inner();
@@ -252,7 +279,11 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
 
         let out_stream = tokio_stream::iter(chunks);
         let reply = client
-            .install_snapshot(Request::new(out_stream))
+            .install_snapshot(
+                self.pool
+                    .authenticate(Request::new(out_stream))
+                    .map_err(Self::streaming_unreachable)?,
+            )
             .await
             .map_err(Self::streaming_unreachable)?
             .into_inner();

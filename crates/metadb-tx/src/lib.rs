@@ -13,6 +13,7 @@ pub mod recovery_worker;
 pub mod rename_cycle;
 pub mod state_machine_impl;
 pub mod two_pc;
+mod validation;
 
 pub use attr_aggregator::{AsyncAttrAggregator, AttrDeltaItem};
 pub use aux_outbox::{ReplicatedAttrAggregator, ShardAuxOutbox, DEFAULT_OUTBOX_SPILL_THRESHOLD};

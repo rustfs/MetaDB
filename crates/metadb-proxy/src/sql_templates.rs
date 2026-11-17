@@ -59,8 +59,14 @@ pub enum MetadataSqlCommand {
     },
     /// #16 `SELECT * FROM QuotaTable WHERE uid = ?`
     GetQuota { uid: UserId },
-    /// #17 `INSERT INTO QuotaTable (uid, quota_limit_bytes) VALUES (?, ?) ON CONFLICT (uid) DO UPDATE SET quota_limit_bytes = ?`
+    /// Explicit quota setter retained for callers constructing execution commands directly.
     SetQuotaLimit { uid: UserId, quota_limit_bytes: u64 },
+    /// #17 `INSERT INTO QuotaTable (uid, quota_limit_bytes) VALUES (?, ?) ON CONFLICT (uid) DO UPDATE SET quota_limit_bytes = ?`
+    UpsertQuotaLimit {
+        uid: UserId,
+        insert_quota_limit_bytes: u64,
+        update_quota_limit_bytes: u64,
+    },
     /// #18 `SELECT * FROM QuotaTable WHERE uid >= ? ORDER BY uid ASC LIMIT ?`
     ListQuotas { start_uid: UserId, limit: usize },
     /// #19 `SELECT * FROM SecondaryIndexTable WHERE fid = ?`
@@ -143,6 +149,12 @@ impl<'a> TokenCursor<'a> {
                 other
             ))),
         }
+    }
+
+    fn parse_mode_arg(&mut self) -> Result<u32> {
+        let value = self.parse_u64_arg()?;
+        u32::try_from(value)
+            .map_err(|_| MetaDbError::SqlParseError(format!("mode {} exceeds u32::MAX", value)))
     }
 
     fn parse_i64_arg(&mut self) -> Result<i64> {
@@ -314,7 +326,7 @@ impl SqlTemplateParser {
                         c.expect_token(&SqlToken::Comma)?;
                         let uid = c.parse_u64_arg()?;
                         c.expect_token(&SqlToken::Comma)?;
-                        let mode = c.parse_u64_arg()? as u32;
+                        let mode = c.parse_mode_arg()?;
                         c.expect_token(&SqlToken::Comma)?;
                         let size_bytes = c.parse_i64_arg()?;
                         c.expect_token(&SqlToken::RParen)?;
@@ -354,7 +366,7 @@ impl SqlTemplateParser {
                         c.expect_token(&SqlToken::Comma)?;
                         let uid = c.parse_u64_arg()?;
                         c.expect_token(&SqlToken::Comma)?;
-                        let mode = c.parse_u64_arg()? as u32;
+                        let mode = c.parse_mode_arg()?;
                         c.expect_token(&SqlToken::RParen)?;
 
                         Ok(MetadataSqlCommand::Mkdir {
@@ -396,14 +408,12 @@ impl SqlTemplateParser {
                 c.expect_word("QUOTA_LIMIT_BYTES")?;
                 c.expect_token(&SqlToken::Eq)?;
                 let limit_2 = c.parse_u64_arg()?;
-                if limit_1 != limit_2 {
-                    return Err(MetaDbError::SqlParseError(
-                        "Template #17 requires VALUES quota_limit_bytes to equal the ON CONFLICT UPDATE value; SetQuotaLimit stores one absolute limit".to_string(),
-                    ));
-                }
-                Ok(MetadataSqlCommand::SetQuotaLimit {
+                // A missing row takes the INSERT value. An existing row takes the
+                // ON CONFLICT value. They are not collapsed into one absolute limit.
+                Ok(MetadataSqlCommand::UpsertQuotaLimit {
                     uid,
-                    quota_limit_bytes: limit_1,
+                    insert_quota_limit_bytes: limit_1,
+                    update_quota_limit_bytes: limit_2,
                 })
             }
             other => Err(MetaDbError::SqlParseError(format!(
@@ -491,7 +501,7 @@ impl SqlTemplateParser {
             }
             "MODE" => {
                 // Template #12: chmod
-                let mode = c.parse_u64_arg()? as u32;
+                let mode = c.parse_mode_arg()?;
                 let (pid, name) = Self::parse_where_pid_and_user_name(c)?;
                 Ok(MetadataSqlCommand::SetAttr {
                     pid,
@@ -745,25 +755,8 @@ mod tests {
          ON CONFLICT (uid) DO UPDATE SET quota_limit_bytes = ?";
 
     #[test]
-    fn template_17_requires_equal_insert_and_update_limits() {
+    fn template_17_keeps_distinct_insert_and_update_limits() {
         let cmd = SqlTemplateParser::parse_with_params(
-            SET_QUOTA,
-            &[
-                SqlParam::U64(77),
-                SqlParam::U64(9_000_000),
-                SqlParam::U64(9_000_000),
-            ],
-        )
-        .unwrap();
-        assert_eq!(
-            cmd,
-            MetadataSqlCommand::SetQuotaLimit {
-                uid: 77,
-                quota_limit_bytes: 9_000_000,
-            }
-        );
-
-        let err = SqlTemplateParser::parse_with_params(
             SET_QUOTA,
             &[
                 SqlParam::U64(77),
@@ -771,7 +764,14 @@ mod tests {
                 SqlParam::U64(1_000),
             ],
         )
-        .unwrap_err();
-        assert!(matches!(err, MetaDbError::SqlParseError(_)));
+        .unwrap();
+        assert_eq!(
+            cmd,
+            MetadataSqlCommand::UpsertQuotaLimit {
+                uid: 77,
+                insert_quota_limit_bytes: 9_000_000,
+                update_quota_limit_bytes: 1_000,
+            }
+        );
     }
 }
