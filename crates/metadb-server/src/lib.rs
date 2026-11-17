@@ -11,8 +11,10 @@ pub mod grpc_services;
 pub mod metrics;
 pub mod stress;
 
+mod metrics_http;
+
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -38,7 +40,7 @@ impl BearerAuth {
     }
 }
 
-fn bearer_header_matches(presented: &str, secret: &str) -> bool {
+pub(crate) fn bearer_header_matches(presented: &str, secret: &str) -> bool {
     let mut expected = Vec::with_capacity(7 + secret.len());
     expected.extend_from_slice(b"Bearer ");
     expected.extend_from_slice(secret.as_bytes());
@@ -501,6 +503,7 @@ pub struct PersistentMetaDbCluster {
     proxy_router: Arc<StatelessProxyRouter>,
     shutdown_tx: watch::Sender<bool>,
     task_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    metrics_addr: OnceLock<String>,
 }
 
 impl PersistentMetaDbCluster {
@@ -516,6 +519,10 @@ impl PersistentMetaDbCluster {
                  be, proxy, cell-manager, and global-manager are not role-trimmed and must not be treated as disaggregated deployments",
                 config.node.role
             )));
+        }
+        config.reject_unauthenticated_bind(&config.node.grpc_listen_addr)?;
+        if let Some(metrics_addr) = &config.node.metrics_listen_addr {
+            config.reject_unauthenticated_bind(metrics_addr)?;
         }
         std::fs::create_dir_all(&config.node.data_dir)?;
         let cell_dir = config
@@ -534,6 +541,7 @@ impl PersistentMetaDbCluster {
         } else {
             config.node.grpc_listen_addr.clone()
         };
+        config.reject_unauthenticated_bind(&listen_addr)?;
         let listener = match TcpListener::bind(&listen_addr).await {
             Ok(listener) => listener,
             Err(error)
@@ -637,10 +645,10 @@ impl PersistentMetaDbCluster {
         if shared_secret.is_empty() {
             tracing::warn!(
                 listen = %bound_addr,
-                "gRPC metadata, transaction, and control-plane services have no authentication or TLS. \
-                 Default bind is 127.0.0.1. Do not expose this process to untrusted networks until \
-                 [security].shared_secret or an external TLS terminator is configured. \
-                 RaftTransport on the same listener requires the same bearer when the secret is set."
+                "gRPC and metrics listeners have no authentication and this process does not terminate TLS. \
+                 An empty shared_secret is accepted only for loopback binds. \
+                 A wildcard or other non-loopback address refuses to serve. \
+                 RaftTransport on this listener requires the same bearer when the secret is set."
             );
         }
         let grpc_handle =
@@ -670,6 +678,7 @@ impl PersistentMetaDbCluster {
             proxy_router,
             shutdown_tx,
             task_handles: tokio::sync::Mutex::new(vec![grpc_handle]),
+            metrics_addr: OnceLock::new(),
         });
 
         // Background maintenance task (`AuxDispatcher` + `TxnRecoveryWorker` every 250ms).
@@ -687,6 +696,38 @@ impl PersistentMetaDbCluster {
             }
         });
         cluster.task_handles.lock().await.push(bg_handle);
+
+        if let Some(metrics_listen) = cluster.config.node.metrics_listen_addr.clone() {
+            let metrics_listener = match TcpListener::bind(&metrics_listen).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    let _ = cluster.shutdown().await;
+                    return Err(error.into());
+                }
+            };
+            let metrics_bound = match metrics_listener.local_addr() {
+                Ok(addr) => addr.to_string(),
+                Err(error) => {
+                    let _ = cluster.shutdown().await;
+                    return Err(error.into());
+                }
+            };
+            let _ = cluster.metrics_addr.set(metrics_bound.clone());
+            tracing::info!(
+                metrics_addr = %metrics_bound,
+                "Prometheus metrics endpoint listening"
+            );
+            let metrics_cluster = Arc::downgrade(&cluster);
+            let metrics_secret = cluster.config.security.shared_secret.clone();
+            let metrics_shutdown = cluster.shutdown_tx.subscribe();
+            let metrics_handle = tokio::spawn(metrics_http::serve(
+                metrics_listener,
+                metrics_cluster,
+                metrics_secret,
+                metrics_shutdown,
+            ));
+            cluster.task_handles.lock().await.push(metrics_handle);
+        }
 
         // Publish only after bootstrap or join has finished, so readers know the port is serving.
         std::fs::write(
@@ -808,6 +849,11 @@ impl PersistentMetaDbCluster {
 
     pub fn metrics_snapshot(&self) -> ClusterMetricsSnapshot {
         collect_cluster_metrics(&self.global_manager)
+    }
+
+    /// Bound Prometheus address, when `node.metrics_listen_addr` was set.
+    pub fn metrics_addr(&self) -> Option<&str> {
+        self.metrics_addr.get().map(String::as_str)
     }
 
     /// Gracefully stops gRPC/background loops, flushes all shard state to disk, and stops OpenRaft groups.

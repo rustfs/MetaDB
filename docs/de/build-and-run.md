@@ -64,7 +64,7 @@ cargo run -p metadb-server --bin metadbd -- --config ./standalone.toml
 
 Logs verwenden den `EnvFilter` von `tracing-subscriber`. Der Standardfilter ist `info`. Überschreiben mit der üblichen Variable `RUST_LOG`, zum Beispiel `RUST_LOG=debug`.
 
-Beim Start mit leerem `security.shared_secret` schreibt der Prozess eine Warnung, dass gRPC keine Authentifizierung und kein TLS hat. Die Standardbindung ist `127.0.0.1`. Diesen Socket nicht in ein nicht vertrauenswürdiges Netz stellen. Ein nicht leeres `[security].shared_secret` verlangt denselben Bearer für Metadaten-, Transaktions-, Control-Plane- und Raft-Transport-RPCs. Der Prozess beendet TLS weiterhin nicht. Den Listener in einem vertrauenswürdigen Netz lassen, oder jeden Dienst hinter einen Proxy setzen, der Clients authentifiziert, und den direkten Zugriff auf diesen Prozess sperren.
+Beim Start mit leerem `security.shared_secret` schreibt der Prozess eine Warnung, dass Loopback-gRPC keine Authentifizierung hat. Die Standardbindung ist `127.0.0.1`. Eine Wildcard oder eine andere Nicht-Loopback-Adresse mit leerem, fehlendem oder falsch geschriebenem Geheimnis verweigert das Binden. Ein nicht leeres `[security].shared_secret` verlangt denselben Bearer für Metadaten-, Transaktions-, Control-Plane- und Raft-Transport-RPCs sowie für `GET /metrics`. Der Prozess beendet TLS nicht. Ein TLS- oder Zertifikatsschlüssel in der Konfiguration lässt den Start fehlschlagen, statt Klartext zu dienen. Den Listener in einem vertrauenswürdigen Netz lassen, oder jeden Dienst hinter einen Proxy setzen, der Clients authentifiziert, und den direkten Zugriff auf diesen Prozess sperren.
 
 Strg-C schreibt den Shard-Zustand und stoppt die OpenRaft-Gruppen (`cluster.shutdown()`).
 

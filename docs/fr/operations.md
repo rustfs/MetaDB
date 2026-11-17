@@ -71,7 +71,7 @@ Voir [Tests et bancs](./testing.md#metadb-ctl-bench). C'est un client contre un 
 
 ## Métriques
 
-Définir `node.metrics_listen_addr` (par exemple `127.0.0.1:9100`). `metadbd` accepte les connexions TCP et écrit un unique HTTP `200` dont le corps est du texte Prometheus. Il ne route pas sur le chemin d'URL. Toute requête reçoit le même corps.
+Définir `node.metrics_listen_addr` (par exemple `127.0.0.1:9100`). `open_and_serve` accepte les connexions TCP sur cette adresse. `GET /metrics` renvoie du texte Prometheus. Tout autre chemin renvoie 404, et toute autre méthode renvoie 405. Lorsque `[security].shared_secret` n'est pas vide, chaque requête sur cet écouteur doit envoyer `Authorization: Bearer <shared_secret>`. Un bearer absent, vide ou incorrect renvoie HTTP 401 et un corps qui n'est pas le texte des métriques, y compris une requête vers `/status`. Une adresse de métriques non locale avec un secret vide refuse de démarrer. Cet écouteur ne termine pas TLS.
 
 Jauges et compteurs de `render_prometheus_metrics` :
 
@@ -135,7 +135,7 @@ Les variantes sont définies dans `crates/metadb-core/src/error.rs`. Les méthod
 - `GetRoutes` échoue fermé pour un `cell_id` non nul inconnu. `StoreHeartbeat` ne remplace pas les routes en cache.
 - L'isolation jumbo est un indicateur de route plus un identifiant de nœud choisi dans la table locale. Elle n'évince pas d'autres shards d'un disque.
 - Les battements de cœur sont un RPC sans émetteur dans `metadbd`. `StoreHeartbeat` ne persiste pas.
-- Un secret partagé non vide authentifie Raft sur le port gRPC public avec le même bearer que les trois autres services. Un secret vide laisse Raft non authentifié. Le processus ne termine pas TLS.
+- Un secret partagé non vide authentifie Raft, les trois autres services gRPC et l'écouteur de métriques avec le même bearer. Un secret vide n'est accepté que pour les liaisons en boucle locale et laisse ces écouteurs non authentifiés. Une liaison joker avec un secret vide refuse de démarrer. Le processus ne termine pas TLS.
 - `memtable_size_bytes` et tous les champs de temporisation Raft ne changent pas le comportement d'exécution via le TOML.
 - `metadb-ctl bench` pour `hotspot-create` et `bulk-ttl-delete` imprime des lignes JSON : un en-tête avec `bench_pid`, puis des rapports de phase avec attempted, succeeded, failed et des percentiles de latence. Le processus se termine en erreur si une opération demandée échoue. `--workload mixed` ou `--embedded` lance le harnais de stress dans le processus. `sql` imprime la réponse en JSON et se termine en erreur sur une erreur d'application.
 
@@ -147,6 +147,6 @@ Ces éléments manquent au produit, donc ce guide ne peut pas décrire de procé
 2. L'ajout d'un second et d'un troisième processus `metadbd` du système d'exploitation à un groupe Raft existant.
 3. La création et le routage vers une seconde cellule.
 4. Le placement d'un shard jumbo sur sa propre machine et le déplacement des autres shards hors de cette machine.
-5. La matière TLS, l'authentification Raft, et une boucle de contrôle pilotée par les battements de cœur.
+5. Le TLS natif. Ce processus ne termine pas TLS. Les clés de configuration qui demandent TLS ou un certificat sont rejetées au lieu de servir en clair. Placer la terminaison dans un proxy externe. Raft et les métriques utilisent le même bearer que les autres services lorsqu'un secret est défini ; ce n'est pas du TLS mutuel. Une boucle de contrôle pilotée par les battements de cœur n'est pas implémentée.
 6. Une taille de memtable ou une temporisation Raft que l'exploitant peut régler et observer.
 7. Un résultat de niveau service enregistré pour `metadb-ctl bench`. La commande imprime des nombres pour la machine sur laquelle on l'exécute. Ce dépôt n'en enregistre pas. La pull request non fusionnée n° 2 rapporte un harnais embarqué distinct ; ces commandes ne sont pas dans cet arbre. Voir [Tests et bancs](./testing.md).

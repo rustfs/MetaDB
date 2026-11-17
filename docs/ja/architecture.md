@@ -9,16 +9,16 @@
 `PersistentMetaDbCluster::open_and_serve`（`crates/metadb-server/src/lib.rs`）は次を行います。
 
 1. `all-in-one` 以外の `node.role` を拒否する。
-2. `node.grpc_listen_addr` をバインドする（既定は `127.0.0.1:7800`。`127.0.0.1:0` は OS にポートを選ばせる）。
+2. `shared_secret` が空のとき、ワイルドカードまたはループバック以外の `grpc_listen_addr` と `metrics_listen_addr` を拒否する。その後 `node.grpc_listen_addr` をバインドする（既定は `127.0.0.1:7800`。`127.0.0.1:0` は OS にポートを選ばせる）。
 3. `<data_dir>/global_allocator` で `DurableIdAllocator` を開く。
 4. `<data_dir>/be` で `ShardGroupHost` を開く。
 5. `<data_dir>/cell_<cell_id>` で `DurableCellManager` を開くかブートストラップする。
 6. その 1 つのセルを、キー範囲 `[0x01, 0x04)` で `DurableGlobalManager` に登録する。
 7. ルートの inode `1`（`ROOT_INODE_ID`）に属性レコードがあることを保証する。
-8. 同じリスナーで 4 つの gRPC サービスを提供する。4 つとも同じ任意のベアラインターセプタを取る。シークレットが空ならすべての呼び出しを通す。
+8. 同じリスナーで 4 つの gRPC サービスを提供する。4 つとも同じベアラインターセプタを取る。`metrics_listen_addr` が設定されているとき、そのアドレスの `GET /metrics` は同じシークレットを要求する。シークレットが空でなければ、欠落または誤ったベアラは拒否される。空のシークレットはループバックのバインドだけを受け付ける。このプロセスは TLS を終端しない。
 9. 250 ms 間隔のメンテナンスタスクを起動する。
 
-`metadbd` は薄いラッパです。TOML を読み、CLI の上書きを適用し、`open_and_serve` を呼び、任意で `--cell-manager` へ `RegisterNode` を呼び、任意で Prometheus テキストを提供し、Ctrl-C で `shutdown` を呼びます。
+`metadbd` は薄いラッパです。TOML を読み、CLI の上書きを適用し、`open_and_serve` を呼び、任意で `--cell-manager` へ `RegisterNode` を呼び、Ctrl-C で `shutdown` を呼びます。メトリクスは設定されているとき `open_and_serve` の中で提供されます。
 
 ## キーとテーブル
 

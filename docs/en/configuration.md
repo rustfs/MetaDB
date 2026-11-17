@@ -2,7 +2,7 @@
 
 [Overview](./README.md) · [Français](../fr/configuration.md) · [Deutsch](../de/configuration.md) · [日本語](../ja/configuration.md) · [简体中文](../zh/configuration.md)
 
-`metadbd --config` and `ServerTomlConfig::from_toml_file` / `from_toml_str` read TOML (`crates/metadb-server/src/config.rs`). Unknown keys are ignored. The structs use `#[serde(default)]` and do not set `deny_unknown_fields`, and `from_toml_str` calls `toml::from_str` directly. A misspelled key keeps its default, including an empty `security.shared_secret`, and startup still succeeds. Every section is optional. Omitted fields take the defaults below.
+`metadbd --config` and `ServerTomlConfig::from_toml_file` / `from_toml_str` read TOML (`crates/metadb-server/src/config.rs`). Unknown keys that do not name a secret or TLS setting are ignored. A misspelled `shared_secret`, a token or password key, or any TLS or certificate key is rejected and startup does not proceed. Every known section is optional. Omitted fields take the defaults below.
 
 ## Defaults
 
@@ -13,7 +13,7 @@
 | `node.role` | `all-in-one` | Yes. Any other value returns an error |
 | `node.data_dir` | `./metadb-data` | Yes |
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | Yes. Bind address |
-| `node.metrics_listen_addr` | unset | Yes, only when set. `metadbd` binds a separate TCP listener |
+| `node.metrics_listen_addr` | unset | Yes, only when set. Separate TCP listener. A non-loopback address requires a non-empty secret |
 | `clock.max_clock_drift_ms` | `500` | Yes. `HybridLogicalClock::with_max_drift_ms` |
 | `storage.memtable_size_bytes` | `33554432` (32 MiB) | **No.** The field is stored and never read |
 | `storage.block_cache_bytes` | `67108864` (64 MiB) | Yes. Total budget of the 16-way block cache |
@@ -23,7 +23,7 @@
 | `storage.locality_tombstone_ratio` | `0.50` | Yes. Multiplied by 1000, clamped to 1..=1000, stored as `tombstone_min_ratio_permille` |
 | `sharding.bootstrap_table_shards` | `true` | Yes. `true` creates shards 1, 2, and 3. `false` creates shard 1 over `[0x01, 0x04)` |
 | `sharding.shard_split_threshold_bytes` | `4294967296` (4 GiB) | Yes. Split check uses approximate shard size |
-| `security.shared_secret` | `""` | Yes. Empty means all four gRPC services on this listener are unauthenticated |
+| `security.shared_secret` | `""` | Yes. Empty is accepted only for loopback listeners. Non-empty requires the same bearer on gRPC and metrics |
 
 There is no `[raft]` table. `ServerTomlConfig.raft_options` is skipped by serde and stays at `RaftNodeOptions::default()` (heartbeat 150 ms, election 450–900 ms, snapshot log keep 0, segment 64 MiB).
 
@@ -67,11 +67,11 @@ CLI flags override the file after it is parsed: `--node-id`, `--cell-id`, `--rol
 
 ## Security
 
-The process does not terminate TLS.
+This process does not terminate TLS. There is no certificate configuration that turns on native TLS. If the file contains a TLS, SSL, or certificate key, parsing fails and the process does not serve plaintext. Terminate TLS in an external proxy, and do not leave a TLS key in this file.
 
-When `shared_secret` is non-empty, `MetadataService`, `TransactionService`, `ControlPlaneService`, and `RaftTransportService` require `authorization` to equal `Bearer <shared_secret>` exactly. Raft peers send the same bearer. `metadb-ctl --auth-token` (environment variable `METADB_AUTH_TOKEN`) and `metadbd --join` / `--cell-manager` send it. A prefix or a longer token is rejected. An empty secret leaves all four services unauthenticated.
+When `shared_secret` is non-empty, `MetadataService`, `TransactionService`, `ControlPlaneService`, and `RaftTransportService` require `authorization` to equal `Bearer <shared_secret>` exactly. `GET /metrics` on `metrics_listen_addr` requires the same `Authorization` header. A missing header, an empty bearer, a prefix, or a longer token is rejected. The metrics failure body is not Prometheus text. Raft peers send the same bearer. `metadb-ctl --auth-token` (environment variable `METADB_AUTH_TOKEN`) and `metadbd --join` / `--cell-manager` send it. `metadb-ctl cluster status` calls `GetRoutes` and is covered by that interceptor.
 
-An empty secret allows every RPC on the listener. The code warns about this at startup. The process still does not terminate TLS. Before an untrusted client can reach the port, keep the bind on a trusted network such as `127.0.0.1`, or put every service behind a proxy that authenticates the client (for example mutual TLS) and block direct access to this process.
+An empty or whitespace-only secret is accepted only when `grpc_listen_addr` and `metrics_listen_addr` (if set) are loopback (`127.0.0.0/8`, `::1`, or the name `localhost`). A wildcard (`0.0.0.0`, `::`) or any other address refuses to listen. The code warns about an empty loopback secret at startup. The listeners are still plaintext. Keep them on a trusted network, or put every service behind a proxy that authenticates the client and block direct access to this process.
 
 ## What you cannot configure
 
@@ -79,4 +79,4 @@ An empty secret allows every RPC on the listener. The code warns about this at s
 - A voter list in TOML. The first process bootstraps alone. A later all-in-one process joins with `[cluster] join = "host:port"` (or `--join` / `--cell-manager`) pointing at the current leader, and only when its data directory does not already own a cell. The leader must be reached directly; a follower does not forward the membership change. That join is the same cell, not a second cell. See [Operations](./operations.md).
 - A second cell's key range. `RegisterCell` returns an error and stores nothing.
 - Memtable byte limit, Raft timers, or locality-compaction on/off.
-- TLS certificates.
+- Native TLS certificates. A TLS key in this file is rejected. Termination belongs in an external proxy.

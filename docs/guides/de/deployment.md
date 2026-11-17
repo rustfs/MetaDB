@@ -34,7 +34,7 @@ bootstrap_table_shards = true
 shard_split_threshold_bytes = 4294967296 # 4 GiB
 ```
 
-Rust 1.100.0 (`rust-toolchain.toml`). Nur die Rolle `all-in-one` startet. Ohne `[security].shared_secret` haben die gRPC-Dienste weder Auth noch TLS; der Default-Bind ist `127.0.0.1`. Den Port nicht in unvertrauenswürdige Netze stellen.
+Rust 1.100.0 (`rust-toolchain.toml`). Nur die Rolle `all-in-one` startet. Dieser Prozess beendet TLS nicht. Ohne `[security].shared_secret` gibt es keine Authentifizierung, und nur Loopback-Binds werden akzeptiert. Der Default ist `127.0.0.1`. Eine Wildcard oder eine andere Adresse mit leerem Geheimnis verweigert den Start. Ein nicht leeres `shared_secret` verlangt `authorization: Bearer <secret>` für Metadaten, Transaktionen, die Control Plane, Raft auf demselben Port und `GET /metrics`.
 
 ```bash
 metadbd --config /etc/metadb/standalone.toml

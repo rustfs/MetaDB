@@ -34,7 +34,7 @@ bootstrap_table_shards = true
 shard_split_threshold_bytes = 4294967296 # 4 Gio
 ```
 
-Rust 1.100.0 (`rust-toolchain.toml`). Seul le rôle `all-in-one` démarre. Sans `[security].shared_secret`, le gRPC n'a ni authentification ni TLS ; l'écoute par défaut est `127.0.0.1`. Ne pas exposer ce port à un réseau non fiable.
+Rust 1.100.0 (`rust-toolchain.toml`). Seul le rôle `all-in-one` démarre. Ce processus ne termine pas TLS. Sans `[security].shared_secret`, il n'y a pas d'authentification, et seules les liaisons en boucle locale sont acceptées. Le défaut est `127.0.0.1`. Un joker ou une autre adresse avec un secret vide refuse de démarrer. Un `shared_secret` non vide exige `authorization: Bearer <secret>` pour les métadonnées, les transactions, le plan de contrôle, Raft sur le même port, et `GET /metrics`.
 
 ```bash
 metadbd --config /etc/metadb/standalone.toml

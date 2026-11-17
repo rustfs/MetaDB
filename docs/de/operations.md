@@ -71,7 +71,7 @@ Siehe [Tests und Benches](./testing.md#metadb-ctl-bench). Das ist ein Client geg
 
 ## Metriken
 
-`node.metrics_listen_addr` setzen (zum Beispiel `127.0.0.1:9100`). `metadbd` nimmt TCP-Verbindungen an und schreibt ein einzelnes HTTP `200`, dessen Rumpf Prometheus-Text ist. Es routet nicht nach URL-Pfad. Jede Anfrage erhält denselben Rumpf.
+`node.metrics_listen_addr` setzen (zum Beispiel `127.0.0.1:9100`). `open_and_serve` nimmt auf dieser Adresse TCP-Verbindungen an. `GET /metrics` liefert Prometheus-Text. Jeder andere Pfad liefert 404, jede andere Methode 405. Wenn `[security].shared_secret` nicht leer ist, muss jede Anfrage auf diesem Listener `Authorization: Bearer <shared_secret>` senden. Ein fehlender, leerer oder falscher Bearer liefert HTTP 401 und einen Rumpf, der nicht der Metriktext ist, auch für `/status`. Eine Nicht-Loopback-Metrikadresse mit leerem Geheimnis verweigert den Start. Dieser Listener beendet TLS nicht.
 
 Gauges und Counter aus `render_prometheus_metrics`:
 
@@ -135,7 +135,7 @@ Die Varianten sind in `crates/metadb-core/src/error.rs` definiert. gRPC-Methoden
 - `GetRoutes` scheitert geschlossen bei einer unbekannten `cell_id` ungleich null. `StoreHeartbeat` ersetzt zwischengespeicherte Routen nicht.
 - Jumbo-Isolation ist ein Routenflag plus eine Knotenkennung aus der lokalen Knotentabelle. Sie verdrängt andere Shards nicht von einer Platte.
 - Heartbeats sind ein RPC ohne Sender in `metadbd`. `StoreHeartbeat` speichert nicht dauerhaft.
-- Ein nicht leeres gemeinsames Geheimnis authentifiziert Raft auf dem öffentlichen gRPC-Port mit demselben Bearer wie die drei anderen Dienste. Ein leeres Geheimnis lässt Raft unauthentifiziert. Der Prozess beendet TLS nicht.
+- Ein nicht leeres gemeinsames Geheimnis authentifiziert Raft, die drei anderen gRPC-Dienste und den Metrik-Listener mit demselben Bearer. Ein leeres Geheimnis wird nur für Loopback-Binds akzeptiert und lässt diese Listener unauthentifiziert. Ein Wildcard-Bind mit leerem Geheimnis verweigert den Start. Der Prozess beendet TLS nicht.
 - `memtable_size_bytes` und alle Raft-Zeitgeberfelder ändern das Laufzeitverhalten über TOML nicht.
 - `metadb-ctl bench` für `hotspot-create` und `bulk-ttl-delete` druckt JSON-Zeilen: einen Kopf mit `bench_pid`, dann Phasenberichte mit attempted, succeeded, failed und Latenzperzentilen. Der Prozess endet mit einem Fehler, wenn nicht jede angeforderte Operation gelingt. `--workload mixed` oder `--embedded` startet den prozessinternen Stress-Harness. `sql` druckt die Antwort als JSON und endet bei einem Anwendungsfehler mit einem Fehlerstatus.
 
@@ -147,6 +147,6 @@ Diese Punkte fehlen im Produkt, daher kann dieser Leitfaden kein Verfahren dafü
 2. Einen zweiten und dritten `metadbd`-Betriebssystemprozess einer bestehenden Raft-Gruppe hinzufügen.
 3. Eine zweite Zelle anlegen und dorthin routen.
 4. Einen Jumbo-Shard auf eine eigene Maschine legen und andere Shards von dieser Maschine wegziehen.
-5. TLS-Material, Raft-Authentifizierung und eine heartbeat-getriebene Steuerschleife.
+5. Natives TLS. Dieser Prozess beendet TLS nicht. Konfigurationsschlüssel, die TLS oder ein Zertifikat verlangen, werden abgelehnt, statt Klartext zu dienen. Die Terminierung gehört in einen externen Proxy. Raft und Metriken nutzen denselben Bearer wie die anderen Dienste, wenn ein Geheimnis gesetzt ist; das ist kein gegenseitiges TLS. Eine heartbeat-getriebene Steuerschleife ist nicht implementiert.
 6. Eine Memtable-Größe oder einen Raft-Zeitgeber, den der Betrieb setzen und beobachten kann.
 7. Ein eingechecktes Ergebnis auf Dienstebene für `metadb-ctl bench`. Der Befehl druckt Zahlen für die Maschine, auf der man ihn ausführt. Dieses Repository zeichnet keine auf. Der nicht zusammengeführte Pull Request 2 berichtet einen eigenen eingebetteten Harness; diese Befehle sind nicht in diesem Baum. Siehe [Tests und Benches](./testing.md).

@@ -71,7 +71,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ## 指标
 
-设置 `node.metrics_listen_addr`（例如 `127.0.0.1:9100`）。`metadbd` 接受 TCP 连接，并写出一个 HTTP `200`，正文是 Prometheus 文本。它不按 URL 路径路由。任何请求都得到同一正文。
+设置 `node.metrics_listen_addr`（例如 `127.0.0.1:9100`）。`open_and_serve` 在该地址接受 TCP 连接。`GET /metrics` 返回 Prometheus 文本。其他路径返回 404，其他方法返回 405。`[security].shared_secret` 非空时，该监听器上的每个请求都必须发送 `Authorization: Bearer <shared_secret>`。缺失、空或错误的令牌返回 HTTP 401，正文不是指标文本，包括对 `/status` 的请求。空密钥配合非环回的指标地址会拒绝启动。该监听器不终结 TLS。
 
 `render_prometheus_metrics` 的计量与计数：
 
@@ -135,7 +135,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 - 未知且非零的 `cell_id` 上，`GetRoutes` 失败关闭。`StoreHeartbeat` 不会替换缓存路由。
 - 巨型隔离是路由标志加上从本地节点表选出的节点标识。它不会把其他分片从磁盘上赶走。
 - 心跳是一个 RPC，`metadbd` 里没有发送方。`StoreHeartbeat` 不持久化。
-- 非空共享密钥用与另外三个服务相同的持有者令牌认证公开 gRPC 端口上的 Raft。空密钥下 Raft 仍然不认证。进程不终结 TLS。
+- 非空共享密钥用同一个持有者令牌认证 Raft、另外三个 gRPC 服务和指标监听器。空密钥只接受环回绑定，这些监听器不认证。通配绑定加上空密钥会拒绝启动。进程不终结 TLS。
 - `memtable_size_bytes` 和所有 Raft 计时字段不会通过 TOML 改变运行行为。
 - `hotspot-create` 和 `bulk-ttl-delete` 的 `metadb-ctl bench` 打印 JSON 行：先是带 `bench_pid` 的头，然后是包含 attempted、succeeded、failed 和延迟分位数的阶段报告。只要有一次请求的操作失败，进程就以非零状态退出。`--workload mixed` 或 `--embedded` 运行进程内的压力工具。`sql` 把响应打印成 JSON，遇到应用错误时以非零状态退出。
 
@@ -147,6 +147,6 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 2. 把第二个和第三个 `metadbd` 操作系统进程加入已有 Raft 组。
 3. 创建第二个单元并路由到它。
 4. 把巨型分片放到独立机器上，并把其他分片从那台机器移走。
-5. TLS 材料、Raft 认证，以及由心跳驱动的控制循环。
+5. 本进程内的 TLS。进程不终结 TLS。要求 TLS 或证书的配置键会被拒绝，而不是以明文提供服务。请在外部代理终结 TLS。密钥非空时，Raft 和指标与其他服务使用同一个持有者令牌；这不是双向 TLS。由心跳驱动的控制循环没有实现。
 6. 运维人员可以设置并观察到的 memtable 大小或 Raft 计时器。
 7. 记入仓库的 `metadb-ctl bench` 服务级结果。该命令打印你运行它的那台机器上的数字。本仓库没有记录一份。未合并的拉取请求 2 报告了另一套嵌入式工具；那些命令不在本树中。见 [测试与压测](./testing.md)。
