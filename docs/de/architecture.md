@@ -9,16 +9,16 @@ Diese Seite folgt dem Code in `crates/`. Sie beschreibt keinen Mehrprozess-Zelle
 `PersistentMetaDbCluster::open_and_serve` (`crates/metadb-server/src/lib.rs`):
 
 1. Weist jedes `node.role` außer `all-in-one` zurück.
-2. Bindet `node.grpc_listen_addr` (Vorgabe `127.0.0.1:7800`; `127.0.0.1:0` lässt das Betriebssystem einen Port wählen).
+2. Weist eine Wildcard oder eine andere Nicht-Loopback-Adresse in `grpc_listen_addr` oder `metrics_listen_addr` zurück, wenn `shared_secret` leer ist. Bindet danach `node.grpc_listen_addr` (Vorgabe `127.0.0.1:7800`; `127.0.0.1:0` lässt das Betriebssystem einen Port wählen).
 3. Öffnet `DurableIdAllocator` unter `<data_dir>/global_allocator`.
 4. Öffnet `ShardGroupHost` unter `<data_dir>/be`.
 5. Öffnet oder bootstrapt `DurableCellManager` unter `<data_dir>/cell_<cell_id>`.
 6. Registriert diese eine Zelle bei `DurableGlobalManager` für den Schlüsselbereich `[0x01, 0x04)`.
 7. Stellt sicher, dass Wurzel-Inode `1` (`ROOT_INODE_ID`) einen Attributsatz hat.
-8. Bedient vier gRPC-Dienste auf demselben Listener. Alle vier nehmen denselben optionalen Bearer-Interceptor. Ein leeres Geheimnis lässt jeden Aufruf zu.
+8. Bedient vier gRPC-Dienste auf demselben Listener. Alle vier nehmen denselben Bearer-Interceptor. Wenn `metrics_listen_addr` gesetzt ist, verlangt `GET /metrics` auf dieser Adresse dasselbe Geheimnis. Ein nicht leeres Geheimnis weist einen fehlenden oder falschen Bearer zurück. Ein leeres Geheimnis wird nur für Loopback-Binds akzeptiert. Dieser Prozess beendet TLS nicht.
 9. Startet eine Wartungsaufgabe im Abstand von 250 ms.
 
-`metadbd` ist eine dünne Hülle: Es lädt TOML, wendet CLI-Überschreibungen an, ruft `open_and_serve` auf, ruft optional `RegisterNode` an `--cell-manager` auf, liefert optional Prometheus-Text und ruft bei Strg-C `shutdown` auf.
+`metadbd` ist eine dünne Hülle: Es lädt TOML, wendet CLI-Überschreibungen an, ruft `open_and_serve` auf, ruft optional `RegisterNode` an `--cell-manager` auf und ruft bei Strg-C `shutdown` auf. Metriken werden, wenn konfiguriert, in `open_and_serve` bedient.
 
 ## Schlüssel und Tabellen
 

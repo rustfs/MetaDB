@@ -64,7 +64,7 @@ cargo run -p metadb-server --bin metadbd -- --config ./standalone.toml
 
 Les journaux utilisent l'`EnvFilter` de `tracing-subscriber`. Le filtre par défaut est `info`. On le remplace avec la variable standard `RUST_LOG`, par exemple `RUST_LOG=debug`.
 
-Au démarrage, si `security.shared_secret` est vide, le processus journalise un avertissement : gRPC n'a ni authentification ni TLS. La liaison par défaut est `127.0.0.1`. Ne pas publier cette socket sur un réseau non fiable. Un `[security].shared_secret` non vide exige le même bearer pour les RPC de métadonnées, de transaction, de plan de contrôle et de transport Raft. Le processus ne termine toujours pas TLS. Garder l'écouteur sur un réseau de confiance, ou placer chaque service derrière un proxy qui authentifie les clients, et bloquer l'accès direct à ce processus.
+Au démarrage, si `security.shared_secret` est vide, le processus journalise un avertissement : le gRPC en boucle locale n'a pas d'authentification. La liaison par défaut est `127.0.0.1`. Un joker ou une autre adresse non locale avec un secret vide, absent ou mal orthographié refuse d'écouter. Un `[security].shared_secret` non vide exige le même bearer pour les RPC de métadonnées, de transaction, de plan de contrôle, de transport Raft, et pour `GET /metrics`. Le processus ne termine pas TLS. Une clé TLS ou de certificat dans la configuration fait échouer le démarrage au lieu de servir en clair. Garder l'écouteur sur un réseau de confiance, ou placer chaque service derrière un proxy qui authentifie les clients, et bloquer l'accès direct à ce processus.
 
 Ctrl-C vide l'état des shards et arrête les groupes OpenRaft (`cluster.shutdown()`).
 

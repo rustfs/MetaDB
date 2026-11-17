@@ -34,7 +34,7 @@ bootstrap_table_shards = true
 shard_split_threshold_bytes = 4294967296 # 4 GiB
 ```
 
-Rust 1.100.0（`rust-toolchain.toml`）。実装されているロールは `all-in-one` のみ。gRPC は既定で認証も TLS もなく、待受は `127.0.0.1`。信頼できないネットワークに公開しないこと。空でない `[security].shared_secret` は metadata、transaction、control-plane、および同じポートの Raft 転送に `authorization: Bearer <secret>` を要求する。
+Rust 1.100.0（`rust-toolchain.toml`）。実装されているロールは `all-in-one` のみ。このプロセスは TLS を終端しない。空の `[security].shared_secret` では認証もなく、待受はループバックだけを受け付ける。既定は `127.0.0.1`。ワイルドカードやそれ以外のアドレスに空のシークレットがあると起動を拒否する。空でない `shared_secret` は metadata、transaction、control-plane、同じポートの Raft 転送、および `GET /metrics` に `authorization: Bearer <secret>` を要求する。
 
 ```bash
 metadbd --config /etc/metadb/standalone.toml

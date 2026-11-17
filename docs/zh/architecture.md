@@ -9,16 +9,16 @@
 `PersistentMetaDbCluster::open_and_serve`（`crates/metadb-server/src/lib.rs`）：
 
 1. 拒绝除 `all-in-one` 以外的任何 `node.role`。
-2. 绑定 `node.grpc_listen_addr`（默认 `127.0.0.1:7800`；`127.0.0.1:0` 让操作系统分配端口）。
+2. `shared_secret` 为空时，拒绝通配或其他非环回的 `grpc_listen_addr` 与 `metrics_listen_addr`。然后绑定 `node.grpc_listen_addr`（默认 `127.0.0.1:7800`；`127.0.0.1:0` 让操作系统分配端口）。
 3. 在 `<data_dir>/global_allocator` 打开 `DurableIdAllocator`。
 4. 在 `<data_dir>/be` 打开 `ShardGroupHost`。
 5. 在 `<data_dir>/cell_<cell_id>` 打开或引导 `DurableCellManager`。
 6. 把这一个单元以键范围 `[0x01, 0x04)` 注册到 `DurableGlobalManager`。
 7. 保证根 inode `1`（`ROOT_INODE_ID`）有属性记录。
-8. 在同一监听器上提供四个 gRPC 服务。四个服务使用同一个可选的持有者拦截器。密钥为空时，所有调用都放行。
+8. 在同一监听器上提供四个 gRPC 服务。四个服务使用同一个持有者拦截器。设置了 `metrics_listen_addr` 时，该地址上的 `GET /metrics` 要求同一个密钥。密钥非空时，缺失或错误的令牌会被拒绝。空密钥只接受环回绑定。本进程不终结 TLS。
 9. 启动间隔 250 ms 的维护任务。
 
-`metadbd` 是薄封装：加载 TOML，应用命令行覆盖，调用 `open_and_serve`，可选地对 `--cell-manager` 调用 `RegisterNode`，可选地提供 Prometheus 文本，并在 Ctrl-C 时调用 `shutdown`。
+`metadbd` 是薄封装：加载 TOML，应用命令行覆盖，调用 `open_and_serve`，可选地对 `--cell-manager` 调用 `RegisterNode`，并在 Ctrl-C 时调用 `shutdown`。配置了指标时，由 `open_and_serve` 提供。
 
 ## 键与表
 

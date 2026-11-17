@@ -71,7 +71,7 @@ See [Tests and benches](./testing.md#metadb-ctl-bench). This is a client against
 
 ## Metrics
 
-Set `node.metrics_listen_addr` (for example `127.0.0.1:9100`). `metadbd` accepts TCP connections and writes a single HTTP `200` whose body is Prometheus text. It does not route on the URL path. Any request receives the same body.
+Set `node.metrics_listen_addr` (for example `127.0.0.1:9100`). `open_and_serve` accepts TCP connections on that address. `GET /metrics` returns Prometheus text. Any other path returns 404, and any other method returns 405. When `[security].shared_secret` is non-empty, every request on this listener must send `Authorization: Bearer <shared_secret>`. A missing, empty, or wrong bearer returns HTTP 401 and a body that is not the metric text, including a request for `/status`. A non-loopback metrics address with an empty secret refuses to start. This listener does not terminate TLS.
 
 Gauges and counters from `render_prometheus_metrics`:
 
@@ -138,7 +138,7 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 - Quota cursor rows are written after the outbox lock is released, so a flush that already holds the memtable lock can still take the outbox lock.
 - Jumbo isolation is a route flag plus a node id chosen from the local node map. It does not evict other shards from a disk.
 - Heartbeats are an RPC with no sender in `metadbd`. `StoreHeartbeat` does not persist.
-- A non-empty shared secret authenticates Raft on the public gRPC port with the same bearer as the other three services. An empty secret leaves Raft unauthenticated. The process does not terminate TLS.
+- A non-empty shared secret authenticates Raft, the other three gRPC services, and the metrics listener with the same bearer. An empty secret is accepted only for loopback binds and leaves those listeners unauthenticated. A wildcard bind with an empty secret refuses to start. The process does not terminate TLS.
 - `memtable_size_bytes` and all Raft timer fields do not change runtime behavior through TOML.
 - `metadb-ctl bench` for `hotspot-create` and `bulk-ttl-delete` prints JSON lines: a header with `bench_pid`, then phase reports with attempted, succeeded, failed, and latency percentiles. The process exits non-zero unless every requested operation succeeds. `--workload mixed` or `--embedded` runs the in-process stress harness. `sql` prints the response as JSON and exits non-zero on an application error.
 
@@ -149,6 +149,6 @@ These items are missing from the product, so this guide cannot describe a proced
 1. A multi-process layout for `be`, `proxy`, `cell-manager`, and `global-manager`.
 2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
 3. Placing a jumbo shard on its own machine and moving other shards off that machine.
-4. TLS material, Raft authentication, and a heartbeat-driven control loop.
+4. Native TLS. This process does not terminate TLS. Config keys that ask for TLS or a certificate are rejected instead of serving plaintext. Put termination in an external proxy. Raft and metrics use the same bearer as the other services when a secret is set; that bearer is not mutual TLS. A heartbeat-driven control loop is not implemented.
 5. A memtable size or Raft timer that operators can set and observe.
 6. A checked-in service-level result for `metadb-ctl bench`. The command prints numbers for the machine you run it on. This repository does not record one. See [Tests and benches](./testing.md).

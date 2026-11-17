@@ -48,9 +48,9 @@ metadbd --config /etc/metadb/standalone.toml
 
 ### Network exposure
 
-`MetadataService`, `TransactionService`, `ControlPlaneService`, and `RaftTransportService` do **not** terminate TLS. With an empty `[security].shared_secret` (the default) they also perform no application authentication. The default `grpc_listen_addr` is `127.0.0.1:7800`. Do not publish that socket on an untrusted network.
+`MetadataService`, `TransactionService`, `ControlPlaneService`, and `RaftTransportService` do **not** terminate TLS. Neither does the metrics listener. With an empty `[security].shared_secret` (the default) they perform no application authentication, and only loopback binds are accepted. A wildcard or other non-loopback address without a non-empty secret refuses to start. The default `grpc_listen_addr` is `127.0.0.1:7800`. A TLS or certificate key in this file is rejected rather than served as plaintext.
 
-Set a shared secret to require `authorization: Bearer <secret>` on metadata, transaction, control-plane, and Raft transport RPCs. Peer Raft clients propagate the same token. `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --cell-manager` send that header:
+Set a shared secret to require `authorization: Bearer <secret>` on metadata, transaction, control-plane, Raft transport, and `GET /metrics`. Peer Raft clients propagate the same token. `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --cell-manager` send that header:
 
 ```toml
 [security]

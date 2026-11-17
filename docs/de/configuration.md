@@ -2,7 +2,7 @@
 
 [Überblick](./README.md) · [English](../en/configuration.md) · [Français](../fr/configuration.md) · [日本語](../ja/configuration.md) · [简体中文](../zh/configuration.md)
 
-`metadbd --config` und `ServerTomlConfig::from_toml_file` / `from_toml_str` lesen TOML (`crates/metadb-server/src/config.rs`). Unbekannte Schlüssel werden ignoriert. Die Strukturen verwenden `#[serde(default)]` und setzen `deny_unknown_fields` nicht, und `from_toml_str` ruft `toml::from_str` direkt auf. Ein falsch geschriebener Schlüssel behält seine Vorgabe, auch ein leeres `security.shared_secret`, und der Start gelingt trotzdem. Jeder Abschnitt ist optional. Ausgelassene Felder nehmen die Vorgaben unten an.
+`metadbd --config` und `ServerTomlConfig::from_toml_file` / `from_toml_str` lesen TOML (`crates/metadb-server/src/config.rs`). Unbekannte Schlüssel, die kein Geheimnis und kein TLS benennen, werden ignoriert. Ein falsch geschriebenes `shared_secret`, ein Token- oder Passwortschlüssel oder ein TLS- oder Zertifikatsschlüssel wird abgelehnt, und der Prozess startet nicht. Jeder bekannte Abschnitt ist optional. Ausgelassene Felder nehmen die Vorgaben unten an.
 
 ## Vorgaben
 
@@ -13,7 +13,7 @@
 | `node.role` | `all-in-one` | Ja. Jeder andere Wert liefert einen Fehler |
 | `node.data_dir` | `./metadb-data` | Ja |
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | Ja. Bind-Adresse |
-| `node.metrics_listen_addr` | nicht gesetzt | Ja, nur wenn gesetzt. `metadbd` bindet einen eigenen TCP-Listener |
+| `node.metrics_listen_addr` | nicht gesetzt | Ja, nur wenn gesetzt. Eigener TCP-Listener. Eine Nicht-Loopback-Adresse verlangt ein nicht leeres Geheimnis |
 | `clock.max_clock_drift_ms` | `500` | Ja. `HybridLogicalClock::with_max_drift_ms` |
 | `storage.memtable_size_bytes` | `33554432` (32 MiB) | **Nein.** Das Feld wird gespeichert und nie gelesen |
 | `storage.block_cache_bytes` | `67108864` (64 MiB) | Ja. Gesamtbudget des 16-fachen Blockcaches |
@@ -23,7 +23,7 @@
 | `storage.locality_tombstone_ratio` | `0.50` | Ja. Mal 1000, auf 1..=1000 begrenzt, gespeichert als `tombstone_min_ratio_permille` |
 | `sharding.bootstrap_table_shards` | `true` | Ja. `true` erzeugt die Shards 1, 2 und 3. `false` erzeugt Shard 1 über `[0x01, 0x04)` |
 | `sharding.shard_split_threshold_bytes` | `4294967296` (4 GiB) | Ja. Die Split-Prüfung nutzt die ungefähre Shard-Größe |
-| `security.shared_secret` | `""` | Ja. Leer heißt: Metadaten-, Transaktions- und Control-Plane-RPCs sind unauthentifiziert |
+| `security.shared_secret` | `""` | Ja. Leer ist nur zulässig, wenn jeder Listener Loopback ist. Nicht leer verlangt denselben Bearer für gRPC und Metriken |
 
 Es gibt keine Tabelle `[raft]`. `ServerTomlConfig.raft_options` wird von serde übersprungen und bleibt bei `RaftNodeOptions::default()` (Heartbeat 150 ms, Wahl 450–900 ms, Snapshot-Log-Behalten 0, Segment 64 MiB).
 
@@ -67,13 +67,11 @@ CLI-Flags überschreiben die Datei nach dem Einlesen: `--node-id`, `--cell-id`, 
 
 ## Sicherheit
 
-Der Prozess beendet TLS nicht.
+Dieser Prozess beendet TLS nicht. Es gibt keine Zertifikatskonfiguration, die natives TLS einschaltet. Ein TLS-, SSL- oder Zertifikatsschlüssel in der Datei lässt das Parsen fehlschlagen, und der Prozess dient nicht im Klartext. TLS in einem externen Proxy beenden und keinen TLS-Schlüssel in dieser Datei lassen.
 
-Wenn `shared_secret` nicht leer ist, verlangen `MetadataService`, `TransactionService` und `ControlPlaneService`, dass der Metadatenwert `authorization` gleich `Bearer <shared_secret>` ist. `metadb-ctl --auth-token` (Umgebungsvariable `METADB_AUTH_TOKEN`) sendet diesen Header. `metadbd --cell-manager` sendet dasselbe Geheimnis, wenn es `RegisterNode` aufruft.
+Wenn `shared_secret` nicht leer ist, verlangen `MetadataService`, `TransactionService`, `ControlPlaneService` und `RaftTransportService`, dass `authorization` genau `Bearer <shared_secret>` ist. `GET /metrics` auf `metrics_listen_addr` verlangt denselben `Authorization`-Header. Ein fehlender Header, ein leerer Bearer, ein Präfix oder ein längerer Token wird abgelehnt. Der Fehlerkörper der Metriken ist kein Prometheus-Text. Raft-Peers senden denselben Bearer. `metadb-ctl --auth-token` (Umgebungsvariable `METADB_AUTH_TOKEN`) und `metadbd --join` / `--cell-manager` senden ihn. `metadb-ctl cluster status` ruft `GetRoutes` auf und liegt unter demselben Interceptor.
 
-`RaftTransportService` verwendet denselben Interceptor. Ein nicht leeres Geheimnis verlangt auch für Raft-RPCs auf diesem Port `Bearer <shared_secret>`.
-
-Ein leeres Geheimnis lässt alle vier Dienste auf dem Listener zu. Der Code warnt beim Start davor. Der Prozess beendet TLS weiterhin nicht. Bevor ein nicht vertrauenswürdiger Client den Port erreichen kann, die Bindung auf einem vertrauenswürdigen Netz wie `127.0.0.1` lassen, oder jeden Dienst hinter einen Proxy setzen, der den Client authentifiziert (zum Beispiel gegenseitiges TLS), und den direkten Zugriff auf diesen Prozess sperren.
+Ein leeres oder nur aus Leerzeichen bestehendes Geheimnis ist nur zulässig, wenn `grpc_listen_addr` und, falls gesetzt, `metrics_listen_addr` Loopback sind (`127.0.0.0/8`, `::1` oder der Name `localhost`). Eine Wildcard (`0.0.0.0`, `::`) oder jede andere Adresse verweigert das Binden. Ein leeres Loopback-Geheimnis wird beim Start gewarnt. Die Listener bleiben Klartext. Sie in einem vertrauenswürdigen Netz lassen, oder jeden Dienst hinter einen Proxy setzen, der den Client authentifiziert, und den direkten Zugriff auf diesen Prozess sperren.
 
 ## Was sich nicht konfigurieren lässt
 
@@ -81,4 +79,4 @@ Ein leeres Geheimnis lässt alle vier Dienste auf dem Listener zu. Der Code warn
 - Peer-Listen, Wählermengen oder ein Join-Token. Die Membership beginnt als dieser eine Prozess. Weitere Peers erscheinen erst nach `RegisterNode` plus `ScaleShardReplicas`, und diese Peers müssen bereits Raft-Mitglieder sein, die `RaftTransportService` für dieselben Shard-Logs sprechen. Ein zweiter all-in-one-Prozess tut das nicht. Siehe [Betrieb](./operations.md).
 - Den Schlüsselbereich einer zweiten Zelle. `RegisterCell` liefert einen Fehler und speichert nichts. Ein zweiter all-in-one-Prozess mit leerem Verzeichnis tritt dem aktuellen Leader mit `[cluster] join` bei; das bleibt dieselbe Zelle.
 - Memtable-Bytegrenze, Raft-Zeitgeber oder Locality-Compaction an/aus.
-- TLS-Zertifikate.
+- Native TLS-Zertifikate. Ein TLS-Schlüssel in dieser Datei wird abgelehnt. Die Terminierung gehört in einen externen Proxy.

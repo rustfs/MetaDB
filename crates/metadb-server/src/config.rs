@@ -1,6 +1,7 @@
 //! TOML & programmatic server configuration for `metadbd` and `PersistentMetaDbCluster`.
 
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -90,15 +91,15 @@ impl Default for StorageSection {
     }
 }
 
-/// Application-level gRPC auth. TLS is not terminated by this process.
+/// Application-level bearer auth. This process does not terminate TLS.
 ///
-/// An empty `shared_secret` leaves metadata and control-plane RPCs unauthenticated.
-/// The default bind address is `127.0.0.1`. Do not publish that socket on an
-/// untrusted network until a secret (or an external TLS terminator) is configured.
+/// An empty `shared_secret` is accepted only for loopback listeners. A wildcard or
+/// any other non-loopback bind with an empty secret refuses to start. When the
+/// secret is non-empty, gRPC and the metrics listener require the same bearer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecuritySection {
-    /// When non-empty, every gRPC call must send `authorization: Bearer <shared_secret>`.
+    /// When non-empty, gRPC and metrics require `authorization: Bearer <shared_secret>`.
     pub shared_secret: String,
 }
 
@@ -147,8 +148,11 @@ pub struct ServerTomlConfig {
 
 impl ServerTomlConfig {
     pub fn from_toml_str(s: &str) -> Result<Self> {
-        toml::from_str(s)
-            .map_err(|e| MetaDbError::CodecError(format!("invalid TOML config: {}", e)))
+        let value: toml::Value = toml::from_str(s)
+            .map_err(|e| MetaDbError::CodecError(format!("invalid TOML config: {e}")))?;
+        reject_unsupported_security_keys(&value)?;
+        ServerTomlConfig::deserialize(value)
+            .map_err(|e| MetaDbError::CodecError(format!("invalid TOML config: {e}")))
     }
 
     pub fn from_toml_file(path: impl AsRef<Path>) -> Result<Self> {
@@ -172,6 +176,130 @@ impl ServerTomlConfig {
             auto_locality_compaction: true,
         })
     }
+
+    /// Refuses to start when a listener is not loopback and no secret is configured.
+    ///
+    /// Call this on the configured addresses and again on the address that will
+    /// actually be bound (a restarted process may reuse a saved advertise address).
+    pub fn reject_unauthenticated_bind(&self, addr: &str) -> Result<()> {
+        reject_unauthenticated_bind(addr, &self.security.shared_secret)
+    }
+}
+
+/// `true` only for an explicit loopback bind: `localhost`, `127.0.0.0/8`, or `::1`.
+///
+/// Wildcard addresses (`0.0.0.0`, `::`) and unparseable hosts are not loopback.
+/// `localhost` is accepted as a name and is not resolved, so a hosts-file alias
+/// is not detected here.
+fn is_loopback_bind(addr: &str) -> bool {
+    let host = bind_host(addr.trim());
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+fn reject_unauthenticated_bind(addr: &str, secret: &str) -> Result<()> {
+    if !secret.trim().is_empty() || is_loopback_bind(addr) {
+        return Ok(());
+    }
+    Err(MetaDbError::CodecError(format!(
+        "refusing to serve unauthenticated listener {addr}; a wildcard or non-loopback bind requires a non-empty [security].shared_secret. Empty, missing, and misspelled secrets fail closed. This process does not terminate TLS"
+    )))
+}
+
+fn bind_host(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        let end = rest.find(']').unwrap_or(rest.len());
+        return &rest[..end];
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port))
+            if !host.is_empty()
+                && !host.contains(':')
+                && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            host
+        }
+        _ => addr,
+    }
+}
+
+fn normalize_key(key: &str) -> String {
+    key.to_ascii_lowercase().replace('-', "_")
+}
+
+fn is_tls_key(key: &str) -> bool {
+    let key = normalize_key(key);
+    [
+        "tls", "ssl", "cert", "x509", "mtls", "cipher", "keystore", "https",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let key = normalize_key(key);
+    [
+        "secret",
+        "password",
+        "passwd",
+        "token",
+        "credential",
+        "auth",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+        || key.starts_with("secur")
+}
+
+fn security_key_error(key: &str) -> MetaDbError {
+    if is_tls_key(key) {
+        MetaDbError::CodecError(format!(
+            "refusing to start: `{key}` is not a supported TLS setting. This process does not terminate TLS and will not serve plaintext while a TLS option is present. Terminate TLS in an external proxy, then remove `{key}`"
+        ))
+    } else {
+        MetaDbError::CodecError(format!(
+            "refusing to start: unrecognized security key `{key}`. A missing or misspelled shared_secret must not leave listeners open. The only accepted security key is [security].shared_secret"
+        ))
+    }
+}
+
+const KNOWN_SECTIONS: &[&str] = &[
+    "node", "clock", "storage", "sharding", "security", "cluster",
+];
+
+fn reject_unsupported_security_keys(value: &toml::Value) -> Result<()> {
+    let Some(root) = value.as_table() else {
+        return Err(MetaDbError::CodecError(
+            "TOML config must be a table".to_string(),
+        ));
+    };
+    for (key, child) in root {
+        if !KNOWN_SECTIONS.contains(&key.as_str()) && (is_tls_key(key) || is_secret_key(key)) {
+            return Err(security_key_error(key));
+        }
+        let Some(table) = child.as_table() else {
+            continue;
+        };
+        if key == "security" {
+            for sub in table.keys() {
+                if sub != "shared_secret" {
+                    return Err(security_key_error(sub));
+                }
+            }
+            continue;
+        }
+        for sub in table.keys() {
+            if is_tls_key(sub) || is_secret_key(sub) {
+                return Err(security_key_error(sub));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -212,5 +340,90 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.storage.memtable_size_bytes, 1024);
         assert_eq!(cfg.storage.block_cache_bytes, 65536);
+    }
+
+    #[test]
+    fn loopback_binds_are_explicit_and_wildcards_are_not() {
+        for addr in [
+            "127.0.0.1:7800",
+            "127.0.0.1:0",
+            "localhost:7800",
+            "[::1]:7800",
+        ] {
+            assert!(is_loopback_bind(addr), "{addr}");
+            assert!(reject_unauthenticated_bind(addr, "").is_ok(), "{addr}");
+        }
+        for addr in [
+            "0.0.0.0:7800",
+            "[::]:7800",
+            "10.1.2.3:7800",
+            "db.internal:7800",
+        ] {
+            assert!(!is_loopback_bind(addr), "{addr}");
+            let err = reject_unauthenticated_bind(addr, "  ").unwrap_err();
+            assert!(err.to_string().contains("refusing to serve"), "{err}");
+        }
+        assert!(reject_unauthenticated_bind("0.0.0.0:7800", "secret").is_ok());
+    }
+
+    #[test]
+    fn misspelled_secret_and_tls_keys_fail_closed() {
+        let typo = ServerTomlConfig::from_toml_str(
+            r#"
+            [node]
+            grpc_listen_addr = "0.0.0.0:7800"
+            [security]
+            shared_secrett = "not-applied"
+            "#,
+        );
+        assert!(
+            typo.unwrap_err().to_string().contains("shared_secrett"),
+            "a misspelled secret key must not parse"
+        );
+
+        let tls = ServerTomlConfig::from_toml_str(
+            r#"
+            [security]
+            shared_secret = "secret"
+            tls_cert = "/tmp/cert.pem"
+            "#,
+        );
+        let tls_err = tls.unwrap_err().to_string();
+        assert!(tls_err.contains("does not terminate TLS"), "{tls_err}");
+
+        let misplaced = ServerTomlConfig::from_toml_str(
+            r#"
+            [node]
+            shared_secret = "not-in-this-section"
+            "#,
+        );
+        assert!(
+            misplaced.unwrap_err().to_string().contains("shared_secret"),
+            "a secret outside [security] must not be ignored"
+        );
+
+        let section = ServerTomlConfig::from_toml_str(
+            r#"
+            [tls]
+            enabled = true
+            "#,
+        );
+        assert!(section
+            .unwrap_err()
+            .to_string()
+            .contains("does not terminate TLS"));
+
+        let cfg = ServerTomlConfig::from_toml_str(
+            r#"
+            [node]
+            node_id = 2
+            extra_note = "ignored"
+            [security]
+            shared_secret = "secret"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.node.node_id, 2);
+        assert_eq!(cfg.security.shared_secret, "secret");
     }
 }
