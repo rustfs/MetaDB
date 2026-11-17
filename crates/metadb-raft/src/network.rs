@@ -234,51 +234,34 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
             .map_err(Self::streaming_unreachable)?;
         let mut client = RaftTransportServiceClient::new(ch);
 
-        let vote_bincode = codec::serialize_serde(&vote).map_err(Self::streaming_unreachable)?;
-        let meta_bincode =
+        let mut vote_bincode =
+            codec::serialize_serde(&vote).map_err(Self::streaming_unreachable)?;
+        let mut meta_bincode =
             codec::serialize_serde(&snapshot.meta).map_err(Self::streaming_unreachable)?;
         let archive_bytes =
             codec::serialize(&snapshot.snapshot).map_err(Self::streaming_unreachable)?;
 
-        let mut chunks: Vec<SnapshotChunkRequest> = Vec::new();
-        if archive_bytes.is_empty() {
-            chunks.push(SnapshotChunkRequest {
-                shard_id: self.shard_id,
-                vote_bincode,
-                snapshot_meta_bincode: meta_bincode,
-                relative_file_path: String::new(),
-                offset: 0,
-                data: Vec::new(),
-                done: true,
-            });
-        } else {
-            let total = archive_bytes.len();
-            let mut off = 0usize;
-            while off < total {
-                let end = (off + SNAPSHOT_STREAM_CHUNK_BYTES).min(total);
-                let is_done = end == total;
-                chunks.push(SnapshotChunkRequest {
-                    shard_id: self.shard_id,
-                    vote_bincode: if off == 0 {
-                        vote_bincode.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    snapshot_meta_bincode: if off == 0 {
-                        meta_bincode.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    relative_file_path: "archive.bin".to_string(),
-                    offset: off as u64,
-                    data: archive_bytes[off..end].to_vec(),
-                    done: is_done,
-                });
-                off = end;
+        let shard_id = self.shard_id;
+        let total = archive_bytes.len();
+        // Allocate each chunk when tonic polls the stream. Explicit chunk
+        // storage is bounded by the active chunk.
+        let offsets = (0..total.max(1)).step_by(SNAPSHOT_STREAM_CHUNK_BYTES);
+        let out_stream = tokio_stream::iter(offsets.map(move |off| {
+            let end = off.saturating_add(SNAPSHOT_STREAM_CHUNK_BYTES).min(total);
+            SnapshotChunkRequest {
+                shard_id,
+                vote_bincode: std::mem::take(&mut vote_bincode),
+                snapshot_meta_bincode: std::mem::take(&mut meta_bincode),
+                relative_file_path: if total == 0 {
+                    String::new()
+                } else {
+                    "archive.bin".to_string()
+                },
+                offset: off as u64,
+                data: archive_bytes[off..end].to_vec(),
+                done: end == total,
             }
-        }
-
-        let out_stream = tokio_stream::iter(chunks);
+        }));
         let reply = client
             .install_snapshot(
                 self.pool
@@ -381,24 +364,48 @@ impl RaftTransportService for MultiRaftTransportServer {
         request: Request<Streaming<SnapshotChunkRequest>>,
     ) -> Result<Response<SnapshotChunkResponse>, Status> {
         let mut stream = request.into_inner();
-        let mut shard_id = 0u64;
-        let mut vote_bytes = Vec::new();
-        let mut meta_bytes = Vec::new();
-        let mut archive_buf = Vec::new();
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| Status::invalid_argument("empty snapshot stream"))??;
+        if first.vote_bincode.is_empty() || first.snapshot_meta_bincode.is_empty() {
+            return Err(Status::invalid_argument(
+                "snapshot first chunk must contain vote and metadata",
+            ));
+        }
+        if first.offset != 0 {
+            return Err(Status::invalid_argument(
+                "snapshot first chunk offset must be zero",
+            ));
+        }
+        let shard_id = first.shard_id;
+        let vote_bytes = first.vote_bincode;
+        let meta_bytes = first.snapshot_meta_bincode;
+        let mut archive_buf = first.data;
+        let mut done = first.done;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            shard_id = chunk.shard_id;
-            if !chunk.vote_bincode.is_empty() {
-                vote_bytes = chunk.vote_bincode;
+        while !done {
+            let chunk = stream
+                .next()
+                .await
+                .ok_or_else(|| Status::invalid_argument("snapshot stream ended before done"))??;
+            if chunk.shard_id != shard_id {
+                return Err(Status::invalid_argument(
+                    "snapshot shard changed within stream",
+                ));
             }
-            if !chunk.snapshot_meta_bincode.is_empty() {
-                meta_bytes = chunk.snapshot_meta_bincode;
+            if !chunk.vote_bincode.is_empty() || !chunk.snapshot_meta_bincode.is_empty() {
+                return Err(Status::invalid_argument(
+                    "snapshot headers must occur only in the first chunk",
+                ));
+            }
+            if chunk.offset != archive_buf.len() as u64 {
+                return Err(Status::invalid_argument(
+                    "snapshot chunk offset is not contiguous",
+                ));
             }
             archive_buf.extend_from_slice(&chunk.data);
-            if chunk.done {
-                break;
-            }
+            done = chunk.done;
         }
 
         let Some(raft) = self.router.get_group(shard_id) else {

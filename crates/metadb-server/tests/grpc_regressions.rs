@@ -191,3 +191,130 @@ async fn unsupported_cell_registration_does_not_report_success() {
         "RegisterCell must fail closed instead of reporting success"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_snapshot_streams_are_rejected_before_installation() {
+    use metadb_proto::SnapshotChunkRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (cluster, addr) = PersistentMetaDbCluster::open_and_serve(config(dir.path()))
+        .await
+        .unwrap();
+    let mut client = RaftTransportServiceClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    let header = SnapshotChunkRequest {
+        shard_id: 99999,
+        vote_bincode: vec![1],
+        snapshot_meta_bincode: vec![1],
+        data: vec![1],
+        done: false,
+        ..Default::default()
+    };
+    let cases = [
+        vec![],
+        vec![header.clone()],
+        vec![
+            header.clone(),
+            SnapshotChunkRequest {
+                shard_id: header.shard_id + 1,
+                offset: 1,
+                done: true,
+                ..Default::default()
+            },
+        ],
+        vec![
+            header.clone(),
+            SnapshotChunkRequest {
+                shard_id: header.shard_id,
+                vote_bincode: vec![2],
+                offset: 1,
+                done: true,
+                ..Default::default()
+            },
+        ],
+        vec![
+            header.clone(),
+            SnapshotChunkRequest {
+                shard_id: header.shard_id,
+                snapshot_meta_bincode: vec![2],
+                offset: 1,
+                done: true,
+                ..Default::default()
+            },
+        ],
+        vec![SnapshotChunkRequest {
+            vote_bincode: vec![],
+            done: true,
+            ..header.clone()
+        }],
+        vec![SnapshotChunkRequest {
+            snapshot_meta_bincode: vec![],
+            done: true,
+            ..header.clone()
+        }],
+        vec![SnapshotChunkRequest {
+            offset: 1,
+            done: true,
+            ..header.clone()
+        }],
+        vec![
+            header.clone(),
+            SnapshotChunkRequest {
+                shard_id: header.shard_id,
+                offset: 0,
+                done: true,
+                ..Default::default()
+            },
+        ],
+        vec![
+            header.clone(),
+            SnapshotChunkRequest {
+                shard_id: header.shard_id,
+                offset: 2,
+                done: true,
+                ..Default::default()
+            },
+        ],
+    ];
+    let mut results = Vec::new();
+    for chunks in cases {
+        results.push(client.install_snapshot(tokio_stream::iter(chunks)).await);
+    }
+    // The existing sender also permits a complete snapshot in its first chunk.
+    let valid_multi_frame = client
+        .install_snapshot(tokio_stream::iter(vec![
+            header.clone(),
+            SnapshotChunkRequest {
+                shard_id: header.shard_id,
+                offset: 1,
+                data: vec![2],
+                done: true,
+                ..Default::default()
+            },
+        ]))
+        .await;
+    let valid_frame = client
+        .install_snapshot(tokio_stream::iter(vec![SnapshotChunkRequest {
+            done: true,
+            ..header
+        }]))
+        .await;
+    cluster.shutdown().await.unwrap();
+    for (case, result) in results.into_iter().enumerate() {
+        assert_eq!(
+            result
+                .expect_err(&format!("accepted malformed stream {case}"))
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    assert!(
+        valid_multi_frame.is_ok(),
+        "contiguous multi-chunk frame was rejected"
+    );
+    assert!(
+        valid_frame.is_ok(),
+        "well-framed unknown shard must retain its RPC error reply"
+    );
+}

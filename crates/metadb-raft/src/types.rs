@@ -69,6 +69,9 @@ pub struct SnapshotFileEntry {
     pub name: String,
     pub expected_len: u64,
     pub crc32c: u32,
+    // SST files routinely exceed the default preallocation cap. Native byte
+    // vectors validate the complete input slice before allocating their buffer.
+    #[wincode(with = "wincode::containers::Vec<u8, wincode::len::UseIntLen<u64, { usize::MAX }>>")]
     pub bytes: Vec<u8>,
 }
 
@@ -178,5 +181,40 @@ impl ShardWatermarkTracker {
     pub fn safe_purge_index(&self) -> u64 {
         let (s, a, snap) = self.snapshot_values();
         s.min(a).min(snap)
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+    use metadb_core::{checksum_crc32c, codec};
+
+    #[test]
+    fn large_snapshot_file_uses_native_decoder_and_preserves_wire_bytes() {
+        let payload = vec![42u8; (4 << 20) + 1];
+        let archive = SnapshotArchive {
+            checkpoint: DurableShardCheckpoint::default(),
+            files: vec![SnapshotFileEntry {
+                name: "000001.sst".into(),
+                expected_len: payload.len() as u64,
+                crc32c: checksum_crc32c(&payload),
+                bytes: payload,
+            }],
+        };
+        let mut bytes = codec::serialize(&archive).unwrap();
+        assert_eq!(bytes, codec::serialize_serde(&archive).unwrap());
+        let decoded: SnapshotArchive =
+            wincode::deserialize(&bytes).expect("large snapshot file must use native decoding");
+        assert_eq!(decoded, archive);
+        assert_eq!(
+            codec::deserialize::<SnapshotArchive>(&bytes).unwrap(),
+            archive
+        );
+
+        let length_offset = bytes.len() - archive.files[0].bytes.len() - 8;
+        bytes.truncate(length_offset + 8);
+        bytes[length_offset..].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(wincode::deserialize::<SnapshotArchive>(&bytes).is_err());
+        assert!(codec::deserialize::<SnapshotArchive>(&bytes).is_err());
     }
 }

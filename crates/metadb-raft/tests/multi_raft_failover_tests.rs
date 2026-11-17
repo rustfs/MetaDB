@@ -117,10 +117,16 @@ async fn run_promotion_and_failover(authenticated: bool) {
         .unwrap();
     node1.wait_for_leader(Duration::from_secs(5)).await.unwrap();
     let ep1 = node1.current_epoch();
+    // Force multiple transport chunks and a file above the native 4 MiB default cap.
+    let large_snapshot_value = vec![42u8; (4 << 20) + 1];
     for i in 0..25u64 {
         let cmd = BasicKvCommand::Put {
             key: MetaKey::child(100, format!("snap_file_{:03}", i)).encode(),
-            value: format!("val_{}", i).into_bytes(),
+            value: if i == 0 {
+                large_snapshot_value.clone()
+            } else {
+                format!("val_{}", i).into_bytes()
+            },
         };
         node1
             .propose(ep1, HlcTimestamp::ZERO, codec::serialize(&cmd).unwrap())
@@ -199,9 +205,14 @@ async fn run_promotion_and_failover(authenticated: bool) {
     // Verify both snapshot-transferred keys (`0..25`), tail log keys (`25..30`), and 3-voter key!
     for i in 0..30u64 {
         let k = MetaKey::child(100, format!("snap_file_{:03}", i)).encode();
-        assert_eq!(
-            leader.engine().get_with_snapshot(&k, &snap).unwrap(),
-            Some(format!("val_{}", i).into_bytes())
+        let expected = if i == 0 {
+            large_snapshot_value.clone()
+        } else {
+            format!("val_{}", i).into_bytes()
+        };
+        assert!(
+            leader.engine().get_with_snapshot(&k, &snap).unwrap() == Some(expected),
+            "snapshot-transferred value for key {i} differs"
         );
     }
     assert_eq!(

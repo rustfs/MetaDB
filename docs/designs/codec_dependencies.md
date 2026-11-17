@@ -62,6 +62,18 @@ A temporary bincode 1.3.3 differential oracle compares serialized bytes at the n
 
 Final validation with Rust 1.100.0 passed `cargo test --workspace --locked --no-fail-fast` with 177 passed and one ignored stress test. The exact staged source tree passed `cargo clippy --workspace --all-targets --locked -- -D warnings`, formatting, the ignored-test policy check and `git diff --cached --check`. Dependency-tree inspection confirmed removal of bincode and crc32c. Throughput benchmarks and deployment-platform runs remain unmeasured.
 
+## Follow-up snapshot review
+
+Snapshot file byte vectors now override the native preallocation cap with the same u64 length encoding. The byte-vector reader checks the complete input window before allocating. Files larger than 4 MiB therefore stay on the native decoder, while dynamic-element collections retain the default cap and incremental fallback. A regression verifies native decoding, equality with Serde-compatible wire bytes and rejection of a forged u64::MAX file length.
+
+The sender constructs each 256 KiB chunk as tonic polls the stream. This removes the eager vector containing copies of every archive chunk. The serialized archive and transport buffering still consume memory.
+
+The receiver requires a nonempty stream, vote and metadata in the first chunk, a fixed shard ID, zero initial offset, contiguous subsequent offsets and an explicit final done marker. It rejects incomplete streams and repeated headers before calling OpenRaft installation. The existing sender already emits this framing.
+
+Real gRPC regressions exercise malformed streams and valid single/multiple-chunk framing. Both authenticated and ordinary learner-promotion/failover tests transfer a snapshot file larger than 4 MiB, then verify its contents after leader failure.
+
+Follow-up validation on Rust 1.100.0 passed 179 workspace tests with one ignored stress test. The exact staged source tree passed all-target Clippy with warnings denied, formatting, the ignored-test policy and diff checks. The optimization is verified by native-decoder coverage and the lazy stream construction. Throughput and peak-memory measurements remain unmeasured.
+
 ## Upstream references
 
 - [crc-fast API and architecture support](https://docs.rs/crc-fast/1.10.0/crc_fast/)

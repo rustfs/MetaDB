@@ -12,13 +12,16 @@ message RaftRpcReply {
   string error_message = 2;
 }
 
+// A stream targets one shard. Only its first chunk carries vote and metadata.
 message SnapshotChunkRequest {
   uint64 shard_id = 1;
   bytes vote_bincode = 2;
   bytes snapshot_meta_bincode = 3;
   string relative_file_path = 4;
+  // Contiguous byte offset in the serialized archive, starting at zero.
   uint64 offset = 5;
   bytes data = 6;
+  // Required on the final chunk before the archive can be installed.
   bool done = 7;
 }
 
