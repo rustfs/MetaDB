@@ -46,7 +46,9 @@ jobs:
 
       - name: Reject ignored tests that have no reason
         run: |
-          if grep -R -n -E '#\[ignore\]' --include='*.rs' crates; then
+          # Match a bare attribute only. Mentions inside comments, and
+          # #[ignore = "reason"], are allowed.
+          if grep -R -n -E '^[[:space:]]*#\[ignore\][[:space:]]*(//.*)?$' --include='*.rs' crates; then
             echo 'bare #[ignore] is not allowed; use #[ignore = "why CI skips this test"]'
             exit 1
           fi
