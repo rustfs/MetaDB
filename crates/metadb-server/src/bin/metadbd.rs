@@ -43,9 +43,13 @@ struct Cli {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Optional cell manager endpoint when joining as a BE node.
+    /// Optional cell manager endpoint. For `all-in-one`, this is the Raft leader to join.
     #[arg(long)]
     cell_manager: Option<String>,
+
+    /// gRPC address of an existing cell leader. A fresh data directory joins that Raft group.
+    #[arg(long)]
+    join: Option<String>,
 }
 
 #[tokio::main]
@@ -87,7 +91,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(dd) = cli.data_dir {
         cfg.node.data_dir = dd;
     }
-    let cell_manager_ep = cli.cell_manager.clone();
+    if let Some(join) = cli.join.clone().or(cli.cell_manager.clone()) {
+        cfg.cluster.join = join;
+    }
+    let cell_manager_ep = if cfg.cluster.join.is_empty() {
+        cli.cell_manager.clone()
+    } else {
+        // Join registers this node and proposes membership. A second register is unnecessary.
+        None
+    };
     let node_id = cfg.node.node_id;
     let cell_id = cfg.node.cell_id;
 

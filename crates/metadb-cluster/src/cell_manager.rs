@@ -1,7 +1,7 @@
 //! Persistent `DurableCellManager` managing OpenRaft shard groups, 3-stage recoverable
 //! `ExecuteSplit` (`SplitPlanRecord`), Jumbo Shard dedicated-node isolation, and `DualModeFineGrained`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -50,6 +50,46 @@ struct PersistedCellState {
     nodes: BTreeMap<NodeId, String>,
     routes: BTreeMap<ShardId, CompositeShardRoute>,
     split_plans: BTreeMap<u128, SplitPlanRecord>,
+    /// This process joined an existing Raft group. Restart must not call `Raft::initialize`,
+    /// which would fork a new cluster if the local log were empty.
+    #[serde(default)]
+    joined_existing: bool,
+    /// Promotion was requested, or had already committed, before `joined_existing` was published.
+    /// Restart resumes this join instead of rejecting the node id as a fresh member.
+    #[serde(default)]
+    join_pending: bool,
+}
+
+/// On-disk layout after `joined_existing` and before `join_pending`.
+#[derive(Debug, Deserialize)]
+struct CellStateJoinedOnly {
+    nodes: BTreeMap<NodeId, String>,
+    routes: BTreeMap<ShardId, CompositeShardRoute>,
+    split_plans: BTreeMap<u128, SplitPlanRecord>,
+    joined_existing: bool,
+}
+
+/// On-disk layout before `joined_existing` was stored in the same record.
+#[derive(Debug, Deserialize)]
+struct CellStateBeforeJoinFlag {
+    nodes: BTreeMap<NodeId, String>,
+    routes: BTreeMap<ShardId, CompositeShardRoute>,
+    split_plans: BTreeMap<u128, SplitPlanRecord>,
+}
+
+/// What a cell directory already contains, before this process opens it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellDirectoryRole {
+    /// No `CELL_MANAGER_STATE` file.
+    Absent,
+    /// State file exists but no shard routes were published.
+    Empty,
+    /// This directory bootstrapped its own cell.
+    Bootstrapped,
+    /// This directory joined an existing Raft group.
+    Joined,
+    /// Join was persisted but not finished. Resume it; do not bootstrap.
+    Joining,
 }
 
 /// Cell-level manager coordinating OpenRaft shards, `ExecuteSplit`, Jumbo isolation, and `ConfChange`.
@@ -162,6 +202,267 @@ impl DurableCellManager {
         Ok(mgr)
     }
 
+    /// Opens a cell directory that will join an existing group.
+    ///
+    /// Does not publish shard routes and does not call `Raft::initialize`. The caller starts
+    /// uninitialized replica groups, then asks the current leader to add this node.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_joining(
+        cell_id: CellId,
+        state_dir: impl AsRef<Path>,
+        host: Arc<ShardGroupHost>,
+        local_addr: String,
+        split_threshold_bytes: usize,
+        lsm_config: LsmEngineConfig,
+        raft_opts: RaftNodeOptions,
+        id_allocator: Arc<DurableIdAllocator>,
+        meta_cache: Arc<CompositeMetaCache>,
+    ) -> Result<Arc<Self>> {
+        let state_dir = state_dir.as_ref().to_path_buf();
+        fs::create_dir_all(&state_dir)?;
+        let state_path = state_dir.join("CELL_MANAGER_STATE");
+        let persisted = if state_path.exists() {
+            let mut loaded = Self::load_state_file(&state_dir)?;
+            loaded.nodes.insert(host.node_id(), local_addr);
+            Self::write_state_file(&state_dir, &loaded)?;
+            loaded
+        } else {
+            let mut init = PersistedCellState::default();
+            init.nodes.insert(host.node_id(), local_addr);
+            Self::write_state_file(&state_dir, &init)?;
+            init
+        };
+        Ok(Arc::new(Self {
+            cell_id,
+            state_dir,
+            split_threshold_bytes,
+            lsm_config,
+            raft_opts,
+            id_allocator,
+            meta_cache,
+            host,
+            handlers: RwLock::new(HashMap::new()),
+            state: Mutex::new(persisted),
+            split_lock: tokio::sync::Mutex::new(()),
+            fail_persists: AtomicU32::new(0),
+            crash_point: Mutex::new(None),
+        }))
+    }
+
+    /// Classifies an existing cell directory without starting Raft.
+    pub fn inspect_directory(state_dir: impl AsRef<Path>) -> Result<CellDirectoryRole> {
+        let state_dir = state_dir.as_ref();
+        let state_path = state_dir.join("CELL_MANAGER_STATE");
+        if !state_path.exists() {
+            return Ok(CellDirectoryRole::Absent);
+        }
+        let st = Self::load_state_file(state_dir)?;
+        if st.joined_existing {
+            Ok(CellDirectoryRole::Joined)
+        } else if st.join_pending {
+            Ok(CellDirectoryRole::Joining)
+        } else if st.routes.is_empty() {
+            Ok(CellDirectoryRole::Empty)
+        } else {
+            Ok(CellDirectoryRole::Bootstrapped)
+        }
+    }
+
+    /// Address this node must keep listening on so existing Raft peers can dial it.
+    pub fn persisted_advertise_addr(
+        state_dir: impl AsRef<Path>,
+        node_id: NodeId,
+    ) -> Result<Option<String>> {
+        let state_dir = state_dir.as_ref();
+        if !state_dir.join("CELL_MANAGER_STATE").exists() {
+            return Ok(None);
+        }
+        let st = Self::load_state_file(state_dir)?;
+        let mut voter_addrs = BTreeSet::new();
+        for route in st.routes.values() {
+            if let Some((addr, is_voter)) = route.peers.get(&node_id) {
+                if *is_voter && !addr.is_empty() {
+                    voter_addrs.insert(addr.clone());
+                }
+            }
+        }
+        if voter_addrs.len() > 1 {
+            return Err(MetaDbError::ConsensusError(format!(
+                "node {node_id} has conflicting persisted raft addresses: {voter_addrs:?}"
+            )));
+        }
+        if let Some(addr) = voter_addrs.into_iter().next() {
+            return Ok(Some(addr));
+        }
+        Ok(st
+            .nodes
+            .get(&node_id)
+            .filter(|addr| !addr.is_empty())
+            .cloned())
+    }
+
+    pub fn joined_existing(&self) -> bool {
+        self.state.lock().unwrap().joined_existing
+    }
+
+    pub fn join_pending(&self) -> bool {
+        self.state.lock().unwrap().join_pending
+    }
+
+    /// Records the routes this process intends to join before membership is proposed.
+    pub fn begin_join(&self, routes: &[CompositeShardRoute]) -> Result<()> {
+        let mut guard = self.state.lock().unwrap();
+        if guard.joined_existing {
+            return Ok(());
+        }
+        let mut next = guard.clone();
+        next.join_pending = true;
+        for route in routes {
+            next.routes.insert(route.shard_id, route.clone());
+            self.meta_cache.upsert_route(route.clone());
+        }
+        self.persist_sync(&next)?;
+        *guard = next;
+        Ok(())
+    }
+
+    /// Test hook. Leaves Raft logs in place but clears the finished-join flag so reopen resumes.
+    pub fn testing_mark_join_interrupted(&self) -> Result<()> {
+        let mut guard = self.state.lock().unwrap();
+        let mut next = guard.clone();
+        next.joined_existing = false;
+        next.join_pending = true;
+        self.persist_sync(&next)?;
+        *guard = next;
+        Ok(())
+    }
+
+    /// Replaces cached peer sets with the committed Raft membership.
+    pub fn routes_with_local_membership(&self) -> Result<Vec<CompositeShardRoute>> {
+        let mut routes = self.list_routes();
+        for route in &mut routes {
+            let (_, group, _) = self.lookup_local_handle(route.shard_id)?;
+            let voters = group.uniform_voter_addrs()?;
+            route.epoch = group.current_epoch();
+            route.peers = voters
+                .into_iter()
+                .map(|(node_id, addr)| (node_id, (addr, true)))
+                .collect();
+        }
+        Ok(routes)
+    }
+
+    /// Committed voter ids for `shard_id`, taken from Raft rather than the route cache.
+    pub fn raft_voter_ids(&self, shard_id: ShardId) -> Result<BTreeSet<NodeId>> {
+        let (_, group, _) = self.lookup_local_handle(shard_id)?;
+        Ok(group.uniform_voter_addrs()?.into_keys().collect())
+    }
+
+    /// Voter set `remove_voter` would submit, planned from Raft membership.
+    pub fn voters_after_removal(
+        &self,
+        shard_id: ShardId,
+        node_id: NodeId,
+    ) -> Result<BTreeSet<NodeId>> {
+        let mut voters = self.raft_voter_ids(shard_id)?;
+        if !voters.contains(&node_id) {
+            return Ok(voters);
+        }
+        if voters.len() <= 1 {
+            return Err(MetaDbError::ConsensusError(format!(
+                "refusing to remove the last voter of shard {shard_id}"
+            )));
+        }
+        voters.remove(&node_id);
+        Ok(voters)
+    }
+
+    /// Starts one uninitialized Raft replica per route. The leader's `ConfChange` replicates
+    /// membership; this method must not call `Raft::initialize`.
+    pub async fn start_joining_replicas(&self, routes: &[CompositeShardRoute]) -> Result<()> {
+        for route in routes {
+            if self.host.get_group(route.shard_id).is_some() {
+                continue;
+            }
+            let wm = Arc::new(ShardWatermarkTracker::default());
+            let handler = Arc::new(TxStateMachineHandler::new(
+                route.shard_id,
+                ShardEpoch::initial(),
+                route.range.clone(),
+                wm.clone(),
+            ));
+            let sdir = self.host.shard_dir(route.shard_id);
+            let group = ShardRaftGroup::start(
+                route.shard_id,
+                self.host.node_id(),
+                &sdir,
+                self.host.block_cache().clone(),
+                self.lsm_config.clone(),
+                self.raft_opts.clone(),
+                handler.clone(),
+                wm,
+                self.host.clock().clone(),
+                self.host.router(),
+                self.host.channel_pool().clone(),
+            )
+            .await?;
+            self.host.register_running_group(group);
+            self.handlers
+                .write()
+                .unwrap()
+                .insert(route.shard_id, handler);
+            self.meta_cache.upsert_route(route.clone());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Ok(())
+    }
+
+    /// True when every local shard's applied membership includes `node_id` as a voter.
+    pub fn local_voters_include(&self, node_id: NodeId) -> bool {
+        let groups = self.local_shard_handles();
+        if groups.is_empty() {
+            return false;
+        }
+        groups
+            .iter()
+            .all(|(_, group, _)| group.membership_contains_voter(node_id))
+    }
+
+    /// Persists the leader's post-join routes and records that restart must not bootstrap.
+    pub fn install_joined_membership(&self, mut routes: Vec<CompositeShardRoute>) -> Result<()> {
+        for route in &mut routes {
+            if let Ok((_, group, _)) = self.lookup_local_handle(route.shard_id) {
+                route.epoch = group.current_epoch();
+            }
+        }
+        let mut guard = self.state.lock().unwrap();
+        let mut next = guard.clone();
+        next.joined_existing = true;
+        next.join_pending = false;
+        for route in &routes {
+            for (nid, (addr, _)) in &route.peers {
+                next.nodes.insert(*nid, addr.clone());
+            }
+            next.routes.insert(route.shard_id, route.clone());
+            let voter_addrs = route
+                .peers
+                .iter()
+                .filter(|(_, (_, is_voter))| *is_voter)
+                .map(|(&nid, (addr, _))| (nid, addr.clone()))
+                .collect();
+            self.host.record_registry_state(
+                route.shard_id,
+                RegistryShardState::Active { peers: voter_addrs },
+            )?;
+        }
+        self.persist_sync(&next)?;
+        *guard = next;
+        for route in routes {
+            self.meta_cache.upsert_route(route);
+        }
+        Ok(())
+    }
+
     /// Test hook. The next `n` cell-state persists return an I/O error and leave memory unchanged.
     pub fn testing_fail_next_persists(&self, n: u32) {
         self.fail_persists.store(n, Ordering::Relaxed);
@@ -179,9 +480,9 @@ impl DurableCellManager {
     }
 
     async fn boot_local_shards(&self) -> Result<()> {
-        let routes: Vec<CompositeShardRoute> = {
+        let (routes, joined_existing): (Vec<CompositeShardRoute>, bool) = {
             let st = self.state.lock().unwrap();
-            st.routes.values().cloned().collect()
+            (st.routes.values().cloned().collect(), st.joined_existing)
         };
 
         for route in routes {
@@ -194,9 +495,16 @@ impl DurableCellManager {
 
             if route.peers.contains_key(&self.host.node_id()) {
                 let wm = Arc::new(ShardWatermarkTracker::default());
+                // A joined replica replays membership from the log (or restores it from the
+                // flushed checkpoint). Starting at the persisted final epoch would bump again.
+                let handler_epoch = if joined_existing {
+                    ShardEpoch::initial()
+                } else {
+                    route.epoch
+                };
                 let handler = Arc::new(TxStateMachineHandler::new(
                     route.shard_id,
-                    route.epoch,
+                    handler_epoch,
                     route.range.clone(),
                     wm.clone(),
                 ));
@@ -215,7 +523,11 @@ impl DurableCellManager {
                     self.host.channel_pool().clone(),
                 )
                 .await?;
-                group.initialize_if_needed(voter_addrs.clone()).await?;
+                if !joined_existing {
+                    // Joined replicas already have membership in the replicated log.
+                    // `initialize` on an empty log would fork a cluster with the same node ids.
+                    group.initialize_if_needed(voter_addrs.clone()).await?;
+                }
                 self.host.register_running_group(group.clone());
                 self.host.record_registry_state(
                     route.shard_id,
@@ -498,9 +810,18 @@ impl DurableCellManager {
         Ok(())
     }
 
-    /// Upgrades local shard Raft groups in this Cell to `target_voters` via `ConfChangeOrchestrator`.
+    /// Grows or shrinks every local shard to `target_voters`.
+    ///
+    /// Growth adds the lowest registered node ids that are not yet voters.
+    /// Shrink drops the highest voter ids until the target count remains.
+    /// Existing voters are kept when the count already matches.
     pub async fn scale_out_replicas(&self, target_voters: usize) -> Result<usize> {
-        let (candidates, shard_ids): (Vec<(NodeId, String)>, Vec<ShardId>) = {
+        if target_voters == 0 {
+            return Err(MetaDbError::ConsensusError(
+                "target_voters must be at least 1".to_string(),
+            ));
+        }
+        let (nodes, shard_ids): (BTreeMap<NodeId, String>, Vec<ShardId>) = {
             let st = self.state.lock().unwrap();
             if st.nodes.len() < target_voters {
                 return Err(MetaDbError::ConsensusError(format!(
@@ -510,66 +831,138 @@ impl DurableCellManager {
                     st.nodes.len()
                 )));
             }
-            let cands = st
-                .nodes
-                .iter()
-                .take(target_voters)
-                .map(|(&nid, addr)| (nid, addr.clone()))
-                .collect();
-            let sids = st.routes.keys().copied().collect();
-            (cands, sids)
+            (st.nodes.clone(), st.routes.keys().copied().collect())
         };
-
-        let final_voters: std::collections::BTreeSet<NodeId> =
-            candidates.iter().map(|(nid, _)| *nid).collect();
         let mut upgraded = 0usize;
-
         for sid in shard_ids {
-            let (_, group, _) = self.lookup_local_handle(sid)?;
-            let existing_peers: BTreeMap<NodeId, (String, bool)> = {
-                let st = self.state.lock().unwrap();
-                st.routes
-                    .get(&sid)
-                    .map(|r| r.peers.clone())
-                    .unwrap_or_default()
-            };
-            let learners_to_add: Vec<(NodeId, String)> = candidates
-                .iter()
-                .filter(|(nid, _)| !existing_peers.contains_key(nid))
-                .cloned()
-                .collect();
-
-            if !learners_to_add.is_empty() {
-                ConfChangeOrchestrator::add_learners_and_promote_voters(
-                    group.raft(),
-                    &learners_to_add,
-                    final_voters.clone(),
-                    64,
-                    Duration::from_secs(10),
-                )
+            self.retarget_shard_voters(sid, target_voters, &nodes)
                 .await?;
-            }
-
-            let new_epoch = group.current_epoch();
-            let mut st = self.state.lock().unwrap();
-            if st.routes.contains_key(&sid) {
-                let mut next = st.clone();
-                if let Some(r) = next.routes.get_mut(&sid) {
-                    for (nid, addr) in &candidates {
-                        r.peers.insert(*nid, (addr.clone(), true));
-                    }
-                    r.epoch = new_epoch;
-                }
-                let updated = next.routes.get(&sid).cloned();
-                self.persist_sync(&next)?;
-                *st = next;
-                if let Some(updated) = updated {
-                    self.meta_cache.upsert_route(updated);
-                }
-            }
             upgraded += 1;
         }
         Ok(upgraded)
+    }
+
+    /// Removes `node_id` from every local shard voter set. Refuses to drop the last voter.
+    pub async fn remove_voter(&self, node_id: NodeId) -> Result<usize> {
+        let shard_ids: Vec<ShardId> = {
+            let st = self.state.lock().unwrap();
+            st.routes.keys().copied().collect()
+        };
+        let mut changed = 0usize;
+        for sid in shard_ids {
+            let voters = self.voters_after_removal(sid, node_id)?;
+            let (_, group, _) = self.lookup_local_handle(sid)?;
+            let current = group.uniform_voter_addrs()?;
+            if current.len() == voters.len() && current.keys().all(|id| voters.contains(id)) {
+                continue;
+            }
+            ConfChangeOrchestrator::change_voters(group.raft(), voters.clone()).await?;
+            let committed = group.wait_uniform_voter_addrs().await?;
+            self.persist_voter_set(sid, &committed, group.current_epoch())?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
+    async fn retarget_shard_voters(
+        &self,
+        shard_id: ShardId,
+        target_voters: usize,
+        nodes: &BTreeMap<NodeId, String>,
+    ) -> Result<()> {
+        let (_, group, _) = self.lookup_local_handle(shard_id)?;
+        let current = group.uniform_voter_addrs()?;
+        let current_voters: BTreeSet<NodeId> = current.keys().copied().collect();
+        let mut final_voters = current_voters.clone();
+        if final_voters.len() > target_voters {
+            while final_voters.len() > target_voters {
+                let Some(drop_id) = final_voters.iter().next_back().copied() else {
+                    break;
+                };
+                final_voters.remove(&drop_id);
+            }
+        } else {
+            for nid in nodes.keys().copied() {
+                if final_voters.len() >= target_voters {
+                    break;
+                }
+                final_voters.insert(nid);
+            }
+            if final_voters.len() < target_voters {
+                return Err(MetaDbError::ConsensusError(format!(
+                    "need {target_voters} voters for shard {shard_id}, can form {}",
+                    final_voters.len()
+                )));
+            }
+        }
+        if final_voters.is_empty() {
+            return Err(MetaDbError::ConsensusError(
+                "refusing to remove every voter".to_string(),
+            ));
+        }
+
+        let mut addrs = nodes.clone();
+        for (nid, addr) in &current {
+            addrs.entry(*nid).or_insert_with(|| addr.clone());
+        }
+        let learners_to_add: Vec<(NodeId, String)> = final_voters
+            .iter()
+            .filter(|nid| !current_voters.contains(nid))
+            .filter_map(|nid| addrs.get(nid).map(|addr| (*nid, addr.clone())))
+            .collect();
+        if !learners_to_add.is_empty() {
+            // Split children seed inherited keys into SSTables at Raft index 0. Purge a snapshot
+            // first so the learner cannot become a voter by replaying a log that never contained them.
+            let min_matched = group.prepare_learner_snapshot().await?;
+            ConfChangeOrchestrator::add_learners_and_promote_voters(
+                group.raft(),
+                &learners_to_add,
+                final_voters.clone(),
+                64,
+                Duration::from_secs(20),
+                min_matched,
+            )
+            .await?;
+        } else if current_voters != final_voters {
+            ConfChangeOrchestrator::change_voters(group.raft(), final_voters.clone()).await?;
+        }
+        let committed = group.wait_uniform_voter_addrs().await?;
+        self.persist_voter_set(shard_id, &committed, group.current_epoch())?;
+        Ok(())
+    }
+
+    fn persist_voter_set(
+        &self,
+        shard_id: ShardId,
+        voters: &BTreeMap<NodeId, String>,
+        epoch: metadb_core::ShardEpoch,
+    ) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        if !st.routes.contains_key(&shard_id) {
+            return Ok(());
+        }
+        let mut next = st.clone();
+        if let Some(route) = next.routes.get_mut(&shard_id) {
+            let mut peers = BTreeMap::new();
+            for (nid, addr) in voters {
+                if addr.is_empty() {
+                    return Err(MetaDbError::ConsensusError(format!(
+                        "missing grpc address for voter {nid} on shard {shard_id}"
+                    )));
+                }
+                next.nodes.insert(*nid, addr.clone());
+                peers.insert(*nid, (addr.clone(), true));
+            }
+            route.peers = peers;
+            route.epoch = epoch;
+        }
+        let updated = next.routes.get(&shard_id).cloned();
+        self.persist_sync(&next)?;
+        *st = next;
+        if let Some(updated) = updated {
+            self.meta_cache.upsert_route(updated);
+        }
+        Ok(())
     }
 
     fn load_state_file(dir: &Path) -> Result<PersistedCellState> {
@@ -1000,6 +1393,24 @@ fn decode_cell_state(body: &[u8]) -> Result<PersistedCellState> {
     if let Ok(state) = bincode::deserialize::<PersistedCellState>(body) {
         return Ok(state);
     }
+    if let Ok(prior) = bincode::deserialize::<CellStateJoinedOnly>(body) {
+        return Ok(PersistedCellState {
+            nodes: prior.nodes,
+            routes: prior.routes,
+            split_plans: prior.split_plans,
+            joined_existing: prior.joined_existing,
+            join_pending: false,
+        });
+    }
+    if let Ok(prior) = bincode::deserialize::<CellStateBeforeJoinFlag>(body) {
+        return Ok(PersistedCellState {
+            nodes: prior.nodes,
+            routes: prior.routes,
+            split_plans: prior.split_plans,
+            joined_existing: false,
+            join_pending: false,
+        });
+    }
     let legacy: LegacyPersistedCellState = bincode::deserialize(body)
         .map_err(|e| MetaDbError::CodecError(format!("CELL_MANAGER_STATE: {e}")))?;
     Ok(PersistedCellState {
@@ -1022,5 +1433,7 @@ fn decode_cell_state(body: &[u8]) -> Result<PersistedCellState> {
                 )
             })
             .collect(),
+        joined_existing: false,
+        join_pending: false,
     })
 }

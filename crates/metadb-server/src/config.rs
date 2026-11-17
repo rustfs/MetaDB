@@ -14,6 +14,9 @@ use metadb_storage::{LsmEngineConfig, DEFAULT_MVCC_RETENTION_MS};
 /// Only [`ServerRole::AllInOne`] is implemented. The other variants are accepted by
 /// config parsing so deployments can name them, but `PersistentMetaDbCluster::open_and_serve`
 /// rejects them instead of silently starting every subsystem.
+///
+/// A second all-in-one process joins an existing Raft group when [`ClusterSection::join`]
+/// is set and its data directory does not already own a cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ServerRole {
@@ -115,6 +118,19 @@ impl Default for ShardingSection {
     }
 }
 
+/// Seed address for joining an existing cell instead of bootstrapping a new one.
+///
+/// Leave [`ClusterSection::join`] empty on the first process. A later process with the
+/// same `cell_id` and a fresh data directory registers itself and is added to every
+/// shard Raft group. The seed must be the current Raft leader. Restarting a directory
+/// that already bootstrapped or joined ignores this field and reopens local state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClusterSection {
+    /// `host:port` (or `http://host:port`) of a cell member that can propose membership.
+    pub join: String,
+}
+
 /// Top-level TOML configuration matching `docs/guides/{en,ja,fr,zh,de}/deployment.md`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -124,6 +140,7 @@ pub struct ServerTomlConfig {
     pub storage: StorageSection,
     pub sharding: ShardingSection,
     pub security: SecuritySection,
+    pub cluster: ClusterSection,
     #[serde(skip)]
     pub raft_options: RaftNodeOptions,
 }

@@ -93,6 +93,12 @@ mod route_conv {
     }
 }
 
+pub fn composite_route_from_proto(
+    descriptor: ShardDescriptorProto,
+) -> std::result::Result<CompositeShardRoute, MetaDbError> {
+    route_conv::from_proto_route(descriptor)
+}
+
 fn decode_req_txn_id(bytes: &[u8]) -> Result<u128, Status> {
     metadb_proto::convert::decode_u128_be(bytes)
         .map_err(|e| Status::invalid_argument(e.to_string()))
