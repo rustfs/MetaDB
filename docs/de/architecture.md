@@ -130,11 +130,11 @@ Split-Pläne liegen in `CELL_MANAGER_STATE`. Absturzpunkte, die `split_crash_rec
 | RPC | Verhalten in diesem Baum |
 | :--- | :--- |
 | `RegisterNode` | Fügt `(node_id, grpc_addr)` in das `CELL_MANAGER_STATE` dieser Zelle ein |
-| `StoreHeartbeat` | Schreibt Routen-Protos in den Cache im Speicher. Ignoriert Platten- und QPS-Felder. `metadbd` sendet diesen RPC nie |
-| `GetRoutes` | Listet Cache-Routen (`cell_id = 0`) oder die Routen einer Zelle |
+| `StoreHeartbeat` | Schreibt keine vom Aufrufer gelieferten Shard-Deskriptoren in den Routen-Cache. `metadbd` sendet diesen RPC nie |
+| `GetRoutes` | `cell_id = 0` listet jede zwischengespeicherte Route. Eine unbekannte `cell_id` ungleich null liefert einen Fehler statt einer leeren Liste |
 | `AllocateIdBlock` | Zuteilen aus dem lokalen dauerhaften Zuteiler |
 | `AllocSplitPlan` / `ActivateSplit` | Leitet an den lokalen Zellmanager weiter |
 | `TriggerShardSplit` | Erzwingt `maybe_split_or_isolate_shard` auf einem lokalen Shard |
 | `EnableDualModeSplit` | Setzt das lokale Routenflag. `split_name` in der Anfrage wird ignoriert |
 | `ScaleShardReplicas` | Ruft `scale_out_replicas` auf, wenn diese Zelle existiert und genug Knoten registriert sind |
-| `RegisterCell` | Liefert `error: None` und speichert weder `cell_id` noch den Schlüsselbereich noch die Endpunkte |
+| `RegisterCell` | Liefert einen Anwendungsfehler. Dieser Prozess beherbergt weiter genau eine Zelle und speichert die angeforderte Zelle nicht |

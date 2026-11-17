@@ -79,6 +79,6 @@ shared_secret = "replace-with-a-long-random-string"
 
 - 按角色裁剪子系统。角色字段是允许或拒绝的开关，不是功能集合。
 - 对等体列表、投票者集合或加入令牌。成员关系从这一个进程开始。额外对等体只在 `RegisterNode` 加上 `ScaleShardReplicas` 之后出现，而且这些对等体必须已经是同一分片日志上会说 `RaftTransportService` 的 Raft 成员。第二个 all-in-one 进程不会这样做。见 [运维](./operations.md)。
-- 第二个单元的键范围。`RegisterCell` 不读取请求。
+- 第二个单元的键范围。`RegisterCell` 返回错误并且什么都不保存。空数据目录上的第二个 all-in-one 进程用 `[cluster] join` 加入当前 leader，这仍是同一个单元。
 - memtable 字节上限、Raft 计时器，或局部性压缩的开关。
 - TLS 证书。

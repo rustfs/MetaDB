@@ -130,11 +130,11 @@ Split plans are stored in `CELL_MANAGER_STATE`. Crash points covered by `split_c
 | RPC | Behavior in this tree |
 | :--- | :--- |
 | `RegisterNode` | Inserts `(node_id, grpc_addr)` into this cell's `CELL_MANAGER_STATE` |
-| `StoreHeartbeat` | Upserts route protos into the in-memory cache. Ignores disk and QPS fields. `metadbd` never sends this RPC |
-| `GetRoutes` | Lists cache routes (`cell_id = 0`) or one cell's routes |
+| `StoreHeartbeat` | Does not install caller-supplied shard descriptors into the route cache. `metadbd` never sends this RPC |
+| `GetRoutes` | `cell_id = 0` lists every cached route. An unknown non-zero `cell_id` returns an error instead of an empty shard list |
 | `AllocateIdBlock` | Allocates from the local durable allocator |
 | `AllocSplitPlan` / `ActivateSplit` | Forwards to the local cell manager |
 | `TriggerShardSplit` | Forces `maybe_split_or_isolate_shard` on a local shard |
 | `EnableDualModeSplit` | Sets the local route flag. `split_name` in the request is ignored |
 | `ScaleShardReplicas` | Calls `scale_out_replicas` if this cell exists and enough nodes are registered |
-| `RegisterCell` | Returns `error: None` and does not store `cell_id`, the key range, or the endpoints |
+| `RegisterCell` | Returns an application error. This process still hosts one cell and does not store the requested cell |

@@ -54,7 +54,7 @@ Calls `ScaleShardReplicas`. The server requires `target_voters` entries already 
 
 ### `cell register --cell-id <u64> --endpoints <a,b,c>`
 
-Calls `RegisterCell`. The server drops the body and returns success. The command prints `Registered Cell <id>` even though no cell was stored. Do not use this as a federation step.
+Calls `RegisterCell`. The server returns an application error and does not add a cell. `metadb-ctl` exits non-zero and does not print `Registered Cell`. Do not use this as a federation step.
 
 ### `sql <statement>`
 
@@ -101,11 +101,11 @@ What works inside one process:
 What does not work as an operator procedure:
 
 1. `metadbd --role be`, `--role proxy`, `--role cell-manager`, and `--role global-manager` exit in `open_and_serve`. The subsystems are not trimmed by role, and the process refuses to start them under those names.
-2. A second `metadbd --role all-in-one` with `--cell-manager <first>` still bootstraps its own cell and its own shards 1–3, then calls `RegisterNode`. Registration records an address. It does not copy the first process's log or make the second process a learner. `ScaleShardReplicas` will try `add_learner` against that address and time out or fail unless that process is already hosting the same shard groups, which the all-in-one bootstrap does not do.
-3. `metadb-ctl cell register` does not create a second cell. `open_and_serve` registers only the local cell on the global manager.
+2. A second `metadbd --role all-in-one` joins an existing group when `--join` or `--cell-manager` names the current leader and the data directory is fresh. The leader appends a blank entry, snapshots, and promotes the joiner from learner to voter on the shards it already hosts. `--join` must reach that leader. A directory that already has Raft state reopens it and ignores a new join address. Each process still has its own id allocator, so automatic inode and file ids issued on the joiner can collide with ids the first process already issued. `Lookup` on a follower returns `NotLeader` and is not forwarded.
+3. `metadb-ctl cell register` does not create a second cell. `RegisterCell` fails closed. `open_and_serve` registers only the local cell on the global manager.
 4. The in-memory `MetaDbEngine::new_single_node` path used by tests `T1`–`T6` can bump an in-memory voter count to 3. That object has no disk and no Raft. It is not a scale-out of `metadbd`.
 
-[Open pull request #2](https://github.com/rustfs/MetaDB/pull/2) (not merged) states the same boundary: its distributed test calls `DurableCellManager::scale_out_replicas` with three localhost Raft voters inside one OS process. It does not launch three `metadbd` processes. Disaggregated roles and a second Cell are not tested as live deployments there either. Jumbo dedicated-node isolation in that pull request remains the in-memory simulator behavior.
+`topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. Disaggregated roles and a second Cell are still not live deployments. Jumbo dedicated-node isolation remains a route flag, not a move of shards onto another machine.
 
 ## Errors you can hit
 
@@ -130,9 +130,12 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 
 ## Known limitations
 
-- One OS process, role `all-in-one` only.
-- No join protocol. A second data directory is a second cluster.
-- `RegisterCell` is a no-op success.
+- Role `all-in-one` only. `be`, `proxy`, `cell-manager`, and `global-manager` are rejected before listen.
+- A second all-in-one process can join the same cell with `[cluster] join`. It does not create a second cell. `RegisterCell` returns an error.
+- `GetRoutes` fails closed for an unknown non-zero `cell_id`. `StoreHeartbeat` does not replace cached routes.
+- User names `.`, `..`, `/`, `\`, `_attr_`, empty, and NUL are rejected. A negative file size is rejected. A directory rename into its own descendant fails closed, including chains deeper than 1024.
+- The HLC saturates at the 48-bit physical ceiling instead of wrapping the logical counter. `Prepare2pc` follows `header.shard_id`, not the primary-key shard.
+- Quota cursor rows are written after the outbox lock is released, so a flush that already holds the memtable lock can still take the outbox lock.
 - Jumbo isolation is a route flag plus a node id chosen from the local node map. It does not evict other shards from a disk.
 - Heartbeats are an RPC with no sender in `metadbd`. `StoreHeartbeat` does not persist.
 - Raft on the public gRPC port is unauthenticated. The process does not terminate TLS.
@@ -144,9 +147,8 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 These items are missing from the product, so this guide cannot describe a procedure for them:
 
 1. A multi-process layout for `be`, `proxy`, `cell-manager`, and `global-manager`.
-2. Adding a second and third `metadbd` OS process to an existing Raft group.
-3. Creating and routing to a second Cell.
-4. Placing a jumbo shard on its own machine and moving other shards off that machine.
-5. TLS material, Raft authentication, and a heartbeat-driven control loop.
-6. A memtable size or Raft timer that operators can set and observe.
-7. A checked-in service-level result for `metadb-ctl bench`. The command prints numbers for the machine you run it on. This repository does not record one. The unmerged pull request #2 reports a separate embedded harness; those commands are not in this tree. See [Tests and benches](./testing.md).
+2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
+3. Placing a jumbo shard on its own machine and moving other shards off that machine.
+4. TLS material, Raft authentication, and a heartbeat-driven control loop.
+5. A memtable size or Raft timer that operators can set and observe.
+6. A checked-in service-level result for `metadb-ctl bench`. The command prints numbers for the machine you run it on. This repository does not record one. See [Tests and benches](./testing.md).

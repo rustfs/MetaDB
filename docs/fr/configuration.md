@@ -79,6 +79,6 @@ Un secret vide autorise les RPC de métadonnées, de transaction et de plan de c
 
 - Le découpage des sous-systèmes par rôle. Le champ de rôle est un interrupteur autoriser/refuser, pas un ensemble de fonctions.
 - Les listes de pairs, les ensembles de votants ou un jeton de jonction. L'appartenance commence par ce seul processus. Des pairs supplémentaires n'apparaissent qu'après `RegisterNode` plus `ScaleShardReplicas`, et ces pairs doivent déjà être des membres Raft qui parlent `RaftTransportService` pour les mêmes journaux de shard. Un second processus all-in-one ne le fait pas. Voir [Exploitation](./operations.md).
-- L'intervalle de clés d'une seconde cellule. `RegisterCell` ne lit pas sa requête.
+- L'intervalle de clés d'une seconde cellule. `RegisterCell` renvoie une erreur et ne stocke rien. Un second all-in-one au répertoire vide rejoint le leader courant avec `[cluster] join` ; c'est toujours la même cellule.
 - La limite en octets du memtable, les temporisations Raft, ou l'activation de la compaction par localité.
 - Les certificats TLS.

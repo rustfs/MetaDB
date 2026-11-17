@@ -79,6 +79,6 @@ Ein leeres Geheimnis lässt Metadaten-, Transaktions- und Control-Plane-RPCs zu.
 
 - Zuschneiden der Teilsysteme nach Rolle. Das Rollenfeld ist ein Zulassen/Ablehnen-Schalter, keine Funktionsmenge.
 - Peer-Listen, Wählermengen oder ein Join-Token. Die Membership beginnt als dieser eine Prozess. Weitere Peers erscheinen erst nach `RegisterNode` plus `ScaleShardReplicas`, und diese Peers müssen bereits Raft-Mitglieder sein, die `RaftTransportService` für dieselben Shard-Logs sprechen. Ein zweiter all-in-one-Prozess tut das nicht. Siehe [Betrieb](./operations.md).
-- Den Schlüsselbereich einer zweiten Zelle. `RegisterCell` liest seine Anfrage nicht.
+- Den Schlüsselbereich einer zweiten Zelle. `RegisterCell` liefert einen Fehler und speichert nichts. Ein zweiter all-in-one-Prozess mit leerem Verzeichnis tritt dem aktuellen Leader mit `[cluster] join` bei; das bleibt dieselbe Zelle.
 - Memtable-Bytegrenze, Raft-Zeitgeber oder Locality-Compaction an/aus.
 - TLS-Zertifikate.

@@ -54,7 +54,7 @@
 
 ### `cell register --cell-id <u64> --endpoints <a,b,c>`
 
-调用 `RegisterCell`。服务器丢弃请求体并返回成功。命令会打印 `Registered Cell <id>`，即使没有保存任何单元。不要把它当作联邦步骤。
+调用 `RegisterCell`。服务器返回应用错误，不增加单元。`metadb-ctl` 以非零状态退出，不会打印 `Registered Cell`。不要把它当作联邦步骤。
 
 ### `sql <语句>`
 
@@ -101,7 +101,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 不能当作运维步骤的做法：
 
 1. `metadbd --role be`、`--role proxy`、`--role cell-manager` 和 `--role global-manager` 在 `open_and_serve` 中退出。子系统不会按角色裁剪，进程拒绝以这些名字启动它们。
-2. 带 `--cell-manager <第一个>` 的第二个 `metadbd --role all-in-one` 仍会引导自己的单元和自己的分片 1–3，然后调用 `RegisterNode`。注册只记录一个地址。它不复制第一个进程的日志，也不把第二个进程变成 learner。`ScaleShardReplicas` 会对该地址尝试 `add_learner`，除非该进程已经托管同一组分片，否则会超时或失败。all-in-one 引导不会这样做。
+2. 第二个 `metadbd --role all-in-one` 在数据目录为空、且 `--join` 或 `--cell-manager` 指向当前 leader 时，会加入已有 Raft 组。leader 先追加一条空日志并做快照，再把加入者从 learner 提升为 voter。`--join` 必须打到该 leader。已经有 Raft 状态的目录会重新打开本地状态，并忽略新的 join 地址。每个进程仍有自己的 ID 分配器，后加入进程自动发出的 inode 和 file id 可能与第一个进程已经发出的 id 冲突。follower 上的 `Lookup` 返回 `NotLeader`，不会转发。
 3. `metadb-ctl cell register` 不创建第二个单元。`open_and_serve` 只把本地单元注册到全局管理器。
 4. 测试 `T1`–`T6` 使用的内存路径 `MetaDbEngine::new_single_node` 可以把内存中的投票者计数加到 3。那个对象没有磁盘，也没有 Raft。它不是 `metadbd` 的扩容。
 
@@ -131,8 +131,8 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 ## 已知限制
 
 - 一个操作系统进程，角色只能是 `all-in-one`。
-- 没有加入协议。第二个数据目录就是第二个集群。
-- `RegisterCell` 是一次什么都不做的成功。
+- 第二个 all-in-one 进程可以用 `[cluster] join` 加入同一个单元。这不会创建第二个单元。`RegisterCell` 返回错误。
+- 未知且非零的 `cell_id` 上，`GetRoutes` 失败关闭。`StoreHeartbeat` 不会替换缓存路由。
 - 巨型隔离是路由标志加上从本地节点表选出的节点标识。它不会把其他分片从磁盘上赶走。
 - 心跳是一个 RPC，`metadbd` 里没有发送方。`StoreHeartbeat` 不持久化。
 - 公开 gRPC 端口上的 Raft 不认证。进程不终结 TLS。

@@ -130,11 +130,11 @@ MVCC の版は `storage.mvcc_retention_ms`（既定 5,000）のあいだメモ�
 | RPC | このツリーでの挙動 |
 | :--- | :--- |
 | `RegisterNode` | このセルの `CELL_MANAGER_STATE` へ `(node_id, grpc_addr)` を入れる |
-| `StoreHeartbeat` | ルートの proto をメモリ内キャッシュへ upsert する。ディスクと QPS の項目は無視する。`metadbd` はこの RPC を送らない |
-| `GetRoutes` | キャッシュのルート（`cell_id = 0`）または 1 つのセルのルートを列挙する |
+| `StoreHeartbeat` | 呼び出し元が渡したシャード記述子をルートキャッシュへ入れない。`metadbd` はこの RPC を送らない |
+| `GetRoutes` | `cell_id = 0` はキャッシュ済みルートをすべて列挙する。未知で非ゼロの `cell_id` は空リストではなくエラーを返す |
 | `AllocateIdBlock` | ローカルの永続アロケータから割り当てる |
 | `AllocSplitPlan` / `ActivateSplit` | ローカルのセルマネージャへ転送する |
 | `TriggerShardSplit` | ローカルシャードで `maybe_split_or_isolate_shard` を強制する |
 | `EnableDualModeSplit` | ローカルのルートフラグを立てる。リクエストの `split_name` は無視される |
 | `ScaleShardReplicas` | このセルが存在し、登録ノードが足りるときに `scale_out_replicas` を呼ぶ |
-| `RegisterCell` | `error: None` を返し、`cell_id` もキー範囲もエンドポイントも保存しない |
+| `RegisterCell` | アプリケーションエラーを返す。このプロセスは引き続き 1 つのセルだけをホストし、要求されたセルは保存しない |

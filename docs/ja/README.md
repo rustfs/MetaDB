@@ -20,7 +20,7 @@ MetaDB は、ファイルとオブジェクトの名前空間向けの純粋な 
 - `MetadataService`、`TransactionService`、`ControlPlaneService`、`RaftTransportService` を提供する gRPC リスナーは 1 つ
 - 250 ms ごとのバックグラウンドループが、補助アウトボックスの排出、2PC 回復、分割方針の確認、Raft ログのスナップショットを行う
 
-`ServerRole` は `be`、`proxy`、`cell-manager`、`global-manager` も解析します。`open_and_serve` は `all-in-one` 以外のロールを拒否します。別のデータディレクトリを持つ 2 つ目の `metadbd` は、自分のセルをブートストラップします。最初のプロセスの Raft グループには参加しません。`ControlPlaneService.RegisterCell` は成功を返し、リクエストを無視します。したがって `metadb-ctl cell register` は 2 つ目のセルを作りません。
+`ServerRole` は `be`、`proxy`、`cell-manager`、`global-manager` も解析します。`open_and_serve` は `all-in-one` 以外のロールを拒否します。空のデータディレクトリを持つ 2 つ目の `metadbd` が `[cluster] join`（または `--join` / `--cell-manager`）を現在のリーダーに向けると、そのセルの Raft グループに参加します。リーダーは learner として加え、その後 voter に昇格します。すでにセル状態があるディレクトリはローカル Raft を開き直し、再参加しません。`RegisterCell` はアプリケーションエラーを返し、セルを追加しません。`metadb-ctl cell register` は非ゼロで終了します。未知で非ゼロの `cell_id` に対する `GetRoutes` はエラーを返します。`cell_id = 0` はキャッシュ済みルートをすべて列挙します。
 
 シャード分割、デュアルモードの `(PID, name)` 分割、ジャンボのルートフラグは、その 1 プロセスの中で動きます。投票者を 3 つへ昇格する処理は `DurableCellManager::scale_out_replicas` に実装され、プロセス内の Raft テストで覆われています。これは `metadbd` を 3 プロセス起動する配備ではありません。詳細は [運用](./operations.md) を参照してください。
 

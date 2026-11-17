@@ -112,19 +112,15 @@ Behavior from `crates/metadb-server/src/bin/metadb-ctl.rs`:
 
 Do not treat a number from this command as a repository result. It depends on the machine, the build profile, and the server you pointed at. This tree does not record a sample.
 
-## Open pull request #2
+## Persistent topology and join
 
-[Pull request #2](https://github.com/rustfs/MetaDB/pull/2) is open and not part of this branch. It adds persistent topology tests and an embedded stress harness. Its own description says:
+These commands are in this tree. CI runs them with `cargo test --workspace --locked`.
 
-- The single-node test calls `PersistentMetaDbCluster::open_and_serve` on a temporary directory.
-- The scale-out test forces a PID-boundary split in that same process.
-- The distributed test is one process with three localhost Raft voters. It calls `DurableCellManager::scale_out_replicas`. It does not launch three `metadbd` OS processes.
-- `open_and_serve` still rejects every role except `all-in-one`. Disaggregated roles and a second Cell stay unimplemented.
+- `cargo test -p metadb-server --test topology_single_node` opens `PersistentMetaDbCluster` on a temporary directory.
+- `cargo test -p metadb-server --test topology_scale_out` forces a PID-boundary split in that process.
+- `cargo test -p metadb-server --test topology_distributed` uses one process and `DurableCellManager::scale_out_replicas` for three localhost voters, including leader loss under create load.
+- `cargo test -p metadb-server --test stress_crash_restart` stops without flushing the memtable while a create is inside `propose`, then reopens the same `data_dir`.
+- `cargo test -p metadb-server --test join_existing_group` starts a second `metadbd` and joins the first process's Raft group, including a shared-secret case.
+- `open_and_serve` still rejects every role except `all-in-one`. A second Cell stays unimplemented. `RegisterCell` returns an error.
 
-That pull request's report, on the author's VM with Rust 1.100.0 (hardware is not named), includes one smoke line from the harness that this branch does not contain:
-
-```text
-metadb stress profile=smoke ops=12219 errors=0 correctness_errors=0 elapsed_ms=5221 ops_per_s=2340.3 latency_us p50=1318 p99=5207 max=12449
-```
-
-That line is a single run of an unmerged test. It is not a service target and it is not reproduced by `metadb-ctl bench` on this branch. Commands such as `cargo test -p metadb-server --test topology_distributed` and `metadb-ctl bench --embedded` exist only on that pull request's branch.
+`stress_smoke_mixed_workload` runs in that same workspace test. It prints one line for the machine that ran it. This repository does not check in a service-level target, and `metadb-ctl bench` still does not record percentiles or application errors for `hotspot-create`.

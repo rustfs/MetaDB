@@ -54,7 +54,7 @@ Appelle `ScaleShardReplicas`. Le serveur exige que `target_voters` entrées soie
 
 ### `cell register --cell-id <u64> --endpoints <a,b,c>`
 
-Appelle `RegisterCell`. Le serveur abandonne le corps et renvoie un succès. La commande imprime `Registered Cell <id>` alors qu'aucune cellule n'a été stockée. Ne pas l'utiliser comme étape de fédération.
+Appelle `RegisterCell`. Le serveur renvoie une erreur applicative et n'ajoute pas de cellule. `metadb-ctl` se termine avec un code non nul et n'imprime pas `Registered Cell`. Ne pas l'utiliser comme étape de fédération.
 
 ### `sql <énoncé>`
 
@@ -101,7 +101,7 @@ Ce qui fonctionne dans un seul processus :
 Ce qui ne fonctionne pas comme procédure d'exploitation :
 
 1. `metadbd --role be`, `--role proxy`, `--role cell-manager` et `--role global-manager` sortent dans `open_and_serve`. Les sous-systèmes ne sont pas découpés par rôle, et le processus refuse de les démarrer sous ces noms.
-2. Un second `metadbd --role all-in-one` avec `--cell-manager <premier>` amorce quand même sa propre cellule et ses propres shards 1–3, puis appelle `RegisterNode`. L'enregistrement note une adresse. Il ne copie pas le journal du premier processus et ne fait pas du second un learner. `ScaleShardReplicas` tentera `add_learner` vers cette adresse et expirera ou échouera, sauf si ce processus héberge déjà les mêmes groupes de shards, ce que l'amorçage all-in-one ne fait pas.
+2. Un second `metadbd --role all-in-one` rejoint un groupe existant lorsque `--join` ou `--cell-manager` nomme le leader courant et que le répertoire de données est vide. Le leader ajoute une entrée vide, prend un instantané, puis promeut le nouveau membre de learner à voter. `--join` doit atteindre ce leader. Un répertoire qui a déjà un état Raft le rouvre et ignore une nouvelle adresse de join. Chaque processus a son propre allocateur d'identifiants : les inode et file id automatiques du processus qui rejoint peuvent entrer en collision avec ceux déjà émis. `Lookup` sur un follower renvoie `NotLeader` et n'est pas transmis.
 3. `metadb-ctl cell register` ne crée pas une seconde cellule. `open_and_serve` n'enregistre que la cellule locale sur le gestionnaire global.
 4. Le chemin en mémoire `MetaDbEngine::new_single_node` utilisé par les tests `T1`–`T6` peut porter un compteur de votants en mémoire à 3. Cet objet n'a ni disque ni Raft. Ce n'est pas une montée en charge de `metadbd`.
 
@@ -131,8 +131,8 @@ Les variantes sont définies dans `crates/metadb-core/src/error.rs`. Les méthod
 ## Limites connues
 
 - Un seul processus du système d'exploitation, rôle `all-in-one` seulement.
-- Pas de protocole de jonction. Un second répertoire de données est un second cluster.
-- `RegisterCell` est un succès qui ne fait rien.
+- Un second processus all-in-one peut rejoindre la même cellule avec `[cluster] join`. Cela ne crée pas une seconde cellule. `RegisterCell` renvoie une erreur.
+- `GetRoutes` échoue fermé pour un `cell_id` non nul inconnu. `StoreHeartbeat` ne remplace pas les routes en cache.
 - L'isolation jumbo est un indicateur de route plus un identifiant de nœud choisi dans la table locale. Elle n'évince pas d'autres shards d'un disque.
 - Les battements de cœur sont un RPC sans émetteur dans `metadbd`. `StoreHeartbeat` ne persiste pas.
 - Raft sur le port gRPC public n'est pas authentifié. Le processus ne termine pas TLS.

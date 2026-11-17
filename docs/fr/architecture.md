@@ -130,11 +130,11 @@ Les plans de découpage sont stockés dans `CELL_MANAGER_STATE`. Les points de p
 | RPC | Comportement dans cet arbre |
 | :--- | :--- |
 | `RegisterNode` | Insère `(node_id, grpc_addr)` dans le `CELL_MANAGER_STATE` de cette cellule |
-| `StoreHeartbeat` | Insère les protos de route dans le cache en mémoire. Ignore les champs disque et QPS. `metadbd` n'envoie jamais ce RPC |
-| `GetRoutes` | Liste les routes du cache (`cell_id = 0`) ou les routes d'une cellule |
+| `StoreHeartbeat` | N'installe pas les descripteurs de shard fournis par l'appelant dans le cache de routes. `metadbd` n'envoie jamais ce RPC |
+| `GetRoutes` | `cell_id = 0` liste toutes les routes en cache. Un `cell_id` non nul inconnu renvoie une erreur au lieu d'une liste vide |
 | `AllocateIdBlock` | Alloue depuis l'allocateur durable local |
 | `AllocSplitPlan` / `ActivateSplit` | Transmet au gestionnaire de cellule local |
 | `TriggerShardSplit` | Force `maybe_split_or_isolate_shard` sur un shard local |
 | `EnableDualModeSplit` | Pose l'indicateur de route local. `split_name` de la requête est ignoré |
 | `ScaleShardReplicas` | Appelle `scale_out_replicas` si cette cellule existe et si assez de nœuds sont enregistrés |
-| `RegisterCell` | Renvoie `error: None` et ne stocke ni `cell_id`, ni l'intervalle de clés, ni les points de terminaison |
+| `RegisterCell` | Renvoie une erreur applicative. Ce processus héberge toujours une seule cellule et n'enregistre pas la cellule demandée |

@@ -20,7 +20,7 @@ The workspace version is `0.1.0` (Apache-2.0). The Rust toolchain is pinned to *
 - one gRPC listener that serves `MetadataService`, `TransactionService`, `ControlPlaneService`, and `RaftTransportService`
 - a background loop every 250 ms that drains auxiliary outboxes, runs 2PC recovery, checks split policy, and snapshots Raft logs
 
-`ServerRole` also parses `be`, `proxy`, `cell-manager`, and `global-manager`. `open_and_serve` rejects every role except `all-in-one`. A second `metadbd` process with its own data directory bootstraps its own cell. It does not join the first process's Raft groups. `ControlPlaneService.RegisterCell` returns success and ignores the request, so a second Cell is not created by `metadb-ctl cell register`.
+`ServerRole` also parses `be`, `proxy`, `cell-manager`, and `global-manager`. `open_and_serve` rejects every role except `all-in-one`. A second `metadbd` with an empty data directory and `[cluster] join` (or `--join` / `--cell-manager`) set to the current leader joins that cell's Raft groups: the leader adds it as a learner and then promotes it to a voter. A directory that already has cell state reopens local Raft and does not join again. `RegisterCell` returns an application error and does not add a cell; `metadb-ctl cell register` exits non-zero. `GetRoutes` for an unknown non-zero `cell_id` returns an error. `cell_id = 0` still lists every cached route.
 
 Shard splits, dual-mode `(PID, name)` splits, and jumbo route flags do run inside that one process. Replica promotion to three voters is implemented on `DurableCellManager::scale_out_replicas` and is covered by in-process Raft tests. It is not a three-`metadbd`-process deployment. See [Operations](./operations.md).
 

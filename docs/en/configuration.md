@@ -69,7 +69,7 @@ CLI flags override the file after it is parsed: `--node-id`, `--cell-id`, `--rol
 
 The process does not terminate TLS.
 
-When `shared_secret` is non-empty, `MetadataService`, `TransactionService`, and `ControlPlaneService` require the metadata value `authorization` to equal `Bearer <shared_secret>`. `metadb-ctl --auth-token` (environment variable `METADB_AUTH_TOKEN`) sends that header. `metadbd --cell-manager` sends the same secret when it calls `RegisterNode`.
+When `shared_secret` is non-empty, `MetadataService`, `TransactionService`, and `ControlPlaneService` require `authorization` to equal `Bearer <shared_secret>` exactly. Clients use a separate interceptor that attaches that header. `metadb-ctl --auth-token` (environment variable `METADB_AUTH_TOKEN`) and `metadbd --join` / `--cell-manager` send it. A prefix or a longer token is rejected. An empty secret still means those three services are unauthenticated.
 
 `RaftTransportService` is registered without the interceptor. A bearer token does not authenticate Raft RPCs on that port.
 
@@ -78,7 +78,7 @@ An empty secret allows metadata, transaction, and control-plane RPCs. The code w
 ## What you cannot configure
 
 - Per-role subsystem trimming. The role field is an allow/deny switch, not a feature set.
-- Peer lists, voter sets, or a join token. Membership starts as this process alone. Extra peers appear only after `RegisterNode` plus `ScaleShardReplicas`, and those peers must already be Raft members that speak `RaftTransportService` for the same shard logs. A second all-in-one process does not do that. See [Operations](./operations.md).
-- A second cell's key range. `RegisterCell` does not read its request.
+- A voter list in TOML. The first process bootstraps alone. A later all-in-one process joins with `[cluster] join = "host:port"` (or `--join` / `--cell-manager`) pointing at the current leader, and only when its data directory does not already own a cell. The leader must be reached directly; a follower does not forward the membership change. That join is the same cell, not a second cell. See [Operations](./operations.md).
+- A second cell's key range. `RegisterCell` returns an error and stores nothing.
 - Memtable byte limit, Raft timers, or locality-compaction on/off.
 - TLS certificates.

@@ -130,11 +130,11 @@ MVCC 版本在内存中保留 `storage.mvcc_retention_ms`（默认 5,000）。�
 | RPC | 本树中的行为 |
 | :--- | :--- |
 | `RegisterNode` | 把 `(node_id, grpc_addr)` 插入本单元的 `CELL_MANAGER_STATE` |
-| `StoreHeartbeat` | 把路由 proto 写入内存缓存。忽略磁盘与 QPS 字段。`metadbd` 从不发送此 RPC |
-| `GetRoutes` | 列出缓存路由（`cell_id = 0`）或一个单元的路由 |
+| `StoreHeartbeat` | 不把调用方提供的分片描述写入路由缓存。`metadbd` 从不发送此 RPC |
+| `GetRoutes` | `cell_id = 0` 列出全部缓存路由。未知且非零的 `cell_id` 返回错误，而不是空分片列表 |
 | `AllocateIdBlock` | 从本地持久分配器分配 |
 | `AllocSplitPlan` / `ActivateSplit` | 转发给本地单元管理器 |
 | `TriggerShardSplit` | 在本地分片上强制 `maybe_split_or_isolate_shard` |
 | `EnableDualModeSplit` | 设置本地路由标志。请求中的 `split_name` 被忽略 |
 | `ScaleShardReplicas` | 若本单元存在且已注册节点足够，则调用 `scale_out_replicas` |
-| `RegisterCell` | 返回 `error: None`，不保存 `cell_id`、键范围或端点 |
+| `RegisterCell` | 返回应用错误。本进程仍然只托管一个单元，不保存请求中的单元 |

@@ -54,7 +54,7 @@
 
 ### `cell register --cell-id <u64> --endpoints <a,b,c>`
 
-`RegisterCell` を呼びます。サーバは本体を捨てて成功を返します。コマンドはセルが保存されていなくても `Registered Cell <id>` を印字します。連合の手順として使わないでください。
+`RegisterCell` を呼びます。サーバはアプリケーションエラーを返し、セルを追加しません。`metadb-ctl` は非ゼロで終了し、`Registered Cell` を印字しません。連合の手順として使わないでください。
 
 ### `sql <文>`
 
@@ -101,7 +101,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 運用手順として動かないもの:
 
 1. `metadbd --role be`、`--role proxy`、`--role cell-manager`、`--role global-manager` は `open_and_serve` で終了します。サブシステムはロールで切り出されず、プロセスはそれらの名前で起動することを拒否します。
-2. `--cell-manager <最初>` を付けた 2 つ目の `metadbd --role all-in-one` も、自分のセルと自分のシャード 1–3 をブートストラップしてから `RegisterNode` を呼びます。登録はアドレスを記録します。最初のプロセスのログをコピーせず、2 つ目のプロセスを learner にもしません。`ScaleShardReplicas` はそのアドレスへ `add_learner` を試み、そのプロセスがすでに同じシャードグループをホストしていない限り、タイムアウトするか失敗します。all-in-one のブートストラップはそれをしません。
+2. 2 つ目の `metadbd --role all-in-one` は、データディレクトリが空で `--join` または `--cell-manager` が現在のリーダーを指すとき、既存の Raft グループに参加します。リーダーは空エントリを追記してスナップショットを取り、参加者を learner から voter へ昇格します。`--join` はそのリーダーに届く必要があります。すでに Raft 状態があるディレクトリはそれを開き直し、新しい join アドレスを無視します。各プロセスは自分の ID アロケータを持つため、参加側が自動発行した inode と file id は、最初のプロセスが既に発行した ID と衝突し得ます。follower の `Lookup` は `NotLeader` を返し、転送しません。
 3. `metadb-ctl cell register` は 2 つ目のセルを作りません。`open_and_serve` はグローバルマネージャへローカルセルだけを登録します。
 4. テスト `T1`–`T6` が使うメモリ内の `MetaDbEngine::new_single_node` は、メモリ上の投票者数を 3 に増やせます。そのオブジェクトにはディスクも Raft もありません。`metadbd` のスケールアウトではありません。
 
@@ -131,8 +131,8 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 ## 既知の制限
 
 - OS プロセスは 1 つ、ロールは `all-in-one` だけ。
-- 参加プロトコルはない。2 つ目のデータディレクトリは 2 つ目のクラスタである。
-- `RegisterCell` は何もしない成功である。
+- 2 つ目の all-in-one プロセスは `[cluster] join` で同じセルに参加できる。これは 2 つ目のセルを作らない。`RegisterCell` はエラーを返す。
+- 未知で非ゼロの `cell_id` に対する `GetRoutes` は失敗して閉じる。`StoreHeartbeat` はキャッシュ済みルートを置き換えない。
 - ジャンボ隔離はルートフラグと、ローカルノード表から選んだノード ID である。他のシャードをディスクから追い出すことはしない。
 - ハートビートは RPC であり、`metadbd` に送信側はない。`StoreHeartbeat` は永続化しない。
 - 公開 gRPC ポート上の Raft は無認証である。プロセスは TLS を終端しない。
