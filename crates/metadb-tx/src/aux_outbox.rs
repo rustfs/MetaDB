@@ -535,26 +535,32 @@ impl ShardAuxOutbox {
         acked_keys: &[(u64, u16)],
         engine: &LifecycleStorageEngine,
     ) -> u64 {
-        let mut guard = self.inner.write().unwrap();
-        guard.max_observed_raft_index = guard.max_observed_raft_index.max(raft_index);
-
-        for &(idx, ord) in acked_keys {
-            if let Some(removed) = guard.tasks.remove(&(idx, ord)) {
-                if removed.durable_spilled || removed.sealed_at_index.is_some() {
-                    let spill_key = SpilledAuxOutboxKey::new(idx, ord).encode().to_vec();
-                    engine.apply_committed_delete(spill_key, hlc, raft_index);
+        // Collect deletions under the outbox lock, then write them after releasing it.
+        // A size-triggered flush takes this same lock from `spill_into_seal_batch`.
+        let (deletes, acked) = {
+            let mut guard = self.inner.write().unwrap();
+            guard.max_observed_raft_index = guard.max_observed_raft_index.max(raft_index);
+            let mut deletes = Vec::new();
+            for &(idx, ord) in acked_keys {
+                let delete_spill = if let Some(removed) = guard.tasks.remove(&(idx, ord)) {
+                    removed.durable_spilled || removed.sealed_at_index.is_some()
+                } else {
+                    // Idempotent delete in case `[0x07]` existed from prior snapshot/recovery.
+                    true
+                };
+                if delete_spill {
+                    deletes.push(SpilledAuxOutboxKey::new(idx, ord).encode().to_vec());
                 }
-            } else {
-                // Idempotent delete in case `[0x07]` existed from prior snapshot/recovery.
-                let spill_key = SpilledAuxOutboxKey::new(idx, ord).encode().to_vec();
-                engine.apply_committed_delete(spill_key, hlc, raft_index);
             }
+            guard.recompute_contiguous_acked();
+            let frontier = guard.contiguous_durable_frontier();
+            self.watermarks.advance_aux_outbox_durable(frontier);
+            (deletes, guard.contiguous_acked_index)
+        };
+        for key in deletes {
+            engine.apply_committed_delete(key, hlc, raft_index);
         }
-
-        guard.recompute_contiguous_acked();
-        let frontier = guard.contiguous_durable_frontier();
-        self.watermarks.advance_aux_outbox_durable(frontier);
-        guard.contiguous_acked_index
+        acked
     }
 
     /// Rehydrates spilled `[0x07]` tasks from `engine` on startup or after `install_snapshot` (`Resolution B6`).

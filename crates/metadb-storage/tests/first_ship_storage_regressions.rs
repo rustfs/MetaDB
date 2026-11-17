@@ -6,10 +6,14 @@ use std::thread;
 use std::time::Duration;
 
 use metadb_core::{HlcTimestamp, MetaKey};
+use metadb_storage::block::BlockEntryValue;
 use metadb_storage::sstable::{
     data_blocks_touched, full_range_materializations, reset_scan_probes,
 };
-use metadb_storage::{LifecycleStorageEngine, LsmEngineConfig, ScanControl, ShardedBlockCache};
+use metadb_storage::{
+    DurableShardCheckpoint, LifecycleStorageEngine, LsmEngineConfig, ManifestLog, ScanControl,
+    ShardedBlockCache, SstableBuilder, VersionEdit,
+};
 use tempfile::tempdir;
 
 fn engine(dir: &std::path::Path, config: LsmEngineConfig) -> LifecycleStorageEngine {
@@ -271,4 +275,148 @@ fn tiny_memtable_flushes_and_immutable_tables_respect_the_cap() {
         reopened.get_with_snapshot(b"fifth", &snap).unwrap(),
         Some(b"y".to_vec())
     );
+}
+
+#[test]
+fn size_flush_waits_until_the_command_finishes() {
+    let dir = tempdir().unwrap();
+    let lsm = dir.path().join("lsm");
+    let engine = engine(
+        &lsm,
+        LsmEngineConfig {
+            auto_locality_compaction: false,
+            memtable_size_bytes: 1,
+            ..LsmEngineConfig::default()
+        },
+    );
+    engine.begin_command();
+    engine.apply_committed_put(
+        b"child".to_vec(),
+        b"a".to_vec(),
+        HlcTimestamp::new(9_000, 1),
+        7,
+    );
+    engine.apply_committed_put(
+        b"attr".to_vec(),
+        b"b".to_vec(),
+        HlcTimestamp::new(9_000, 2),
+        7,
+    );
+    assert_eq!(
+        engine.durable_checkpoint().flushed_raft_index,
+        0,
+        "a threshold crossing must not checkpoint a partial command"
+    );
+    engine.end_command(false).unwrap();
+    assert_eq!(engine.durable_checkpoint().flushed_raft_index, 0);
+
+    engine.begin_command();
+    engine.apply_committed_put(
+        b"child".to_vec(),
+        b"a".to_vec(),
+        HlcTimestamp::new(9_000, 1),
+        7,
+    );
+    engine.apply_committed_put(
+        b"attr".to_vec(),
+        b"b".to_vec(),
+        HlcTimestamp::new(9_000, 2),
+        7,
+    );
+    engine.end_command(true).unwrap();
+    assert!(engine.durable_checkpoint().flushed_raft_index >= 7);
+
+    drop(engine);
+    let cache = Arc::new(ShardedBlockCache::new(1024 * 1024));
+    let reopened = LifecycleStorageEngine::open_lsm(
+        1,
+        &lsm,
+        cache,
+        LsmEngineConfig {
+            memtable_size_bytes: 32 * 1024 * 1024,
+            auto_locality_compaction: false,
+            ..LsmEngineConfig::default()
+        },
+    )
+    .unwrap();
+    let snap = reopened.acquire_linearizable_snapshot(0).unwrap();
+    assert_eq!(
+        reopened.get_with_snapshot(b"child", &snap).unwrap(),
+        Some(b"a".to_vec())
+    );
+    assert_eq!(
+        reopened.get_with_snapshot(b"attr", &snap).unwrap(),
+        Some(b"b".to_vec())
+    );
+}
+
+#[test]
+fn limited_scan_does_not_open_later_nonoverlapping_files() {
+    let dir = tempdir().unwrap();
+    let lsm = dir.path().join("lsm");
+    std::fs::create_dir_all(&lsm).unwrap();
+    let live = MetaKey::child(3, "a").encode();
+    let mut later = Vec::new();
+    for index in 0..2048u32 {
+        later.push((
+            MetaKey::child(3, format!("t{index:04}")).encode(),
+            BlockEntryValue::PhysicalTombstone,
+        ));
+    }
+    {
+        let (mut manifest, _) = ManifestLog::open_or_create(&lsm).unwrap();
+        let first = SstableBuilder::new(1, 10, 1, 1, HlcTimestamp::new(1, 0))
+            .write_to_dir(
+                &lsm,
+                &[(live.clone(), BlockEntryValue::Value(b"live".to_vec()))],
+            )
+            .unwrap();
+        let second = SstableBuilder::new(1, 11, 2, 2, HlcTimestamp::new(2, 0))
+            .write_to_dir(&lsm, &later)
+            .unwrap();
+        manifest
+            .append(&VersionEdit {
+                next_file_id: Some(12),
+                next_flush_generation: Some(3),
+                checkpoint: Some(DurableShardCheckpoint::default()),
+                deleted_files: vec![],
+                added_files: vec![first, second],
+            })
+            .unwrap();
+    }
+
+    let cache = Arc::new(ShardedBlockCache::new(8 * 1024 * 1024));
+    let engine = LifecycleStorageEngine::open_lsm(
+        1,
+        &lsm,
+        cache,
+        LsmEngineConfig {
+            auto_locality_compaction: false,
+            tombstone_density_threshold: 100_000,
+            ..LsmEngineConfig::default()
+        },
+    )
+    .unwrap();
+    let version = engine.backend().current_version();
+    let first_blocks = version.levels[1][0].index_entries().len() as u64;
+    let later_blocks = version.levels[1][1].index_entries().len() as u64;
+    assert!(later_blocks > first_blocks);
+
+    reset_scan_probes();
+    let snap = engine.acquire_linearizable_snapshot(0).unwrap();
+    let mut rows = Vec::new();
+    engine
+        .scan_live_until(
+            &MetaKey::encode_pid_prefix_start(3),
+            &MetaKey::encode_pid_prefix_end(3),
+            &snap,
+            |key, value| {
+                rows.push((key.to_vec(), value.to_vec()));
+                Ok(ScanControl::Stop)
+            },
+        )
+        .unwrap();
+    assert_eq!(rows, vec![(live, b"live".to_vec())]);
+    assert_eq!(data_blocks_touched(), first_blocks);
+    assert_eq!(engine.metrics().tombstones_traversed_on_scans, 0);
 }
