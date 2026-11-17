@@ -20,7 +20,7 @@ This skill loads the architectural history, foundational literature, subsystem c
    * [`docs/designs/sharding_and_control_plane.md`](../../../docs/designs/sharding_and_control_plane.md)
 6. **EGM Goldfish Review Report**: [`docs/designs/review_report.md`](../../../docs/designs/review_report.md)
 7. **Multilingual Usage Documentation (`en`, `ja`, `fr`, `zh`, `de`)**: [`docs/README.md`](../../../docs/README.md)
-8. **Foundational Paper**: Biao Cao et al. (Baidu & Peking University), *"MetaDB: Putting File-System Structure Back into Distributed Databases"*, arXiv:2610.32247v1 (2026).
+8. **Foundational Paper**: Zebin Ren ([@ZebinRen](https://github.com/ZebinRen)), Biao Cao, Kang Chen ([@kangchenPKU](https://github.com/kangchenPKU)), Zhihui Yin, Qiushi Chen, Jielong Jian, Jiwei Xiong, Xinxing Wang, Yan Xing, Liguo Duan, Ran Zheng, Xianjun Meng, and Zhenyu Hou, *"MetaDB: Putting File-System Structure Back into Distributed Databases"*, [arXiv:2610.32247v1](https://arxiv.org/html/2610.32247v1) (Vrije Universiteit Amsterdam, Baidu & Peking University, 2026).
 
 ## Target 8-Crate Pure-Rust Workspace
 
