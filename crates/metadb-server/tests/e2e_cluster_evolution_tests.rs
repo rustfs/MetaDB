@@ -171,31 +171,40 @@ shard_split_threshold_bytes = 2048
         assert!(rename_resp.error.is_none());
         let renamed_fid = rename_resp.entry.unwrap().attr.unwrap().fid;
 
-        // Run maintenance tick so `AuxDispatcher` drains Quota & SecondaryIndex updates!
-        cluster.run_maintenance_tick().await.unwrap();
-
-        let quota_resp = meta_client
-            .get_quota(GetQuotaRequest {
-                header: None,
-                uid: 50,
-            })
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(quota_resp.found);
-        // 20 initial files - 1 overwritten file = 19 live files * 512 bytes!
-        assert_eq!(quota_resp.record.unwrap().used_bytes, 19 * 512);
-
-        let idx_resp = meta_client
-            .get_secondary_index(GetSecondaryIndexRequest {
-                header: None,
-                fid: renamed_fid,
-            })
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(idx_resp.found);
-        assert_eq!(idx_resp.record.unwrap().pid, dir_b_id);
+        // One aux propose can miss while the background drain is in flight.
+        // Retry until the overwrite delta is visible, then assert the final values.
+        let mut used_bytes = None;
+        let mut index_pid = None;
+        for _ in 0..8 {
+            cluster.run_maintenance_tick().await.unwrap();
+            let quota_resp = meta_client
+                .get_quota(GetQuotaRequest {
+                    header: None,
+                    uid: 50,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(quota_resp.found);
+            used_bytes = quota_resp.record.map(|record| record.used_bytes);
+            let idx_resp = meta_client
+                .get_secondary_index(GetSecondaryIndexRequest {
+                    header: None,
+                    fid: renamed_fid,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            if idx_resp.found {
+                index_pid = idx_resp.record.map(|record| record.pid);
+            }
+            // 20 initial files - 1 overwritten file = 19 live files * 512 bytes.
+            if used_bytes == Some(19 * 512) && index_pid == Some(dir_b_id) {
+                break;
+            }
+        }
+        assert_eq!(used_bytes, Some(19 * 512));
+        assert_eq!(index_pid, Some(dir_b_id));
 
         // Consecutive bulk TTL deletion test on `dir_b_id`: create 25 TTL files, flush to L1,
         // delete 22 of them (`>= locality_tombstone_threshold = 20`), flush, and verify 0 tombstones!
