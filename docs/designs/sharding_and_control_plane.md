@@ -2,7 +2,7 @@
 
 * **Status**: Phase 0 Approved Specification
 * **Target Crates**: `crates/metadb-proto`, `crates/metadb-cluster`, and `crates/metadb-proxy`
-* **Primary Reference**: Biao Cao et al., *"MetaDB: Putting File-System Structure Back into Distributed Databases"*, [arXiv:2610.32247v1](https://arxiv.org/html/2610.32247v1), §3.1, §3.2, §4.1, §8
+* **Primary Reference**: Zebin Ren ([@ZebinRen](https://github.com/ZebinRen)), Biao Cao, Kang Chen ([@kangchenPKU](https://github.com/kangchenPKU)), Zhihui Yin, Qiushi Chen, Jielong Jian, Jiwei Xiong, Xinxing Wang, Yan Xing, Liguo Duan, Ran Zheng, Xianjun Meng, and Zhenyu Hou, *"MetaDB: Putting File-System Structure Back into Distributed Databases"*, [arXiv:2610.32247v1](https://arxiv.org/html/2610.32247v1) (Vrije Universiteit Amsterdam, Baidu & Peking University, 2026), §3.1, §3.2, §4.1, §8
 * **Semantic Boundaries**:
   * `FeatureRange`: Sections 1 – 4
   * `DetailedRange` (Zero-Decision Implementation Contract): Sections 5 – 10

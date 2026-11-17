@@ -2,7 +2,7 @@
 
 * **Status**: Phase 0 Approved Umbrella Specification
 * **Methodology**: [Google Elephant-Goldfish Model (EGM)](https://github.com/google/elephant-goldfish-model)
-* **Primary Reference**: Biao Cao et al., *"MetaDB: Putting File-System Structure Back into Distributed Databases"*, [arXiv:2610.32247v1](https://arxiv.org/html/2610.32247v1) (Baidu & Peking University, 2026)
+* **Primary Reference**: Zebin Ren ([@ZebinRen](https://github.com/ZebinRen)), Biao Cao, Kang Chen ([@kangchenPKU](https://github.com/kangchenPKU)), Zhihui Yin, Qiushi Chen, Jielong Jian, Jiwei Xiong, Xinxing Wang, Yan Xing, Liguo Duan, Ran Zheng, Xianjun Meng, and Zhenyu Hou, *"MetaDB: Putting File-System Structure Back into Distributed Databases"*, [arXiv:2610.32247v1](https://arxiv.org/html/2610.32247v1) (Vrije Universiteit Amsterdam, Baidu & Peking University, 2026)
 * **Modular Subsystem Contracts**:
   * [`storage_lsm_mvcc.md`](./storage_lsm_mvcc.md) — Pure-Rust WAL-less LSM, `SnapshotGuard` MVCC & `LocalityCompactor` (`metadb-storage`)
   * [`consensus_and_transactions.md`](./consensus_and_transactions.md) — `openraft` Multi-Raft, 3-Watermark Log, `ReadIndex`, `PushdownExecutor`, `AsyncAttrAggregator`, `AuxOutbox` & 2PC (`metadb-raft`, `metadb-tx`)
