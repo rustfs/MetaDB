@@ -17,7 +17,7 @@ use crate::mvcc::{
     MemMvccStore, MvccValue, PinnedSnapshotData, PreFlushHook, ReadCut, SnapshotGuard,
 };
 use crate::raft_log::{LogSequenceNumber, RaftLog, RaftLogPayload};
-use crate::version_set::Version;
+use crate::version_set::{MergedCursor, Version};
 
 /// Caller of [`LifecycleStorageEngine::scan_live_until`] stops or keeps scanning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +95,8 @@ pub struct LifecycleStorageEngine {
     flush_identity: RwLock<Option<FlushIdentity>>,
     entries_examined: AtomicU64,
     last_aux_frontier: AtomicU64,
+    /// Non-zero while a Raft command is still applying. Size flushes wait until it returns to zero.
+    command_depth: AtomicU64,
 }
 
 impl LifecycleStorageEngine {
@@ -119,6 +121,7 @@ impl LifecycleStorageEngine {
             flush_identity: RwLock::new(None),
             entries_examined: AtomicU64::new(0),
             last_aux_frontier: AtomicU64::new(0),
+            command_depth: AtomicU64::new(0),
         }
     }
 
@@ -181,7 +184,28 @@ impl LifecycleStorageEngine {
             flush_identity: RwLock::new(None),
             entries_examined: AtomicU64::new(0),
             last_aux_frontier: AtomicU64::new(0),
+            command_depth: AtomicU64::new(0),
         })
+    }
+
+    /// Holds size-triggered flushes until [`Self::end_command`] sees the whole command.
+    pub fn begin_command(&self) {
+        self.command_depth.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Ends a command started by [`Self::begin_command`].
+    /// A successful command may seal once; a failed command does not advance the checkpoint.
+    pub fn end_command(&self, commit: bool) -> Result<()> {
+        let previous = self.command_depth.fetch_sub(1, Ordering::AcqRel);
+        if previous == 0 {
+            return Err(MetaDbError::StorageIoError(
+                "end_command without begin_command".to_string(),
+            ));
+        }
+        if previous == 1 && commit {
+            self.maintain_memtables()?;
+        }
+        Ok(())
     }
 
     /// Installs the Raft pre-flush hook used by size-triggered seals.
@@ -237,7 +261,7 @@ impl LifecycleStorageEngine {
         raft_index: LogSequenceNumber,
     ) {
         self.mvcc.put(key, value, hlc, raft_index);
-        self.maintain_memtables().expect("memtable size flush");
+        self.maintain_after_write();
     }
 
     /// Applies an externally Raft-logged `Delete` at `(raft_index, hlc)` directly into `MemMvccStore`.
@@ -248,7 +272,7 @@ impl LifecycleStorageEngine {
         raft_index: LogSequenceNumber,
     ) {
         self.mvcc.delete(key, hlc, raft_index);
-        self.maintain_memtables().expect("memtable size flush");
+        self.maintain_after_write();
     }
 
     /// Appends a `Put` to the internal `RaftLog` and applies it to `MemMvccStore`.
@@ -413,12 +437,19 @@ impl LifecycleStorageEngine {
         if start_key >= end_key {
             return Ok(());
         }
-        let mut disk_from = start_key.to_vec();
+        let version = snap.with_step_lease(|pinned| Ok(pinned.version.clone()))?;
+        let mut disk = if version.has_sst_files() {
+            DiskScan::Sst(version.lazy_merged_cursor(start_key, Some(end_key))?)
+        } else {
+            DiskScan::Inline {
+                from: start_key.to_vec(),
+            }
+        };
         let mut mvcc_from = start_key.to_vec();
         let cut = snap.cut();
         loop {
             let pulled = snap.with_step_lease(|pinned| {
-                self.pull_next(pinned, cut, &mut disk_from, &mut mvcc_from, end_key)
+                self.pull_next(pinned, cut, &mut disk, &mut mvcc_from, end_key)
             })?;
             match pulled {
                 Pulled::Done => break,
@@ -444,14 +475,16 @@ impl LifecycleStorageEngine {
         &self,
         pinned: &PinnedSnapshotData,
         cut: ReadCut,
-        disk_from: &mut Vec<u8>,
+        disk: &mut DiskScan,
         mvcc_from: &mut Vec<u8>,
         end_key: &[u8],
     ) -> Result<Pulled> {
-        if mvcc_from.as_slice() >= end_key && disk_from.as_slice() >= end_key {
+        let mvcc_done = mvcc_from.as_slice() >= end_key;
+        let disk_done = disk.is_finished(end_key);
+        if mvcc_done && disk_done {
             return Ok(Pulled::Done);
         }
-        let mvcc_item = if mvcc_from.as_slice() >= end_key {
+        let mvcc_item = if mvcc_done {
             None
         } else {
             self.mvcc
@@ -459,13 +492,10 @@ impl LifecycleStorageEngine {
                 .into_iter()
                 .next()
         };
-        let disk_item = if disk_from.as_slice() >= end_key {
+        let disk_item = if disk_done {
             None
         } else {
-            let (page, _) =
-                self.backend
-                    .scan_in_version_page(&pinned.version, disk_from, end_key, 1)?;
-            page.into_iter().next()
+            disk.peek(self, pinned, end_key)?
         };
         match (mvcc_item, disk_item) {
             (None, None) => Ok(Pulled::Done),
@@ -474,7 +504,7 @@ impl LifecycleStorageEngine {
                 Ok(pulled_from_mvcc(key, value))
             }
             (None, Some((key, value))) => {
-                *disk_from = key_successor(&key);
+                disk.advance(&key)?;
                 Ok(pulled_from_disk(key, value))
             }
             (Some((mvcc_key, mvcc_value)), Some((disk_key, disk_value))) => {
@@ -482,15 +512,22 @@ impl LifecycleStorageEngine {
                     *mvcc_from = key_successor(&mvcc_key);
                     Ok(pulled_from_mvcc(mvcc_key, mvcc_value))
                 } else if disk_key < mvcc_key {
-                    *disk_from = key_successor(&disk_key);
+                    disk.advance(&disk_key)?;
                     Ok(pulled_from_disk(disk_key, disk_value))
                 } else {
                     *mvcc_from = key_successor(&mvcc_key);
-                    *disk_from = key_successor(&disk_key);
+                    disk.advance(&disk_key)?;
                     Ok(pulled_from_mvcc(mvcc_key, mvcc_value))
                 }
             }
         }
+    }
+
+    fn maintain_after_write(&self) {
+        if self.command_depth.load(Ordering::Acquire) > 0 {
+            return;
+        }
+        self.maintain_memtables().expect("memtable size flush");
     }
 
     /// Point lookup at `read_hlc` consulting `MemMvccStore` first and falling back to persistent storage.
@@ -718,6 +755,53 @@ impl LifecycleStorageEngine {
                 flushed_max_hlc: hlc,
                 ..current
             },
+        }
+    }
+}
+
+enum DiskScan {
+    Sst(MergedCursor),
+    Inline { from: Vec<u8> },
+}
+
+impl DiskScan {
+    fn is_finished(&self, end_key: &[u8]) -> bool {
+        match self {
+            DiskScan::Sst(_) => false,
+            DiskScan::Inline { from } => from.as_slice() >= end_key,
+        }
+    }
+
+    fn peek(
+        &mut self,
+        engine: &LifecycleStorageEngine,
+        pinned: &PinnedSnapshotData,
+        end_key: &[u8],
+    ) -> Result<Option<(Vec<u8>, PersistentEntry)>> {
+        match self {
+            DiskScan::Sst(cursor) => Ok(cursor
+                .peek()?
+                .map(|(key, value)| (key, PersistentEntry::from(value)))),
+            DiskScan::Inline { from } => {
+                if from.as_slice() >= end_key {
+                    return Ok(None);
+                }
+                let (page, _) =
+                    engine
+                        .backend
+                        .scan_in_version_page(&pinned.version, from, end_key, 1)?;
+                Ok(page.into_iter().next())
+            }
+        }
+    }
+
+    fn advance(&mut self, key: &[u8]) -> Result<()> {
+        match self {
+            DiskScan::Sst(cursor) => cursor.advance(),
+            DiskScan::Inline { from } => {
+                *from = key_successor(key);
+                Ok(())
+            }
         }
     }
 }

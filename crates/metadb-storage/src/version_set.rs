@@ -223,11 +223,44 @@ impl Version {
         }
         MergedCursor::open(readers, start, end)
     }
+
+    /// Like [`Self::merged_cursor`], but opens only the first overlapping file of each
+    /// non-overlapping level. The next file is opened when the current one is exhausted.
+    pub(crate) fn lazy_merged_cursor(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<MergedCursor> {
+        let l0 = self.levels[0].clone();
+        let mut later = Vec::with_capacity(NUM_LSM_LEVELS - 1);
+        for level in &self.levels[1..] {
+            let first = if start.is_empty() {
+                0
+            } else {
+                level.partition_point(|sst| sst.meta().max_key.as_slice() < start)
+            };
+            let mut files = Vec::new();
+            for sst in &level[first..] {
+                if end.is_some_and(|bound| sst.meta().min_key.as_slice() >= bound) {
+                    break;
+                }
+                files.push(sst.clone());
+            }
+            later.push(files);
+        }
+        MergedCursor::open_layered(l0, later, start, end)
+    }
+
+    pub(crate) fn has_sst_files(&self) -> bool {
+        self.levels.iter().any(|level| !level.is_empty())
+    }
 }
 
 /// K-way merge. Earlier readers win on equal keys (`L0` newest-first, then `L1..L3`).
 pub(crate) struct MergedCursor {
     sources: Vec<MergeSource>,
+    pending_levels: Vec<PendingLevel>,
+    reheap_ids: Vec<u32>,
     heap: BinaryHeap<HeapNode>,
     staged: Option<StagedEntry>,
     exhausted: bool,
@@ -237,7 +270,15 @@ struct MergeSource {
     cursor: SstCursor,
     precedence: u32,
     generation: u64,
-    needs_reheap: bool,
+    /// Index into `pending_levels` when this source walks a non-overlapping level.
+    level_slot: Option<usize>,
+}
+
+struct PendingLevel {
+    files: Vec<Arc<SstableReader>>,
+    next: usize,
+    start: Vec<u8>,
+    end: Option<Vec<u8>>,
 }
 
 struct StagedEntry {
@@ -279,31 +320,63 @@ impl MergedCursor {
         end: Option<&[u8]>,
     ) -> Result<Self> {
         let mut sources = Vec::with_capacity(readers.len());
-        let mut heap = BinaryHeap::new();
+        let heap = BinaryHeap::new();
         for (index, reader) in readers.into_iter().enumerate() {
-            let mut cursor = SstCursor::open(reader, start, end)?;
+            let cursor = SstCursor::open(reader, start, end)?;
             let cursor_id = index as u32;
-            if let Some((key, _)) = cursor.peek()? {
-                heap.push(HeapNode {
-                    key,
-                    precedence: cursor_id,
-                    cursor_id,
-                    generation: 0,
-                });
-            }
             sources.push(MergeSource {
                 cursor,
                 precedence: cursor_id,
                 generation: 0,
-                needs_reheap: false,
+                level_slot: None,
             });
         }
-        Ok(Self {
+        let mut cursor = Self {
             sources,
+            pending_levels: Vec::new(),
+            reheap_ids: Vec::new(),
             heap,
             staged: None,
             exhausted: false,
-        })
+        };
+        for id in 0..cursor.sources.len() {
+            cursor.reheap_one(id as u32)?;
+        }
+        Ok(cursor)
+    }
+
+    /// `L0` readers are opened immediately because they overlap. Each later level
+    /// opens its first overlapping file only; the rest wait until that file ends.
+    pub(crate) fn open_layered(
+        l0: Vec<Arc<SstableReader>>,
+        levels: Vec<Vec<Arc<SstableReader>>>,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Self> {
+        let mut cursor = Self::open(l0, start, end)?;
+        for files in levels {
+            if files.is_empty() {
+                continue;
+            }
+            let level_slot = cursor.pending_levels.len();
+            let precedence = ((level_slot as u32) + 1) << 20;
+            cursor.pending_levels.push(PendingLevel {
+                files,
+                next: 1,
+                start: start.to_vec(),
+                end: end.map(|key| key.to_vec()),
+            });
+            let reader = cursor.pending_levels[level_slot].files[0].clone();
+            let source_id = cursor.sources.len() as u32;
+            cursor.sources.push(MergeSource {
+                cursor: SstCursor::open(reader, start, end)?,
+                precedence,
+                generation: 0,
+                level_slot: Some(level_slot),
+            });
+            cursor.reheap_one(source_id)?;
+        }
+        Ok(cursor)
     }
 
     pub(crate) fn peek(&mut self) -> Result<Option<(Vec<u8>, BlockEntryValue)>> {
@@ -321,10 +394,10 @@ impl MergedCursor {
             return Ok(());
         };
         for source_id in staged.source_ids {
-            let source = &mut self.sources[source_id as usize];
-            source.cursor.advance();
-            source.generation = source.generation.wrapping_add(1);
-            source.needs_reheap = true;
+            self.sources[source_id as usize].cursor.advance();
+            self.sources[source_id as usize].generation =
+                self.sources[source_id as usize].generation.wrapping_add(1);
+            self.reheap_ids.push(source_id);
         }
         Ok(())
     }
@@ -389,23 +462,40 @@ impl MergedCursor {
     }
 
     fn reheap_pending(&mut self) -> Result<()> {
-        for cursor_id in 0..self.sources.len() {
-            if !self.sources[cursor_id].needs_reheap {
-                continue;
-            }
-            self.sources[cursor_id].needs_reheap = false;
-            let generation = self.sources[cursor_id].generation;
-            let precedence = self.sources[cursor_id].precedence;
-            let Some((key, _)) = self.sources[cursor_id].cursor.peek()? else {
-                continue;
-            };
-            self.heap.push(HeapNode {
-                key,
-                precedence,
-                cursor_id: cursor_id as u32,
-                generation,
-            });
+        let ids = std::mem::take(&mut self.reheap_ids);
+        for id in ids {
+            self.reheap_one(id)?;
         }
         Ok(())
+    }
+
+    fn reheap_one(&mut self, id: u32) -> Result<()> {
+        loop {
+            if let Some((key, _)) = self.sources[id as usize].cursor.peek()? {
+                let generation = self.sources[id as usize].generation;
+                let precedence = self.sources[id as usize].precedence;
+                self.heap.push(HeapNode {
+                    key,
+                    precedence,
+                    cursor_id: id,
+                    generation,
+                });
+                return Ok(());
+            }
+            let Some(level_slot) = self.sources[id as usize].level_slot else {
+                return Ok(());
+            };
+            if self.pending_levels[level_slot].next >= self.pending_levels[level_slot].files.len() {
+                return Ok(());
+            }
+            let reader =
+                self.pending_levels[level_slot].files[self.pending_levels[level_slot].next].clone();
+            self.pending_levels[level_slot].next += 1;
+            let start = self.pending_levels[level_slot].start.clone();
+            let end = self.pending_levels[level_slot].end.clone();
+            self.sources[id as usize].generation =
+                self.sources[id as usize].generation.wrapping_add(1);
+            self.sources[id as usize].cursor = SstCursor::open(reader, &start, end.as_deref())?;
+        }
     }
 }

@@ -141,6 +141,26 @@ struct PersistedSnapshotMeta {
     file_specs: Vec<(String, u64, u32)>,
 }
 
+struct CommandFlush<'a> {
+    engine: &'a LifecycleStorageEngine,
+    open: bool,
+}
+
+impl CommandFlush<'_> {
+    fn commit(mut self) -> Result<()> {
+        self.open = false;
+        self.engine.end_command(true)
+    }
+}
+
+impl Drop for CommandFlush<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self.engine.end_command(false);
+        }
+    }
+}
+
 fn attach_flush_hook(engine: &LifecycleStorageEngine, handler: &Arc<dyn ShardApplyHandler>) {
     engine.set_pre_flush_hook(Arc::new(HandlerFlushHook {
         handler: handler.clone(),
@@ -707,21 +727,31 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
                             descriptor: self.shared.handler.encode_descriptor_bytes(),
                             aux_index: self.shared.watermarks.snapshot_values().1,
                         });
-                        self.shared
-                            .handler
-                            .apply_command(log_id.index, commit_hlc, &req, &engine)
+                        // Seal only after every key and side effect of this command is in the memtable.
+                        engine.begin_command();
+                        let command = CommandFlush {
+                            engine: &engine,
+                            open: true,
+                        };
+                        match self.shared.handler.apply_command(
+                            log_id.index,
+                            commit_hlc,
+                            &req,
+                            &engine,
+                        ) {
+                            Ok(bytes) => command.commit().map(|()| bytes),
+                            Err(error) => {
+                                drop(command);
+                                Err(error)
+                            }
+                        }
                     };
                     let apply_res = match apply_res {
                         Ok(bytes) => self
                             .shared
                             .refresh_flushed_checkpoint(&engine, &log_id, commit_hlc)
                             .map(|()| bytes),
-                        Err(error) => {
-                            let _ = self
-                                .shared
-                                .refresh_flushed_checkpoint(&engine, &log_id, commit_hlc);
-                            Err(error)
-                        }
+                        Err(error) => Err(error),
                     };
 
                     let updated_epoch = self.shared.handler.current_epoch();
