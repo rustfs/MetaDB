@@ -144,6 +144,18 @@ async fn cross_shard_prepare_and_commit_retry_known_not_leader() {
     tx.mkdir(ROOT_INODE_ID, "other", 700, 7, 0o755)
         .await
         .expect("a split-style epoch mismatch must regroup and commit");
+    left_group.testing_fail_next_log_discarded(1);
+    right_group.testing_fail_next_log_discarded(1);
+    tx.mkdir(ROOT_INODE_ID, "third", 800, 7, 0o755)
+        .await
+        .expect("Prepare and Commit must retry a discarded log entry");
+    tx.create_file(ROOT_INODE_ID, "same_shard.dat", 42, 42, 7, 0o644, 8)
+        .await
+        .unwrap();
+    left_group.testing_fail_next_log_discarded(1);
+    tx.create_file(100, "again.dat", 43, 43, 7, 0o644, 8)
+        .await
+        .expect("a same-shard write must retry a discarded log entry");
     let found = tx.lookup(ROOT_INODE_ID, "dst").await.unwrap();
     assert!(found.is_some());
 }

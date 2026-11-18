@@ -15,7 +15,8 @@ use metadb_core::{HlcTimestamp, MetaDbError, MetaKey, ROOT_INODE_ID};
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::metadata_service_client::MetadataServiceClient;
 use metadb_proto::{
-    CreateFileRequest, GetRoutesRequest, LookupRequest, MkdirRequest, ShardDescriptorProto,
+    CreateFileRequest, GetDirPartitionStatRequest, GetRoutesRequest, LookupRequest, MkdirRequest,
+    RequestRoutingHeader, ShardDescriptorProto,
 };
 use metadb_server::{PersistentMetaDbCluster, ServerTomlConfig};
 use metadb_tx::TxRaftCmd;
@@ -188,6 +189,14 @@ async fn second_process_joins_existing_raft_group_fails_over_and_reopens() {
     assert!(create_named(&node2, "from_follower.dat", 110, 510).await);
     wait_visible(&node1, "from_follower.dat").await;
     node2.tx_router().dirstat(BUCKET_ID).await.unwrap();
+    let partition = follower_dir_partition(&addr2, &node2).await;
+    assert!(
+        partition.error.is_none(),
+        "follower GetDirPartitionStat returned {:?}",
+        partition.error
+    );
+    assert!(partition.is_anchor);
+    assert!(partition.partition_attr.is_some());
     assert_eq!(
         node1.cell_manager().bound_instance(2),
         Some(node2.cell_manager().node_instance_id())
@@ -373,6 +382,12 @@ async fn stale_route_cache_does_not_drop_a_live_voter() {
             .lookup_local_handle(route.shard_id)
             .unwrap();
         assert_eq!(
+            route.epoch.conf_ver,
+            group.current_epoch().conf_ver,
+            "shard {} status conf_ver lagged the applied Raft membership",
+            route.shard_id
+        );
+        assert_eq!(
             route.epoch,
             group.current_epoch(),
             "shard {} status epoch lagged the applied Raft epoch",
@@ -388,6 +403,12 @@ async fn stale_route_cache_does_not_drop_a_live_voter() {
             reported,
             node2.cell_manager().raft_voter_ids(route.shard_id).unwrap(),
             "shard {} status voters lagged Raft membership",
+            route.shard_id
+        );
+        assert_eq!(
+            reported,
+            BTreeSet::from([1, 2, 3]),
+            "shard {} reported the previous two-voter set after node 3 joined",
             route.shard_id
         );
     }
@@ -592,6 +613,59 @@ async fn wait_lookup_on_any(addrs: &[&str], name: &str) -> String {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("timed out waiting for {name} on {addrs:?}");
+}
+
+async fn follower_dir_partition(
+    addr: &str,
+    cluster: &PersistentMetaDbCluster,
+) -> metadb_proto::GetDirPartitionStatResponse {
+    let route = cluster
+        .cell_manager()
+        .list_routes()
+        .into_iter()
+        .next()
+        .expect("follower has a shard route");
+    let mut meta = MetadataServiceClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    meta.get_dir_partition_stat(GetDirPartitionStatRequest {
+        header: Some(RequestRoutingHeader {
+            shard_id: route.shard_id,
+            expected_epoch: Some(route.epoch.into()),
+            caller_hlc: 0,
+        }),
+        pid: BUCKET_ID,
+        use_fixed_barrier_hlc: false,
+        barrier_hlc: 0,
+    })
+    .await
+    .unwrap()
+    .into_inner()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_join_returns_and_releases_the_directory() {
+    let dir = tempdir().unwrap();
+    let mut cfg = fast_config(&dir.path().join("joiner"), 2, "127.0.0.1:1");
+    cfg.join_timeout = Some(Duration::from_millis(700));
+    let started = std::time::Instant::now();
+    let first = match PersistentMetaDbCluster::open_and_serve(cfg.clone()).await {
+        Ok(_) => panic!("join to a closed port succeeded"),
+        Err(error) => error,
+    };
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "a refused join waited without returning"
+    );
+    assert!(!first.to_string().contains("exclusive lock"), "{first}");
+    let second = match PersistentMetaDbCluster::open_and_serve(cfg).await {
+        Ok(_) => panic!("second join to a closed port succeeded"),
+        Err(error) => error,
+    };
+    assert!(
+        !second.to_string().contains("exclusive lock"),
+        "failed join left the data directory locked: {second}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

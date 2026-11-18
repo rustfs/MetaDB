@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::errors::{LinearizableReadError, RaftError};
 use openraft::ReadPolicy;
 use tokio::sync::{oneshot, watch, Mutex};
 
@@ -125,13 +124,9 @@ impl ReadIndexBatcher {
 
                 let res = match raft.ensure_linearizable(ReadPolicy::ReadIndex).await {
                     Ok(read_log_id) => Ok(read_log_id.index()),
-                    Err(RaftError::APIError(LinearizableReadError::ForwardToLeader(fwd))) => {
-                        Err(MetaDbError::NotLeader {
-                            shard_id,
-                            leader_hint: fwd.leader_id,
-                        })
-                    }
-                    Err(other) => Err(MetaDbError::ConsensusError(other.to_string())),
+                    Err(error) => Err(crate::error_map::map_linearizable_read_error(
+                        shard_id, error,
+                    )),
                 };
                 for w in waiters {
                     let _ = w.send(res.clone());

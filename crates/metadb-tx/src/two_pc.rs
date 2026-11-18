@@ -107,6 +107,15 @@ pub struct DirRenameLease {
 }
 
 pub type RoutedShardHandle = (ShardEpoch, Arc<ShardRaftGroup>, Arc<TxStateMachineHandler>);
+
+/// One shard's directory partition, as returned by `GetDirPartitionStat`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirPartitionStat {
+    pub is_anchor: bool,
+    pub attr: Option<InodeAttr>,
+    pub max_applied_hlc: u64,
+    pub anchor_missing: bool,
+}
 type PreparedShardBatch = (ShardEpoch, Arc<ShardRaftGroup>, Vec<Vec<u8>>);
 type ShardIntentGroup = (ShardEpoch, Arc<ShardRaftGroup>, Vec<(Vec<u8>, IntentOp)>);
 
@@ -286,11 +295,8 @@ impl DistributedTxRouter {
                 Ok((applied_hlc, decoded)) => {
                     return Ok((epoch, group, applied_hlc, decoded));
                 }
-                Err(MetaDbError::NotLeader { .. }) => {
-                    last = Some(MetaDbError::NotLeader {
-                        shard_id: group.shard_id(),
-                        leader_hint: None,
-                    });
+                Err(error) if error.is_retryable_write_consensus() => {
+                    last = Some(error);
                     tokio::time::sleep(ROUTE_RETRY_INTERVAL).await;
                 }
                 Err(error) => return Err(error),
@@ -344,7 +350,7 @@ impl DistributedTxRouter {
             .await;
             match result {
                 Ok((_, out)) => return Ok(out),
-                Err(MetaDbError::NotLeader { .. }) if attempt < 11 => {
+                Err(error) if error.is_retryable_write_consensus() && attempt < 11 => {
                     tokio::time::sleep(std::time::Duration::from_millis(5 * (attempt as u64 + 1)))
                         .await;
                 }
@@ -1444,6 +1450,22 @@ impl DistributedTxRouter {
                 self.local_index_scan(shard_id, epoch, &start, &end, limit)
                     .await?,
             ),
+            ForwardedRouterOp::ShardDirPartition {
+                shard_id,
+                epoch,
+                pid,
+                barrier,
+            } => {
+                let stat = self
+                    .local_dir_partition(shard_id, epoch, pid, barrier)
+                    .await?;
+                ForwardedRouterOut::DirPartition {
+                    is_anchor: stat.is_anchor,
+                    attr: stat.attr,
+                    max_applied_hlc: stat.max_applied_hlc,
+                    anchor_missing: stat.anchor_missing,
+                }
+            }
         };
         codec::serialize(&out).map_err(|error| MetaDbError::CodecError(error.to_string()))
     }
@@ -1713,6 +1735,119 @@ impl DistributedTxRouter {
         Err(MetaDbError::ShardRoutingError(
             "anchor read exceeded max intent/route retries".to_string(),
         ))
+    }
+
+    /// Directory partition on `shard_id`. A follower that knows the leader forwards
+    /// this read and does not return `NotLeader` to the caller.
+    pub async fn dir_partition_stat(
+        &self,
+        shard_id: u64,
+        epoch: ShardEpoch,
+        pid: InodeId,
+        barrier: Option<HlcTimestamp>,
+    ) -> Result<DirPartitionStat> {
+        match self
+            .local_dir_partition(shard_id, epoch, pid, barrier)
+            .await
+        {
+            Err(MetaDbError::NotLeader {
+                shard_id,
+                leader_hint: Some(leader),
+            }) => {
+                self.forward_shard(
+                    shard_id,
+                    leader,
+                    ForwardedRouterOp::ShardDirPartition {
+                        shard_id,
+                        epoch,
+                        pid,
+                        barrier,
+                    },
+                    |out| match out {
+                        ForwardedRouterOut::DirPartition {
+                            is_anchor,
+                            attr,
+                            max_applied_hlc,
+                            anchor_missing,
+                        } => Some(DirPartitionStat {
+                            is_anchor,
+                            attr,
+                            max_applied_hlc,
+                            anchor_missing,
+                        }),
+                        _ => None,
+                    },
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+
+    async fn local_dir_partition(
+        &self,
+        shard_id: u64,
+        epoch: ShardEpoch,
+        pid: InodeId,
+        barrier: Option<HlcTimestamp>,
+    ) -> Result<DirPartitionStat> {
+        let (_, group, handler) = self.directory.local_shard(shard_id)?;
+        let (token, snap) = match barrier {
+            Some(barrier) => group.fixed_barrier_read(epoch, barrier).await?,
+            None => group.linearizable_read(epoch).await?,
+        };
+        Self::validate_read_epoch(&group, epoch)?;
+        let max_applied_hlc = token.max_applied_hlc.0;
+        let attr_key = MetaKey::dir_attr(pid).encode();
+        if handler.key_range().contains_key(&attr_key) {
+            let attr = match group.engine().get_with_snapshot(&attr_key, &snap)? {
+                Some(raw) => {
+                    let base = InodeAttr::decode(&raw)?;
+                    Some(
+                        handler
+                            .attr_aggregator()
+                            .reconcile_inode_attr(pid, base, &snap),
+                    )
+                }
+                None => None,
+            };
+            return Ok(DirPartitionStat {
+                is_anchor: true,
+                anchor_missing: attr.is_none(),
+                attr,
+                max_applied_hlc,
+            });
+        }
+        let delta_key = DirShardDeltaKey { pid }.encode();
+        let attr = match group.engine().get_with_snapshot(&delta_key, &snap)? {
+            Some(raw) => {
+                let sub_base = DirShardDeltaRecord::decode(&raw)?;
+                let sub = handler
+                    .attr_aggregator()
+                    .reconcile_dir_shard_delta(pid, sub_base, &snap);
+                Some(InodeAttr {
+                    inode_id: sub.inode_id,
+                    parent_pid: sub.parent_pid,
+                    entry_type: EntryType::DirectoryAttr,
+                    uid: sub.uid,
+                    mode: sub.mode,
+                    link_count: 1,
+                    num_children: sub.num_children,
+                    size_bytes: sub.size_bytes,
+                    create_time: sub.create_time,
+                    modify_time: sub.modify_time,
+                    fid: None,
+                    applied_lsn: sub.applied_raft_index,
+                })
+            }
+            None => None,
+        };
+        Ok(DirPartitionStat {
+            is_anchor: false,
+            attr,
+            max_applied_hlc,
+            anchor_missing: false,
+        })
     }
 
     /// Linearizable `DirStat(pid)`:

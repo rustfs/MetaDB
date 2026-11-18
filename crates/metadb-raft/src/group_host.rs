@@ -1,6 +1,6 @@
 //! Per-shard `ShardRaftGroup` wrapper and multi-shard `ShardGroupHost` with `NODE_SHARD_REGISTRY`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use openraft::async_runtime::watch::WatchReceiver;
-use openraft::errors::{ClientWriteError, RaftError};
+use openraft::errors::RaftError;
 use openraft::{BasicNode, Config};
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,18 @@ use crate::network::{
 use crate::read_index::{ReadIndexBatcher, ReadToken};
 use crate::state_machine::{ShardApplyHandler, ShardStateMachine};
 use crate::types::{MetaDbRaftRequest, MetaDbRaftResponse, ShardWatermarkTracker};
+
+/// Union of the voter configs in an applied membership.
+///
+/// A uniform config is a single set. A joint config contributes every voter that
+/// Raft has already applied, so status does not keep the previous uniform set.
+pub fn voter_ids_from_joint_configs<I, S>(configs: I) -> BTreeSet<NodeId>
+where
+    I: IntoIterator<Item = S>,
+    S: IntoIterator<Item = NodeId>,
+{
+    configs.into_iter().flatten().collect()
+}
 
 /// Tuning parameters for OpenRaft timers and snapshot policies.
 #[derive(Debug, Clone)]
@@ -136,6 +148,7 @@ pub struct ShardRaftGroup {
     /// `(remaining failures, leader hint)` injected before `client_write`.
     testing_not_leader: std::sync::Mutex<(u32, Option<NodeId>)>,
     testing_epoch_mismatch: std::sync::atomic::AtomicU32,
+    testing_log_discarded: std::sync::atomic::AtomicU32,
 }
 
 impl ShardRaftGroup {
@@ -220,6 +233,7 @@ impl ShardRaftGroup {
             channel_pool,
             testing_not_leader: std::sync::Mutex::new((0, None)),
             testing_epoch_mismatch: std::sync::atomic::AtomicU32::new(0),
+            testing_log_discarded: std::sync::atomic::AtomicU32::new(0),
         });
         router.register_local_proposer(shard_id, group.clone());
         Ok(group)
@@ -234,6 +248,12 @@ impl ShardRaftGroup {
     /// The next `count` `propose` calls return `NotLeader` before reaching Raft.
     pub fn testing_fail_next_proposals(&self, count: u32, leader_hint: Option<NodeId>) {
         *self.testing_not_leader.lock().unwrap() = (count, leader_hint);
+    }
+
+    /// The next `count` proposals fail as a discarded log entry before reaching Raft.
+    pub fn testing_fail_next_log_discarded(&self, count: u32) {
+        self.testing_log_discarded
+            .store(count, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn current_leader(&self) -> Option<NodeId> {
@@ -404,6 +424,38 @@ impl ShardRaftGroup {
         Ok(out)
     }
 
+    /// Voter ids in the applied Raft membership, including every config of a joint pair.
+    ///
+    /// Status and `GetRoutes` use this so a third voter that is already in the applied
+    /// membership is visible before the uniform config commits. Membership changes are
+    /// still planned from [`uniform_voter_addrs`](Self::uniform_voter_addrs).
+    pub fn applied_voter_addrs(&self) -> Result<BTreeMap<NodeId, String>> {
+        let metrics = self.raft.metrics();
+        let snapshot = metrics.borrow_watched().clone();
+        let membership = snapshot.membership_config.membership();
+        let ids = voter_ids_from_joint_configs(
+            membership
+                .get_joint_config()
+                .iter()
+                .map(|set| set.iter().copied()),
+        );
+        if ids.is_empty() {
+            return Err(MetaDbError::ConsensusError(format!(
+                "shard {} has no applied voters",
+                self.shard_id
+            )));
+        }
+        let mut out = BTreeMap::new();
+        for id in ids {
+            let addr = membership
+                .get_node(&id)
+                .map(|node| node.addr.clone())
+                .unwrap_or_default();
+            out.insert(id, addr);
+        }
+        Ok(out)
+    }
+
     pub async fn wait_uniform_voter_addrs(&self) -> Result<BTreeMap<NodeId, String>> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -498,6 +550,19 @@ impl ShardRaftGroup {
                 actual: expected_epoch.bump_version(),
             });
         }
+        if self
+            .testing_log_discarded
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            self.testing_log_discarded
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(MetaDbError::RetryableConsensus {
+                shard_id: self.shard_id,
+                leader_hint: Some(self.node_id),
+                kind: metadb_core::RetryableConsensusKind::LogDiscarded,
+            });
+        }
         match self
             .propose_local(expected_epoch, caller_hlc, payload.clone())
             .await
@@ -509,6 +574,18 @@ impl ShardRaftGroup {
                     payload,
                 };
                 self.forward_client_write(leader_hint, None, request, deadline)
+                    .await
+            }
+            Err(MetaDbError::RetryableConsensus {
+                leader_hint: Some(leader),
+                ..
+            }) if leader != self.node_id => {
+                let request = MetaDbRaftRequest {
+                    expected_epoch,
+                    hlc: caller_hlc,
+                    payload,
+                };
+                self.forward_client_write(Some(leader), None, request, deadline)
                     .await
             }
             other => other,
@@ -554,13 +631,12 @@ impl ShardRaftGroup {
 
         let write_resp = match self.raft.client_write(req).await {
             Ok(response) => response,
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => {
-                return Err(MetaDbError::NotLeader {
-                    shard_id: self.shard_id,
-                    leader_hint: fwd.leader_id,
-                });
+            Err(error) => {
+                return Err(crate::error_map::map_client_write_error(
+                    self.shard_id,
+                    error,
+                ))
             }
-            Err(error) => return Err(MetaDbError::ConsensusError(error.to_string())),
         };
         let app_resp = write_resp.data;
         if let Err(err) = &app_resp.result {
@@ -926,4 +1002,25 @@ fn decode_registry(body: &[u8]) -> Result<BTreeMap<ShardId, RegistryShardState>>
             (id, state)
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joint_membership_reports_every_applied_voter() {
+        let previous = BTreeSet::from([1, 2]);
+        let incoming = BTreeSet::from([1, 2, 3]);
+        let reported = voter_ids_from_joint_configs([previous.clone(), incoming]);
+        assert_eq!(reported, BTreeSet::from([1, 2, 3]));
+        assert_ne!(
+            reported, previous,
+            "a joint config must not keep the previous uniform voter set"
+        );
+        assert_eq!(
+            voter_ids_from_joint_configs([BTreeSet::from([1, 2, 3])]),
+            BTreeSet::from([1, 2, 3])
+        );
+    }
 }

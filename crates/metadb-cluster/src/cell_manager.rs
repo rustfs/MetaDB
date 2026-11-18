@@ -537,7 +537,7 @@ impl DurableCellManager {
         let mut routes = self.list_routes();
         for route in &mut routes {
             let (_, group, _) = self.lookup_local_handle(route.shard_id)?;
-            let voters = group.uniform_voter_addrs()?;
+            let voters = group.applied_voter_addrs()?;
             route.epoch = group.current_epoch();
             route.peers = voters
                 .into_iter()
@@ -550,7 +550,7 @@ impl DurableCellManager {
     /// Committed voter ids for `shard_id`, taken from Raft rather than the route cache.
     pub fn raft_voter_ids(&self, shard_id: ShardId) -> Result<BTreeSet<NodeId>> {
         let (_, group, _) = self.lookup_local_handle(shard_id)?;
-        Ok(group.uniform_voter_addrs()?.into_keys().collect())
+        Ok(group.applied_voter_addrs()?.into_keys().collect())
     }
 
     /// Voter set `remove_voter` would submit, planned from Raft membership.
@@ -992,10 +992,21 @@ impl DurableCellManager {
             if let Some(leader) = group.current_leader() {
                 route.leader_node = leader;
             }
-            if let Ok(voters) = group.uniform_voter_addrs() {
+            if let Ok(voters) = group.applied_voter_addrs() {
                 route.peers = voters
                     .into_iter()
-                    .map(|(node_id, addr)| (node_id, (addr, true)))
+                    .map(|(node_id, addr)| {
+                        let addr = if addr.is_empty() {
+                            route
+                                .peers
+                                .get(&node_id)
+                                .map(|(cached, _)| cached.clone())
+                                .unwrap_or_default()
+                        } else {
+                            addr
+                        };
+                        (node_id, (addr, true))
+                    })
                     .collect();
             }
         }

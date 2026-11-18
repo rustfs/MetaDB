@@ -93,6 +93,13 @@ pub enum ForwardedRouterOp {
         end: Vec<u8>,
         limit: usize,
     },
+    /// One shard's directory partition, anchor or delta, read on that shard's leader.
+    ShardDirPartition {
+        shard_id: u64,
+        epoch: metadb_core::ShardEpoch,
+        pid: InodeId,
+        barrier: Option<metadb_core::HlcTimestamp>,
+    },
 }
 
 #[derive(
@@ -119,6 +126,12 @@ pub enum ForwardedRouterOut {
         children: i64,
         bytes: i64,
         mtime: u64,
+    },
+    DirPartition {
+        is_anchor: bool,
+        attr: Option<InodeAttr>,
+        max_applied_hlc: u64,
+        anchor_missing: bool,
     },
 }
 

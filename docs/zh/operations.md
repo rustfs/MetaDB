@@ -101,7 +101,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 不能当作运维步骤的做法：
 
 1. `metadbd --role be`、`--role proxy`、`--role cell-manager` 和 `--role global-manager` 在 `open_and_serve` 中退出。子系统不会按角色裁剪，进程拒绝以这些名字启动它们。
-2. 第二个 `metadbd --role all-in-one` 在数据目录为空、且 `--join` 或 `--cell-manager` 指向当前 leader 时，会加入已有 Raft 组。leader 先追加一条空日志并做快照，再把加入者从 learner 提升为 voter。`--join` 必须打到该 leader。已经有 Raft 状态的目录会重新打开本地状态，并忽略新的 join 地址。每个进程仍有自己的 ID 分配器，后加入进程自动发出的 inode 和 file id 可能与第一个进程已经发出的 id 冲突。follower 上的 `Lookup` 返回 `NotLeader`，不会转发。
+2. 第二个 `metadbd --role all-in-one` 在数据目录为空、且 `--join` 或 `--cell-manager` 指向当前 leader 时，会加入已有 Raft 组。leader 先追加一条空日志并做快照，再把加入者从 learner 提升为 voter。`--join` 必须打到该 leader。已经有 Raft 状态的目录会重新打开本地状态，并忽略新的 join 地址。节点号 2 到 32767 的全新分配器从该节点自己的 inode、file id 和 shard id 命名空间起步，因此不会重发节点 1 已经发出的 id。已经发过低位 id 的分配器文件不会被搬迁。已知 leader 的 follower 上，`Lookup`、列目录、目录统计、`GetDirPartitionStat`、配额读和二级索引读会转发到该 leader。不知道 leader 时仍返回 `NotLeader`。成员变更处于 joint 时，`GetRoutes` 报告已经应用的全部投票者、当前 leader 和应用后的 epoch。统一配置提交后，这些投票者和 `conf_ver` 与 Raft 一致。加入在 45 秒内重试暂时性错误，然后关闭监听和本地 Raft 组并返回错误。`metadbd` 结束是因为启动返回了这个错误。第一次失败本身不会中止进程。
 3. `metadb-ctl cell register` 不创建第二个单元。`open_and_serve` 只把本地单元注册到全局管理器。
 4. 测试 `T1`–`T6` 使用的内存路径 `MetaDbEngine::new_single_node` 可以把内存中的投票者计数加到 3。那个对象没有磁盘，也没有 Raft。它不是 `metadbd` 的扩容。
 
@@ -119,7 +119,8 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 | `InvalidEntryType` | 对文件 `rmdir`，或对目录 `unlink` |
 | `TransactionTimeout` | 快照 HLC 早于内存 MVCC 窗口 |
 | `ClockSkewExceeded` | 远端 HLC 领先本地墙钟超过 `max_clock_drift_ms` |
-| `EpochMismatch` / `NotLeader` | 过期的路由纪元，或向非领导者提议 |
+| `EpochMismatch` / `NotLeader` | 过期的路由纪元，或本副本不是 leader。已知 leader 的 follower 读会转发。多键 Prepare 上的 `EpochMismatch` 会放弃这一轮并重新分组，不会把同一批再提议一次 |
+| `RetryableConsensus` | 写日志在换主时被丢弃，或法定人数没有应答。同分片写和 2PC 会在现有路由预算内重试。被丢弃的条目可能已由另一个 leader 提交，因此随后的 `AlreadyExists` 或 `EpochMismatch` 按应用错误返回。存储失败和已停止的 Raft 节点仍是 `ConsensusError`，不会重试 |
 | `UnsplittableJumboShard` | 内存分裂器（`shard.rs`），不是持久巨型路径。持久路径设置 `JumboIsolated` 并在没有子分片时返回成功 |
 | `WriteIntentConflict` / `TransactionAborted` | 2PC 冲突，或目录重命名租约已被持有 |
 | `InvalidRenameCycle` | 把目录重命名到自身或后代 |

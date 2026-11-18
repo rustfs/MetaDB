@@ -2,6 +2,7 @@
 
 pub mod backup;
 pub mod conf_change;
+mod error_map;
 pub mod group_host;
 pub mod log_store;
 pub mod network;
