@@ -331,14 +331,13 @@ impl StateMachineShared {
         let ckpt_preview = engine.durable_checkpoint();
         let snap_index = ckpt_preview.flushed_raft_index;
         let tmp_dir = snaps_root.join(format!("snap_{:020}.tmp", snap_index));
-        let final_dir = snaps_root.join(format!("snap_{:020}", snap_index));
         if tmp_dir.exists() {
             fs::remove_dir_all(&tmp_dir)?;
         }
-        if final_dir.exists() {
-            fs::remove_dir_all(&final_dir)?;
-        }
 
+        // Do not delete `snap_<index>` before this temporary directory is complete.
+        // A reader that opens the live directory during that gap sees ENOENT and
+        // OpenRaft turns that into a fatal `Read Snapshot` error.
         let ckpt_lsm_dir = tmp_dir.join("lsm");
         let checkpoint = engine
             .create_checkpoint(&ckpt_lsm_dir)
@@ -402,16 +401,7 @@ impl StateMachineShared {
 
         // Persist SNAPSHOT_META's directory entry before publishing the snapshot.
         sync_dir(&tmp_dir).map_err(|e| io::Error::other(e.to_string()))?;
-        fs::rename(&tmp_dir, &final_dir)?;
-        sync_dir(&snaps_root).map_err(|e| io::Error::other(e.to_string()))?;
-        // Remove older `snap_*` directories only AFTER `final_dir` is durably fsync'd in `snaps_root`.
-        for d in fs::read_dir(&snaps_root)? {
-            let d = d?;
-            if d.path() != final_dir {
-                let _ = fs::remove_dir_all(d.path());
-            }
-        }
-        sync_dir(&snaps_root).map_err(|e| io::Error::other(e.to_string()))?;
+        publish_snapshot_dir(&snaps_root, snap_index, &tmp_dir)?;
 
         self.watermarks
             .advance_last_snapshot(checkpoint.flushed_raft_index);
@@ -426,63 +416,193 @@ impl StateMachineShared {
         &self,
     ) -> io::Result<Option<SnapshotOf<MetaDbTypeConfig, SnapshotArchive>>> {
         let snaps_root = self.shard_dir.join("raft/snapshots");
-        if !snaps_root.exists() {
-            return Ok(None);
-        }
-        let mut best: Option<(u64, PathBuf)> = None;
-        for d in fs::read_dir(&snaps_root)? {
-            let d = d?;
-            let fname = d.file_name();
-            let Some(name) = fname.to_str() else {
-                continue;
-            };
-            if let Some(num) = name.strip_prefix("snap_") {
-                if !num.ends_with(".tmp") {
-                    if let Ok(idx) = num.parse::<u64>() {
-                        if best.as_ref().map(|(b, _)| idx > *b).unwrap_or(true) {
-                            best = Some((idx, d.path()));
-                        }
-                    }
+        // A missing file used to return `NotFound`. OpenRaft maps that to
+        // `StorageError { subject: Snapshot(None), verb: Read }` and stops RaftCore,
+        // after which every later read repeats the same error. Skip a broken
+        // directory and use the newest complete snapshot instead, including the
+        // `.bak` copy left by an in-progress replace.
+        for (_, snap_dir) in snapshot_candidates(&snaps_root) {
+            match load_snapshot_dir(&snap_dir) {
+                Ok(snapshot) => return Ok(Some(snapshot)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    tracing::warn!(
+                        path = %snap_dir.display(),
+                        "skipping raft snapshot directory with a missing file"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %snap_dir.display(),
+                        error = %error,
+                        "skipping unreadable raft snapshot directory"
+                    );
                 }
             }
         }
-        let Some((_, snap_dir)) = best else {
-            return Ok(None);
-        };
-        let mut raw_meta = Vec::new();
-        File::open(snap_dir.join("SNAPSHOT_META"))?.read_to_end(&mut raw_meta)?;
-        let body = verify_crc32c_le(&raw_meta, "SNAPSHOT_META")
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let pmeta: PersistedSnapshotMeta = codec::deserialize(body)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-        let lsm_dir = snap_dir.join("lsm");
-        let mut files = Vec::with_capacity(pmeta.file_specs.len());
-        for (fname, expected_len, expected_crc) in &pmeta.file_specs {
-            let mut buf = Vec::new();
-            File::open(lsm_dir.join(fname))?.read_to_end(&mut buf)?;
-            if buf.len() as u64 != *expected_len || checksum_crc32c(&buf) != *expected_crc {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("snapshot file {} failed length/CRC32C check", fname),
-                ));
-            }
-            files.push(SnapshotFileEntry {
-                name: fname.clone(),
-                expected_len: *expected_len,
-                crc32c: *expected_crc,
-                bytes: buf,
-            });
-        }
-
-        Ok(Some(Snapshot {
-            meta: pmeta.meta,
-            snapshot: SnapshotArchive {
-                checkpoint: pmeta.checkpoint,
-                files,
-            },
-        }))
+        Ok(None)
     }
+}
+
+/// Highest snapshot index whose directory is complete. Log purge must not pass this.
+pub(crate) fn highest_durable_snapshot_index(raft_dir: &Path) -> u64 {
+    snapshot_candidates(&raft_dir.join("snapshots"))
+        .into_iter()
+        .filter(|(_, path)| snapshot_dir_is_complete(path))
+        .map(|(index, _)| index)
+        .max()
+        .unwrap_or(0)
+}
+
+fn snapshot_candidates(snaps_root: &Path) -> Vec<(u64, PathBuf)> {
+    let Ok(entries) = fs::read_dir(snaps_root) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix("snap_") else {
+            continue;
+        };
+        let (index_text, rank) = if let Some(index_text) = rest.strip_suffix(".bak") {
+            (index_text, 0u8)
+        } else if rest.ends_with(".tmp") || rest.contains('.') {
+            continue;
+        } else {
+            (rest, 1u8)
+        };
+        let Ok(index) = index_text.parse::<u64>() else {
+            continue;
+        };
+        found.push((index, rank, entry.path()));
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    found
+        .into_iter()
+        .map(|(index, _, path)| (index, path))
+        .collect()
+}
+
+fn snapshot_dir_is_complete(snap_dir: &Path) -> bool {
+    load_snapshot_meta(snap_dir)
+        .map(|meta| snapshot_files_present(snap_dir, &meta))
+        .unwrap_or(false)
+}
+
+fn snapshot_files_present(snap_dir: &Path, meta: &PersistedSnapshotMeta) -> bool {
+    let lsm_dir = snap_dir.join("lsm");
+    meta.file_specs.iter().all(|(name, expected_len, _)| {
+        fs::metadata(lsm_dir.join(name))
+            .map(|info| info.is_file() && info.len() == *expected_len)
+            .unwrap_or(false)
+    })
+}
+
+fn load_snapshot_meta(snap_dir: &Path) -> io::Result<PersistedSnapshotMeta> {
+    let mut raw_meta = Vec::new();
+    File::open(snap_dir.join("SNAPSHOT_META"))?.read_to_end(&mut raw_meta)?;
+    let body = verify_crc32c_le(&raw_meta, "SNAPSHOT_META")
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    codec::deserialize(body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+}
+
+fn load_snapshot_dir(snap_dir: &Path) -> io::Result<SnapshotOf<MetaDbTypeConfig, SnapshotArchive>> {
+    let pmeta = load_snapshot_meta(snap_dir)?;
+    let lsm_dir = snap_dir.join("lsm");
+    let mut files = Vec::with_capacity(pmeta.file_specs.len());
+    for (fname, expected_len, expected_crc) in &pmeta.file_specs {
+        let mut buf = Vec::new();
+        File::open(lsm_dir.join(fname))?.read_to_end(&mut buf)?;
+        if buf.len() as u64 != *expected_len || checksum_crc32c(&buf) != *expected_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("snapshot file {fname} failed length/CRC32C check"),
+            ));
+        }
+        files.push(SnapshotFileEntry {
+            name: fname.clone(),
+            expected_len: *expected_len,
+            crc32c: *expected_crc,
+            bytes: buf,
+        });
+    }
+    Ok(Snapshot {
+        meta: pmeta.meta,
+        snapshot: SnapshotArchive {
+            checkpoint: pmeta.checkpoint,
+            files,
+        },
+    })
+}
+
+/// Publishes `tmp_dir` as `snap_<index>` without removing the previous complete
+/// snapshot until the new directory is renamed into place and the parent is synced.
+fn publish_snapshot_dir(snaps_root: &Path, index: u64, tmp_dir: &Path) -> io::Result<()> {
+    let final_dir = snaps_root.join(format!("snap_{index:020}"));
+    let bak_dir = snaps_root.join(format!("snap_{index:020}.bak"));
+    if bak_dir.exists() {
+        fs::remove_dir_all(&bak_dir)?;
+    }
+    if final_dir.exists() {
+        fs::rename(&final_dir, &bak_dir)?;
+    }
+    fs::rename(tmp_dir, &final_dir)?;
+    sync_dir(snaps_root).map_err(|e| io::Error::other(e.to_string()))?;
+    if bak_dir.exists() {
+        let _ = fs::remove_dir_all(&bak_dir);
+    }
+    if let Ok(entries) = fs::read_dir(snaps_root) {
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Some(rest) = name.strip_prefix("snap_") else {
+                continue;
+            };
+            if rest.ends_with(".tmp") || rest.ends_with(".bak") || rest.contains('.') {
+                continue;
+            }
+            if rest.parse::<u64>().ok().is_some_and(|older| older < index) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    sync_dir(snaps_root).map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(())
+}
+
+/// Writes an empty complete snapshot directory at `index`.
+///
+/// Recovery tests use this to cover a log prefix without building an LSM
+/// checkpoint. A directory without `SNAPSHOT_META` does not cover a purge.
+pub fn write_complete_snapshot_marker(raft_dir: &Path, index: u64) -> io::Result<()> {
+    let snaps_root = raft_dir.join("snapshots");
+    fs::create_dir_all(&snaps_root)?;
+    let snap_dir = snaps_root.join(format!("snap_{index:020}"));
+    if snap_dir.exists() {
+        fs::remove_dir_all(&snap_dir)?;
+    }
+    fs::create_dir_all(&snap_dir)?;
+    let persisted = PersistedSnapshotMeta {
+        meta: SnapshotMeta {
+            last_log_id: Some(LogIdOf::<MetaDbTypeConfig>::new(
+                CommittedLeaderIdOf::<MetaDbTypeConfig>::new(1, 1),
+                index,
+            )),
+            last_membership: StoredMembership::default(),
+        },
+        checkpoint: DurableShardCheckpoint {
+            flushed_raft_index: index,
+            ..DurableShardCheckpoint::default()
+        },
+        file_specs: Vec::new(),
+    };
+    let mut bytes = codec::serialize(&persisted)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    append_crc32c_le(&mut bytes);
+    fs::write(snap_dir.join("SNAPSHOT_META"), bytes)?;
+    Ok(())
 }
 
 pub struct ShardSnapshotBuilder {
@@ -988,13 +1108,9 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
         // Persist in `raft/snapshots/snap_<S>` so `get_current_snapshot` returns it on restart!
         let snaps_root = self.shared.shard_dir.join("raft/snapshots");
         fs::create_dir_all(&snaps_root)?;
-        let saved_snap_dir = snaps_root.join(format!("snap_{:020}", snap_idx));
         let saved_tmp = snaps_root.join(format!("snap_{:020}.tmp", snap_idx));
         if saved_tmp.exists() {
             fs::remove_dir_all(&saved_tmp)?;
-        }
-        if saved_snap_dir.exists() {
-            fs::remove_dir_all(&saved_snap_dir)?;
         }
         let _ = reopened
             .create_checkpoint(&saved_tmp.join("lsm"))
@@ -1017,15 +1133,7 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
             mf.sync_data()?;
         }
         sync_dir(&saved_tmp).map_err(|e| io::Error::other(e.to_string()))?;
-        fs::rename(&saved_tmp, &saved_snap_dir)?;
-        sync_dir(&snaps_root).map_err(|e| io::Error::other(e.to_string()))?;
-        for d in fs::read_dir(&snaps_root)? {
-            let d = d?;
-            if d.path() != saved_snap_dir {
-                let _ = fs::remove_dir_all(d.path());
-            }
-        }
-        sync_dir(&snaps_root).map_err(|e| io::Error::other(e.to_string()))?;
+        publish_snapshot_dir(&snaps_root, snap_idx, &saved_tmp)?;
 
         if old_lsm_dir.exists() {
             let _ = fs::remove_dir_all(&old_lsm_dir);

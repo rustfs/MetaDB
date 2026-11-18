@@ -17,7 +17,13 @@ use metadb_core::codec;
 use metadb_core::{append_crc32c_le, checksum_crc32c, verify_crc32c_le};
 use metadb_storage::sstable::sync_dir;
 
+use crate::state_machine::highest_durable_snapshot_index;
 use crate::types::{MetaDbTypeConfig, ShardWatermarkTracker};
+
+fn purge_limit(raft_dir: &Path, watermark_safe: u64, requested: u64) -> u64 {
+    let covered = highest_durable_snapshot_index(raft_dir);
+    watermark_safe.min(requested).min(covered)
+}
 
 pub const RAFT_SEGMENT_MAGIC: &[u8; 8] = b"MRAFTLO1";
 pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
@@ -602,7 +608,11 @@ impl SegmentedRaftLogStore {
     /// if OpenRaft has already requested a purge or if called after advancing watermarks.
     pub fn try_purge_to_safe_watermark(&self) -> io::Result<usize> {
         let mut guard = self.inner.lock().unwrap();
-        let safe_idx = self.watermarks.safe_purge_index();
+        let safe_idx = purge_limit(
+            &guard.raft_dir,
+            self.watermarks.safe_purge_index(),
+            u64::MAX,
+        );
         if safe_idx == 0 {
             return Ok(0);
         }
@@ -768,8 +778,17 @@ impl RaftLogStorage<MetaDbTypeConfig> for SegmentedRaftLogStore {
     }
 
     async fn purge(&mut self, log_id: LogIdOf<MetaDbTypeConfig>) -> Result<(), io::Error> {
-        // Clamp OpenRaft's requested `log_id` against the 3-watermark durability gate!
-        let safe_idx = self.watermarks.safe_purge_index().min(log_id.index);
+        // Clamp OpenRaft's requested `log_id` against the 3-watermark durability gate
+        // and against a snapshot directory that is still readable. Purging the log
+        // past a missing snapshot leaves restart with nothing to read.
+        let safe_idx = {
+            let guard = self.inner.lock().unwrap();
+            purge_limit(
+                &guard.raft_dir,
+                self.watermarks.safe_purge_index(),
+                log_id.index,
+            )
+        };
         if safe_idx == 0 {
             return Ok(());
         }
@@ -912,5 +931,26 @@ mod regression_tests {
                 result.as_ref().ok().map(|s| s.entries.len())
             );
         }
+    }
+
+    #[test]
+    fn purge_retains_the_log_when_no_complete_snapshot_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let watermarks = Arc::new(ShardWatermarkTracker::new(10, 10, 10));
+        let store = SegmentedRaftLogStore::open(dir.path(), watermarks).unwrap();
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .append_entries_sync(vec![EntryOf::<MetaDbTypeConfig> {
+                log_id: LogIdOf::<MetaDbTypeConfig>::new(
+                    CommittedLeaderIdOf::<MetaDbTypeConfig>::new(1, 1),
+                    1,
+                ),
+                payload: EntryPayload::Blank,
+            }])
+            .unwrap();
+        assert_eq!(store.try_purge_to_safe_watermark().unwrap(), 0);
+        assert_eq!(store.retained_entry_count(), 1);
     }
 }
