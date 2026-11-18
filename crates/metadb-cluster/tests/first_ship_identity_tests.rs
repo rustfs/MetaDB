@@ -65,4 +65,13 @@ fn target_voter_count_does_not_drop_an_explicit_member() {
 
     let shrunk = plan_membership_voters(&second, &registered, 2, None).unwrap();
     assert_eq!(shrunk, BTreeSet::from([1, 2]));
+    assert_eq!(
+        metadb_cluster::join_scale_target(&BTreeSet::from([1, 2, 3]), 3),
+        3
+    );
+    assert_eq!(
+        metadb_cluster::join_scale_target(&BTreeSet::from([1, 2]), 3),
+        3
+    );
+    assert!(metadb_cluster::node_id_in_ha_range(1 << 15).is_err());
 }

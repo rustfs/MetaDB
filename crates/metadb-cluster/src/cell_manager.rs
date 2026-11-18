@@ -134,6 +134,8 @@ pub struct DurableCellManager {
     identity: Mutex<Option<ClusterIdentity>>,
     /// Serializes `add_learner` / `change_membership` across concurrent join and scale RPCs.
     membership_lock: tokio::sync::Mutex<()>,
+    /// Raft-applied node instance bindings. Shared with every shard handler.
+    instance_bindings: Arc<Mutex<BTreeMap<NodeId, (u128, String)>>>,
 }
 
 impl DurableCellManager {
@@ -153,7 +155,7 @@ impl DurableCellManager {
         node_id_in_ha_range(host.node_id())?;
         let state_dir = state_dir.as_ref().to_path_buf();
         fs::create_dir_all(&state_dir)?;
-        let identity = ClusterIdentity::load_or_create(&state_dir, host.node_id(), cell_id, None)?;
+        let preexisting_identity = ClusterIdentity::load(&state_dir)?;
         let state_path = state_dir.join("CELL_MANAGER_STATE");
 
         let is_existing = state_path.try_exists()?;
@@ -271,19 +273,41 @@ impl DurableCellManager {
             split_lock: tokio::sync::Mutex::new(()),
             fail_persists: AtomicU32::new(0),
             crash_point: Mutex::new(None),
-            identity: Mutex::new(Some(identity)),
+            identity: Mutex::new(preexisting_identity),
             membership_lock: tokio::sync::Mutex::new(()),
+            instance_bindings: Arc::new(Mutex::new(BTreeMap::new())),
         });
 
         if let Err(error) = mgr.boot_local_shards().await {
             let _ = mgr.host.shutdown_all().await;
             return Err(error);
         }
+        if mgr.cluster_id() == 0 {
+            if mgr.replicated_membership() {
+                let _ = mgr.host.shutdown_all().await;
+                return Err(MetaDbError::IdentityRejected(
+                    "legacy replicated cell directory has no shared CLUSTER_IDENTITY; refusing to invent a per-member cluster id"
+                        .to_string(),
+                ));
+            }
+            match ClusterIdentity::load_or_create(&mgr.state_dir, mgr.host.node_id(), cell_id, None)
+            {
+                Ok(created) => *mgr.identity.lock().unwrap() = Some(created),
+                Err(error) => {
+                    let _ = mgr.host.shutdown_all().await;
+                    return Err(error);
+                }
+            }
+        }
         if let Err(error) = mgr.recover_incomplete_splits().await {
             let _ = mgr.host.shutdown_all().await;
             return Err(error);
         }
-        if let Err(error) = mgr.bind_local_instance() {
+        if let Err(error) = mgr.ingest_engine_bindings() {
+            let _ = mgr.host.shutdown_all().await;
+            return Err(error);
+        }
+        if let Err(error) = mgr.bind_local_instance().await {
             let _ = mgr.host.shutdown_all().await;
             return Err(error);
         }
@@ -349,6 +373,7 @@ impl DurableCellManager {
             crash_point: Mutex::new(None),
             identity: Mutex::new(identity),
             membership_lock: tokio::sync::Mutex::new(()),
+            instance_bindings: Arc::new(Mutex::new(BTreeMap::new())),
         }))
     }
 
@@ -437,14 +462,30 @@ impl DurableCellManager {
             Some(cluster_id),
         )?;
         *self.identity.lock().unwrap() = Some(identity);
-        self.bind_local_instance()?;
         Ok(identity)
     }
 
-    fn bind_local_instance(&self) -> Result<()> {
+    pub fn bound_instance(&self, node_id: NodeId) -> Option<u128> {
+        self.instance_bindings
+            .lock()
+            .unwrap()
+            .get(&node_id)
+            .map(|(instance, _)| *instance)
+    }
+
+    fn replicated_membership(&self) -> bool {
+        self.local_shard_handles()
+            .iter()
+            .any(|(_, group, _)| group.voter_count() > 1)
+    }
+
+    async fn bind_local_instance(&self) -> Result<()> {
         let Some(identity) = *self.identity.lock().unwrap() else {
             return Ok(());
         };
+        if self.bound_instance(identity.node_id) == Some(identity.node_instance_id) {
+            return self.mirror_bindings_to_state();
+        }
         let addr = self
             .state
             .lock()
@@ -460,6 +501,7 @@ impl DurableCellManager {
             )));
         }
         self.register_node_instance(identity.node_id, addr, identity.node_instance_id)
+            .await
     }
 
     /// Records the routes this process intends to join before membership is proposed.
@@ -544,6 +586,7 @@ impl DurableCellManager {
                 route.range.clone(),
                 wm.clone(),
             ));
+            handler.set_instance_bindings(self.instance_bindings.clone());
             let sdir = self.host.shard_dir(route.shard_id);
             let group = ShardRaftGroup::start(
                 route.shard_id,
@@ -610,9 +653,11 @@ impl DurableCellManager {
         }
         self.persist_sync(&next)?;
         *guard = next;
+        drop(guard);
         for route in routes {
             self.meta_cache.upsert_route(route);
         }
+        self.ingest_engine_bindings()?;
         Ok(())
     }
 
@@ -661,6 +706,7 @@ impl DurableCellManager {
                     route.range.clone(),
                     wm.clone(),
                 ));
+                handler.set_instance_bindings(self.instance_bindings.clone());
                 let sdir = self.host.shard_dir(route.shard_id);
                 let group = ShardRaftGroup::start(
                     route.shard_id,
@@ -766,76 +812,163 @@ impl DurableCellManager {
     }
 
     pub fn register_node(&self, node_id: NodeId, grpc_addr: String) -> Result<()> {
-        self.register_node_instance(node_id, grpc_addr, 0)
+        node_id_in_ha_range(node_id)?;
+        self.register_address_only(node_id, grpc_addr)
     }
 
-    /// Binds `node_id` to `instance_id`.
+    /// Binds `node_id` to `instance_id` and replicates that binding before returning.
     ///
-    /// `instance_id == 0` is the legacy address-only register. It may not change an
-    /// existing address, and it may not replace an instance that is already bound.
-    pub fn register_node_instance(
+    /// `instance_id == 0` is the legacy address-only register. A non-zero instance is
+    /// proposed through Raft, so followers learn it before this call acknowledges success.
+    /// Voter removal does not drop the binding.
+    pub async fn register_node_instance(
         &self,
         node_id: NodeId,
         grpc_addr: String,
         instance_id: u128,
     ) -> Result<()> {
-        if node_id == 0 || grpc_addr.trim().is_empty() {
+        node_id_in_ha_range(node_id)?;
+        if instance_id == 0 {
+            return self.register_address_only(node_id, grpc_addr);
+        }
+        if grpc_addr.trim().is_empty() {
             return Err(MetaDbError::IdentityRejected(
-                "refusing to register node id 0 or an empty grpc address".to_string(),
+                "refusing to register an empty grpc address".to_string(),
             ));
         }
         let grpc_addr = grpc_addr.trim().to_string();
-        let mut guard = self.state.lock().unwrap();
-        if let Some((other_id, _)) = guard
-            .node_instances
-            .iter()
-            .find(|(id, instance)| **instance == instance_id && **id != node_id && instance_id != 0)
-        {
-            return Err(MetaDbError::IdentityRejected(format!(
-                "node instance {instance_id:#x} is already bound to node {other_id}"
-            )));
-        }
-        if let Some(bound) = guard.node_instances.get(&node_id) {
-            if instance_id == 0 || *bound != instance_id {
+        if let Some((bound, _)) = self.instance_bindings.lock().unwrap().get(&node_id) {
+            if *bound != instance_id {
                 return Err(MetaDbError::IdentityRejected(format!(
                     "node {node_id} is already bound to instance {bound:#x}; refusing a reused node identity"
                 )));
             }
-        } else if instance_id == 0 {
-            if let Some(existing) = guard.nodes.get(&node_id) {
-                if existing != &grpc_addr {
-                    return Err(MetaDbError::IdentityRejected(format!(
-                        "node {node_id} is already bound to {existing}; refusing {grpc_addr}"
-                    )));
-                }
-                return Ok(());
-            }
+        }
+        if let Some((other, (bound, _))) = self
+            .instance_bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, (instance, _))| **id != node_id && *instance == instance_id)
+        {
+            return Err(MetaDbError::IdentityRejected(format!(
+                "node instance {bound:#x} is already bound to node {other}"
+            )));
+        }
+        self.propose_instance_binding(node_id, instance_id, grpc_addr.clone())
+            .await?;
+        self.mirror_bindings_to_state()
+    }
+
+    fn register_address_only(&self, node_id: NodeId, grpc_addr: String) -> Result<()> {
+        if grpc_addr.trim().is_empty() {
+            return Err(MetaDbError::IdentityRejected(
+                "refusing to register an empty grpc address".to_string(),
+            ));
+        }
+        let grpc_addr = grpc_addr.trim().to_string();
+        let mut guard = self.state.lock().unwrap();
+        if self
+            .instance_bindings
+            .lock()
+            .unwrap()
+            .contains_key(&node_id)
+            || guard.node_instances.contains_key(&node_id)
+        {
+            return Err(MetaDbError::IdentityRejected(format!(
+                "node {node_id} is already bound to an instance; refusing an anonymous register"
+            )));
         }
         if let Some(existing) = guard.nodes.get(&node_id) {
             if existing != &grpc_addr {
-                let replicated = guard.routes.values().any(|route| {
-                    let voters: Vec<NodeId> = route
-                        .peers
-                        .iter()
-                        .filter(|(_, (_, voter))| *voter)
-                        .map(|(id, _)| *id)
-                        .collect();
-                    voters.len() > 1 && voters.contains(&node_id)
-                });
-                if replicated {
-                    return Err(MetaDbError::IdentityRejected(format!(
-                        "node {node_id} cannot change address from {existing} to {grpc_addr} while it is a voter"
-                    )));
-                }
+                return Err(MetaDbError::IdentityRejected(format!(
+                    "node {node_id} is already bound to {existing}; refusing {grpc_addr}"
+                )));
             }
+            return Ok(());
         }
         let mut next = guard.clone();
         next.nodes.insert(node_id, grpc_addr);
-        if instance_id != 0 {
-            next.node_instances.insert(node_id, instance_id);
-        }
         self.persist_sync(&next)?;
         *guard = next;
+        Ok(())
+    }
+
+    async fn propose_instance_binding(
+        &self,
+        node_id: NodeId,
+        instance_id: u128,
+        grpc_addr: String,
+    ) -> Result<()> {
+        let (_, group, _) = self.lookup_local_handle(1).or_else(|_| {
+            self.local_shard_handles()
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    MetaDbError::ConsensusError(
+                        "no local shard can replicate the node instance binding".to_string(),
+                    )
+                })
+        })?;
+        let payload = metadb_core::codec::serialize(&metadb_tx::TxRaftCmd::BindNodeInstance {
+            node_id,
+            instance_id,
+            grpc_addr,
+        })
+        .map_err(|error| MetaDbError::CodecError(error.to_string()))?;
+        let epoch = group.current_epoch();
+        group
+            .propose_until(
+                epoch,
+                metadb_core::HlcTimestamp::ZERO,
+                payload,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn ingest_engine_bindings(&self) -> Result<()> {
+        let read_at = metadb_core::HlcTimestamp::new(metadb_core::HlcTimestamp::MAX_PHYSICAL_MS, 0);
+        for (_, group, _) in self.local_shard_handles() {
+            let rows = group.engine().scan_range(&[0x09], &[0x0A], read_at)?;
+            for (key, value) in rows {
+                if key.len() != 9 || key[0] != 0x09 {
+                    continue;
+                }
+                let node_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
+                let record: metadb_tx::NodeInstanceRecord = metadb_core::codec::deserialize(&value)
+                    .map_err(|error| MetaDbError::CodecError(error.to_string()))?;
+                self.instance_bindings
+                    .lock()
+                    .unwrap()
+                    .insert(node_id, (record.instance_id, record.grpc_addr));
+            }
+        }
+        self.mirror_bindings_to_state()
+    }
+
+    fn mirror_bindings_to_state(&self) -> Result<()> {
+        let bindings = self.instance_bindings.lock().unwrap().clone();
+        let mut guard = self.state.lock().unwrap();
+        let mut next = guard.clone();
+        let mut changed = false;
+        for (node_id, (instance_id, addr)) in bindings {
+            if next.node_instances.get(&node_id) != Some(&instance_id) {
+                next.node_instances.insert(node_id, instance_id);
+                changed = true;
+            }
+            if !addr.is_empty() {
+                next.nodes.entry(node_id).or_insert_with(|| {
+                    changed = true;
+                    addr
+                });
+            }
+        }
+        if changed {
+            self.persist_sync(&next)?;
+            *guard = next;
+        }
         Ok(())
     }
 
@@ -1830,6 +1963,13 @@ fn decode_cell_state(body: &[u8]) -> Result<PersistedCellState> {
         join_pending: false,
         node_instances: BTreeMap::new(),
     })
+}
+
+/// Voter target for a join. `our_id` is included once even when some shards already list it.
+pub fn join_scale_target(reported_voters: &BTreeSet<NodeId>, our_id: NodeId) -> usize {
+    let mut voters = reported_voters.clone();
+    voters.insert(our_id);
+    voters.len()
 }
 
 /// Plans the voter set for one shard.
