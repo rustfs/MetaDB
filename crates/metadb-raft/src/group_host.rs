@@ -191,9 +191,12 @@ impl ShardRaftGroup {
         .await
         .map_err(|e| MetaDbError::ConsensusError(e.to_string()))?;
 
-        // Block until OpenRaft replays any committed tail entries `(flushed_raft_index ..= last_committed]`
-        // into the WAL-less `MemMvccStore` before serving traffic (`Resolution B5`)!
-        let _ = raft.wait_for_recovery(Some(Duration::from_secs(5))).await;
+        // Replay a committed tail into the WAL-less memtable before serving.
+        // A fresh log has no committed entry, and the recovery condition stays
+        // false until initialize, so waiting here only burns the timeout.
+        if log_store.has_committed_entries() {
+            let _ = raft.wait_for_recovery(Some(Duration::from_secs(5))).await;
+        }
 
         router.register_group(shard_id, raft.clone());
         let read_batcher = Arc::new(ReadIndexBatcher::new(shard_id, raft.clone(), frontier_rx));
@@ -229,7 +232,9 @@ impl ShardRaftGroup {
             Err(e) => return Err(MetaDbError::ConsensusError(e.to_string())),
         }
         if should_wait_leader {
-            self.wait_for_leader(Duration::from_secs(5)).await?;
+            // Single-voter election is local, but a loaded test runner can
+            // delay the metrics update past a 5 second budget.
+            self.wait_for_leader(Duration::from_secs(15)).await?;
         }
         Ok(())
     }
