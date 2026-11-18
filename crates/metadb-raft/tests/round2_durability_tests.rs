@@ -139,6 +139,7 @@ async fn every_legal_prefix_purge_recovers_its_remaining_committed_entries() {
                 .await
                 .unwrap();
             store.save_committed(Some(log_id(4))).await.unwrap();
+            metadb_raft::state_machine::write_complete_snapshot_marker(dir.path(), purged).unwrap();
             store.purge(log_id(purged)).await.unwrap();
             drop(store);
             let mut reopened = SegmentedRaftLogStore::open(dir.path(), watermarks).unwrap();
@@ -195,6 +196,7 @@ async fn missing_hard_state_after_purge_is_fatal() {
         .await
         .unwrap();
     store.save_committed(Some(log_id(2))).await.unwrap();
+    metadb_raft::state_machine::write_complete_snapshot_marker(dir.path(), 2).unwrap();
     store.purge(log_id(2)).await.unwrap();
     assert_eq!(store.segment_file_count(), 0);
     drop(store);
