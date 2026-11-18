@@ -20,13 +20,13 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status, Streaming};
 
 use metadb_core::codec;
-use metadb_core::ShardId;
+use metadb_core::{MetaDbError, ShardId};
 use metadb_proto::raft_transport_service_client::RaftTransportServiceClient;
 use metadb_proto::raft_transport_service_server::RaftTransportService;
 use metadb_proto::{RaftRpcEnvelope, RaftRpcReply, SnapshotChunkRequest, SnapshotChunkResponse};
 
 use crate::state_machine::ShardStateMachine;
-use crate::types::{MetaDbTypeConfig, SnapshotArchive};
+use crate::types::{MetaDbRaftRequest, MetaDbRaftResponse, MetaDbTypeConfig, SnapshotArchive};
 
 const SNAPSHOT_STREAM_CHUNK_BYTES: usize = 256 * 1024;
 
@@ -102,6 +102,39 @@ impl ChannelPool {
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
         self.channels.lock().await.insert(url, channel.clone());
         Ok(channel)
+    }
+
+    /// Sends a client proposal to `addr`. The remote handler does not forward again.
+    pub async fn client_write(
+        &self,
+        addr: &str,
+        shard_id: ShardId,
+        request: &MetaDbRaftRequest,
+    ) -> std::result::Result<MetaDbRaftResponse, MetaDbError> {
+        let channel = self.connect(addr).await.map_err(|error| {
+            MetaDbError::RpcError(format!("connect to leader {addr} failed: {error}"))
+        })?;
+        let mut client = RaftTransportServiceClient::new(channel);
+        let bincode_payload = codec::serialize(request)
+            .map_err(|error| MetaDbError::CodecError(error.to_string()))?;
+        let reply = client
+            .client_write(
+                self.authenticate(Request::new(RaftRpcEnvelope {
+                    shard_id,
+                    bincode_payload,
+                }))
+                .map_err(|error| MetaDbError::RpcError(error.to_string()))?,
+            )
+            .await
+            .map_err(|error| {
+                MetaDbError::RpcError(format!("client_write to leader {addr} failed: {error}"))
+            })?
+            .into_inner();
+        if !reply.error_message.is_empty() && reply.bincode_payload.is_empty() {
+            return Err(MetaDbError::RpcError(reply.error_message));
+        }
+        codec::deserialize(&reply.bincode_payload)
+            .map_err(|error| MetaDbError::CodecError(error.to_string()))?
     }
 }
 
@@ -438,6 +471,48 @@ impl RaftTransportService for MultiRaftTransportServer {
             Err(err) => Ok(Response::new(SnapshotChunkResponse {
                 bincode_payload: Vec::new(),
                 error_message: err.to_string(),
+            })),
+        }
+    }
+
+    async fn client_write(
+        &self,
+        request: Request<RaftRpcEnvelope>,
+    ) -> Result<Response<RaftRpcReply>, Status> {
+        let env = request.into_inner();
+        let Some(raft) = self.router.get_group(env.shard_id) else {
+            return Ok(Response::new(RaftRpcReply {
+                bincode_payload: Vec::new(),
+                error_message: format!("unknown shard {}", env.shard_id),
+            }));
+        };
+        let req: MetaDbRaftRequest = match codec::deserialize(&env.bincode_payload) {
+            Ok(req) => req,
+            Err(error) => {
+                return Ok(Response::new(RaftRpcReply {
+                    bincode_payload: Vec::new(),
+                    error_message: error.to_string(),
+                }))
+            }
+        };
+        let result = match raft.client_write(req).await {
+            Ok(response) => Ok(response.data),
+            Err(openraft::errors::RaftError::APIError(
+                openraft::errors::ClientWriteError::ForwardToLeader(fwd),
+            )) => Err(MetaDbError::NotLeader {
+                shard_id: env.shard_id,
+                leader_hint: fwd.leader_id,
+            }),
+            Err(error) => Err(MetaDbError::ConsensusError(error.to_string())),
+        };
+        match codec::serialize(&result) {
+            Ok(bincode_payload) => Ok(Response::new(RaftRpcReply {
+                bincode_payload,
+                error_message: String::new(),
+            })),
+            Err(error) => Ok(Response::new(RaftRpcReply {
+                bincode_payload: Vec::new(),
+                error_message: error.to_string(),
             })),
         }
     }

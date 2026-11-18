@@ -107,6 +107,17 @@ message ApplyAuxBatchResponse {
   uint32 applied_count = 2;
 }
 
+// One client read executed on the current leader. `op` is a wincode
+// `ForwardedRouterOp`. The handler does not forward again.
+message ForwardRouterRequest {
+  bytes op = 1;
+}
+
+message ForwardRouterResponse {
+  ErrorDetailProto error = 1;
+  bytes result = 2;
+}
+
 service TransactionService {
   rpc Rename(RenameRequest) returns (RenameResponse);
   rpc Prepare2pc(Prepare2pcRequest) returns (Prepare2pcResponse);
@@ -115,4 +126,5 @@ service TransactionService {
   rpc Abort2pc(Abort2pcRequest) returns (Abort2pcResponse);
   rpc CheckTxnStatus(CheckTxnStatusRequest) returns (CheckTxnStatusResponse);
   rpc ApplyAuxBatch(ApplyAuxBatchRequest) returns (ApplyAuxBatchResponse);
+  rpc ForwardRouter(ForwardRouterRequest) returns (ForwardRouterResponse);
 }

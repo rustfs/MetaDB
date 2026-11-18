@@ -27,9 +27,15 @@ impl ConfChangeOrchestrator {
         min_matched_index: u64,
     ) -> Result<()> {
         for (node_id, addr) in learners_to_add {
-            raft.add_learner(*node_id, BasicNode::new(addr), false)
-                .await
-                .map_err(|e| MetaDbError::ConsensusError(format!("add_learner failed: {}", e)))?;
+            tokio::time::timeout(
+                timeout,
+                raft.add_learner(*node_id, BasicNode::new(addr), false),
+            )
+            .await
+            .map_err(|_| {
+                MetaDbError::ConsensusError(format!("add_learner for node {node_id} timed out"))
+            })?
+            .map_err(|e| MetaDbError::ConsensusError(format!("add_learner failed: {}", e)))?;
         }
 
         let start = tokio::time::Instant::now();

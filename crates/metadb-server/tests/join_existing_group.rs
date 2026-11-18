@@ -9,7 +9,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use metadb_core::{HlcTimestamp, MetaKey, ROOT_INODE_ID};
+use metadb_cluster::ClusterIdentity;
+use metadb_core::{HlcTimestamp, MetaDbError, MetaKey, ROOT_INODE_ID};
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::metadata_service_client::MetadataServiceClient;
 use metadb_proto::{
@@ -179,9 +180,12 @@ async fn second_process_joins_existing_raft_group_fails_over_and_reopens() {
     assert_eq!(voter_set(&node1), BTreeSet::from([1, 2]));
     assert_eq!(voter_set(&node2), BTreeSet::from([1, 2]));
     assert!(create_named(&node1, "on_two_voters.dat", 101, 501).await);
-    // Followers replicate the state machine. Linearizable lookup runs only on the leader.
-    wait_applied(&node2, "before_join.dat").await;
-    wait_applied(&node2, "on_two_voters.dat").await;
+    // A follower with a known leader completes the read and write instead of returning NotLeader.
+    wait_visible(&node2, "before_join.dat").await;
+    wait_visible(&node2, "on_two_voters.dat").await;
+    assert!(create_named(&node2, "from_follower.dat", 110, 510).await);
+    wait_visible(&node1, "from_follower.dat").await;
+    node2.tx_router().dirstat(BUCKET_ID).await.unwrap();
 
     let cfg3 = fast_config(&dir3, 3, &addr1);
     let (node3, addr3) = PersistentMetaDbCluster::open_and_serve(cfg3.clone())
@@ -312,7 +316,31 @@ async fn stale_route_cache_does_not_drop_a_live_voter() {
             .await
             .unwrap();
     wait_applied(&node2, "before_join.dat").await;
-    assert_eq!(voter_set(&node2), BTreeSet::from([1, 2]));
+    assert_eq!(voter_set(&node2), BTreeSet::from([1, 2, 3]));
+    for route in node2.cell_manager().list_routes() {
+        let (_, group, _) = node2
+            .cell_manager()
+            .lookup_local_handle(route.shard_id)
+            .unwrap();
+        assert_eq!(
+            route.epoch,
+            group.current_epoch(),
+            "shard {} status epoch lagged the applied Raft epoch",
+            route.shard_id
+        );
+        let reported = route
+            .peers
+            .iter()
+            .filter(|(_, (_, is_voter))| *is_voter)
+            .map(|(node_id, _)| *node_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            reported,
+            node2.cell_manager().raft_voter_ids(route.shard_id).unwrap(),
+            "shard {} status voters lagged Raft membership",
+            route.shard_id
+        );
+    }
     assert_eq!(
         node2.cell_manager().raft_voter_ids(1).unwrap(),
         BTreeSet::from([1, 2, 3])
@@ -626,4 +654,100 @@ async fn metadbd_processes_join_existing_group_and_fail_over() {
     restarted.stop();
     proc2.stop();
     proc3.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_joiners_both_become_voters() {
+    let dir = tempdir().unwrap();
+    let (node1, addr1) =
+        PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n1"), 1, ""))
+            .await
+            .unwrap();
+    node1
+        .tx_router()
+        .mkdir(ROOT_INODE_ID, "bucket", BUCKET_ID, 7, 0o755)
+        .await
+        .unwrap();
+    let join2 =
+        PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n2"), 2, &addr1));
+    let join3 =
+        PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n3"), 3, &addr1));
+    let (joined2, joined3) = tokio::join!(join2, join3);
+    let (node2, _) = joined2.expect("node 2 join");
+    let (node3, _) = joined3.expect("node 3 join");
+    let expected = BTreeSet::from([1, 2, 3]);
+    assert_eq!(voter_set(&node1), expected);
+    assert_eq!(voter_set(&node2), expected);
+    assert_eq!(voter_set(&node3), expected);
+    assert_ne!(node1.cell_manager().cluster_id(), 0);
+    assert_eq!(
+        node2.cell_manager().cluster_id(),
+        node1.cell_manager().cluster_id()
+    );
+    assert_eq!(
+        node3.cell_manager().cluster_id(),
+        node1.cell_manager().cluster_id()
+    );
+    assert!(create_named(&node2, "concurrent.dat", 130, 530).await);
+    wait_visible(&node3, "concurrent.dat").await;
+    node1.shutdown().await.unwrap();
+    node2.shutdown().await.unwrap();
+    node3.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reused_node_id_and_foreign_cluster_are_rejected() {
+    let dir = tempdir().unwrap();
+    let (node1, addr1) =
+        PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n1"), 1, ""))
+            .await
+            .unwrap();
+    let (node2, _) =
+        PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n2"), 2, &addr1))
+            .await
+            .unwrap();
+    let reused = PersistentMetaDbCluster::open_and_serve(fast_config(
+        &dir.path().join("n2-reused"),
+        2,
+        &addr1,
+    ))
+    .await;
+    match reused {
+        Ok((cluster, _)) => {
+            cluster.shutdown().await.unwrap();
+            panic!("a fresh directory reused node id 2");
+        }
+        Err(error) => assert!(
+            matches!(error, MetaDbError::IdentityRejected(_)),
+            "unexpected reuse error: {error}"
+        ),
+    }
+
+    let foreign_dir = dir.path().join("foreign");
+    ClusterIdentity {
+        cluster_id: 0x1111_2222_3333_4444,
+        node_instance_id: 0x5555_6666_7777_8888,
+        node_id: 3,
+        cell_id: 1,
+    }
+    .persist(foreign_dir.join("cell_1"))
+    .unwrap();
+    let foreign =
+        PersistentMetaDbCluster::open_and_serve(fast_config(&foreign_dir, 3, &addr1)).await;
+    match foreign {
+        Ok((cluster, _)) => {
+            cluster.shutdown().await.unwrap();
+            panic!("joiner adopted a different cluster identity");
+        }
+        Err(error) => assert!(
+            matches!(error, MetaDbError::IdentityRejected(_)),
+            "unexpected cluster identity error: {error}"
+        ),
+    }
+    assert_ne!(
+        node1.cell_manager().cluster_id(),
+        0x1111_2222_3333_4444_u128
+    );
+    node2.shutdown().await.unwrap();
+    node1.shutdown().await.unwrap();
 }

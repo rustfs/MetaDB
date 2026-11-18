@@ -195,4 +195,13 @@ impl ShardDirectory for DurableGlobalManager {
     async fn release_dir_rename_lease(&self, token: u64) {
         let _ = self.id_allocator.release_dir_rename_lease(token);
     }
+
+    fn raft_peer_addr(&self, shard_id: u64, node_id: u64) -> Option<String> {
+        for cell in self.all_cells() {
+            if let Ok((_, group, _)) = cell.lookup_local_handle(shard_id) {
+                return group.peer_addr(node_id);
+            }
+        }
+        None
+    }
 }
