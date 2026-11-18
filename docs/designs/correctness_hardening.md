@@ -4,7 +4,7 @@ This change hardens acknowledged-write recovery, transaction migration, input va
 
 ## Recovery and snapshots
 
-Recovery validates the entire unpurged committed log prefix, frame ordering and identity, and the durable vote/commit metadata before repairing files. Existing histories with missing `HARD_STATE` are rejected. A durable initialization marker also protects empty or fully purged stores from silently resetting their election identity.
+Recovery validates the entire unpurged committed log prefix, frame ordering and identity, and the durable vote/commit metadata before repairing files. Existing histories with missing `HARD_STATE` are rejected. A durable initialization marker also protects empty or fully purged stores from silently resetting their election identity. A fresh log has nothing to replay, so startup does not spend the recovery timeout before the first membership entry exists.
 
 Snapshot installation requires a complete existing database image. It verifies required and duplicate filenames, the recovered checkpoint, LogId and membership, MANIFEST-to-SST metadata equality, and all data blocks before replacing live data. An empty or stale archive cannot create a new empty database and advance its advertised applied index. Snapshot publication syncs the temporary directory, renames it into place, and only then deletes the previous directory. A missing or unreadable snapshot directory is skipped. `get_current_snapshot` returns no snapshot instead of a fatal `Read Snapshot` error, and startup can rebuild one from the flushed LSM. Log purge stops at the newest complete snapshot directory, so a missing snapshot file does not also discard the log a restart still needs.
 

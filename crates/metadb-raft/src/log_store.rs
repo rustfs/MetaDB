@@ -595,6 +595,17 @@ impl SegmentedRaftLogStore {
         self.inner.lock().unwrap().entries.len()
     }
 
+    /// True when startup must replay a committed or purged log before serving.
+    ///
+    /// A fresh store has neither, and OpenRaft's recovery wait cannot succeed
+    /// until `initialize` creates the first committed entry.
+    pub fn has_committed_entries(&self) -> bool {
+        let guard = self.inner.lock().unwrap();
+        guard.hard_state.committed.is_some()
+            || guard.hard_state.last_purged_log_id.is_some()
+            || !guard.entries.is_empty()
+    }
+
     /// Test hook. The next `n` append fsyncs fail and roll the in-memory log back.
     pub fn testing_fail_next_syncs(&self, n: u32) {
         self.inner.lock().unwrap().fail_syncs = n;
@@ -931,6 +942,15 @@ mod regression_tests {
                 result.as_ref().ok().map(|s| s.entries.len())
             );
         }
+    }
+
+    #[test]
+    fn fresh_store_has_nothing_to_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            SegmentedRaftLogStore::open(dir.path(), Arc::new(ShardWatermarkTracker::default()))
+                .unwrap();
+        assert!(!store.has_committed_entries());
     }
 
     #[test]
