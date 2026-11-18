@@ -22,7 +22,9 @@ use metadb_storage::sstable::sync_dir;
 use metadb_storage::{LifecycleStorageEngine, LsmEngineConfig, ShardedBlockCache, SnapshotGuard};
 
 use crate::log_store::SegmentedRaftLogStore;
-use crate::network::{ChannelPool, MetaDbRaft, MultiRaftRouter, TonicRaftNetworkFactory};
+use crate::network::{
+    ChannelPool, LocalProposer, MetaDbRaft, MultiRaftRouter, TonicRaftNetworkFactory,
+};
 use crate::read_index::{ReadIndexBatcher, ReadToken};
 use crate::state_machine::{ShardApplyHandler, ShardStateMachine};
 use crate::types::{MetaDbRaftRequest, MetaDbRaftResponse, ShardWatermarkTracker};
@@ -133,6 +135,7 @@ pub struct ShardRaftGroup {
     channel_pool: ChannelPool,
     /// `(remaining failures, leader hint)` injected before `client_write`.
     testing_not_leader: std::sync::Mutex<(u32, Option<NodeId>)>,
+    testing_epoch_mismatch: std::sync::atomic::AtomicU32,
 }
 
 impl ShardRaftGroup {
@@ -204,7 +207,7 @@ impl ShardRaftGroup {
         router.register_group(shard_id, raft.clone());
         let read_batcher = Arc::new(ReadIndexBatcher::new(shard_id, raft.clone(), frontier_rx));
 
-        Ok(Arc::new(Self {
+        let group = Arc::new(Self {
             shard_id,
             node_id,
             raft,
@@ -216,7 +219,16 @@ impl ShardRaftGroup {
             proposal_gate: RwLock::new(None),
             channel_pool,
             testing_not_leader: std::sync::Mutex::new((0, None)),
-        }))
+            testing_epoch_mismatch: std::sync::atomic::AtomicU32::new(0),
+        });
+        router.register_local_proposer(shard_id, group.clone());
+        Ok(group)
+    }
+
+    /// The next `count` proposals fail with `EpochMismatch` before reaching Raft.
+    pub fn testing_fail_next_epoch_mismatch(&self, count: u32) {
+        self.testing_epoch_mismatch
+            .store(count, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The next `count` `propose` calls return `NotLeader` before reaching Raft.
@@ -226,6 +238,12 @@ impl ShardRaftGroup {
 
     pub fn current_leader(&self) -> Option<NodeId> {
         self.raft.metrics().borrow_watched().current_leader
+    }
+
+    pub fn voter_count(&self) -> usize {
+        let metrics = self.raft.metrics();
+        let snapshot = metrics.borrow_watched();
+        snapshot.membership_config.membership().voter_ids().count()
     }
 
     pub fn peer_addr(&self, node_id: NodeId) -> Option<String> {
@@ -432,11 +450,30 @@ impl ShardRaftGroup {
 
     /// Proposes a mutation to OpenRaft after pre-checking `expected_epoch` (`Resolution B16`)
     /// and stamping a drift-checked causal HLC timestamp.
+    ///
+    /// A known leader is forwarded at most once. The forward budget is five seconds.
     pub async fn propose(
         &self,
         expected_epoch: ShardEpoch,
         caller_hlc: HlcTimestamp,
         payload: Vec<u8>,
+    ) -> Result<MetaDbRaftResponse> {
+        self.propose_until(
+            expected_epoch,
+            caller_hlc,
+            payload,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+    }
+
+    /// Same as [`propose`](Self::propose), but the forwarded RPC cannot outlive `deadline`.
+    pub async fn propose_until(
+        &self,
+        expected_epoch: ShardEpoch,
+        caller_hlc: HlcTimestamp,
+        payload: Vec<u8>,
+        deadline: tokio::time::Instant,
     ) -> Result<MetaDbRaftResponse> {
         {
             let mut hook = self.testing_not_leader.lock().unwrap();
@@ -448,6 +485,47 @@ impl ShardRaftGroup {
                 });
             }
         }
+        if self
+            .testing_epoch_mismatch
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            self.testing_epoch_mismatch
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(MetaDbError::EpochMismatch {
+                shard_id: self.shard_id,
+                expected: expected_epoch,
+                actual: expected_epoch.bump_version(),
+            });
+        }
+        match self
+            .propose_local(expected_epoch, caller_hlc, payload.clone())
+            .await
+        {
+            Err(MetaDbError::NotLeader { leader_hint, .. }) => {
+                let request = MetaDbRaftRequest {
+                    expected_epoch,
+                    hlc: caller_hlc,
+                    payload,
+                };
+                self.forward_client_write(leader_hint, None, request, deadline)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    /// Leader-local proposal. Validates this node's clock and does not forward.
+    ///
+    /// Forwarded `ClientWrite` RPCs enter here so a follower-adjusted timestamp is
+    /// checked against the leader's drift limit, and application errors are returned
+    /// to the caller instead of an outer success.
+    pub async fn propose_local(
+        &self,
+        expected_epoch: ShardEpoch,
+        caller_hlc: HlcTimestamp,
+        payload: Vec<u8>,
+    ) -> Result<MetaDbRaftResponse> {
         let local_epoch = self.current_epoch();
         if expected_epoch != local_epoch {
             return Err(MetaDbError::EpochMismatch {
@@ -474,17 +552,16 @@ impl ShardRaftGroup {
             gate.enter().await;
         }
 
-        let forwarded = req.clone();
         let write_resp = match self.raft.client_write(req).await {
-            Ok(r) => r,
+            Ok(response) => response,
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => {
-                return self
-                    .forward_client_write(fwd.leader_id, fwd.leader_node.as_ref(), forwarded)
-                    .await;
+                return Err(MetaDbError::NotLeader {
+                    shard_id: self.shard_id,
+                    leader_hint: fwd.leader_id,
+                });
             }
-            Err(e) => return Err(MetaDbError::ConsensusError(e.to_string())),
+            Err(error) => return Err(MetaDbError::ConsensusError(error.to_string())),
         };
-
         let app_resp = write_resp.data;
         if let Err(err) = &app_resp.result {
             return Err(err.clone());
@@ -497,6 +574,7 @@ impl ShardRaftGroup {
         leader_id: Option<NodeId>,
         leader_node: Option<&BasicNode>,
         request: MetaDbRaftRequest,
+        deadline: tokio::time::Instant,
     ) -> Result<MetaDbRaftResponse> {
         let Some(leader_id) = leader_id else {
             return Err(MetaDbError::NotLeader {
@@ -520,9 +598,28 @@ impl ShardRaftGroup {
                 leader_hint: Some(leader_id),
             });
         };
-        self.channel_pool
-            .client_write(&addr, self.shard_id, &request)
-            .await
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(MetaDbError::RpcError(
+                "forwarded proposal exceeded the routing deadline".to_string(),
+            ));
+        }
+        let response = match tokio::time::timeout(
+            remaining,
+            self.channel_pool
+                .client_write(&addr, self.shard_id, &request),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(MetaDbError::RpcError(
+                    "forwarded proposal timed out".to_string(),
+                ))
+            }
+        };
+        response.result.clone()?;
+        Ok(response)
     }
 
     /// Acquires a linearizable `SnapshotGuard` fenced by `ReadIndex` and post-wait `ShardEpoch` revalidation.
@@ -590,6 +687,19 @@ impl ShardRaftGroup {
             .shutdown()
             .await
             .map_err(|e| MetaDbError::ConsensusError(e.to_string()))
+    }
+}
+
+#[tonic::async_trait]
+impl LocalProposer for ShardRaftGroup {
+    async fn propose_local_forwarded(
+        &self,
+        expected_epoch: ShardEpoch,
+        caller_hlc: HlcTimestamp,
+        payload: Vec<u8>,
+    ) -> Result<MetaDbRaftResponse> {
+        self.propose_local(expected_epoch, caller_hlc, payload)
+            .await
     }
 }
 
@@ -719,6 +829,7 @@ impl ShardGroupHost {
     }
 
     async fn shutdown_groups(&self, flush: bool) -> Result<()> {
+        self.router.clear();
         let groups: Vec<Arc<ShardRaftGroup>> = {
             let mut guard = self.groups.write().unwrap();
             guard.drain().map(|(_, g)| g).collect()

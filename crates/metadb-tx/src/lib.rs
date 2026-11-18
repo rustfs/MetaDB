@@ -21,7 +21,10 @@ pub use aux_outbox::{ReplicatedAttrAggregator, ShardAuxOutbox, DEFAULT_OUTBOX_SP
 pub use aux_sink::{AsyncAuxiliarySink, AuxUpdateTask};
 pub use pushdown::{PushdownExecutor, TwoPhaseCommitCoordinator};
 pub use recovery_worker::{AuxDispatcher, TxnRecoveryWorker};
-pub use state_machine_impl::{SetAttrPatch, TxRaftCmd, TxRaftOutput, TxStateMachineHandler};
+pub use state_machine_impl::{
+    node_instance_key, NodeInstanceRecord, SetAttrPatch, TxRaftCmd, TxRaftOutput,
+    TxStateMachineHandler,
+};
 pub use two_pc::{
     DirRenameLease, DistributedTxRouter, RoutedShardHandle, ShardDirectory, TwoPcCrashStage,
 };

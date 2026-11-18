@@ -1044,12 +1044,10 @@ impl ControlPlaneService for MetaDbGrpcService {
                 }))
             }
         };
-        let registered = if instance_id == 0 {
-            cell.register_node(req.node_id, req.grpc_addr)
-        } else {
-            cell.register_node_instance(req.node_id, req.grpc_addr, instance_id)
-        };
-        match registered {
+        match cell
+            .register_node_instance(req.node_id, req.grpc_addr, instance_id)
+            .await
+        {
             Ok(()) => Ok(Response::new(RegisterNodeResponse { error: None })),
             Err(e) => Ok(Response::new(RegisterNodeResponse {
                 error: Some(ErrorDetailProto::from(&e)),

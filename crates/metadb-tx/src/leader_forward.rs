@@ -53,6 +53,46 @@ pub enum ForwardedRouterOp {
         after_fid: FileId,
         limit: usize,
     },
+    /// One shard's directory attribute. The handler does not read other shards.
+    ShardPointDirStat {
+        shard_id: u64,
+        epoch: metadb_core::ShardEpoch,
+        pid: InodeId,
+    },
+    /// Quorum timestamp from one shard, used to build a shared dirstat barrier.
+    ShardAppliedHlc {
+        shard_id: u64,
+        epoch: metadb_core::ShardEpoch,
+    },
+    /// One shard's reconciled contribution at a shared barrier.
+    ShardBarrierStat {
+        shard_id: u64,
+        epoch: metadb_core::ShardEpoch,
+        pid: InodeId,
+        barrier: metadb_core::HlcTimestamp,
+    },
+    ShardMetaScan {
+        shard_id: u64,
+        epoch: metadb_core::ShardEpoch,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        name_prefix: Option<String>,
+        limit: usize,
+    },
+    ShardQuotaScan {
+        shard_id: u64,
+        epoch: metadb_core::ShardEpoch,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        limit: usize,
+    },
+    ShardIndexScan {
+        shard_id: u64,
+        epoch: metadb_core::ShardEpoch,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        limit: usize,
+    },
 }
 
 #[derive(
@@ -73,6 +113,13 @@ pub enum ForwardedRouterOut {
     ListQuotas(Vec<QuotaRecord>),
     GetSecondaryIndex(Option<metadb_core::SecondaryIndexRecord>),
     ScanSecondaryIndex(Vec<metadb_core::SecondaryIndexRecord>),
+    AppliedHlc(u64),
+    BarrierStat {
+        anchor: Option<InodeAttr>,
+        children: i64,
+        bytes: i64,
+        mtime: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -110,7 +157,14 @@ pub async fn forward_op(
     secret: &str,
     addr: &str,
     op: &ForwardedRouterOp,
+    deadline: tokio::time::Instant,
 ) -> Result<ForwardedRouterOut> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(MetaDbError::RpcError(
+            "forwarded read exceeded the routing deadline".to_string(),
+        ));
+    }
     let url = if addr.starts_with("http://") || addr.starts_with("https://") {
         addr.to_string()
     } else {
@@ -118,11 +172,18 @@ pub async fn forward_op(
     };
     let endpoint = Endpoint::from_shared(url.clone())
         .map_err(|error| MetaDbError::RpcError(format!("invalid leader address {url}: {error}")))?
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(5));
-    let channel: Channel = endpoint.connect().await.map_err(|error| {
-        MetaDbError::RpcError(format!("connect to leader {url} failed: {error}"))
-    })?;
+        .connect_timeout(remaining.min(Duration::from_secs(3)))
+        .timeout(remaining);
+    let channel: Channel = match tokio::time::timeout(remaining, endpoint.connect()).await {
+        Ok(channel) => channel.map_err(|error| {
+            MetaDbError::RpcError(format!("connect to leader {url} failed: {error}"))
+        })?,
+        Err(_) => {
+            return Err(MetaDbError::RpcError(
+                "forwarded read connect timed out".to_string(),
+            ))
+        }
+    };
     let mut client = TransactionServiceClient::with_interceptor(
         channel,
         ForwardAuth {

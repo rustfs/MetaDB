@@ -204,4 +204,15 @@ impl ShardDirectory for DurableGlobalManager {
         }
         None
     }
+
+    fn local_shard(&self, shard_id: u64) -> Result<RoutedShardHandle> {
+        for cell in self.all_cells() {
+            if let Ok(handle) = cell.lookup_local_handle(shard_id) {
+                return Ok(handle);
+            }
+        }
+        Err(MetaDbError::ShardRoutingError(format!(
+            "shard {shard_id} is not hosted locally"
+        )))
+    }
 }

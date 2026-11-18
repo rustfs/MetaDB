@@ -174,6 +174,13 @@ pub enum TxRaftCmd {
         insert_quota_limit_bytes: u64,
         update_quota_limit_bytes: u64,
     },
+    /// Replicated node-instance binding. Appended so earlier command tags stay stable.
+    /// Apply keeps the first instance for a node id and ignores a conflicting one.
+    BindNodeInstance {
+        node_id: u64,
+        instance_id: u128,
+        grpc_addr: String,
+    },
 }
 
 /// Typed output serialized inside `MetaDbRaftResponse.result`.
@@ -203,12 +210,33 @@ struct PersistedShardRouteMeta {
     range: CompositeKeyRange,
 }
 
+/// Durable `(instance id, address)` stored under prefix `0x09` on every replica.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
+pub struct NodeInstanceRecord {
+    pub instance_id: u128,
+    pub grpc_addr: String,
+}
+
+pub fn node_instance_key(node_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(9);
+    key.push(0x09);
+    key.extend_from_slice(&node_id.to_be_bytes());
+    key
+}
+
+/// Process-local copy of Raft-applied `(instance id, grpc address)` bindings.
+pub type SharedNodeInstanceBindings = Arc<std::sync::Mutex<BTreeMap<u64, (u128, String)>>>;
+
 /// Stateful per-shard transaction handler implementing both `ShardApplyHandler` and `PreFlushHook`.
 pub struct TxStateMachineHandler {
     shard_id: ShardId,
     meta: RwLock<PersistedShardRouteMeta>,
     attr_agg: Arc<ReplicatedAttrAggregator>,
     outbox: Arc<ShardAuxOutbox>,
+    /// Filled on apply, including replay, so every replica learns node-instance bindings.
+    instance_bindings: std::sync::Mutex<Option<SharedNodeInstanceBindings>>,
 }
 
 impl TxStateMachineHandler {
@@ -242,7 +270,13 @@ impl TxStateMachineHandler {
             }),
             attr_agg: Arc::new(ReplicatedAttrAggregator::new()),
             outbox: Arc::new(ShardAuxOutbox::new(shard_id, spill_threshold, watermarks)),
+            instance_bindings: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Shares the cell's binding map. Set this before `ShardRaftGroup::start` so replay fills it.
+    pub fn set_instance_bindings(&self, bindings: SharedNodeInstanceBindings) {
+        *self.instance_bindings.lock().unwrap() = Some(bindings);
     }
 
     pub fn shard_id(&self) -> ShardId {
@@ -1992,6 +2026,39 @@ impl TxStateMachineHandler {
                     let mut m = self.meta.write().unwrap();
                     m.range = restored_range;
                     m.epoch = new_epoch;
+                }
+                self.outbox
+                    .record_entry_specs(raft_index, commit_hlc, vec![]);
+                Ok(TxRaftOutput::Unit)
+            }
+            TxRaftCmd::BindNodeInstance {
+                node_id,
+                instance_id,
+                grpc_addr,
+            } => {
+                let key = node_instance_key(node_id);
+                if let Some(raw) = Self::read_latest_in_apply(engine, &key)? {
+                    let existing: NodeInstanceRecord = codec::deserialize(&raw)
+                        .map_err(|error| MetaDbError::CodecError(error.to_string()))?;
+                    if existing.instance_id != instance_id {
+                        return Err(MetaDbError::IdentityRejected(format!(
+                            "node {node_id} is already bound to instance {:#x}; refusing a reused node identity",
+                            existing.instance_id
+                        )));
+                    }
+                }
+                let record = NodeInstanceRecord {
+                    instance_id,
+                    grpc_addr: grpc_addr.clone(),
+                };
+                let bytes = codec::serialize(&record)
+                    .map_err(|error| MetaDbError::CodecError(error.to_string()))?;
+                engine.apply_committed_put(key, bytes, commit_hlc, raft_index);
+                if let Some(bindings) = self.instance_bindings.lock().unwrap().clone() {
+                    bindings
+                        .lock()
+                        .unwrap()
+                        .insert(node_id, (instance_id, grpc_addr));
                 }
                 self.outbox
                     .record_entry_specs(raft_index, commit_hlc, vec![]);

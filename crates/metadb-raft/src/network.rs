@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use openraft::entry::RaftEntry;
 use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Unreachable};
@@ -33,9 +34,20 @@ const SNAPSHOT_STREAM_CHUNK_BYTES: usize = 256 * 1024;
 pub type MetaDbRaft = Raft<MetaDbTypeConfig, ShardStateMachine>;
 
 /// Per-node registry mapping `ShardId -> MetaDbRaft` for incoming multiplexed Raft RPCs.
+#[tonic::async_trait]
+pub trait LocalProposer: Send + Sync {
+    async fn propose_local_forwarded(
+        &self,
+        expected_epoch: metadb_core::ShardEpoch,
+        caller_hlc: metadb_core::HlcTimestamp,
+        payload: Vec<u8>,
+    ) -> metadb_core::Result<MetaDbRaftResponse>;
+}
+
 #[derive(Clone, Default)]
 pub struct MultiRaftRouter {
     groups: Arc<RwLock<HashMap<ShardId, MetaDbRaft>>>,
+    local_proposers: Arc<RwLock<HashMap<ShardId, std::sync::Arc<dyn LocalProposer>>>>,
 }
 
 impl MultiRaftRouter {
@@ -53,6 +65,30 @@ impl MultiRaftRouter {
 
     pub fn get_group(&self, shard_id: ShardId) -> Option<MetaDbRaft> {
         self.groups.read().unwrap().get(&shard_id).cloned()
+    }
+
+    pub fn register_local_proposer(
+        &self,
+        shard_id: ShardId,
+        proposer: std::sync::Arc<dyn LocalProposer>,
+    ) {
+        self.local_proposers
+            .write()
+            .unwrap()
+            .insert(shard_id, proposer);
+    }
+
+    pub fn get_local_proposer(
+        &self,
+        shard_id: ShardId,
+    ) -> Option<std::sync::Arc<dyn LocalProposer>> {
+        self.local_proposers.read().unwrap().get(&shard_id).cloned()
+    }
+
+    /// Drops routed Raft handles so a later reopen can take the LSM lock.
+    pub fn clear(&self) {
+        self.local_proposers.write().unwrap().clear();
+        self.groups.write().unwrap().clear();
     }
 }
 
@@ -95,7 +131,8 @@ impl ChannelPool {
             }
         }
         let endpoint = Endpoint::from_shared(url.clone())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
+            .connect_timeout(Duration::from_secs(3));
         let channel = endpoint
             .connect()
             .await
@@ -495,15 +532,27 @@ impl RaftTransportService for MultiRaftTransportServer {
                 }))
             }
         };
-        let result = match raft.client_write(req).await {
-            Ok(response) => Ok(response.data),
-            Err(openraft::errors::RaftError::APIError(
-                openraft::errors::ClientWriteError::ForwardToLeader(fwd),
-            )) => Err(MetaDbError::NotLeader {
-                shard_id: env.shard_id,
-                leader_hint: fwd.leader_id,
-            }),
-            Err(error) => Err(MetaDbError::ConsensusError(error.to_string())),
+        let result = if let Some(proposer) = self.router.get_local_proposer(env.shard_id) {
+            proposer
+                .propose_local_forwarded(req.expected_epoch, req.hlc, req.payload)
+                .await
+        } else {
+            match raft.client_write(req).await {
+                Ok(response) => {
+                    if let Err(error) = response.data.result.clone() {
+                        Err(error)
+                    } else {
+                        Ok(response.data)
+                    }
+                }
+                Err(openraft::errors::RaftError::APIError(
+                    openraft::errors::ClientWriteError::ForwardToLeader(fwd),
+                )) => Err(MetaDbError::NotLeader {
+                    shard_id: env.shard_id,
+                    leader_hint: fwd.leader_id,
+                }),
+                Err(error) => Err(MetaDbError::ConsensusError(error.to_string())),
+            }
         };
         match codec::serialize(&result) {
             Ok(bincode_payload) => Ok(Response::new(RaftRpcReply {

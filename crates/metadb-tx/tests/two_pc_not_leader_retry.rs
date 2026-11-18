@@ -139,6 +139,11 @@ async fn cross_shard_prepare_and_commit_retry_known_not_leader() {
     tx.mkdir(ROOT_INODE_ID, "dst", 600, 7, 0o755)
         .await
         .expect("Prepare and Commit must retry NotLeader and finish the cross-shard mkdir");
+    left_group.testing_fail_next_epoch_mismatch(1);
+    right_group.testing_fail_next_epoch_mismatch(1);
+    tx.mkdir(ROOT_INODE_ID, "other", 700, 7, 0o755)
+        .await
+        .expect("a split-style epoch mismatch must regroup and commit");
     let found = tx.lookup(ROOT_INODE_ID, "dst").await.unwrap();
     assert!(found.is_some());
 }

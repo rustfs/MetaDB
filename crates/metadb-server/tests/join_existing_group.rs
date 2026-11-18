@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use metadb_cluster::ClusterIdentity;
+use metadb_core::codec;
 use metadb_core::{HlcTimestamp, MetaDbError, MetaKey, ROOT_INODE_ID};
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::metadata_service_client::MetadataServiceClient;
@@ -17,6 +18,7 @@ use metadb_proto::{
     CreateFileRequest, GetRoutesRequest, LookupRequest, MkdirRequest, ShardDescriptorProto,
 };
 use metadb_server::{PersistentMetaDbCluster, ServerTomlConfig};
+use metadb_tx::TxRaftCmd;
 use tempfile::tempdir;
 
 const BUCKET_ID: u64 = 10;
@@ -186,6 +188,54 @@ async fn second_process_joins_existing_raft_group_fails_over_and_reopens() {
     assert!(create_named(&node2, "from_follower.dat", 110, 510).await);
     wait_visible(&node1, "from_follower.dat").await;
     node2.tx_router().dirstat(BUCKET_ID).await.unwrap();
+    assert_eq!(
+        node1.cell_manager().bound_instance(2),
+        Some(node2.cell_manager().node_instance_id())
+    );
+    assert_eq!(
+        node2.cell_manager().bound_instance(2),
+        Some(node2.cell_manager().node_instance_id())
+    );
+    let duplicate = codec::serialize(&TxRaftCmd::CreateFile {
+        pid: BUCKET_ID,
+        name: "before_join.dat".to_string(),
+        inode_id: 100,
+        fid: 500,
+        uid: 7,
+        mode: 0o644,
+        size_bytes: 32,
+    })
+    .unwrap();
+    let duplicate_error = {
+        let (_, follower_group, _) = node2.cell_manager().lookup_local_handle(1).unwrap();
+        follower_group
+            .propose(
+                follower_group.current_epoch(),
+                HlcTimestamp::ZERO,
+                duplicate,
+            )
+            .await
+            .unwrap_err()
+    };
+    assert!(
+        matches!(duplicate_error, MetaDbError::AlreadyExists { .. }),
+        "{duplicate_error}"
+    );
+    let skewed = {
+        let (_, leader_group, _) = node1.cell_manager().lookup_local_handle(1).unwrap();
+        leader_group
+            .propose_local(
+                leader_group.current_epoch(),
+                HlcTimestamp::new(10_000_000_000_000, 0),
+                vec![0],
+            )
+            .await
+            .unwrap_err()
+    };
+    assert!(
+        matches!(skewed, MetaDbError::ClockSkewExceeded { .. }),
+        "{skewed}"
+    );
 
     let cfg3 = fast_config(&dir3, 3, &addr1);
     let (node3, addr3) = PersistentMetaDbCluster::open_and_serve(cfg3.clone())
@@ -702,10 +752,14 @@ async fn reused_node_id_and_foreign_cluster_are_rejected() {
         PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n1"), 1, ""))
             .await
             .unwrap();
-    let (node2, _) =
+    let (node2, addr2) =
         PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n2"), 2, &addr1))
             .await
             .unwrap();
+    assert_eq!(
+        node2.cell_manager().bound_instance(2),
+        Some(node2.cell_manager().node_instance_id())
+    );
     let reused = PersistentMetaDbCluster::open_and_serve(fast_config(
         &dir.path().join("n2-reused"),
         2,
@@ -748,6 +802,37 @@ async fn reused_node_id_and_foreign_cluster_are_rejected() {
         node1.cell_manager().cluster_id(),
         0x1111_2222_3333_4444_u128
     );
-    node2.shutdown().await.unwrap();
     node1.shutdown().await.unwrap();
+    drop(node1);
+    let reused_after_failover = PersistentMetaDbCluster::open_and_serve(fast_config(
+        &dir.path().join("n2-after-failover"),
+        2,
+        &addr2,
+    ))
+    .await;
+    match reused_after_failover {
+        Ok((cluster, _)) => {
+            cluster.shutdown().await.unwrap();
+            panic!("failover leader accepted a new instance for node 2");
+        }
+        Err(error) => assert!(
+            matches!(error, MetaDbError::IdentityRejected(_)),
+            "unexpected failover reuse error: {error}"
+        ),
+    }
+    node2.shutdown().await.unwrap();
+    drop(node2);
+    std::fs::remove_file(dir.path().join("n2/cell_1/CLUSTER_IDENTITY")).unwrap();
+    let legacy =
+        PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n2"), 2, "")).await;
+    match legacy {
+        Ok((cluster, _)) => {
+            cluster.shutdown().await.unwrap();
+            panic!("legacy replicated directory invented a private cluster id");
+        }
+        Err(error) => assert!(
+            matches!(error, MetaDbError::IdentityRejected(_)),
+            "unexpected legacy identity error: {error}"
+        ),
+    }
 }

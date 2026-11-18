@@ -1227,14 +1227,14 @@ async fn join_existing_raft_group_once(
         )));
     }
     let our_id = config.node.node_id;
-    let seed_has_us = routes.iter().any(|route| {
+    let on_every_shard = routes.iter().all(|route| {
         route
             .peers
             .get(&our_id)
             .map(|(_, is_voter)| *is_voter)
             .unwrap_or(false)
     });
-    if seed_has_us && !cell_manager.join_pending() {
+    if on_every_shard && !cell_manager.join_pending() {
         return Err(MetaDbError::IdentityRejected(format!(
             "node_id {our_id} is already a voter; reopen that node's data directory instead of joining a fresh one"
         )));
@@ -1242,7 +1242,7 @@ async fn join_existing_raft_group_once(
     // Persist intent before promotion. A crash after the leader commits membership can resume
     // from this flag instead of coming back as an empty node the leader still counts.
     cell_manager.begin_join(&routes)?;
-    let voter_ids: BTreeSet<NodeId> = routes
+    let mut voter_ids: BTreeSet<NodeId> = routes
         .iter()
         .flat_map(|route| {
             route
@@ -1253,48 +1253,52 @@ async fn join_existing_raft_group_once(
         })
         .collect();
     cell_manager.start_joining_replicas(&routes).await?;
-    if seed_has_us {
-        return finish_resumed_join(config, cell_manager, &mut client, &seed, routes).await;
-    }
-
-    let instance_id = cell_manager.node_instance_id();
-    if instance_id == 0 {
-        return Err(MetaDbError::IdentityRejected(
-            "joiner has no node instance id".to_string(),
-        ));
-    }
-    let registered = client
-        .register_node(RegisterNodeRequest {
-            cell_id: config.node.cell_id,
-            node_id: config.node.node_id,
-            grpc_addr: bound_addr.to_string(),
-            instance_id: metadb_proto::convert::encode_u128_be(instance_id).to_vec(),
-        })
-        .await
-        .map_err(|e| MetaDbError::ConsensusError(format!("register_node at {seed}: {e}")))?
-        .into_inner();
-    if let Some(error) = rpc_app_error(registered.error) {
-        return Err(error);
-    }
-
-    let target_voters = u32::try_from(voter_ids.len().saturating_add(1)).unwrap_or(u32::MAX);
-    let scaled = client
-        .scale_shard_replicas(ScaleShardReplicasRequest {
-            cell_id: config.node.cell_id,
-            target_voters,
-            ensure_node_id: our_id,
-        })
-        .await
-        .map_err(|e| MetaDbError::ConsensusError(format!("scale_shard_replicas at {seed}: {e}")))?
-        .into_inner();
-    if let Some(error) = rpc_app_error(scaled.error) {
-        if !cell_manager.local_voters_include(config.node.node_id) {
-            return Err(match error {
-                MetaDbError::IdentityRejected(message) => MetaDbError::IdentityRejected(message),
-                other => {
-                    MetaDbError::ConsensusError(format!("scale_shard_replicas at {seed}: {other}"))
-                }
-            });
+    if !on_every_shard {
+        let instance_id = cell_manager.node_instance_id();
+        if instance_id == 0 {
+            return Err(MetaDbError::IdentityRejected(
+                "joiner has no node instance id".to_string(),
+            ));
+        }
+        let registered = client
+            .register_node(RegisterNodeRequest {
+                cell_id: config.node.cell_id,
+                node_id: config.node.node_id,
+                grpc_addr: bound_addr.to_string(),
+                instance_id: metadb_proto::convert::encode_u128_be(instance_id).to_vec(),
+            })
+            .await
+            .map_err(|e| MetaDbError::ConsensusError(format!("register_node at {seed}: {e}")))?
+            .into_inner();
+        if let Some(error) = rpc_app_error(registered.error) {
+            return Err(error);
+        }
+        // Include this node once. A partial promotion already lists it on some shards.
+        voter_ids.insert(our_id);
+        let target_voters = u32::try_from(metadb_cluster::join_scale_target(&voter_ids, our_id))
+            .unwrap_or(u32::MAX);
+        let scaled = client
+            .scale_shard_replicas(ScaleShardReplicasRequest {
+                cell_id: config.node.cell_id,
+                target_voters,
+                ensure_node_id: our_id,
+            })
+            .await
+            .map_err(|e| {
+                MetaDbError::ConsensusError(format!("scale_shard_replicas at {seed}: {e}"))
+            })?
+            .into_inner();
+        if let Some(error) = rpc_app_error(scaled.error) {
+            if !cell_manager.local_voters_include(config.node.node_id) {
+                return Err(match error {
+                    MetaDbError::IdentityRejected(message) => {
+                        MetaDbError::IdentityRejected(message)
+                    }
+                    other => MetaDbError::ConsensusError(format!(
+                        "scale_shard_replicas at {seed}: {other}"
+                    )),
+                });
+            }
         }
     }
 
@@ -1302,7 +1306,7 @@ async fn join_existing_raft_group_once(
     tracing::info!(
         node_id = our_id,
         seed = %seed,
-        voters = target_voters,
+        voters = voter_ids.len(),
         "joined existing raft group"
     );
     Ok(())

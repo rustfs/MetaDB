@@ -17,7 +17,8 @@ pub mod shard;
 pub mod split_worker;
 
 pub use cell_manager::{
-    plan_membership_voters, CellDirectoryRole, DurableCellManager, SplitPlanRecord, SplitPlanState,
+    join_scale_target, plan_membership_voters, CellDirectoryRole, DurableCellManager,
+    SplitPlanRecord, SplitPlanState,
 };
 pub use control_plane::{CellId, CellLocalManager, GlobalManager, MetaCache, ShardRoute};
 pub use global_manager::DurableGlobalManager;
