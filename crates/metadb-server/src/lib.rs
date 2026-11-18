@@ -525,6 +525,7 @@ impl PersistentMetaDbCluster {
     /// When `config.cluster.join` is set and this data directory does not already own a cell,
     /// the process registers with that leader and joins every shard Raft group before returning.
     pub async fn open_and_serve(config: ServerTomlConfig) -> Result<(Arc<Self>, String)> {
+        metadb_cluster::node_id_in_ha_range(config.node.node_id)?;
         if config.node.role != ServerRole::AllInOne {
             return Err(MetaDbError::CodecError(format!(
                 "server role {:?} is not implemented; only all-in-one runs a process. \
@@ -571,8 +572,9 @@ impl PersistentMetaDbCluster {
             config.clock.max_clock_drift_ms,
         ));
         let block_cache = Arc::new(ShardedBlockCache::new(config.storage.block_cache_bytes));
-        let id_allocator = Arc::new(DurableIdAllocator::open(
+        let id_allocator = Arc::new(DurableIdAllocator::open_for_node(
             config.node.data_dir.join("global_allocator"),
+            config.node.node_id,
         )?);
         let id_buffer = Arc::new(LocalIdBuffer::new(
             id_allocator.clone(),
@@ -642,11 +644,10 @@ impl PersistentMetaDbCluster {
             meta_cache,
         ));
         global_manager.register_cell(CompositeKeyRange::all_user_tables(), cell_manager.clone());
-        let tx_router = Arc::new(DistributedTxRouter::new(
-            config.node.node_id,
-            clock.clone(),
-            global_manager.clone(),
-        ));
+        let tx_router = Arc::new(
+            DistributedTxRouter::new(config.node.node_id, clock.clone(), global_manager.clone())
+                .with_forward_secret(config.security.shared_secret.clone()),
+        );
         let proxy_router = Arc::new(StatelessProxyRouter::new(tx_router.clone()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let grpc_svc = MetaDbGrpcService::new(
@@ -670,7 +671,13 @@ impl PersistentMetaDbCluster {
         if join_fresh {
             // Raft RPCs from the leader arrive on this listener while membership is proposed.
             wait_until_accepting(&bound_addr).await;
-            join_existing_raft_group(&config, &cell_manager, &bound_addr).await?;
+            if let Err(error) = join_existing_raft_group(&config, &cell_manager, &bound_addr).await
+            {
+                let _ = shutdown_tx.send(true);
+                let _ = grpc_handle.await;
+                let _ = host.shutdown_all().await;
+                return Err(error);
+            }
         }
 
         // A joined replica already has the root directory in the replicated state machine.
@@ -1105,13 +1112,19 @@ fn normalize_rpc_addr(addr: &str) -> String {
 }
 
 fn rpc_message(err: Option<metadb_proto::ErrorDetailProto>) -> Option<String> {
-    err.and_then(|err| {
-        if err.message.is_empty() && err.error_kind.is_empty() {
-            None
-        } else {
-            Some(format!("{} {}", err.error_kind, err.message))
-        }
-    })
+    rpc_app_error(err).map(|error| error.to_string())
+}
+
+fn rpc_app_error(err: Option<metadb_proto::ErrorDetailProto>) -> Option<MetaDbError> {
+    let err = err?;
+    if err.message.is_empty() && err.error_kind.is_empty() && err.serialized_core_error.is_empty() {
+        return None;
+    }
+    Some(MetaDbError::from(err))
+}
+
+fn join_failure_is_permanent(error: &MetaDbError) -> bool {
+    matches!(error, MetaDbError::IdentityRejected(_))
 }
 
 async fn control_plane_client(
@@ -1126,7 +1139,9 @@ async fn control_plane_client(
     >,
 > {
     let endpoint = Endpoint::from_shared(addr.to_string())
-        .map_err(|e| MetaDbError::ConsensusError(format!("invalid seed address {addr}: {e}")))?;
+        .map_err(|e| MetaDbError::ConsensusError(format!("invalid seed address {addr}: {e}")))?
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(20));
     let channel = endpoint.connect().await.map_err(|e| {
         MetaDbError::ConsensusError(format!("connect to raft leader {addr} failed: {e}"))
     })?;
@@ -1144,7 +1159,34 @@ fn listen_port_is_ephemeral(addr: &str) -> bool {
 
 /// Registers this process with `config.cluster.join` and waits until every local shard
 /// has applied a voter membership that includes this node.
+///
+/// Transient membership and transport errors are retried. A conflicting cluster or node
+/// identity is returned immediately. A failed attempt does not abort the process by itself;
+/// the caller shuts the listeners down and returns the error.
 async fn join_existing_raft_group(
+    config: &ServerTomlConfig,
+    cell_manager: &DurableCellManager,
+    bound_addr: &str,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut last_error = None;
+    while tokio::time::Instant::now() < deadline {
+        match join_existing_raft_group_once(config, cell_manager, bound_addr).await {
+            Ok(()) => return Ok(()),
+            Err(error) if join_failure_is_permanent(&error) => return Err(error),
+            Err(error) => {
+                tracing::warn!(%error, "join attempt failed; retrying");
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        MetaDbError::ConsensusError("join failed before an attempt completed".to_string())
+    }))
+}
+
+async fn join_existing_raft_group_once(
     config: &ServerTomlConfig,
     cell_manager: &DurableCellManager,
     bound_addr: &str,
@@ -1158,11 +1200,22 @@ async fn join_existing_raft_group(
         .await
         .map_err(|e| MetaDbError::ConsensusError(format!("get_routes from {seed}: {e}")))?
         .into_inner();
-    if let Some(message) = rpc_message(listed.error) {
-        return Err(MetaDbError::ConsensusError(format!(
-            "get_routes from {seed}: {message}"
+    if let Some(error) = rpc_app_error(listed.error) {
+        return Err(match error {
+            MetaDbError::IdentityRejected(message) => MetaDbError::IdentityRejected(message),
+            other => MetaDbError::ConsensusError(format!("get_routes from {seed}: {other}")),
+        });
+    }
+    let cluster_id =
+        metadb_proto::convert::decode_optional_u128_be(&listed.cluster_id).map_err(|error| {
+            MetaDbError::IdentityRejected(format!("seed {seed} cluster id is invalid: {error}"))
+        })?;
+    if cluster_id == 0 {
+        return Err(MetaDbError::IdentityRejected(format!(
+            "seed {seed} has no cluster identity"
         )));
     }
+    cell_manager.adopt_cluster_identity(cluster_id)?;
     let mut routes = Vec::with_capacity(listed.shards.len());
     for shard in listed.shards {
         routes.push(grpc_services::composite_route_from_proto(shard)?);
@@ -1182,7 +1235,7 @@ async fn join_existing_raft_group(
             .unwrap_or(false)
     });
     if seed_has_us && !cell_manager.join_pending() {
-        return Err(MetaDbError::ConsensusError(format!(
+        return Err(MetaDbError::IdentityRejected(format!(
             "node_id {our_id} is already a voter; reopen that node's data directory instead of joining a fresh one"
         )));
     }
@@ -1204,19 +1257,24 @@ async fn join_existing_raft_group(
         return finish_resumed_join(config, cell_manager, &mut client, &seed, routes).await;
     }
 
+    let instance_id = cell_manager.node_instance_id();
+    if instance_id == 0 {
+        return Err(MetaDbError::IdentityRejected(
+            "joiner has no node instance id".to_string(),
+        ));
+    }
     let registered = client
         .register_node(RegisterNodeRequest {
             cell_id: config.node.cell_id,
             node_id: config.node.node_id,
             grpc_addr: bound_addr.to_string(),
+            instance_id: metadb_proto::convert::encode_u128_be(instance_id).to_vec(),
         })
         .await
         .map_err(|e| MetaDbError::ConsensusError(format!("register_node at {seed}: {e}")))?
         .into_inner();
-    if let Some(message) = rpc_message(registered.error) {
-        return Err(MetaDbError::ConsensusError(format!(
-            "register_node at {seed}: {message}"
-        )));
+    if let Some(error) = rpc_app_error(registered.error) {
+        return Err(error);
     }
 
     let target_voters = u32::try_from(voter_ids.len().saturating_add(1)).unwrap_or(u32::MAX);
@@ -1224,15 +1282,19 @@ async fn join_existing_raft_group(
         .scale_shard_replicas(ScaleShardReplicasRequest {
             cell_id: config.node.cell_id,
             target_voters,
+            ensure_node_id: our_id,
         })
         .await
         .map_err(|e| MetaDbError::ConsensusError(format!("scale_shard_replicas at {seed}: {e}")))?
         .into_inner();
-    if let Some(message) = rpc_message(scaled.error) {
+    if let Some(error) = rpc_app_error(scaled.error) {
         if !cell_manager.local_voters_include(config.node.node_id) {
-            return Err(MetaDbError::ConsensusError(format!(
-                "scale_shard_replicas at {seed}: {message}"
-            )));
+            return Err(match error {
+                MetaDbError::IdentityRejected(message) => MetaDbError::IdentityRejected(message),
+                other => {
+                    MetaDbError::ConsensusError(format!("scale_shard_replicas at {seed}: {other}"))
+                }
+            });
         }
     }
 
@@ -1279,7 +1341,9 @@ async fn finish_resumed_join(
         let refreshed = response.into_inner();
         if rpc_message(refreshed.error).is_none() {
             for shard in refreshed.shards {
-                joined_routes.push(grpc_services::composite_route_from_proto(shard)?);
+                if let Ok(route) = grpc_services::composite_route_from_proto(shard) {
+                    joined_routes.push(route);
+                }
             }
         }
     }

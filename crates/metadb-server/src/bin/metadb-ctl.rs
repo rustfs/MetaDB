@@ -517,6 +517,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .scale_shard_replicas(ScaleShardReplicasRequest {
                     cell_id,
                     target_voters,
+                    ensure_node_id: 0,
                 })
                 .await?
                 .into_inner();

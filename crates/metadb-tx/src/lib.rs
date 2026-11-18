@@ -8,6 +8,7 @@
 pub mod attr_aggregator;
 pub mod aux_outbox;
 pub mod aux_sink;
+mod leader_forward;
 pub mod pushdown;
 pub mod recovery_worker;
 pub mod rename_cycle;

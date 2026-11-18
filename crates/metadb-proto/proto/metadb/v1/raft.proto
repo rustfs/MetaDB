@@ -34,4 +34,7 @@ service RaftTransportService {
   rpc AppendEntries(RaftRpcEnvelope) returns (RaftRpcReply);
   rpc Vote(RaftRpcEnvelope) returns (RaftRpcReply);
   rpc InstallSnapshot(stream SnapshotChunkRequest) returns (SnapshotChunkResponse);
+  // Follower client proposals. The handler calls `client_write` on the local
+  // group and does not forward again.
+  rpc ClientWrite(RaftRpcEnvelope) returns (RaftRpcReply);
 }

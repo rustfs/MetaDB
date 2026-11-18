@@ -20,6 +20,7 @@ use metadb_core::{
 use metadb_raft::ShardRaftGroup;
 use metadb_storage::{ScanControl, SnapshotGuard};
 
+use crate::leader_forward::{forward_op, ForwardedRouterOp, ForwardedRouterOut};
 use crate::recovery_worker::TxnRecoveryWorker;
 use crate::rename_cycle::RenameCycleWalker;
 use crate::state_machine_impl::{SetAttrPatch, TxRaftCmd, TxRaftOutput, TxStateMachineHandler};
@@ -139,6 +140,11 @@ pub trait ShardDirectory: Send + Sync + 'static {
 
     /// Releases a `DirRenameLease` on completion.
     async fn release_dir_rename_lease(&self, token: u64);
+
+    /// Dial address of `node_id` in `shard_id`'s applied membership, when this process hosts it.
+    fn raft_peer_addr(&self, _shard_id: u64, _node_id: u64) -> Option<String> {
+        None
+    }
 }
 
 /// Executes both `1-RTT` single-shard pushdown and Primary-Anchored `2PC` across `ShardRaftGroup`s.
@@ -147,6 +153,7 @@ pub struct DistributedTxRouter {
     clock: Arc<HybridLogicalClock>,
     directory: Arc<dyn ShardDirectory>,
     ttl_ms: u64,
+    forward_secret: String,
 }
 
 impl DistributedTxRouter {
@@ -160,7 +167,13 @@ impl DistributedTxRouter {
             clock,
             directory,
             ttl_ms: DEFAULT_2PC_TTL_MS,
+            forward_secret: String::new(),
         }
+    }
+
+    pub fn with_forward_secret(mut self, secret: impl Into<String>) -> Self {
+        self.forward_secret = secret.into();
+        self
     }
 
     pub fn with_ttl_ms(mut self, ttl_ms: u64) -> Self {
@@ -237,6 +250,50 @@ impl DistributedTxRouter {
         Ok((resp.applied_hlc, decoded))
     }
 
+    /// Re-resolves `user_key` and proposes until the leader accepts, or the routing budget ends.
+    ///
+    /// `propose` itself forwards one hop when the local replica already knows the leader.
+    /// This loop covers a stale hint and an epoch bumped by membership or split.
+    async fn propose_participant(
+        &self,
+        user_key: &[u8],
+        cmd: &TxRaftCmd,
+        hlc: HlcTimestamp,
+    ) -> Result<(ShardEpoch, Arc<ShardRaftGroup>, HlcTimestamp, TxRaftOutput)> {
+        let deadline = tokio::time::Instant::now() + ROUTE_RETRY_TIMEOUT;
+        let mut last = None;
+        while tokio::time::Instant::now() < deadline {
+            let (epoch, group, _) = match self.route_user_key_once(user_key) {
+                Ok(routed) => routed,
+                Err(
+                    error @ (MetaDbError::EpochMismatch { .. } | MetaDbError::ShardRoutingError(_)),
+                ) => {
+                    last = Some(error);
+                    tokio::time::sleep(ROUTE_RETRY_INTERVAL).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match Self::propose_cmd(&group, epoch, hlc, cmd).await {
+                Ok((applied_hlc, decoded)) => {
+                    return Ok((epoch, group, applied_hlc, decoded));
+                }
+                Err(
+                    error @ (MetaDbError::NotLeader { .. } | MetaDbError::EpochMismatch { .. }),
+                ) => {
+                    last = Some(error);
+                    tokio::time::sleep(ROUTE_RETRY_INTERVAL).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            MetaDbError::ShardRoutingError(
+                "participant propose exhausted leader retries".to_string(),
+            )
+        }))
+    }
+
     async fn propose_key_with_retry(
         &self,
         user_key: &[u8],
@@ -251,6 +308,10 @@ impl DistributedTxRouter {
             .await;
             match result {
                 Ok((_, out)) => return Ok(out),
+                Err(MetaDbError::NotLeader { .. }) if attempt < 11 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5 * (attempt as u64 + 1)))
+                        .await;
+                }
                 Err(MetaDbError::WriteIntentConflict {
                     conflicting_txn_id,
                     primary_key,
@@ -962,7 +1023,7 @@ impl DistributedTxRouter {
         let all_participant_keys: Vec<Vec<u8>> = intents.iter().map(|(k, _)| k.clone()).collect();
 
         // Group intents by routed `ShardId`.
-        let (primary_epoch, primary_group, _) = self.route_user_key(primary_key).await?;
+        let (_primary_epoch, primary_group, _) = self.route_user_key(primary_key).await?;
         let primary_shard_id = primary_group.shard_id();
 
         let mut grouped: HashMap<ShardId, ShardIntentGroup> = HashMap::new();
@@ -997,13 +1058,17 @@ impl DistributedTxRouter {
         let mut ordered_groups: Vec<(ShardId, ShardIntentGroup)> = grouped.into_iter().collect();
         ordered_groups.sort_by_key(|(sid, _)| *sid == primary_shard_id);
 
-        for (sid, (ep, grp, shard_intents)) in ordered_groups {
+        for (sid, (_ep, _grp, shard_intents)) in ordered_groups {
             let shard_keys: Vec<Vec<u8>> = shard_intents.iter().map(|(k, _)| k.clone()).collect();
             let shard_expected_values = expected_values
                 .iter()
                 .filter(|(key, _)| shard_keys.contains(key))
                 .cloned()
                 .collect();
+            let route_key = shard_intents
+                .first()
+                .map(|(key, _)| key.clone())
+                .unwrap_or_else(|| primary_key.to_vec());
             let prep_cmd = TxRaftCmd::Prepare2pcChecked {
                 txn_id,
                 is_primary: sid == primary_shard_id,
@@ -1015,10 +1080,13 @@ impl DistributedTxRouter {
                 intents: shard_intents,
                 expected_values: shard_expected_values,
             };
-            match Self::propose_cmd(&grp, ep, start_hlc, &prep_cmd).await {
-                Ok((_, TxRaftOutput::Prepared { prepared_hlc })) => {
+            match self
+                .propose_participant(&route_key, &prep_cmd, start_hlc)
+                .await
+            {
+                Ok((epoch, group, _, TxRaftOutput::Prepared { prepared_hlc })) => {
                     max_prepared_hlc = max_prepared_hlc.max(prepared_hlc);
-                    prepared_shards.push((ep, grp, shard_keys));
+                    prepared_shards.push((epoch, group, shard_keys));
                 }
                 Ok(_) => {
                     self.abort_prepared_shards(txn_id, &prepared_shards).await;
@@ -1046,13 +1114,9 @@ impl DistributedTxRouter {
             commit_hlc,
             rename_fence_token,
         };
-        let (_, primary_out) = Self::propose_cmd(
-            &primary_group,
-            primary_epoch,
-            commit_hlc,
-            &commit_primary_cmd,
-        )
-        .await?;
+        let (_, _, _, primary_out) = self
+            .propose_participant(primary_key, &commit_primary_cmd, commit_hlc)
+            .await?;
         let final_commit_hlc = match primary_out {
             TxRaftOutput::Committed { commit_hlc: c, .. } => c,
             _ => {
@@ -1070,7 +1134,7 @@ impl DistributedTxRouter {
 
         // Phase 2b: Roll forward all Secondary Shards and mark durable ACKs on Primary (`Resolution B12`).
         let mut acked_secondary_keys = Vec::new();
-        for (ep, grp, keys) in &prepared_shards {
+        for (_ep, grp, keys) in &prepared_shards {
             if grp.shard_id() == primary_shard_id {
                 continue;
             }
@@ -1079,7 +1143,12 @@ impl DistributedTxRouter {
                 commit_hlc: final_commit_hlc,
                 target_user_keys: keys.clone(),
             };
-            if Self::propose_cmd(grp, *ep, final_commit_hlc, &sec_cmd)
+            let route_key = keys
+                .first()
+                .cloned()
+                .unwrap_or_else(|| primary_key.to_vec());
+            if self
+                .propose_participant(&route_key, &sec_cmd, final_commit_hlc)
                 .await
                 .is_ok()
             {
@@ -1092,8 +1161,9 @@ impl DistributedTxRouter {
                 txn_id,
                 acked_user_keys: acked_secondary_keys,
             };
-            let _ =
-                Self::propose_cmd(&primary_group, primary_epoch, final_commit_hlc, &ack_cmd).await;
+            let _ = self
+                .propose_participant(primary_key, &ack_cmd, final_commit_hlc)
+                .await;
         }
 
         Ok(final_commit_hlc)
@@ -1101,18 +1171,129 @@ impl DistributedTxRouter {
 
     async fn abort_prepared_shards(&self, txn_id: TxnId, prepared: &[PreparedShardBatch]) {
         let now = self.clock.now();
-        for (ep, grp, keys) in prepared {
+        for (_ep, _grp, keys) in prepared {
             let cmd = TxRaftCmd::Abort2pc {
                 txn_id,
                 target_user_keys: keys.clone(),
             };
-            let _ = Self::propose_cmd(grp, *ep, now, &cmd).await;
+            if let Some(route_key) = keys.first() {
+                let _ = self.propose_participant(route_key, &cmd, now).await;
+            }
         }
+    }
+
+    async fn finish_read<T>(
+        &self,
+        local: Result<T>,
+        op: ForwardedRouterOp,
+        decode: impl Fn(ForwardedRouterOut) -> Result<T>,
+    ) -> Result<T> {
+        match local {
+            Err(MetaDbError::NotLeader {
+                shard_id,
+                leader_hint: Some(leader),
+            }) => self.chase_forward(shard_id, leader, &op, decode).await,
+            other => other,
+        }
+    }
+
+    async fn chase_forward<T>(
+        &self,
+        mut shard_id: u64,
+        mut leader: u64,
+        op: &ForwardedRouterOp,
+        decode: impl Fn(ForwardedRouterOut) -> Result<T>,
+    ) -> Result<T> {
+        let mut last = MetaDbError::NotLeader {
+            shard_id,
+            leader_hint: Some(leader),
+        };
+        for _ in 0..3 {
+            let Some(addr) = self.directory.raft_peer_addr(shard_id, leader) else {
+                return Err(last);
+            };
+            match forward_op(&self.forward_secret, &addr, op).await {
+                Ok(out) => return decode(out),
+                Err(MetaDbError::NotLeader {
+                    shard_id: next_shard,
+                    leader_hint: Some(next),
+                }) => {
+                    shard_id = next_shard;
+                    leader = next;
+                    last = MetaDbError::NotLeader {
+                        shard_id,
+                        leader_hint: Some(leader),
+                    };
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last)
+    }
+
+    /// Runs a forwarded client read locally. This does not forward again.
+    pub async fn execute_forwarded_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        let op: ForwardedRouterOp = codec::deserialize(bytes)
+            .map_err(|error| MetaDbError::CodecError(error.to_string()))?;
+        let out = match op {
+            ForwardedRouterOp::Lookup { pid, name } => {
+                ForwardedRouterOut::Lookup(retry_routing(|| self.lookup_once(pid, &name)).await?)
+            }
+            ForwardedRouterOp::DirStat { pid } => {
+                ForwardedRouterOut::DirStat(retry_routing(|| self.dirstat_once(pid)).await?)
+            }
+            ForwardedRouterOp::ListDir {
+                pid,
+                after_name,
+                name_prefix,
+                limit,
+            } => {
+                let (entries, cursor) = retry_routing(|| {
+                    self.listdir_paginated_once(
+                        pid,
+                        after_name.as_deref(),
+                        name_prefix.as_deref(),
+                        limit,
+                    )
+                })
+                .await?;
+                ForwardedRouterOut::ListDir(entries, cursor)
+            }
+            ForwardedRouterOp::GetQuota { uid } => {
+                ForwardedRouterOut::GetQuota(retry_routing(|| self.get_quota_once(uid)).await?)
+            }
+            ForwardedRouterOp::ListQuotas { start_uid, limit } => ForwardedRouterOut::ListQuotas(
+                retry_routing(|| self.list_quotas_once(start_uid, limit)).await?,
+            ),
+            ForwardedRouterOp::GetSecondaryIndex { fid } => ForwardedRouterOut::GetSecondaryIndex(
+                retry_routing(|| self.get_secondary_index_once(fid)).await?,
+            ),
+            ForwardedRouterOp::ScanSecondaryIndex { after_fid, limit } => {
+                ForwardedRouterOut::ScanSecondaryIndex(
+                    retry_routing(|| self.scan_secondary_index_once(after_fid, limit)).await?,
+                )
+            }
+        };
+        codec::serialize(&out).map_err(|error| MetaDbError::CodecError(error.to_string()))
     }
 
     /// Linearizable point `Lookup(pid, name)` resolving any encountered `[0x05]` `WriteIntent`s.
     pub async fn lookup(&self, pid: InodeId, name: &str) -> Result<Option<MetaEntry>> {
-        retry_routing(|| self.lookup_once(pid, name)).await
+        let op = ForwardedRouterOp::Lookup {
+            pid,
+            name: name.to_string(),
+        };
+        self.finish_read(
+            retry_routing(|| self.lookup_once(pid, name)).await,
+            op,
+            |out| match out {
+                ForwardedRouterOut::Lookup(value) => Ok(value),
+                _ => Err(MetaDbError::CodecError(
+                    "leader forward returned a different operation result".to_string(),
+                )),
+            },
+        )
+        .await
     }
 
     async fn lookup_once(&self, pid: InodeId, name: &str) -> Result<Option<MetaEntry>> {
@@ -1192,7 +1373,18 @@ impl DistributedTxRouter {
     /// - `DualModeFineGrained` (`K` sub-shards): parallel `ReadIndex` + shared `barrier_hlc`
     ///   scatter-gather across `S_1 .. S_K` (`Resolution B1` / `G-P1`).
     pub async fn dirstat(&self, pid: InodeId) -> Result<InodeAttr> {
-        retry_routing(|| self.dirstat_once(pid)).await
+        let op = ForwardedRouterOp::DirStat { pid };
+        self.finish_read(
+            retry_routing(|| self.dirstat_once(pid)).await,
+            op,
+            |out| match out {
+                ForwardedRouterOut::DirStat(attr) => Ok(attr),
+                _ => Err(MetaDbError::CodecError(
+                    "leader forward returned a different operation result".to_string(),
+                )),
+            },
+        )
+        .await
     }
 
     async fn dirstat_once(&self, pid: InodeId) -> Result<InodeAttr> {
@@ -1205,6 +1397,14 @@ impl DistributedTxRouter {
                 let (epoch, group, handler) = &shards[0];
                 let (_, snap) = match group.linearizable_read(*epoch).await {
                     Ok(p) => p,
+                    Err(
+                        error @ MetaDbError::NotLeader {
+                            leader_hint: Some(_),
+                            ..
+                        },
+                    ) => {
+                        return Err(error);
+                    }
                     Err(MetaDbError::EpochMismatch { .. } | MetaDbError::NotLeader { .. }) => {
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         continue;
@@ -1230,6 +1430,14 @@ impl DistributedTxRouter {
             for (epoch, group, _) in &shards {
                 match group.read_batcher().linearizable_token(*epoch).await {
                     Ok(tok) => max_hlc = max_hlc.max(tok.max_applied_hlc),
+                    Err(
+                        error @ MetaDbError::NotLeader {
+                            leader_hint: Some(_),
+                            ..
+                        },
+                    ) => {
+                        return Err(error);
+                    }
                     Err(MetaDbError::EpochMismatch { .. } | MetaDbError::NotLeader { .. }) => {
                         retry_route = true;
                         break;
@@ -1255,6 +1463,14 @@ impl DistributedTxRouter {
                 let range = handler.key_range();
                 let (_, snap) = match group.fixed_barrier_read(*epoch, barrier_hlc).await {
                     Ok(p) => p,
+                    Err(
+                        error @ MetaDbError::NotLeader {
+                            leader_hint: Some(_),
+                            ..
+                        },
+                    ) => {
+                        return Err(error);
+                    }
                     Err(MetaDbError::EpochMismatch { .. } | MetaDbError::NotLeader { .. }) => {
                         retry_route = true;
                         break;
@@ -1316,7 +1532,24 @@ impl DistributedTxRouter {
         name_prefix: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<MetaEntry>, Option<String>)> {
-        retry_routing(|| self.listdir_paginated_once(pid, after_name, name_prefix, limit)).await
+        let op = ForwardedRouterOp::ListDir {
+            pid,
+            after_name: after_name.map(str::to_string),
+            name_prefix: name_prefix.map(str::to_string),
+            limit,
+        };
+        self.finish_read(
+            retry_routing(|| self.listdir_paginated_once(pid, after_name, name_prefix, limit))
+                .await,
+            op,
+            |out| match out {
+                ForwardedRouterOut::ListDir(entries, cursor) => Ok((entries, cursor)),
+                _ => Err(MetaDbError::CodecError(
+                    "leader forward returned a different operation result".to_string(),
+                )),
+            },
+        )
+        .await
     }
 
     async fn listdir_paginated_once(
@@ -1457,7 +1690,18 @@ impl DistributedTxRouter {
     }
 
     pub async fn get_quota(&self, uid: UserId) -> Result<Option<QuotaRecord>> {
-        retry_routing(|| self.get_quota_once(uid)).await
+        let op = ForwardedRouterOp::GetQuota { uid };
+        self.finish_read(
+            retry_routing(|| self.get_quota_once(uid)).await,
+            op,
+            |out| match out {
+                ForwardedRouterOut::GetQuota(record) => Ok(record),
+                _ => Err(MetaDbError::CodecError(
+                    "leader forward returned a different operation result".to_string(),
+                )),
+            },
+        )
+        .await
     }
 
     async fn get_quota_once(&self, uid: UserId) -> Result<Option<QuotaRecord>> {
@@ -1470,7 +1714,18 @@ impl DistributedTxRouter {
     }
 
     pub async fn list_quotas(&self, start_uid: UserId, limit: usize) -> Result<Vec<QuotaRecord>> {
-        retry_routing(|| self.list_quotas_once(start_uid, limit)).await
+        let op = ForwardedRouterOp::ListQuotas { start_uid, limit };
+        self.finish_read(
+            retry_routing(|| self.list_quotas_once(start_uid, limit)).await,
+            op,
+            |out| match out {
+                ForwardedRouterOut::ListQuotas(records) => Ok(records),
+                _ => Err(MetaDbError::CodecError(
+                    "leader forward returned a different operation result".to_string(),
+                )),
+            },
+        )
+        .await
     }
 
     async fn list_quotas_once(&self, start_uid: UserId, limit: usize) -> Result<Vec<QuotaRecord>> {
@@ -1499,7 +1754,18 @@ impl DistributedTxRouter {
     }
 
     pub async fn get_secondary_index(&self, fid: FileId) -> Result<Option<SecondaryIndexRecord>> {
-        retry_routing(|| self.get_secondary_index_once(fid)).await
+        let op = ForwardedRouterOp::GetSecondaryIndex { fid };
+        self.finish_read(
+            retry_routing(|| self.get_secondary_index_once(fid)).await,
+            op,
+            |out| match out {
+                ForwardedRouterOut::GetSecondaryIndex(record) => Ok(record),
+                _ => Err(MetaDbError::CodecError(
+                    "leader forward returned a different operation result".to_string(),
+                )),
+            },
+        )
+        .await
     }
 
     async fn get_secondary_index_once(&self, fid: FileId) -> Result<Option<SecondaryIndexRecord>> {
@@ -1521,7 +1787,18 @@ impl DistributedTxRouter {
         after_fid: FileId,
         limit: usize,
     ) -> Result<Vec<SecondaryIndexRecord>> {
-        retry_routing(|| self.scan_secondary_index_once(after_fid, limit)).await
+        let op = ForwardedRouterOp::ScanSecondaryIndex { after_fid, limit };
+        self.finish_read(
+            retry_routing(|| self.scan_secondary_index_once(after_fid, limit)).await,
+            op,
+            |out| match out {
+                ForwardedRouterOut::ScanSecondaryIndex(records) => Ok(records),
+                _ => Err(MetaDbError::CodecError(
+                    "leader forward returned a different operation result".to_string(),
+                )),
+            },
+        )
+        .await
     }
 
     async fn scan_secondary_index_once(

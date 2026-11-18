@@ -1,7 +1,7 @@
 //! `tonic` gRPC service implementations (`MetadataService`, `TransactionService`,
 //! and `ControlPlaneService`) backed by `PersistentMetaDbCluster`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
@@ -1004,6 +1004,23 @@ impl TransactionService for MetaDbGrpcService {
             })),
         }
     }
+
+    async fn forward_router(
+        &self,
+        request: Request<ForwardRouterRequest>,
+    ) -> Result<Response<ForwardRouterResponse>, Status> {
+        let req = request.into_inner();
+        match self.tx_router.execute_forwarded_bytes(&req.op).await {
+            Ok(result) => Ok(Response::new(ForwardRouterResponse {
+                error: None,
+                result,
+            })),
+            Err(error) => Ok(Response::new(ForwardRouterResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+                result: Vec::new(),
+            })),
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -1019,7 +1036,20 @@ impl ControlPlaneService for MetaDbGrpcService {
                 error: Some(ErrorDetailProto::from(&e)),
             }));
         };
-        match cell.register_node(req.node_id, req.grpc_addr) {
+        let instance_id = match metadb_proto::convert::decode_optional_u128_be(&req.instance_id) {
+            Ok(id) => id,
+            Err(error) => {
+                return Ok(Response::new(RegisterNodeResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                }))
+            }
+        };
+        let registered = if instance_id == 0 {
+            cell.register_node(req.node_id, req.grpc_addr)
+        } else {
+            cell.register_node_instance(req.node_id, req.grpc_addr, instance_id)
+        };
+        match registered {
             Ok(()) => Ok(Response::new(RegisterNodeResponse { error: None })),
             Err(e) => Ok(Response::new(RegisterNodeResponse {
                 error: Some(ErrorDetailProto::from(&e)),
@@ -1050,20 +1080,43 @@ impl ControlPlaneService for MetaDbGrpcService {
         request: Request<GetRoutesRequest>,
     ) -> Result<Response<GetRoutesResponse>, Status> {
         let req = request.into_inner();
-        let routes = if req.cell_id == 0 {
-            self.global_manager.meta_cache().all_routes()
+        let (routes, cluster_id) = if req.cell_id == 0 {
+            let cells = self.global_manager.all_cells();
+            let cluster_ids: BTreeSet<u128> = cells
+                .iter()
+                .map(|cell| cell.cluster_id())
+                .filter(|id| *id != 0)
+                .collect();
+            let cluster_id = if cluster_ids.len() == 1 {
+                cluster_ids.into_iter().next().unwrap_or(0)
+            } else {
+                0
+            };
+            let mut routes = Vec::new();
+            for cell in &cells {
+                routes.extend(cell.list_routes());
+            }
+            (routes, cluster_id)
         } else if let Some(cell) = self.global_manager.get_cell(req.cell_id) {
-            cell.list_routes()
+            let cluster_id = cell.cluster_id();
+            (cell.list_routes(), cluster_id)
         } else {
             let e = MetaDbError::ShardRoutingError(format!("unknown cell {}", req.cell_id));
             return Ok(Response::new(GetRoutesResponse {
                 error: Some(ErrorDetailProto::from(&e)),
                 shards: Vec::new(),
+                cluster_id: Vec::new(),
             }));
+        };
+        let cluster_id = if cluster_id == 0 {
+            Vec::new()
+        } else {
+            metadb_proto::convert::encode_u128_be(cluster_id).to_vec()
         };
         Ok(Response::new(GetRoutesResponse {
             error: None,
             shards: routes.iter().map(route_conv::to_proto_route).collect(),
+            cluster_id,
         }))
     }
 
@@ -1272,7 +1325,11 @@ impl ControlPlaneService for MetaDbGrpcService {
                 upgraded_shards: 0,
             }));
         };
-        match cell.scale_out_replicas(req.target_voters as usize).await {
+        let ensure_node = (req.ensure_node_id != 0).then_some(req.ensure_node_id);
+        match cell
+            .scale_out_replicas_ensuring(req.target_voters as usize, ensure_node)
+            .await
+        {
             Ok(cnt) => Ok(Response::new(ScaleShardReplicasResponse {
                 error: None,
                 upgraded_shards: cnt as u32,

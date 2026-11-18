@@ -8,6 +8,8 @@ message RegisterNodeRequest {
   uint64 cell_id = 1;
   uint64 node_id = 2;
   string grpc_addr = 3;
+  // 16-byte big-endian node instance id. Empty is rejected once a node id is bound.
+  bytes instance_id = 4;
 }
 
 message RegisterNodeResponse {
@@ -41,6 +43,8 @@ message GetRoutesRequest {
 message GetRoutesResponse {
   ErrorDetailProto error = 1;
   repeated ShardDescriptorProto shards = 2;
+  // 16-byte big-endian cluster id. Empty means this process has not adopted one.
+  bytes cluster_id = 3;
 }
 
 message AllocateIdBlockRequest {
@@ -123,6 +127,8 @@ message EnableDualModeSplitResponse {
 message ScaleShardReplicasRequest {
   uint64 cell_id = 1;
   uint32 target_voters = 2;
+  // When non-zero, this node is added even if `target_voters` is already met.
+  uint64 ensure_node_id = 3;
 }
 
 message ScaleShardReplicasResponse {

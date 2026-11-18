@@ -130,6 +130,9 @@ pub struct ShardRaftGroup {
     watermarks: Arc<ShardWatermarkTracker>,
     clock: Arc<HybridLogicalClock>,
     proposal_gate: RwLock<Option<Arc<ProposalShutdownGate>>>,
+    channel_pool: ChannelPool,
+    /// `(remaining failures, leader hint)` injected before `client_write`.
+    testing_not_leader: std::sync::Mutex<(u32, Option<NodeId>)>,
 }
 
 impl ShardRaftGroup {
@@ -180,7 +183,7 @@ impl ShardRaftGroup {
             .map_err(|e| MetaDbError::ConsensusError(e.to_string()))?,
         );
 
-        let network = TonicRaftNetworkFactory::new(shard_id, channel_pool);
+        let network = TonicRaftNetworkFactory::new(shard_id, channel_pool.clone());
         let raft = MetaDbRaft::new(
             node_id,
             config,
@@ -211,7 +214,34 @@ impl ShardRaftGroup {
             watermarks,
             clock,
             proposal_gate: RwLock::new(None),
+            channel_pool,
+            testing_not_leader: std::sync::Mutex::new((0, None)),
         }))
+    }
+
+    /// The next `count` `propose` calls return `NotLeader` before reaching Raft.
+    pub fn testing_fail_next_proposals(&self, count: u32, leader_hint: Option<NodeId>) {
+        *self.testing_not_leader.lock().unwrap() = (count, leader_hint);
+    }
+
+    pub fn current_leader(&self) -> Option<NodeId> {
+        self.raft.metrics().borrow_watched().current_leader
+    }
+
+    pub fn peer_addr(&self, node_id: NodeId) -> Option<String> {
+        let metrics = self.raft.metrics();
+        let snapshot = metrics.borrow_watched();
+        let addr = snapshot
+            .membership_config
+            .membership()
+            .get_node(&node_id)?
+            .addr
+            .clone();
+        if addr.is_empty() {
+            None
+        } else {
+            Some(addr)
+        }
     }
 
     pub fn set_proposal_shutdown_gate(&self, gate: Option<Arc<ProposalShutdownGate>>) {
@@ -408,6 +438,16 @@ impl ShardRaftGroup {
         caller_hlc: HlcTimestamp,
         payload: Vec<u8>,
     ) -> Result<MetaDbRaftResponse> {
+        {
+            let mut hook = self.testing_not_leader.lock().unwrap();
+            if hook.0 > 0 {
+                hook.0 -= 1;
+                return Err(MetaDbError::NotLeader {
+                    shard_id: self.shard_id,
+                    leader_hint: hook.1,
+                });
+            }
+        }
         let local_epoch = self.current_epoch();
         if expected_epoch != local_epoch {
             return Err(MetaDbError::EpochMismatch {
@@ -434,13 +474,13 @@ impl ShardRaftGroup {
             gate.enter().await;
         }
 
+        let forwarded = req.clone();
         let write_resp = match self.raft.client_write(req).await {
             Ok(r) => r,
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => {
-                return Err(MetaDbError::NotLeader {
-                    shard_id: self.shard_id,
-                    leader_hint: fwd.leader_id,
-                });
+                return self
+                    .forward_client_write(fwd.leader_id, fwd.leader_node.as_ref(), forwarded)
+                    .await;
             }
             Err(e) => return Err(MetaDbError::ConsensusError(e.to_string())),
         };
@@ -450,6 +490,39 @@ impl ShardRaftGroup {
             return Err(err.clone());
         }
         Ok(app_resp)
+    }
+
+    async fn forward_client_write(
+        &self,
+        leader_id: Option<NodeId>,
+        leader_node: Option<&BasicNode>,
+        request: MetaDbRaftRequest,
+    ) -> Result<MetaDbRaftResponse> {
+        let Some(leader_id) = leader_id else {
+            return Err(MetaDbError::NotLeader {
+                shard_id: self.shard_id,
+                leader_hint: None,
+            });
+        };
+        if leader_id == self.node_id {
+            return Err(MetaDbError::NotLeader {
+                shard_id: self.shard_id,
+                leader_hint: Some(leader_id),
+            });
+        }
+        let addr = leader_node
+            .map(|node| node.addr.clone())
+            .filter(|addr| !addr.is_empty())
+            .or_else(|| self.peer_addr(leader_id));
+        let Some(addr) = addr else {
+            return Err(MetaDbError::NotLeader {
+                shard_id: self.shard_id,
+                leader_hint: Some(leader_id),
+            });
+        };
+        self.channel_pool
+            .client_write(&addr, self.shard_id, &request)
+            .await
     }
 
     /// Acquires a linearizable `SnapshotGuard` fenced by `ReadIndex` and post-wait `ShardEpoch` revalidation.

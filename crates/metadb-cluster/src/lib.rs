@@ -10,18 +10,22 @@ pub mod cell_manager;
 pub mod control_plane;
 pub mod global_manager;
 pub mod id_allocator;
+pub mod identity;
 pub mod jumbo;
 pub mod meta_cache;
 pub mod shard;
 pub mod split_worker;
 
-pub use cell_manager::{CellDirectoryRole, DurableCellManager, SplitPlanRecord, SplitPlanState};
+pub use cell_manager::{
+    plan_membership_voters, CellDirectoryRole, DurableCellManager, SplitPlanRecord, SplitPlanState,
+};
 pub use control_plane::{CellId, CellLocalManager, GlobalManager, MetaCache, ShardRoute};
 pub use global_manager::DurableGlobalManager;
 pub use id_allocator::{
     AllocIdKind, DurableIdAllocator, LocalIdBuffer, CELL_DIR_AFFINITY_BLOCK_SIZE,
     CELL_FILE_ID_BLOCK_SIZE, GLOBAL_ID_BLOCK_SIZE, GLOBAL_SHARD_ID_BLOCK_SIZE,
 };
+pub use identity::{node_id_in_ha_range, ClusterIdentity, CLUSTER_IDENTITY_FILE};
 pub use jumbo::JumboIsolationPlanner;
 pub use meta_cache::{CompositeMetaCache, CompositeShardRoute};
 pub use shard::{

@@ -97,6 +97,9 @@ pub enum MetaDbError {
     /// A shard split must wait for transaction recovery before fencing its range.
     /// Appended after `HlcSaturated` so earlier variant tags stay stable.
     SplitDeferred(String),
+    /// Cluster or node identity is missing, colliding, or reused.
+    /// Appended after `SplitDeferred` so earlier variant tags stay stable.
+    IdentityRejected(String),
 }
 
 impl fmt::Display for MetaDbError {
@@ -208,6 +211,7 @@ impl fmt::Display for MetaDbError {
                 "HLC saturated at the 48-bit physical ceiling; refusing to wrap the logical counter"
             ),
             MetaDbError::SplitDeferred(msg) => write!(f, "shard split deferred: {}", msg),
+            MetaDbError::IdentityRejected(msg) => write!(f, "identity rejected: {}", msg),
         }
     }
 }

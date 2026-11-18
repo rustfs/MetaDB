@@ -152,6 +152,31 @@ fn decode_allocator_state(body: &[u8]) -> Result<PersistedAllocatorState> {
     })
 }
 
+fn namespaced_initial_state(node_id: u64) -> PersistedAllocatorState {
+    let mut state = PersistedAllocatorState::default();
+    if node_id > 1 {
+        let high = node_id << 48;
+        state.next_file_inode_seq = high + 1;
+        state.next_dir_inode_id = high + 2;
+        state.next_file_id = high + 1;
+        state.next_shard_id = (node_id << 32) + 4;
+    }
+    state
+}
+
+fn allocator_is_pristine(state: &PersistedAllocatorState) -> bool {
+    let fresh = PersistedAllocatorState::default();
+    state.next_file_inode_seq == fresh.next_file_inode_seq
+        && state.next_dir_inode_id == fresh.next_dir_inode_id
+        && state.next_file_id == fresh.next_file_id
+        && state.next_shard_id == fresh.next_shard_id
+        && state.rename_fence_token == 0
+        && state.active_rename_lease.is_none()
+        && state.recent_grants.is_empty()
+        && state.grant_fifo.is_empty()
+        && state.next_client_seq == fresh.next_client_seq
+}
+
 /// Crash-safe persistent ID & lease allocator enforcing **Write-Before-Grant** (`Resolution B18`).
 pub struct DurableIdAllocator {
     state_dir: PathBuf,
@@ -163,6 +188,16 @@ pub struct DurableIdAllocator {
 
 impl DurableIdAllocator {
     pub fn open(state_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_for_node(state_dir, 1)
+    }
+
+    /// Opens the allocator for `node_id`.
+    ///
+    /// A fresh directory for `node_id > 1` starts in that node's namespace so its
+    /// inode, file, and shard ids cannot collide with node 1 or any other node id
+    /// in `1..=32767`. An allocator that has already granted ids is reopened as stored.
+    pub fn open_for_node(state_dir: impl AsRef<Path>, node_id: u64) -> Result<Self> {
+        crate::identity::node_id_in_ha_range(node_id)?;
         let state_dir = state_dir.as_ref().to_path_buf();
         fs::create_dir_all(&state_dir)?;
         let had_existing_files = fs::read_dir(&state_dir)?.next().transpose()?.is_some();
@@ -184,13 +219,18 @@ impl DurableIdAllocator {
             let mut raw = Vec::new();
             File::open(&path)?.read_to_end(&mut raw)?;
             let body = verify_crc32c_le(&raw, "ID_ALLOCATOR_STATE")?;
-            decode_allocator_state(body)?
+            let mut loaded = decode_allocator_state(body)?;
+            if node_id > 1 && allocator_is_pristine(&loaded) {
+                loaded = namespaced_initial_state(node_id);
+                Self::write_state_file(&state_dir, &loaded)?;
+            }
+            loaded
         } else if had_existing_files {
             return Err(MetaDbError::StorageIoError(
                 "ID_ALLOCATOR_STATE is missing from an existing allocator directory".to_string(),
             ));
         } else {
-            let init = PersistedAllocatorState::default();
+            let init = namespaced_initial_state(node_id);
             Self::write_state_file(&state_dir, &init)?;
             init
         };

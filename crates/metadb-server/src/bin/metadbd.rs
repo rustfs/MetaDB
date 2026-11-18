@@ -121,6 +121,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cell_id,
                 node_id,
                 grpc_addr: bound_addr.clone(),
+                instance_id: metadb_proto::convert::encode_u128_be(
+                    cluster.cell_manager().node_instance_id(),
+                )
+                .to_vec(),
             })
             .await?
             .into_inner();
