@@ -673,9 +673,7 @@ impl PersistentMetaDbCluster {
             wait_until_accepting(&bound_addr).await;
             if let Err(error) = join_existing_raft_group(&config, &cell_manager, &bound_addr).await
             {
-                let _ = shutdown_tx.send(true);
-                let _ = grpc_handle.await;
-                let _ = host.shutdown_all().await;
+                shutdown_failed_startup(shutdown_tx, grpc_handle, &host).await;
                 return Err(error);
             }
         }
@@ -1163,12 +1161,27 @@ fn listen_port_is_ephemeral(addr: &str) -> bool {
 /// Transient membership and transport errors are retried. A conflicting cluster or node
 /// identity is returned immediately. A failed attempt does not abort the process by itself;
 /// the caller shuts the listeners down and returns the error.
+/// Stops the listener and local Raft groups after startup cannot finish.
+///
+/// The error is returned to the caller. `metadbd` then ends because `main`
+/// returned that error. A join attempt does not abort the process itself.
+async fn shutdown_failed_startup(
+    shutdown_tx: watch::Sender<bool>,
+    grpc_handle: tokio::task::JoinHandle<()>,
+    host: &ShardGroupHost,
+) {
+    let _ = shutdown_tx.send(true);
+    let _ = grpc_handle.await;
+    let _ = host.shutdown_all().await;
+}
+
 async fn join_existing_raft_group(
     config: &ServerTomlConfig,
     cell_manager: &DurableCellManager,
     bound_addr: &str,
 ) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let budget = config.join_timeout.unwrap_or(Duration::from_secs(45));
+    let deadline = tokio::time::Instant::now() + budget;
     let mut last_error = None;
     while tokio::time::Instant::now() < deadline {
         match join_existing_raft_group_once(config, cell_manager, bound_addr).await {

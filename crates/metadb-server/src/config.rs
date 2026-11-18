@@ -3,6 +3,7 @@
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -148,6 +149,10 @@ pub struct ServerTomlConfig {
     pub cluster: ClusterSection,
     #[serde(skip)]
     pub raft_options: RaftNodeOptions,
+    /// Overrides the 45-second join budget. `None` keeps that budget.
+    /// Not read from TOML; tests use it so a refused seed returns without waiting.
+    #[serde(skip)]
+    pub join_timeout: Option<Duration>,
 }
 
 impl ServerTomlConfig {

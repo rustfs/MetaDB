@@ -545,13 +545,10 @@ impl RaftTransportService for MultiRaftTransportServer {
                         Ok(response.data)
                     }
                 }
-                Err(openraft::errors::RaftError::APIError(
-                    openraft::errors::ClientWriteError::ForwardToLeader(fwd),
-                )) => Err(MetaDbError::NotLeader {
-                    shard_id: env.shard_id,
-                    leader_hint: fwd.leader_id,
-                }),
-                Err(error) => Err(MetaDbError::ConsensusError(error.to_string())),
+                Err(error) => Err(crate::error_map::map_client_write_error(
+                    env.shard_id,
+                    error,
+                )),
             }
         };
         match codec::serialize(&result) {

@@ -17,7 +17,7 @@ pub use checksum::{
     append_crc32c_be, append_crc32c_le, checksum_crc32c, verify_crc32c_be, verify_crc32c_le,
 };
 pub use epoch::{CellId, CompositeKeyRange, ShardEpoch, TxnId};
-pub use error::{MetaDbError, Result};
+pub use error::{MetaDbError, Result, RetryableConsensusKind};
 pub use hlc::{HlcTimestamp, HybridLogicalClock, DEFAULT_MAX_CLOCK_DRIFT_MS};
 pub use schema::{
     is_dir_inode_id, is_file_inode_id, make_file_inode_id, negate_accounted_size,

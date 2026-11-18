@@ -100,6 +100,39 @@ pub enum MetaDbError {
     /// Cluster or node identity is missing, colliding, or reused.
     /// Appended after `SplitDeferred` so earlier variant tags stay stable.
     IdentityRejected(String),
+    /// A write or linearizable quorum did not produce a committed result.
+    ///
+    /// Appended after `IdentityRejected` so earlier variant tags stay stable.
+    /// Same-shard writes and 2PC may retry this inside the existing routing budget.
+    /// `AlreadyExists`, `EpochMismatch`, and other application results are not this
+    /// variant. A discarded log entry may already have committed through another
+    /// leader, so a retry that then hits an application error returns that error.
+    /// Storage corruption and a stopped Raft node stay [`ConsensusError`](Self::ConsensusError).
+    RetryableConsensus {
+        shard_id: u64,
+        leader_hint: Option<u64>,
+        kind: RetryableConsensusKind,
+    },
+}
+
+/// Why a consensus operation can be proposed again without hiding a durable loss.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
+pub enum RetryableConsensusKind {
+    /// This leader dropped the proposal's log entry while adopting another leader's log.
+    /// Whether the entry committed elsewhere is unknown.
+    LogDiscarded,
+    /// Not enough voters answered to form a quorum. No committed result was returned.
+    QuorumUnavailable,
 }
 
 impl fmt::Display for MetaDbError {
@@ -212,7 +245,30 @@ impl fmt::Display for MetaDbError {
             ),
             MetaDbError::SplitDeferred(msg) => write!(f, "shard split deferred: {}", msg),
             MetaDbError::IdentityRejected(msg) => write!(f, "identity rejected: {}", msg),
+            MetaDbError::RetryableConsensus {
+                shard_id,
+                leader_hint,
+                kind,
+            } => write!(
+                f,
+                "retryable consensus error on shard {} ({:?}, leader_hint: {:?})",
+                shard_id, kind, leader_hint
+            ),
         }
+    }
+}
+
+impl MetaDbError {
+    /// A write may be proposed again inside the existing routing budget.
+    ///
+    /// Application results such as `AlreadyExists` and `EpochMismatch` are not
+    /// retryable here. `EpochMismatch` on a multi-key prepare still aborts that
+    /// round and regroups; it is not proposed again as the same batch.
+    pub fn is_retryable_write_consensus(&self) -> bool {
+        matches!(
+            self,
+            MetaDbError::NotLeader { .. } | MetaDbError::RetryableConsensus { .. }
+        )
     }
 }
 
@@ -223,3 +279,43 @@ impl From<std::io::Error> for MetaDbError {
 }
 
 impl std::error::Error for MetaDbError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_retry_covers_quorum_and_discard_not_application_results() {
+        assert!(MetaDbError::NotLeader {
+            shard_id: 1,
+            leader_hint: Some(2),
+        }
+        .is_retryable_write_consensus());
+        assert!(MetaDbError::RetryableConsensus {
+            shard_id: 1,
+            leader_hint: Some(2),
+            kind: RetryableConsensusKind::LogDiscarded,
+        }
+        .is_retryable_write_consensus());
+        assert!(MetaDbError::RetryableConsensus {
+            shard_id: 1,
+            leader_hint: None,
+            kind: RetryableConsensusKind::QuorumUnavailable,
+        }
+        .is_retryable_write_consensus());
+        assert!(!MetaDbError::AlreadyExists {
+            pid: 1,
+            name: "a".to_string(),
+        }
+        .is_retryable_write_consensus());
+        assert!(!MetaDbError::EpochMismatch {
+            shard_id: 1,
+            expected: ShardEpoch::initial(),
+            actual: ShardEpoch::initial().bump_conf_ver(),
+        }
+        .is_retryable_write_consensus());
+        assert!(
+            !MetaDbError::ConsensusError("raft stopped".to_string()).is_retryable_write_consensus()
+        );
+    }
+}

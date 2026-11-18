@@ -100,7 +100,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cell_id = cfg.node.cell_id;
 
     let shared_secret = cfg.security.shared_secret.clone();
-    let (cluster, bound_addr) = PersistentMetaDbCluster::open_and_serve(cfg).await?;
+    let (cluster, bound_addr) = match PersistentMetaDbCluster::open_and_serve(cfg).await {
+        Ok(started) => started,
+        Err(error) => {
+            tracing::error!(%error, "startup failed after a controlled shutdown of listeners and raft");
+            return Err(error.into());
+        }
+    };
     tracing::info!(grpc_addr = %bound_addr, "metadbd online and serving requests");
 
     if let Some(cm_ep) = cell_manager_ep {

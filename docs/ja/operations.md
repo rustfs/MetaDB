@@ -101,7 +101,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 運用手順として動かないもの:
 
 1. `metadbd --role be`、`--role proxy`、`--role cell-manager`、`--role global-manager` は `open_and_serve` で終了します。サブシステムはロールで切り出されず、プロセスはそれらの名前で起動することを拒否します。
-2. 2 つ目の `metadbd --role all-in-one` は、データディレクトリが空で `--join` または `--cell-manager` が現在のリーダーを指すとき、既存の Raft グループに参加します。リーダーは空エントリを追記してスナップショットを取り、参加者を learner から voter へ昇格します。`--join` はそのリーダーに届く必要があります。すでに Raft 状態があるディレクトリはそれを開き直し、新しい join アドレスを無視します。各プロセスは自分の ID アロケータを持つため、参加側が自動発行した inode と file id は、最初のプロセスが既に発行した ID と衝突し得ます。follower の `Lookup` は `NotLeader` を返し、転送しません。
+2. 2 つ目の `metadbd --role all-in-one` は、データディレクトリが空で `--join` または `--cell-manager` が現在のリーダーを指すとき、既存の Raft グループに参加します。リーダーは空エントリを追記してスナップショットを取り、参加者を learner から voter へ昇格します。`--join` はそのリーダーに届く必要があります。すでに Raft 状態があるディレクトリはそれを開き直し、新しい join アドレスを無視します。ノード ID 2 から 32767 の新しいアロケータは、そのノード自身の inode、file id、shard id 名前空間から始まるため、ノード 1 が既に発行した ID を再発行しません。既に低い ID を発行したアロケータファイルは移し替えません。リーダーが分かっている follower への `Lookup`、ディレクトリ一覧、ディレクトリ統計、`GetDirPartitionStat`、クォータ読み取り、セカンダリインデックス読み取りは、そのリーダーへ転送します。リーダーが不明な follower は引き続き `NotLeader` を返します。メンバーシップが joint の間、`GetRoutes` は適用済みの全投票者、現在のリーダー、適用済み epoch を報告します。均一構成がコミットされた後、それらの投票者と `conf_ver` は Raft と一致します。参加は一時的なエラーを 45 秒間再試行し、その後リスナーとローカル Raft グループを止めてエラーを返します。`metadbd` が終わるのは、起動がそのエラーを返したためです。最初の失敗だけではプロセスを中断しません。
 3. `metadb-ctl cell register` は 2 つ目のセルを作りません。`open_and_serve` はグローバルマネージャへローカルセルだけを登録します。
 4. テスト `T1`–`T6` が使うメモリ内の `MetaDbEngine::new_single_node` は、メモリ上の投票者数を 3 に増やせます。そのオブジェクトにはディスクも Raft もありません。`metadbd` のスケールアウトではありません。
 
@@ -119,7 +119,8 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 | `InvalidEntryType` | ファイルへの `rmdir`、またはディレクトリへの `unlink` |
 | `TransactionTimeout` | スナップショット HLC がメモリ内 MVCC 窓より古い |
 | `ClockSkewExceeded` | 遠隔 HLC がローカルの壁時計より `max_clock_drift_ms` を超えて進んでいる |
-| `EpochMismatch` / `NotLeader` | 古いルートエポック、または非リーダへの propose |
+| `EpochMismatch` / `NotLeader` | 古いルートエポック、またはこのレプリカがリーダーではない。リーダーが分かっている follower の読み取りは転送される。複数キーの Prepare での `EpochMismatch` はそのラウンドを中止して再グループ化し、同じバッチを再提案しない |
+| `RetryableConsensus` | リーダー交代で書き込みログが破棄された、またはクォーラムが応答しなかった。同一シャードの書き込みと 2PC は既存のルーティング予算内で再試行する。破棄されたエントリは別リーダーでコミット済みかもしれないので、その後の `AlreadyExists` や `EpochMismatch` はアプリケーションエラーとして返す。ストレージ障害と停止した Raft ノードは `ConsensusError` のままで再試行しない |
 | `UnsplittableJumboShard` | メモリ内スプリッタ（`shard.rs`）。永続ジャンボ経路ではない。永続経路は `JumboIsolated` を立て、子シャードなしで成功を返す |
 | `WriteIntentConflict` / `TransactionAborted` | 2PC の衝突、またはディレクトリリネームのリースがすでに保持されている |
 | `InvalidRenameCycle` | ディレクトリを自分自身または子孫へリネームする |

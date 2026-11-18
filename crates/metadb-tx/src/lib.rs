@@ -26,5 +26,6 @@ pub use state_machine_impl::{
     TxStateMachineHandler,
 };
 pub use two_pc::{
-    DirRenameLease, DistributedTxRouter, RoutedShardHandle, ShardDirectory, TwoPcCrashStage,
+    DirPartitionStat, DirRenameLease, DistributedTxRouter, RoutedShardHandle, ShardDirectory,
+    TwoPcCrashStage,
 };

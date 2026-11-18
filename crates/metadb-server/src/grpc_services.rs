@@ -11,9 +11,8 @@ use metadb_cluster::{
 };
 use metadb_core::codec;
 use metadb_core::{
-    AuxOutboxEntry, CompositeKeyRange, DirShardDeltaKey, DirShardDeltaRecord, EntryType,
-    HlcTimestamp, InodeAttr, MetaDbError, MetaKey, ShardEpoch, TxnState, WriteIntentKey,
-    WriteIntentRecord,
+    AuxOutboxEntry, CompositeKeyRange, HlcTimestamp, MetaDbError, ShardEpoch, TxnState,
+    WriteIntentKey, WriteIntentRecord,
 };
 use metadb_proto::control_plane_service_server::ControlPlaneService;
 use metadb_proto::metadata_service_server::MetadataService;
@@ -354,117 +353,36 @@ impl MetadataService for MetaDbGrpcService {
         let Some(hdr) = req.header else {
             return Err(Status::invalid_argument("missing routing header"));
         };
-        let ep: ShardEpoch = hdr.expected_epoch.unwrap_or_default().into();
-
-        let find_res = self
-            .global_manager
-            .all_cells()
-            .into_iter()
-            .find_map(|c| c.lookup_local_handle(hdr.shard_id).ok());
-        let Some((_, grp, handler)) = find_res else {
-            let err = MetaDbError::ShardRoutingError(format!("unknown shard {}", hdr.shard_id));
-            return Ok(Response::new(GetDirPartitionStatResponse {
-                error: Some(ErrorDetailProto::from(&err)),
+        let epoch: ShardEpoch = hdr.expected_epoch.unwrap_or_default().into();
+        let barrier = req
+            .use_fixed_barrier_hlc
+            .then_some(HlcTimestamp(req.barrier_hlc));
+        match self
+            .tx_router
+            .dir_partition_stat(hdr.shard_id, epoch, req.pid, barrier)
+            .await
+        {
+            Ok(stat) if stat.anchor_missing => {
+                let error = MetaDbError::DirectoryNotFound(req.pid);
+                Ok(Response::new(GetDirPartitionStatResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                    is_anchor: true,
+                    partition_attr: None,
+                    max_applied_hlc: stat.max_applied_hlc,
+                }))
+            }
+            Ok(stat) => Ok(Response::new(GetDirPartitionStatResponse {
+                error: None,
+                is_anchor: stat.is_anchor,
+                partition_attr: stat.attr.as_ref().map(InodeAttrProto::from),
+                max_applied_hlc: stat.max_applied_hlc,
+            })),
+            Err(error) => Ok(Response::new(GetDirPartitionStatResponse {
+                error: Some(ErrorDetailProto::from(&error)),
                 is_anchor: false,
                 partition_attr: None,
                 max_applied_hlc: 0,
-            }));
-        };
-
-        let read_res = if req.use_fixed_barrier_hlc {
-            grp.fixed_barrier_read(ep, HlcTimestamp(req.barrier_hlc))
-                .await
-        } else {
-            grp.linearizable_read(ep).await
-        };
-
-        let (tok, snap) = match read_res {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(Response::new(GetDirPartitionStatResponse {
-                    error: Some(ErrorDetailProto::from(&e)),
-                    is_anchor: false,
-                    partition_attr: None,
-                    max_applied_hlc: 0,
-                }))
-            }
-        };
-
-        let attr_key = MetaKey::dir_attr(req.pid).encode();
-        if handler.key_range().contains_key(&attr_key) {
-            match grp.engine().get_with_snapshot(&attr_key, &snap) {
-                Ok(Some(raw)) => {
-                    let base =
-                        InodeAttr::decode(&raw).map_err(|e| Status::internal(e.to_string()))?;
-                    let rec = handler
-                        .attr_aggregator()
-                        .reconcile_inode_attr(req.pid, base, &snap);
-                    Ok(Response::new(GetDirPartitionStatResponse {
-                        error: None,
-                        is_anchor: true,
-                        partition_attr: Some(InodeAttrProto::from(&rec)),
-                        max_applied_hlc: tok.max_applied_hlc.0,
-                    }))
-                }
-                Ok(None) => {
-                    let e = MetaDbError::DirectoryNotFound(req.pid);
-                    Ok(Response::new(GetDirPartitionStatResponse {
-                        error: Some(ErrorDetailProto::from(&e)),
-                        is_anchor: true,
-                        partition_attr: None,
-                        max_applied_hlc: tok.max_applied_hlc.0,
-                    }))
-                }
-                Err(e) => Ok(Response::new(GetDirPartitionStatResponse {
-                    error: Some(ErrorDetailProto::from(&e)),
-                    is_anchor: true,
-                    partition_attr: None,
-                    max_applied_hlc: 0,
-                })),
-            }
-        } else {
-            let dk = DirShardDeltaKey { pid: req.pid }.encode();
-            match grp.engine().get_with_snapshot(&dk, &snap) {
-                Ok(Some(raw)) => {
-                    let sub_base = DirShardDeltaRecord::decode(&raw)
-                        .map_err(|e| Status::internal(e.to_string()))?;
-                    let sub = handler
-                        .attr_aggregator()
-                        .reconcile_dir_shard_delta(req.pid, sub_base, &snap);
-                    let synth = InodeAttr {
-                        inode_id: sub.inode_id,
-                        parent_pid: sub.parent_pid,
-                        entry_type: EntryType::DirectoryAttr,
-                        uid: sub.uid,
-                        mode: sub.mode,
-                        link_count: 1,
-                        num_children: sub.num_children,
-                        size_bytes: sub.size_bytes,
-                        create_time: sub.create_time,
-                        modify_time: sub.modify_time,
-                        fid: None,
-                        applied_lsn: sub.applied_raft_index,
-                    };
-                    Ok(Response::new(GetDirPartitionStatResponse {
-                        error: None,
-                        is_anchor: false,
-                        partition_attr: Some(InodeAttrProto::from(&synth)),
-                        max_applied_hlc: tok.max_applied_hlc.0,
-                    }))
-                }
-                Ok(None) => Ok(Response::new(GetDirPartitionStatResponse {
-                    error: None,
-                    is_anchor: false,
-                    partition_attr: None,
-                    max_applied_hlc: tok.max_applied_hlc.0,
-                })),
-                Err(e) => Ok(Response::new(GetDirPartitionStatResponse {
-                    error: Some(ErrorDetailProto::from(&e)),
-                    is_anchor: false,
-                    partition_attr: None,
-                    max_applied_hlc: 0,
-                })),
-            }
+            })),
         }
     }
 

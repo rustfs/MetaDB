@@ -101,7 +101,7 @@ What works inside one process:
 What does not work as an operator procedure:
 
 1. `metadbd --role be`, `--role proxy`, `--role cell-manager`, and `--role global-manager` exit in `open_and_serve`. The subsystems are not trimmed by role, and the process refuses to start them under those names.
-2. A second `metadbd --role all-in-one` joins an existing group when `--join` or `--cell-manager` names the current leader and the data directory is fresh. The leader appends a blank entry, snapshots, and promotes the joiner from learner to voter on the shards it already hosts. `--join` must reach that leader. A directory that already has Raft state reopens it and ignores a new join address. Each process still has its own id allocator, so automatic inode and file ids issued on the joiner can collide with ids the first process already issued. `Lookup` on a follower returns `NotLeader` and is not forwarded.
+2. A second `metadbd --role all-in-one` joins an existing group when `--join` or `--cell-manager` names the current leader and the data directory is fresh. The leader appends a blank entry, snapshots, and promotes the joiner from learner to voter on the shards it already hosts. `--join` must reach that leader. A directory that already has Raft state reopens it and ignores a new join address. A fresh allocator for node ids 2 through 32767 starts in that node's inode, file-id, and shard-id namespace, so it does not reissue ids node 1 has already granted. An allocator file that has already granted low ids is not relocated. `Lookup`, directory listing, directory stat, `GetDirPartitionStat`, quota reads, and secondary-index reads that reach a follower with a known leader are forwarded to that leader. A follower that does not know a leader still returns `NotLeader`. While membership is joint, `GetRoutes` reports every applied voter, the current leader, and the applied epoch. After the uniform config commits, those voters and `conf_ver` match Raft. A join that cannot finish retries transient errors for 45 seconds, then shuts the listeners and local Raft groups down and returns the error. `metadbd` ends because startup returned that error. The first failed attempt does not abort the process by itself.
 3. `metadb-ctl cell register` does not create a second cell. `RegisterCell` fails closed. `open_and_serve` registers only the local cell on the global manager.
 4. The in-memory `MetaDbEngine::new_single_node` path used by tests `T1`–`T6` can bump an in-memory voter count to 3. That object has no disk and no Raft. It is not a scale-out of `metadbd`.
 
@@ -119,11 +119,12 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 | `InvalidEntryType` | `rmdir` on a file, or `unlink` on a directory |
 | `TransactionTimeout` | Snapshot HLC older than the in-memory MVCC window |
 | `ClockSkewExceeded` | Remote HLC ahead of local wall time by more than `max_clock_drift_ms` |
-| `EpochMismatch` / `NotLeader` | Stale route epoch, or a propose sent to a non-leader |
+| `EpochMismatch` / `NotLeader` | Stale route epoch, or this replica is not the leader. Follower reads with a known leader are forwarded. `EpochMismatch` on a multi-key prepare aborts that round and regroups; it is not proposed again as the same batch |
+| `RetryableConsensus` | A write's log entry was discarded on a leader change, or a quorum did not answer. Same-shard writes and 2PC retry these inside the existing routing budget. A discarded entry may already have committed through another leader, so a later `AlreadyExists` or `EpochMismatch` is returned as that application error. Storage failure and a stopped Raft node stay `ConsensusError` and are not retried |
 | `UnsplittableJumboShard` | In-memory splitter (`shard.rs`), not the durable jumbo path, which sets `JumboIsolated` and returns success with no child shard |
 | `WriteIntentConflict` / `TransactionAborted` | 2PC conflict, or a directory-rename lease already held |
 | `InvalidRenameCycle` | Rename of a directory into itself or a descendant |
-| `ConsensusError` | Not enough registered nodes, learner catch-up timeout (10 s), or OpenRaft membership error |
+| `ConsensusError` | Not enough registered nodes, learner catch-up timeout (10 s), a membership change that cannot be planned yet, or a Raft storage or stopped-node failure |
 | `SqlParseError` | Statement is not one of the 20 templates |
 
 `CodecError` is also the type used for the unimplemented-role rejection and for bad TOML.
