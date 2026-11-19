@@ -7,12 +7,18 @@
 //!
 //! This is a single-process test. It does not replace three-VM scale-in evidence.
 
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use metadb_core::{make_file_inode_id, MetaDbError, ROOT_INODE_ID};
+use metadb_cluster::{CompositeShardRoute, SplitPlanRecord};
+use metadb_core::codec;
+use metadb_core::{
+    make_file_inode_id, verify_crc32c_le, MetaDbError, NodeId, ShardId, ROOT_INODE_ID,
+};
 use metadb_server::{PersistentMetaDbCluster, ServerTomlConfig};
 use tempfile::tempdir;
 
@@ -62,11 +68,46 @@ fn raft_voters(cluster: &PersistentMetaDbCluster) -> BTreeSet<u64> {
     found.unwrap()
 }
 
-fn persisted_voters(cluster: &PersistentMetaDbCluster) -> BTreeSet<u64> {
-    let routes = cluster.cell_manager().list_routes();
-    assert!(!routes.is_empty(), "cell has no shard routes");
+/// On-disk `CELL_MANAGER_STATE` body. Field order matches `DurableCellManager`'s
+/// writer. `list_routes` overlays this cache with live Raft membership, so the
+/// shrink check decodes the file instead.
+#[derive(Debug, serde::Deserialize, wincode::SchemaRead)]
+struct OnDiskCellState {
+    _nodes: BTreeMap<NodeId, String>,
+    routes: BTreeMap<ShardId, CompositeShardRoute>,
+    _split_plans: BTreeMap<u128, SplitPlanRecord>,
+    _joined_existing: bool,
+    _join_pending: bool,
+    _node_instances: BTreeMap<NodeId, u128>,
+}
+
+fn cell_dir(cluster: &PersistentMetaDbCluster) -> PathBuf {
+    cluster
+        .config()
+        .node
+        .data_dir
+        .join(format!("cell_{}", cluster.config().node.cell_id))
+}
+
+/// Voter ids stored in `CELL_MANAGER_STATE`, not the live Raft overlay.
+fn voters_in_cell_state_file(cell_dir: &Path) -> BTreeSet<u64> {
+    let path = cell_dir.join("CELL_MANAGER_STATE");
+    let mut raw = Vec::new();
+    File::open(&path)
+        .unwrap_or_else(|err| panic!("open {}: {err}", path.display()))
+        .read_to_end(&mut raw)
+        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let body = verify_crc32c_le(&raw, "CELL_MANAGER_STATE")
+        .unwrap_or_else(|err| panic!("checksum {}: {err}", path.display()));
+    let state: OnDiskCellState =
+        codec::deserialize(body).unwrap_or_else(|err| panic!("decode {}: {err}", path.display()));
+    assert!(
+        !state.routes.is_empty(),
+        "CELL_MANAGER_STATE at {} has no routes",
+        path.display()
+    );
     let mut found: Option<BTreeSet<u64>> = None;
-    for route in routes {
+    for (shard_id, route) in &state.routes {
         let voters = route
             .peers
             .iter()
@@ -75,9 +116,10 @@ fn persisted_voters(cluster: &PersistentMetaDbCluster) -> BTreeSet<u64> {
             .collect::<BTreeSet<_>>();
         match &found {
             None => found = Some(voters),
-            Some(previous) => {
-                assert_eq!(previous, &voters, "persisted shard voter sets diverged")
-            }
+            Some(previous) => assert_eq!(
+                previous, &voters,
+                "on-disk voter sets diverged at shard {shard_id}"
+            ),
         }
     }
     found.unwrap()
@@ -291,6 +333,7 @@ async fn scale_in_and_reopen(target_voters: usize) {
     );
 
     let leader = current_leader(&initial).await;
+    let leader_cell = cell_dir(&leader);
     match leader
         .cell_manager()
         .scale_out_replicas(target_voters)
@@ -313,9 +356,9 @@ async fn scale_in_and_reopen(target_voters: usize) {
             "leader voter set after shrink to {target_voters}"
         );
         assert_eq!(
-            persisted_voters(&leader),
+            voters_in_cell_state_file(&leader_cell),
             expected,
-            "leader persisted voter set after shrink to {target_voters}"
+            "CELL_MANAGER_STATE on disk after shrink to {target_voters}"
         );
     }
 
@@ -357,6 +400,12 @@ async fn scale_in_and_reopen(target_voters: usize) {
     expect_readable(&reopened_survivors, "before_scale_in.dat", &mut errors).await;
     expect_readable(&reopened_survivors, "after_scale_in.dat", &mut errors).await;
     expect_dirstat(&reopened_survivors, "after restart", &mut errors).await;
+    let on_disk = voters_in_cell_state_file(&leader_cell);
+    if on_disk != expected {
+        errors.push(format!(
+            "CELL_MANAGER_STATE after restart is {on_disk:?}, want {expected:?}"
+        ));
+    }
 
     shutdown_all(reopened.to_vec()).await;
     assert!(

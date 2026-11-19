@@ -29,12 +29,17 @@ jobs:
         uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Install cargo-audit 0.23.0 and cargo-deny 0.21.0
+        id: install
         run: |
           cargo install cargo-audit --locked --version 0.23.0
           cargo install cargo-deny --locked --version 0.21.0
 
       - name: cargo audit
+        id: cargo_audit
         run: cargo audit -D unmaintained -D unsound -D yanked
 
+      # Audit failures must not skip deny. A failed audit step still fails the job.
       - name: cargo deny
+        id: cargo_deny
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: cargo deny --locked check
