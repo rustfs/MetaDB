@@ -64,3 +64,9 @@ This is an **initial reporting job**. It is not a production-grade supply-chain 
 `cargo-deny` reads [`deny.toml`](../../deny.toml) at the repository root. The license allow list is Apache-2.0, MIT, BSD-3-Clause, Unicode-3.0, and Zlib, which is the set `cargo deny check licenses` matched in this workspace when the file was added. Duplicate crate versions are warnings and did not fail the bans check. Unknown registries and unknown git sources are denied.
 
 When this file was added, `cargo audit` reported three unmaintained advisories and no vulnerability advisories: `chrono` 0.4.45 (`RUSTSEC-2026-0543`), `chrono-tz` 0.8.6 (`RUSTSEC-2026-0555`), and `chrono-tz-build` 0.2.1 (`RUSTSEC-2026-0559`). No fixed upgrade was listed. They come in through `openraft`. The dependency-audit job is expected to fail on those unmaintained findings until the lockfile no longer pulls them in. That failure is a report, not a production-readiness verdict.
+
+## Seeded simulation catalog
+
+`cargo test --workspace --locked` also runs `cargo test -p metadb-server --test simulation_catalog` because that file lives under `crates/metadb-server/tests/`. The catalog is an in-memory script plus two single-process restart scripts. No workflow file was added for it.
+
+A green result is a scripted directory invariant on those seeds. It is not a first-ship pass, not the official million-operation load, and not three-VM membership evidence. An in-process restart does not replace three-VM evidence. See [Simulation testing](./simulation-testing.md).
