@@ -20,7 +20,7 @@ Every new workload names one of these layers. A result from one layer is evidenc
 | Layer | What the code actually does | What a passing run is |
 | :--- | :--- | :--- |
 | In-memory / same-process simulation | `MetaDbEngine::new_single_node`. No data directory, no WAL-less LSM, no OpenRaft group. | The scripted directory model matches list, lookup, and `dirstat` for that seed. |
-| Single-process persistence | `PersistentMetaDbCluster::open_and_serve` on one data directory. A restart is another `open_and_serve` in the **same OS process** after `shutdown_without_flush` or after `flush_all` plus `shutdown`. `flush_all` runs one maintenance tick, which snapshots and purges a non-empty Raft log, and then flushes memtables. | Acknowledged names, child counts, and byte totals still match after that reopen. |
+| Single-process persistence | `PersistentMetaDbCluster::open_and_serve` on one data directory. A restart is another `open_and_serve` in the **same OS process**. The unflushed path pauses the 250 ms maintenance loop and shuts down with `shutdown_without_flush` only when the acknowledged read index is still ahead of `state_flushed_index`. The flush-and-purge path calls `flush_all`, then waits until `last_purged_index` covers that read index, and only then calls `shutdown`. | Acknowledged names, child counts, and byte totals still match after that reopen, and the frontier check for that restart held. |
 | Real multi-process / multi-node | More than one OS process or machine, with a real network between them. | Not produced by this catalog. Official three-replica coverage/delete and concurrent `add_learner` stay deferred until the Aliyun 1-to-5 rehearsal. This harness does not start those machines. |
 
 In-process shrink, an in-process 3-voter listener set, and a single-process restart are the second layer or an in-process Raft test. They are not the third layer and they do not replace three-VM evidence.
@@ -77,8 +77,8 @@ This is the standard for simulation-style tests added to this tree. It does not 
 | Workload | Seed in the CI test | Fault | Invariant |
 | :--- | :--- | :--- | :--- |
 | `metadata_crud` | 1, 7, 99, and `0xC0FFEE`. Seed 1 is also run twice and the trace hashes are compared. The report prints every seed in hexadecimal (`0x1`, `0x7`, `0x63`, `0xc0ffee`). | One client omission. The step index comes from the seed. | Directory model on `new_single_node`. |
-| `metadata_crud_unflushed_restart` | 11 | `shutdown_without_flush`, then reopen, after a seeded count of mutation-kind steps. | Directory model on one data directory. |
-| `metadata_crud_flush_purge_restart` | 13 | `flush_all`, then `shutdown`, then reopen, after a seeded count of mutation-kind steps. | Directory model on one data directory. |
+| `metadata_crud_unflushed_restart` | 11 | Background maintenance is paused. After a seeded count of mutation-kind steps, `shutdown_without_flush` runs only if the acknowledged index is still ahead of the flushed frontier. Then reopen. | Directory model on one data directory. |
+| `metadata_crud_flush_purge_restart` | 13 | After a seeded count of mutation-kind steps, `flush_all`, then a wait until `last_purged_index` covers the acknowledged index. The wait fails the report after 5 seconds. Then `shutdown` and reopen. | Directory model on one data directory. |
 
 The planner keeps at least four mutation-kind steps (create, unlink, or rename) so a restart has work on both sides of the fault. Unlink or rename on an empty directory becomes a `dirstat` and does not change the model. The restart clock still counts the scripted step, so the fault index does not depend on how many files happened to exist.
 

@@ -17,6 +17,7 @@ mod metrics_http;
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -517,6 +518,10 @@ pub struct PersistentMetaDbCluster {
     shutdown_tx: watch::Sender<bool>,
     task_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     metrics_addr: OnceLock<String>,
+    /// When true, the 250 ms loop skips its maintenance tick. The gRPC listener
+    /// stays up. Production leaves this false. A simulation restart sets it so
+    /// the 250 ms loop cannot checkpoint the Raft tail before `shutdown_without_flush`.
+    maintenance_paused: AtomicBool,
 }
 
 impl PersistentMetaDbCluster {
@@ -698,6 +703,7 @@ impl PersistentMetaDbCluster {
             shutdown_tx,
             task_handles: tokio::sync::Mutex::new(vec![grpc_handle]),
             metrics_addr: OnceLock::new(),
+            maintenance_paused: AtomicBool::new(false),
         });
 
         // Background maintenance task (`AuxDispatcher` + `TxnRecoveryWorker` every 250ms).
@@ -716,6 +722,9 @@ impl PersistentMetaDbCluster {
                 let Some(c) = bg_cluster.upgrade() else {
                     break;
                 };
+                if c.maintenance_paused.load(Ordering::Acquire) {
+                    continue;
+                }
                 // Drop an in-flight tick when shutdown is signaled. The tick proposes
                 // through Raft, and a missing voter can leave that proposal unable to commit.
                 tokio::select! {
@@ -899,6 +908,16 @@ impl PersistentMetaDbCluster {
     /// Bound Prometheus address, when `node.metrics_listen_addr` was set.
     pub fn metrics_addr(&self) -> Option<&str> {
         self.metrics_addr.get().map(String::as_str)
+    }
+
+    /// Skips the 250 ms maintenance tick while `paused` is true.
+    ///
+    /// The listener stays up. The flag is read before each tick, so a tick that
+    /// has already entered `run_maintenance_tick_inner` still finishes. Production
+    /// leaves the flag false. The unflushed simulation restart sets it before any
+    /// scripted write so that restart still has an uncheckpointed Raft tail.
+    pub fn set_background_maintenance_paused(&self, paused: bool) {
+        self.maintenance_paused.store(paused, Ordering::Release);
     }
 
     /// Stops gRPC and maintenance, drains auxiliary work, flushes memtables, and stops OpenRaft.

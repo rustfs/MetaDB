@@ -15,12 +15,14 @@
 //!    Hybrid-logical-clock values still come from the wall clock and are not part
 //!    of the reproduced fingerprint.
 //! 2. **Single-process persistence.** [`crate::PersistentMetaDbCluster`] on one
-//!    data directory, including `flush_all` (one maintenance tick, which snapshots
-//!    and purges a non-empty Raft log, then a memtable flush) and
-//!    `shutdown_without_flush`, followed by another `open_and_serve` in the same
-//!    OS process. The script and the fault index are the same function of the seed.
-//!    OpenRaft and Tokio use wall-clock timers, so this layer does not claim a
-//!    simulated clock or a bit-identical Raft trace.
+//!    data directory. The unflushed restart pauses the 250 ms maintenance loop
+//!    before the scripted writes and refuses to shut down unless an acknowledged
+//!    index is still ahead of `state_flushed_index`. The flush-and-purge restart
+//!    calls `flush_all`, then waits until `last_purged_index` covers that
+//!    acknowledged index before `shutdown`. Either path then calls `open_and_serve`
+//!    again in the same OS process. The script and the fault index are the same
+//!    function of the seed. OpenRaft and Tokio use wall-clock timers, so this
+//!    layer does not claim a simulated clock or a bit-identical Raft trace.
 //! 3. **Real multi-process / multi-node.** Not executed here. Network, machine,
 //!    and datacenter faults need real peers. Official three-replica coverage/delete
 //!    and concurrent `add_learner` stay deferred until the Aliyun 1-to-5 rehearsal.
@@ -33,11 +35,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use metadb_core::{
-    is_dir_inode_id, is_file_inode_id, make_file_inode_id, InodeId, UserId, ATTR_ENTRY_NAME,
-    ROOT_INODE_ID,
+    is_dir_inode_id, is_file_inode_id, make_file_inode_id, InodeId, MetaKey, UserId,
+    ATTR_ENTRY_NAME, ROOT_INODE_ID,
 };
+
+use metadb_tx::ShardDirectory;
 
 use crate::{MetaDbConfig, MetaDbEngine, PersistentMetaDbCluster, ServerTomlConfig};
 
@@ -125,7 +130,7 @@ pub fn ci_workloads() -> &'static [WorkloadSpec] {
         WorkloadSpec {
             id: "metadata_crud_unflushed_restart",
             layer: ExecutionLayer::SingleProcessPersistent,
-            summary: "The same script shape on one persistent process, then shutdown without a memtable flush and reopen of that data directory.",
+            summary: "The same script shape on one persistent process with background maintenance paused, then shutdown without a memtable flush only if the acknowledged index is still ahead of the flushed frontier.",
             dir_count: 2,
             steps: 12,
             fault: FaultTemplate::UnflushedRestart,
@@ -133,7 +138,7 @@ pub fn ci_workloads() -> &'static [WorkloadSpec] {
         WorkloadSpec {
             id: "metadata_crud_flush_purge_restart",
             layer: ExecutionLayer::SingleProcessPersistent,
-            summary: "The same script shape, then flush_all (maintenance tick plus memtable flush), shutdown, and reopen of that data directory.",
+            summary: "The same script shape, then flush_all, wait until the Raft log purge covers the acknowledged index, shutdown, and reopen of that data directory.",
             dir_count: 2,
             steps: 12,
             fault: FaultTemplate::FlushPurgeRestart,
@@ -963,6 +968,12 @@ pub async fn run_persistent(
             );
         }
     };
+    // The 250 ms loop can snapshot and purge before `shutdown_without_flush`.
+    // Pausing it keeps the acknowledged tail uncheckpointed. The flag is read
+    // before each tick; this call is the first use of the cluster.
+    if matches!(schedule.fault, ScriptedFault::UnflushedRestart { .. }) {
+        cluster.set_background_maintenance_paused(true);
+    }
     let mut violations = Vec::new();
     let mut trace = Vec::new();
     let Some(mut model) = setup_persistent(&cluster, schedule.dir_count, &mut violations).await
@@ -982,10 +993,10 @@ pub async fn run_persistent(
         }
         if let Some(kind) = restart_due(&schedule.fault, mutation_steps, restarted) {
             match restart_process(cluster, config, kind).await {
-                Ok(reopened) => {
+                Ok((reopened, restart_note)) => {
                     cluster = reopened;
                     restarted = true;
-                    trace.push(format!("reopen {}", kind.as_str()));
+                    trace.push(restart_note);
                     check_persistent(&cluster, &model, "after-reopen", &mut violations).await;
                 }
                 Err(err) => {
@@ -1052,15 +1063,6 @@ enum RestartKind {
     FlushPurge,
 }
 
-impl RestartKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Unflushed => "unflushed",
-            Self::FlushPurge => "flush-purge",
-        }
-    }
-}
-
 fn restart_due(fault: &ScriptedFault, mutation_steps: u32, restarted: bool) -> Option<RestartKind> {
     if restarted {
         return None;
@@ -1080,28 +1082,102 @@ async fn restart_process(
     cluster: Arc<PersistentMetaDbCluster>,
     config: &ServerTomlConfig,
     kind: RestartKind,
-) -> Result<Arc<PersistentMetaDbCluster>, String> {
-    let shutdown_result = match kind {
-        RestartKind::Unflushed => cluster
-            .shutdown_without_flush()
-            .await
-            .map_err(|err| err.to_string()),
-        RestartKind::FlushPurge => match cluster.flush_all().await {
-            Ok(()) => cluster.shutdown().await.map_err(|err| err.to_string()),
+) -> Result<(Arc<PersistentMetaDbCluster>, String), String> {
+    let note = match kind {
+        RestartKind::Unflushed => match unflushed_tail_note(&cluster).await {
+            Ok(note) => {
+                let shutdown = cluster.shutdown_without_flush().await;
+                drop(cluster);
+                shutdown.map_err(|err| err.to_string())?;
+                note
+            }
             Err(err) => {
-                let message = err.to_string();
                 let _ = cluster.shutdown_without_flush().await;
-                Err(message)
+                drop(cluster);
+                return Err(err);
+            }
+        },
+        RestartKind::FlushPurge => match flush_purge_note(&cluster).await {
+            Ok(note) => {
+                let shutdown = cluster.shutdown().await;
+                drop(cluster);
+                shutdown.map_err(|err| err.to_string())?;
+                note
+            }
+            Err(err) => {
+                let _ = cluster.shutdown_without_flush().await;
+                drop(cluster);
+                return Err(err);
             }
         },
     };
-    // Drop the open cluster before the next `open_and_serve` so the LSM lock is released.
-    drop(cluster);
-    shutdown_result?;
     let (reopened, _addr) = PersistentMetaDbCluster::open_and_serve(config.clone())
         .await
         .map_err(|err| err.to_string())?;
-    Ok(reopened)
+    Ok((reopened, note))
+}
+
+/// Root-shard read index and the LSM flush watermark. One shard holds this
+/// catalog: the persistent config keeps the default split threshold.
+async fn root_frontier(cluster: &PersistentMetaDbCluster) -> Result<(u64, u64), String> {
+    let (_, group, _) = cluster
+        .global_manager()
+        .route_user_key(&MetaKey::dir_attr(ROOT_INODE_ID).encode())
+        .map_err(|err| err.to_string())?;
+    let confirmed = group
+        .linearizable_read(group.current_epoch())
+        .await
+        .map_err(|err| err.to_string())?
+        .0
+        .read_index;
+    let (state_flushed, _, _) = group.watermarks().snapshot_values();
+    Ok((confirmed, state_flushed))
+}
+
+async fn unflushed_tail_note(cluster: &PersistentMetaDbCluster) -> Result<String, String> {
+    let (confirmed, state_flushed) = root_frontier(cluster).await?;
+    if state_flushed >= confirmed {
+        return Err(format!(
+            "acknowledged index {confirmed} is not beyond the flushed frontier {state_flushed}; refusing shutdown_without_flush because the Raft tail is already checkpointed"
+        ));
+    }
+    Ok(format!(
+        "reopen unflushed confirmed={confirmed} flushed={state_flushed}"
+    ))
+}
+
+async fn flush_purge_note(cluster: &PersistentMetaDbCluster) -> Result<String, String> {
+    let (confirmed, _) = root_frontier(cluster).await?;
+    cluster.flush_all().await.map_err(|err| err.to_string())?;
+    let (_, group, _) = cluster
+        .global_manager()
+        .route_user_key(&MetaKey::dir_attr(ROOT_INODE_ID).encode())
+        .map_err(|err| err.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut purged = group.log_store().last_purged_index();
+    while purged < confirmed {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "flush_all returned before last_purged_index {purged} covered acknowledged index {confirmed}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        purged = group.log_store().last_purged_index();
+    }
+    Ok(format!(
+        "reopen flush-purge confirmed={confirmed} purged={purged}"
+    ))
+}
+
+/// `listdir_paginated` returns a cursor when the page is full, including when
+/// that page held the last names. The next call is then an empty page. An empty
+/// page ends the directory, so the cursor from the full page must be dropped.
+fn next_list_cursor(page_empty: bool, next: Option<String>) -> (bool, Option<String>) {
+    if page_empty || next.is_none() {
+        (true, None)
+    } else {
+        (false, next)
+    }
 }
 
 async fn setup_persistent(
@@ -1235,21 +1311,17 @@ async fn observe_persistent(
             .listdir_paginated(pid, cursor.as_deref(), None, 64)
             .await
             .map_err(|err| err.to_string())?;
-        if page.is_empty() {
-            break;
-        }
+        let page_empty = page.is_empty();
         for entry in page {
             if entry.key.name == ATTR_ENTRY_NAME {
                 return Err(format!("listdir pid={pid} included {ATTR_ENTRY_NAME}"));
             }
             names.insert(entry.key.name);
         }
-        match next {
-            Some(next) => cursor = Some(next),
-            None => {
-                cursor = None;
-                break;
-            }
+        let (finished, next_cursor) = next_list_cursor(page_empty, next);
+        cursor = next_cursor;
+        if finished {
+            break;
         }
     }
     if cursor.is_some() {
@@ -1363,6 +1435,19 @@ mod tests {
                 deferred.id
             );
         }
+    }
+
+    #[test]
+    fn empty_page_after_a_full_page_ends_the_listing() {
+        let (finished, cursor) = next_list_cursor(true, Some("page-tail".to_string()));
+        assert!(finished);
+        assert!(cursor.is_none());
+        let (finished, cursor) = next_list_cursor(false, Some("page-tail".to_string()));
+        assert!(!finished);
+        assert_eq!(cursor.as_deref(), Some("page-tail"));
+        let (finished, cursor) = next_list_cursor(false, None);
+        assert!(finished);
+        assert!(cursor.is_none());
     }
 
     #[test]
