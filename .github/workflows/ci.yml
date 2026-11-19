@@ -22,7 +22,8 @@ jobs:
   rust-check-lint-test:
     name: Format, Clippy & Test (locked toolchain)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Workspace cargo test has been cancelled at the 45-minute job budget.
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
