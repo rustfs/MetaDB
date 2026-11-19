@@ -253,3 +253,92 @@ async fn missing_lsm_and_snapshot_after_log_purge_is_not_a_live_voter() {
     );
     group.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn forwarded_propose_local_rewrites_a_missing_snapshot() {
+    let dir = tempdir().unwrap();
+    let shard_dir = dir.path().join("shards/00000000000000000001");
+    let cache = Arc::new(ShardedBlockCache::new(4 * 1024 * 1024));
+    let clock = Arc::new(HybridLogicalClock::new());
+    let group = boot(&shard_dir, cache, clock).await;
+    let epoch = group.current_epoch();
+    for name in ["alpha", "beta", "gamma"] {
+        let cmd = BasicKvCommand::Put {
+            key: MetaKey::child(1, name).encode(),
+            value: name.as_bytes().to_vec(),
+        };
+        group
+            .propose(epoch, HlcTimestamp::ZERO, codec::serialize(&cmd).unwrap())
+            .await
+            .unwrap();
+    }
+    group.flush_snapshot_and_purge().await.unwrap();
+    let published = group.watermarks().snapshot_values().2;
+    let meta = shard_dir.join(format!("raft/snapshots/snap_{published:020}/SNAPSHOT_META"));
+    fs::remove_file(&meta).unwrap();
+    let cmd = BasicKvCommand::Put {
+        key: MetaKey::child(1, "delta").encode(),
+        value: b"delta".to_vec(),
+    };
+    group
+        .propose_local(epoch, HlcTimestamp::ZERO, codec::serialize(&cmd).unwrap())
+        .await
+        .unwrap();
+    let rewritten = shard_dir
+        .join("raft/snapshots")
+        .read_dir()
+        .unwrap()
+        .any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .is_some_and(|name| name.starts_with("snap_") && !name.contains('.'))
+        });
+    assert!(rewritten, "propose_local must rewrite the missing snapshot");
+    assert!(group.storage_unrecoverable().is_none());
+    group.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn older_snapshot_does_not_satisfy_a_purged_prefix() {
+    let dir = tempdir().unwrap();
+    let shard_dir = dir.path().join("shards/00000000000000000001");
+    let cache = Arc::new(ShardedBlockCache::new(4 * 1024 * 1024));
+    let clock = Arc::new(HybridLogicalClock::new());
+    let group = boot(&shard_dir, cache, clock).await;
+    let epoch = group.current_epoch();
+    for name in ["alpha", "beta", "gamma"] {
+        let cmd = BasicKvCommand::Put {
+            key: MetaKey::child(1, name).encode(),
+            value: name.as_bytes().to_vec(),
+        };
+        group
+            .propose(epoch, HlcTimestamp::ZERO, codec::serialize(&cmd).unwrap())
+            .await
+            .unwrap();
+    }
+    let purged = group.flush_snapshot_and_purge().await.unwrap();
+    assert!(purged > 1);
+    for entry in fs::read_dir(shard_dir.join("lsm")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_str().unwrap_or("").ends_with(".sst") {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    let _ = fs::remove_dir_all(shard_dir.join("raft/snapshots"));
+    metadb_raft::state_machine::write_complete_snapshot_marker(&shard_dir.join("raft"), 1).unwrap();
+
+    let mut state_machine = group.state_machine().clone();
+    let first = state_machine.get_current_snapshot().await.unwrap_err();
+    assert!(
+        first.to_string().contains("snapshot unrecoverable"),
+        "{first}"
+    );
+    let second = state_machine.get_current_snapshot().await.unwrap_err();
+    assert!(
+        second.to_string().contains("snapshot unrecoverable"),
+        "a later read must not accept the older snapshot: {second}"
+    );
+    assert!(group.storage_unrecoverable().is_some());
+    group.shutdown().await.unwrap();
+}

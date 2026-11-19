@@ -555,7 +555,6 @@ impl ShardRaftGroup {
         payload: Vec<u8>,
         deadline: tokio::time::Instant,
     ) -> Result<MetaDbRaftResponse> {
-        self.repair_published_snapshot().await?;
         {
             let mut hook = self.testing_not_leader.lock().unwrap();
             if hook.0 > 0 {
@@ -632,6 +631,8 @@ impl ShardRaftGroup {
         caller_hlc: HlcTimestamp,
         payload: Vec<u8>,
     ) -> Result<MetaDbRaftResponse> {
+        // Forwarded ClientWrite RPCs enter here and skip `propose_until`.
+        self.repair_published_snapshot().await?;
         let local_epoch = self.current_epoch();
         if expected_epoch != local_epoch {
             return Err(MetaDbError::EpochMismatch {

@@ -6,6 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::SystemTime;
 
 use openraft::entry::RaftEntry;
 use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine};
@@ -242,6 +243,15 @@ struct StateMachineShared {
     /// Set when a required snapshot cannot be rebuilt. Cluster status must not
     /// keep reporting this process as a live voter after RaftCore has failed.
     unrecoverable: Mutex<Option<String>>,
+    /// Last `SNAPSHOT_META` stat that passed a full completeness check.
+    /// Later requests compare this stat instead of decoding every SSTable.
+    snapshot_cache: Mutex<Option<PublishedSnapshotCache>>,
+}
+
+struct PublishedSnapshotCache {
+    index: u64,
+    meta_len: u64,
+    meta_modified: Option<SystemTime>,
 }
 
 impl StateMachineShared {
@@ -417,7 +427,20 @@ impl StateMachineShared {
 
         // Persist SNAPSHOT_META's directory entry before publishing the snapshot.
         sync_dir(&tmp_dir).map_err(|e| io::Error::other(e.to_string()))?;
+        let purged = crate::log_store::read_persisted_purged_index(&self.shard_dir.join("raft"))
+            .unwrap_or(0);
+        let required = purged.max(self.watermarks.snapshot_values().2);
+        if snap_index < required {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "refusing to publish snapshot index {snap_index}; it does not cover required index {required}"
+                ),
+            ));
+        }
         publish_snapshot_dir(&snaps_root, snap_index, &tmp_dir)?;
+        *self.snapshot_cache.lock().unwrap() = None;
 
         self.watermarks
             .advance_last_snapshot(checkpoint.flushed_raft_index);
@@ -441,16 +464,60 @@ impl StateMachineShared {
         ))
     }
 
-    /// True when this process has published a snapshot that is no longer a complete directory.
+    /// True when the published snapshot directory is missing or no longer matches
+    /// the `SNAPSHOT_META` stat that last passed a full check.
+    ///
+    /// The common path is one metadata call. A changed or new meta file is
+    /// validated once and then cached, so a healthy request does not decode
+    /// every SSTable.
     fn published_snapshot_missing(&self) -> bool {
         let index = self.watermarks.snapshot_values().2;
         if index == 0 {
             return false;
         }
-        let dir = self
+        let meta_path = self
             .shard_dir
-            .join(format!("raft/snapshots/snap_{index:020}"));
-        !snapshot_dir_is_complete(&dir)
+            .join(format!("raft/snapshots/snap_{index:020}/SNAPSHOT_META"));
+        let Ok(info) = fs::metadata(&meta_path) else {
+            *self.snapshot_cache.lock().unwrap() = None;
+            return true;
+        };
+        if !info.is_file() || info.len() <= 4 {
+            *self.snapshot_cache.lock().unwrap() = None;
+            return true;
+        }
+        let modified = info.modified().ok();
+        if self
+            .snapshot_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|cached| {
+                cached.index == index
+                    && cached.meta_len == info.len()
+                    && cached.meta_modified == modified
+            })
+        {
+            return false;
+        }
+        let complete = meta_path.parent().is_some_and(snapshot_dir_is_complete);
+        if complete {
+            *self.snapshot_cache.lock().unwrap() = Some(PublishedSnapshotCache {
+                index,
+                meta_len: info.len(),
+                meta_modified: modified,
+            });
+            false
+        } else {
+            *self.snapshot_cache.lock().unwrap() = None;
+            true
+        }
+    }
+
+    fn required_snapshot_index(&self) -> u64 {
+        let purged = crate::log_store::read_persisted_purged_index(&self.shard_dir.join("raft"))
+            .unwrap_or(0);
+        purged.max(self.watermarks.snapshot_values().2)
     }
 
     fn load_current_snapshot_sync(
@@ -458,13 +525,38 @@ impl StateMachineShared {
     ) -> io::Result<Option<SnapshotOf<MetaDbTypeConfig, SnapshotArchive>>> {
         let snaps_root = self.shard_dir.join("raft/snapshots");
         let candidates = snapshot_candidates(&snaps_root);
+        let required = self.required_snapshot_index();
         // A missing file used to return `NotFound`. OpenRaft maps that to
         // `StorageError { subject: Snapshot(None), verb: Read }` and stops RaftCore,
         // while the process kept answering cluster status from cached membership.
-        // Skip a broken directory, including a `.bak` left by an in-progress replace.
-        for (_, snap_dir) in &candidates {
+        // An older readable directory does not satisfy a higher purged or published index.
+        for (index, snap_dir) in &candidates {
+            if *index < required {
+                tracing::warn!(
+                    path = %snap_dir.display(),
+                    index,
+                    required,
+                    "skipping raft snapshot that does not cover the required index"
+                );
+                continue;
+            }
             match load_snapshot_dir(snap_dir) {
                 Ok(snapshot) => {
+                    let covered = snapshot
+                        .meta
+                        .last_log_id
+                        .as_ref()
+                        .map(|id| id.index)
+                        .unwrap_or(0);
+                    if covered < required {
+                        tracing::warn!(
+                            path = %snap_dir.display(),
+                            covered,
+                            required,
+                            "skipping raft snapshot whose log id is behind the required index"
+                        );
+                        continue;
+                    }
                     self.clear_unrecoverable();
                     return Ok(Some(snapshot));
                 }
@@ -488,20 +580,17 @@ impl StateMachineShared {
             .current_engine()
             .durable_checkpoint()
             .flushed_raft_index;
-        let raft_dir = self.shard_dir.join("raft");
-        let purged = crate::log_store::read_persisted_purged_index(&raft_dir).unwrap_or(0);
-        let snapshot_required =
-            purged > 0 || self.watermarks.snapshot_values().2 > 0 || !candidates.is_empty();
         // The segmented raft log is the WAL until it is purged. Before that,
         // a missing snapshot file is not fatal: restart replays the log.
-        if !snapshot_required {
+        if required == 0 {
             self.clear_unrecoverable();
             return Ok(None);
         }
 
         // After purge, the LSM is the only remaining copy. Rewrite the snapshot
         // from it before returning, so a live process does not keep serving
-        // with the snapshot file gone.
+        // with the snapshot file gone. `build_snapshot_sync` refuses to publish
+        // a directory that does not cover `required`.
         match self.build_snapshot_sync() {
             Ok(snapshot) => {
                 let covered = snapshot
@@ -510,16 +599,16 @@ impl StateMachineShared {
                     .as_ref()
                     .map(|id| id.index)
                     .unwrap_or(0);
-                if purged > covered {
+                if required > covered {
                     return self.fail_unrecoverable(format!(
-                        "rebuilt snapshot index {covered} does not cover purged raft log {purged}. The segmented raft log is the WAL only until it is purged. A missing snapshot is rebuilt from the LSM. If that LSM is also missing, committed data is not reconstructed"
+                        "rebuilt snapshot index {covered} does not cover required index {required}. The segmented raft log is the WAL only until it is purged. A missing snapshot is rebuilt from the LSM. If that LSM is also missing, committed data is not reconstructed"
                     ));
                 }
                 self.clear_unrecoverable();
                 Ok(Some(snapshot))
             }
             Err(error) => self.fail_unrecoverable(format!(
-                "cannot rebuild a missing snapshot from the LSM ({error}). purged log index is {purged}, flushed LSM index is {flushed}, applied index is {applied}. The segmented raft log is the WAL only until it is purged. If the log and the LSM are both gone, committed data is not reconstructed"
+                "cannot rebuild a missing snapshot from the LSM ({error}). required index is {required}, flushed LSM index is {flushed}, applied index is {applied}. The segmented raft log is the WAL only until it is purged. If the log and the LSM are both gone, committed data is not reconstructed"
             )),
         }
     }
@@ -828,6 +917,7 @@ impl ShardStateMachine {
             last_membership: RwLock::new(initial_membership),
             frontier_tx,
             unrecoverable: Mutex::new(None),
+            snapshot_cache: Mutex::new(None),
         });
 
         Ok((Self { shared }, frontier_rx))
