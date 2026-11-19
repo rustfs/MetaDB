@@ -899,19 +899,18 @@ fn backup_online_shard(
     let live_index = shard.engine.durable_checkpoint().flushed_raft_index;
     let (kind, image_index) = if live_index >= purged_now {
         // Hard-linked checkpoints must stay on the source filesystem.
-        let temp = data_dir.join(checkpoint_scratch_name(shard.shard_id));
-        clear_checkpoint_scratch(data_dir, shard.shard_id)?;
-        let checkpoint = shard.engine.create_checkpoint(&temp).map_err(|error| {
-            let _ = fs::remove_dir_all(&temp);
-            backup_error(format!(
-                "shard {} checkpoint failed: {error}",
-                shard.shard_id
-            ))
-        })?;
         let lsm_rel = format!("be/shards/{:020}/lsm", shard.shard_id);
         let lsm_dest = tree.join(safe_relative(&lsm_rel).map_err(backup_error)?);
-        copy_dir_bytes(&temp, &lsm_dest)?;
-        let _ = fs::remove_dir_all(&temp);
+        let checkpoint = with_checkpoint_scratch(data_dir, shard.shard_id, |temp| {
+            let checkpoint = shard.engine.create_checkpoint(temp).map_err(|error| {
+                backup_error(format!(
+                    "shard {} checkpoint failed: {error}",
+                    shard.shard_id
+                ))
+            })?;
+            copy_dir_bytes(temp, &lsm_dest)?;
+            Ok(checkpoint)
+        })?;
         record_tree_files(&lsm_dest, &lsm_rel, files)?;
         (IMAGE_FLUSHED_LSM, checkpoint.flushed_raft_index)
     } else {
@@ -1257,6 +1256,50 @@ fn reject_uncovered_live_shards(data_dir: &Path, copied: &BTreeSet<ShardId>) -> 
 
 fn checkpoint_scratch_name(shard_id: ShardId) -> String {
     format!(".backup-ckpt-{shard_id:020}")
+}
+
+fn checkpoint_scratch_lock_name(shard_id: ShardId) -> String {
+    format!(".backup-ckpt-{shard_id:020}.lock")
+}
+
+struct CheckpointScratchGuard {
+    _file: File,
+}
+
+fn lock_checkpoint_scratch(data_dir: &Path, shard_id: ShardId) -> Result<CheckpointScratchGuard> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(data_dir.join(checkpoint_scratch_lock_name(shard_id)))?;
+    file.lock().map_err(|error| {
+        backup_error(format!(
+            "checkpoint scratch lock for shard {shard_id}: {error}"
+        ))
+    })?;
+    Ok(CheckpointScratchGuard { _file: file })
+}
+
+/// Clears crash residue, then runs `body` while this process still owns the scratch.
+/// Another backup of the same shard waits instead of deleting the directory mid-copy.
+fn with_checkpoint_scratch<T>(
+    data_dir: &Path,
+    shard_id: ShardId,
+    body: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    let _guard = lock_checkpoint_scratch(data_dir, shard_id)?;
+    clear_checkpoint_scratch(data_dir, shard_id)?;
+    let path = data_dir.join(checkpoint_scratch_name(shard_id));
+    let result = body(&path);
+    if path.exists() {
+        if let Err(error) = clear_checkpoint_scratch(data_dir, shard_id) {
+            if result.is_ok() {
+                return Err(error);
+            }
+        }
+    }
+    result
 }
 
 /// Removes one crash scratch directory. A symlink or a non-directory is left in place.
@@ -2014,6 +2057,54 @@ mod tests {
             .join("shards")
             .join(format!("{:020}", 99u64))
             .is_dir());
+    }
+
+    #[test]
+    fn checkpoint_scratch_is_not_cleared_while_another_backup_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join(checkpoint_scratch_name(1));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleared = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dir_holder = dir.path().to_path_buf();
+        let release_holder = release.clone();
+        let started_holder = started.clone();
+        let holder = thread::spawn(move || {
+            let guard = lock_checkpoint_scratch(&dir_holder, 1).unwrap();
+            fs::create_dir_all(&scratch).unwrap();
+            fs::write(scratch.join("KEEP"), b"live").unwrap();
+            started_holder.store(true, std::sync::atomic::Ordering::Release);
+            while !release_holder.load(std::sync::atomic::Ordering::Acquire) {
+                thread::yield_now();
+            }
+            drop(guard);
+        });
+        while !started.load(std::sync::atomic::Ordering::Acquire) {
+            thread::yield_now();
+        }
+        let dir_worker = dir.path().to_path_buf();
+        let cleared_worker = cleared.clone();
+        let worker = thread::spawn(move || {
+            with_checkpoint_scratch(&dir_worker, 1, |_path| {
+                cleared_worker.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            })
+            .unwrap();
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            dir.path()
+                .join(checkpoint_scratch_name(1))
+                .join("KEEP")
+                .is_file(),
+            "the waiting backup removed a scratch that was still in use"
+        );
+        assert!(!cleared.load(std::sync::atomic::Ordering::Acquire));
+        release.store(true, std::sync::atomic::Ordering::Release);
+        holder.join().unwrap();
+        worker.join().unwrap();
+        assert!(cleared.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!dir.path().join(checkpoint_scratch_name(1)).exists());
     }
 
     #[test]
