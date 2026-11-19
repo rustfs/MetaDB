@@ -691,7 +691,8 @@ impl TransactionService for MetaDbGrpcService {
                 prepared_hlc: 0,
             }));
         };
-        let payload = codec::serialize(&cmd).map_err(|e| Status::internal(e.to_string()))?;
+        let payload =
+            metadb_tx::command_payload(&cmd).map_err(|e| Status::internal(e.to_string()))?;
         match grp.propose(ep, HlcTimestamp(req.start_hlc), payload).await {
             Ok(resp) => Ok(Response::new(Prepare2pcResponse {
                 error: None,
@@ -730,7 +731,8 @@ impl TransactionService for MetaDbGrpcService {
             commit_hlc: HlcTimestamp(req.commit_hlc),
             rename_fence_token: req.has_rename_fence_token.then_some(req.rename_fence_token),
         };
-        let payload = codec::serialize(&cmd).map_err(|e| Status::internal(e.to_string()))?;
+        let payload =
+            metadb_tx::command_payload(&cmd).map_err(|e| Status::internal(e.to_string()))?;
         match grp.propose(ep, HlcTimestamp(req.commit_hlc), payload).await {
             Ok(resp) => Ok(Response::new(CommitPrimary2pcResponse {
                 error: None,
@@ -769,7 +771,8 @@ impl TransactionService for MetaDbGrpcService {
             commit_hlc: HlcTimestamp(req.commit_hlc),
             target_user_keys: req.target_user_keys,
         };
-        let payload = codec::serialize(&cmd).map_err(|e| Status::internal(e.to_string()))?;
+        let payload =
+            metadb_tx::command_payload(&cmd).map_err(|e| Status::internal(e.to_string()))?;
         match grp.propose(ep, HlcTimestamp(req.commit_hlc), payload).await {
             Ok(resp) => {
                 let out: TxRaftOutput = codec::deserialize(&resp.result.unwrap_or_default())
@@ -817,7 +820,8 @@ impl TransactionService for MetaDbGrpcService {
             txn_id: decode_req_txn_id(&req.txn_id_be)?,
             target_user_keys: req.target_user_keys,
         };
-        let payload = codec::serialize(&cmd).map_err(|e| Status::internal(e.to_string()))?;
+        let payload =
+            metadb_tx::command_payload(&cmd).map_err(|e| Status::internal(e.to_string()))?;
         match grp.propose(ep, self.tx_router.clock().now(), payload).await {
             Ok(_) => Ok(Response::new(Abort2pcResponse { error: None })),
             Err(e) => Ok(Response::new(Abort2pcResponse {
@@ -845,7 +849,8 @@ impl TransactionService for MetaDbGrpcService {
             txn_id: decode_req_txn_id(&req.txn_id_be)?,
             caller_hlc: HlcTimestamp(req.caller_hlc),
         };
-        let payload = codec::serialize(&cmd).map_err(|e| Status::internal(e.to_string()))?;
+        let payload =
+            metadb_tx::command_payload(&cmd).map_err(|e| Status::internal(e.to_string()))?;
         match grp
             .propose(grp.current_epoch(), HlcTimestamp(req.caller_hlc), payload)
             .await
@@ -902,7 +907,8 @@ impl TransactionService for MetaDbGrpcService {
             }));
         };
         let cmd = TxRaftCmd::ApplyAuxBatch { entries };
-        let payload = codec::serialize(&cmd).map_err(|e| Status::internal(e.to_string()))?;
+        let payload =
+            metadb_tx::command_payload(&cmd).map_err(|e| Status::internal(e.to_string()))?;
         match grp.propose(ep, self.tx_router.clock().now(), payload).await {
             Ok(resp) => {
                 let out: TxRaftOutput = codec::deserialize(&resp.result.unwrap_or_default())

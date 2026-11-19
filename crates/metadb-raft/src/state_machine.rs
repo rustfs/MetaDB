@@ -53,6 +53,19 @@ pub trait ShardApplyHandler: Send + Sync + 'static {
         engine: &LifecycleStorageEngine,
     ) -> Result<Vec<u8>>;
 
+    /// Result of a proposal that already committed, if this request repeats its id.
+    ///
+    /// Checked before the epoch fence. A discarded log entry may already have
+    /// committed under an older epoch; executing it again would apply a
+    /// non-idempotent command twice.
+    fn previously_committed_proposal(
+        &self,
+        _request: &MetaDbRaftRequest,
+        _engine: &LifecycleStorageEngine,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
     fn pre_flush_hook(&self) -> Option<&dyn PreFlushHook> {
         None
     }
@@ -876,37 +889,51 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
                     };
 
                     let cur_epoch = self.shared.handler.current_epoch();
-                    let apply_res = if req.expected_epoch != cur_epoch {
-                        Err(MetaDbError::EpochMismatch {
-                            shard_id: self.shared.shard_id,
-                            expected: req.expected_epoch,
-                            actual: cur_epoch,
-                        })
-                    } else {
-                        let membership = self.shared.last_membership.read().unwrap().clone();
-                        engine.set_flush_identity(FlushIdentity {
-                            term: log_id.committed_leader_id().term,
-                            leader: log_id.committed_leader_id().node_id,
-                            membership: codec::serialize_serde(&membership).unwrap_or_default(),
-                            descriptor: self.shared.handler.encode_descriptor_bytes(),
-                            aux_index: self.shared.watermarks.snapshot_values().1,
-                        });
-                        // Seal only after every key and side effect of this command is in the memtable.
-                        engine.begin_command();
-                        let command = CommandFlush {
-                            engine: &engine,
-                            open: true,
-                        };
-                        match self.shared.handler.apply_command(
-                            log_id.index,
-                            commit_hlc,
-                            &req,
-                            &engine,
-                        ) {
-                            Ok(bytes) => command.commit().map(|()| bytes),
-                            Err(error) => {
-                                drop(command);
-                                Err(error)
+                    let apply_res = match self
+                        .shared
+                        .handler
+                        .previously_committed_proposal(&req, &engine)
+                    {
+                        Ok(Some(prior)) => {
+                            self.shared
+                                .watermarks
+                                .advance_aux_for_non_aux_entry(log_id.index);
+                            Ok(prior)
+                        }
+                        Err(error) => Err(error),
+                        Ok(None) if req.expected_epoch != cur_epoch => {
+                            Err(MetaDbError::EpochMismatch {
+                                shard_id: self.shared.shard_id,
+                                expected: req.expected_epoch,
+                                actual: cur_epoch,
+                            })
+                        }
+                        Ok(None) => {
+                            let membership = self.shared.last_membership.read().unwrap().clone();
+                            engine.set_flush_identity(FlushIdentity {
+                                term: log_id.committed_leader_id().term,
+                                leader: log_id.committed_leader_id().node_id,
+                                membership: codec::serialize_serde(&membership).unwrap_or_default(),
+                                descriptor: self.shared.handler.encode_descriptor_bytes(),
+                                aux_index: self.shared.watermarks.snapshot_values().1,
+                            });
+                            // Seal only after every key and side effect of this command is in the memtable.
+                            engine.begin_command();
+                            let command = CommandFlush {
+                                engine: &engine,
+                                open: true,
+                            };
+                            match self.shared.handler.apply_command(
+                                log_id.index,
+                                commit_hlc,
+                                &req,
+                                &engine,
+                            ) {
+                                Ok(bytes) => command.commit().map(|()| bytes),
+                                Err(error) => {
+                                    drop(command);
+                                    Err(error)
+                                }
                             }
                         }
                     };

@@ -120,7 +120,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 | `TransactionTimeout` | スナップショット HLC がメモリ内 MVCC 窓より古い |
 | `ClockSkewExceeded` | 遠隔 HLC がローカルの壁時計より `max_clock_drift_ms` を超えて進んでいる |
 | `EpochMismatch` / `NotLeader` | 古いルートエポック、またはこのレプリカがリーダーではない。リーダーが分かっている follower の読み取りは転送される。複数キーの Prepare での `EpochMismatch` はそのラウンドを中止して再グループ化し、同じバッチを再提案しない |
-| `RetryableConsensus` | リーダー交代で書き込みログが破棄された、またはクォーラムが応答しなかった。同一シャードの書き込みと 2PC は既存のルーティング予算内で再試行する。破棄されたエントリは別リーダーでコミット済みかもしれないので、その後の `AlreadyExists` や `EpochMismatch` はアプリケーションエラーとして返す。ストレージ障害と停止した Raft ノードは `ConsensusError` のままで再試行しない |
+| `RetryableConsensus` | リーダー交代で書き込みログが破棄された、またはクォーラムが応答しなかった。同一シャードの書き込みと 2PC は既存のルーティング予算内で再試行する。一つの論理書き込みは同じ提案 ID を使う。その ID が既にコミット済みなら、シャードは元の結果を返し、コマンドを再実行しない。ストレージ障害と停止した Raft ノードは `ConsensusError` のままで再試行しない |
 | `UnsplittableJumboShard` | メモリ内スプリッタ（`shard.rs`）。永続ジャンボ経路ではない。永続経路は `JumboIsolated` を立て、子シャードなしで成功を返す |
 | `WriteIntentConflict` / `TransactionAborted` | 2PC の衝突、またはディレクトリリネームのリースがすでに保持されている |
 | `InvalidRenameCycle` | ディレクトリを自分自身または子孫へリネームする |

@@ -59,8 +59,7 @@ impl AuxDispatcher {
                 .map(|e| (e.origin_raft_index, e.task_ordinal))
                 .collect();
             let cmd = TxRaftCmd::ApplyAuxBatch { entries: batch };
-            let payload = codec::serialize(&cmd)
-                .map_err(|e| metadb_core::MetaDbError::CodecError(e.to_string()))?;
+            let payload = crate::command_payload(&cmd)?;
             if target_grp
                 .propose(target_ep, clock.now(), payload)
                 .await
@@ -73,8 +72,7 @@ impl AuxDispatcher {
         let acked_len = acked_keys.len();
         if !acked_keys.is_empty() {
             let ack_cmd = TxRaftCmd::AckAuxTasks { acked_keys };
-            let payload = codec::serialize(&ack_cmd)
-                .map_err(|e| metadb_core::MetaDbError::CodecError(e.to_string()))?;
+            let payload = crate::command_payload(&ack_cmd)?;
             let _ = origin_group
                 .propose(origin_group.current_epoch(), clock.now(), payload)
                 .await?;
@@ -102,8 +100,7 @@ impl TxnRecoveryWorker {
             txn_id,
             caller_hlc: now,
         };
-        let check_bytes = codec::serialize(&check_cmd)
-            .map_err(|e| metadb_core::MetaDbError::CodecError(e.to_string()))?;
+        let check_bytes = crate::command_payload(&check_cmd)?;
         let resp = p_group.propose(p_epoch, now, check_bytes).await?;
         let out: TxRaftOutput = codec::deserialize(&resp.result?)
             .map_err(|e| metadb_core::MetaDbError::CodecError(e.to_string()))?;
@@ -189,7 +186,7 @@ impl TxnRecoveryWorker {
                                     txn_id: tid,
                                     target_user_keys: vec![uk.clone()],
                                 };
-                                let bytes = codec::serialize(&abort_cmd).unwrap();
+                                let bytes = crate::command_payload(&abort_cmd).unwrap();
                                 let _ = group
                                     .propose(group.current_epoch(), clock.now(), bytes)
                                     .await;
@@ -208,7 +205,7 @@ impl TxnRecoveryWorker {
                                 txn_id: irec.txn_id,
                                 target_user_keys: vec![uk],
                             };
-                            let bytes = codec::serialize(&abort_cmd).unwrap();
+                            let bytes = crate::command_payload(&abort_cmd).unwrap();
                             let _ = group
                                 .propose(group.current_epoch(), clock.now(), bytes)
                                 .await;
@@ -219,7 +216,7 @@ impl TxnRecoveryWorker {
                                 commit_hlc,
                                 target_user_keys: vec![uk],
                             };
-                            let bytes = codec::serialize(&sec_cmd).unwrap();
+                            let bytes = crate::command_payload(&sec_cmd).unwrap();
                             let _ = group
                                 .propose(group.current_epoch(), commit_hlc, bytes)
                                 .await;
@@ -271,8 +268,7 @@ impl TxnRecoveryWorker {
                 },
                 TxnState::Pending => continue,
             };
-            let bytes = codec::serialize(&cmd)
-                .map_err(|e| metadb_core::MetaDbError::CodecError(e.to_string()))?;
+            let bytes = crate::command_payload(&cmd)?;
             if grp.propose(ep, clock.now(), bytes).await.is_ok() {
                 newly_acked.extend(keys);
             }
@@ -283,8 +279,7 @@ impl TxnRecoveryWorker {
                 txn_id: rec.txn_id,
                 acked_user_keys: newly_acked,
             };
-            let bytes = codec::serialize(&ack_cmd)
-                .map_err(|e| metadb_core::MetaDbError::CodecError(e.to_string()))?;
+            let bytes = crate::command_payload(&ack_cmd)?;
             let _ = primary_group
                 .propose(primary_group.current_epoch(), clock.now(), bytes)
                 .await;

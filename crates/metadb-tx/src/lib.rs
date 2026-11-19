@@ -22,8 +22,8 @@ pub use aux_sink::{AsyncAuxiliarySink, AuxUpdateTask};
 pub use pushdown::{PushdownExecutor, TwoPhaseCommitCoordinator};
 pub use recovery_worker::{AuxDispatcher, TxnRecoveryWorker};
 pub use state_machine_impl::{
-    node_instance_key, NodeInstanceRecord, SetAttrPatch, TxRaftCmd, TxRaftOutput,
-    TxStateMachineHandler,
+    command_payload, encode_proposed_command, fresh_proposal_id, node_instance_key,
+    NodeInstanceRecord, SetAttrPatch, TxRaftCmd, TxRaftOutput, TxStateMachineHandler,
 };
 pub use two_pc::{
     DirPartitionStat, DirRenameLease, DistributedTxRouter, RoutedShardHandle, ShardDirectory,
