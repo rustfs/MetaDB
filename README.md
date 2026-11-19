@@ -9,10 +9,10 @@
 > **Academic & Architectural Attribution**:
 > The architecture of `rustfs/MetaDB` is inspired by and adapted from Baidu's trillion-scale production metadata center paper:
 > **Zebin Ren ([@ZebinRen](https://github.com/ZebinRen)), Biao Cao, Kang Chen ([@kangchenPKU](https://github.com/kangchenPKU)), Zhihui Yin, Qiushi Chen, Jielong Jian, Jiwei Xiong, Xinxing Wang, Yan Xing, Liguo Duan, Ran Zheng, Xianjun Meng, and Zhenyu Hou**, *"MetaDB: Putting File-System Structure Back into Distributed Databases"*, [arXiv:2610.32247v1](https://arxiv.org/html/2610.32247v1) (Vrije Universiteit Amsterdam, Baidu & Peking University, 2026).
-> *(Note: Trillion-record production figures cited from `arXiv:2610.32247v1` reflect Baidu's production deployment; see [Current Implementation Status](#current-implementation-status) below for `rustfs/MetaDB` repository milestones.)*
+> *(Note: Trillion-record production figures cited from `arXiv:2610.32247v1` are Baidu production data, not results of this repository. [Current Implementation Status](#current-implementation-status) does not record a first-launch or trillion-scale pass.)*
 >
 > **Spec-Driven Development Methodology**:
-> Designed, stress-tested, and verified using Google's [Elephant-Goldfish Model (EGM)](https://github.com/google/elephant-goldfish-model).
+> Designed and stress-tested as a specification with Google's [Elephant-Goldfish Model (EGM)](https://github.com/google/elephant-goldfish-model). That review is not a first-launch or scale-gate pass.
 
 ---
 
@@ -73,11 +73,11 @@ MetaDB runs the **exact same `StorageBackend` and `openraft` state machine** fro
 
 ## Current Implementation Status
 
-Phase completion in the list below means the crates and the tests in [docs/en/testing.md](./docs/en/testing.md) are in this tree. It does not mean a multi-process Cell deployment is supported.
+Phase labels below mean the crates and the tests described in [docs/en/testing.md](./docs/en/testing.md) are in this tree. They do not mean a multi-process Cell deployment is supported, and they do not mean first-launch acceptance has passed. Merging pull requests #18–#25 is not that pass. Trillion-scale figures in `arXiv:2610.32247v1` are Baidu production data, not results of this repository. The `listdir` P99 `<4ms` figure is a design target from that paper, not a measurement of this tree.
 
-* **Phases 0–6 Completed & Verified**:
-  * **Phase 0**: Master `Architecture.md`, EGM subsystem specs, zero-context Goldfish review & resolutions (`B1`–`B18`, `N1`–`N5`), `DEVELOPMENT_PLAN.md`, and 5-language usage guides (`en`, `ja`, `fr`, `zh`, `de`).
-  * **Phases 1–6**: Full 8-crate 100% pure-Rust implementation (`zero C/C++ FFI`) passing `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` (including fault-injection suites for SSTable/MANIFEST crash recovery, `SnapshotGuard` `ReadCut` isolation, `LocalityCompactor`, `1-Voter -> 3-Voter` Multi-Raft snapshot promotion & leader failover, `[0x07]` outbox spill/cleanup, 2PC crash recovery, 3-way `DualModeFineGrained` scatter-gather, all 20 SQL templates, and end-to-end gRPC cluster evolution).
+* **Phases 0–6 are in this tree; they are not a first-launch or scale-gate verification**:
+  * **Phase 0**: Master `Architecture.md`, EGM subsystem specs, zero-context Goldfish review & resolutions (`B1`–`B18`, `N1`–`N5`), `DEVELOPMENT_PLAN.md`, and 5-language usage guides (`en`, `ja`, `fr`, `zh`, `de`). The Goldfish review checked the specification. It is not a runtime acceptance test.
+  * **Phases 1–6**: The 8 crates are a pure-Rust implementation (`zero C/C++ FFI`). In-tree checks are `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`. Those suites include fault-injection coverage for SSTable/`MANIFEST` crash recovery, `SnapshotGuard` `ReadCut` isolation, `LocalityCompactor`, in-process `1-Voter -> 3-Voter` snapshot promotion and leader failover, `[0x07]` outbox spill/cleanup, 2PC crash recovery, 3-way `DualModeFineGrained` scatter-gather, all 20 SQL templates, and the gRPC tests listed in [docs/en/testing.md](./docs/en/testing.md). `crates/metadb-storage/tests/first_ship_storage_regressions.rs` covers live-row `listdir` limit pushdown and density rebuild on open. That file is not first-launch evidence. Process-restart `listdir` and multi-process 3-voter failover `listdir` with `entries_examined` assertions are still required and are not in this tree.
 
 ---
 
