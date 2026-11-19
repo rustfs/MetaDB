@@ -16,22 +16,25 @@
 
 ---
 
-## Feature Readiness Matrix (Phases 1–6 Verified)
+## Feature readiness
 
-MetaDB's 8-crate pure-Rust implementation is verified across all core subsystems:
+The Baidu paper [`arXiv:2610.32247v1`](https://arxiv.org/html/2610.32247v1) reports Baidu production figures, including 575+ nodes per cluster and trillion-scale metadata. Those figures are not results of this repository. This matrix is not a first-launch pass. A documentation merge is not a first-ship pass.
+
+Each status cell uses one label: **design claim**, **crate-tested**, or **multi-process unverified**. In-tree tests are crate or in-process coverage. They are not a multi-process 3-voter operator rehearsal. Operator detail is in [`docs/en/operations.md`](../../en/operations.md) and [`docs/en/architecture.md`](../../en/architecture.md).
 
 | Feature Area | Repository Status | Implementation Crate / Binary |
 | :--- | :--- | :--- |
-| Embedded Rust SDKs (`PersistentMetaDbCluster` & `MetaDbEngine`) | **Implemented & Tested** (async persistent + sync in-memory) | `metadb-server` |
-| `(PID, "_attr_")` Colocation, `0x01..0x07` Codecs & `HLC` | **Implemented & Tested** (88B CRC32C + 500ms drift guard) | `metadb-core` |
-| Disk Persistence (Pure-Rust WAL-less SSTable LSM) | **Implemented & Tested** (`LsmStorageBackend`, `MANIFEST`, Bloom, LRU Cache) | `metadb-storage` |
-| `SnapshotGuard` `ReadCut` MVCC & `LocalityCompactor` | **Implemented & Tested** (`ActiveSnapshotRegistry` + bottommost compaction) | `metadb-storage` |
-| Multi-Raft Consensus (`1-Voter -> 3-Voter` + `ReadIndex`) | **Implemented & Tested** (`openraft` 0.10 + `.raftlog` + `tonic`) | `metadb-raft` |
-| `1-RTT` Pushdown, `ReplicatedAttrAggregator` & `AuxOutbox` | **Implemented & Tested** (Coordinated Flush Barrier + `[0x07]` local spill) | `metadb-tx` |
-| Cross-Shard 2PC (`Rename`, `Mkdir`, `Rmdir`, `SetAttr`) | **Implemented & Tested** (Primary-Anchored `TxnRecord` + `WriteIntent` recovery) | `metadb-tx` |
-| `PID`-Boundary Split, Jumbo Isolation & `DualMode` | **Implemented & Tested** (`ShardEpoch` fencing + `DirShardDelta` scatter-gather) | `metadb-cluster` |
-| 20 Parameterized SQL Templates | **Implemented & Tested** (all 20 `?` & escaped SQL templates) | `metadb-proxy` |
-| `metadbd` Server Daemon & `metadb-ctl` CLI | **Implemented & Tested** (`crates/metadb-server/src/bin/`) | `metadb-server` |
+| Embedded Rust SDKs (`PersistentMetaDbCluster` & `MetaDbEngine`) | **crate-tested**. `PersistentMetaDbCluster` is covered by single-process tests. `MetaDbEngine::new_single_node` is an in-memory simulator with no disk and no Raft. Tests `T1`–`T6` use that simulator. `T6` only edits an in-memory membership map. | `metadb-server` |
+| `(PID, "_attr_")` Colocation, `0x01..0x07` Codecs & `HLC` | **crate-tested**. `metadb-core` unit tests cover the 88B CRC32C `InodeAttr` and the 500ms drift guard. | `metadb-core` |
+| Disk Persistence (Pure-Rust WAL-less SSTable LSM) | **crate-tested**. `LsmStorageBackend`, `MANIFEST`, Bloom, and the LRU block cache are covered by storage crate tests. | `metadb-storage` |
+| `SnapshotGuard` `ReadCut` MVCC & `LocalityCompactor` | **crate-tested**. `ActiveSnapshotRegistry` and bottommost compaction are covered by storage crate tests and the single-process end-to-end test. | `metadb-storage` |
+| Multi-Raft Consensus (`1-Voter -> 3-Voter` + `ReadIndex`) | **multi-process unverified**. The checked-in 1-voter to 3-voter test runs three tonic listeners and a basic KV state machine inside one OS process. It does not start `metadbd`. A three-`metadbd` voter rehearsal is outside these tests. | `metadb-raft` |
+| `1-RTT` Pushdown, `ReplicatedAttrAggregator` & `AuxOutbox` | **crate-tested**. Coordinated flush-barrier aggregation and `[0x07]` local spill are covered by `metadb-tx` tests inside one process. | `metadb-tx` |
+| Cross-Shard 2PC (`Rename`, `Mkdir`, `Rmdir`, `SetAttr`) | **crate-tested**. Primary-anchored `TxnRecord` and `WriteIntent` recovery are covered by `two_pc_crash_tests` and the single-process end-to-end test. | `metadb-tx` |
+| `PID`-boundary split & `DualMode` route flag | **crate-tested**. Epoch-fenced PID split is covered in-process. `EnableDualModeSplit` persists a route flag and does not itself copy keys. A later split may cut on `(pid, name)`. | `metadb-cluster` |
+| Jumbo isolation (dedicated host) | **design claim**. Jumbo isolation in this tree is a route flag plus a node id chosen from the local node map. With one node, the flag names this process. Files stay on this host. Peer shards stay on their current host. | `metadb-cluster` |
+| 20 Parameterized SQL Templates | **crate-tested**. `sql_templates_tests` covers all 20 templates, including `?` placeholders and `_attr_` isolation. | `metadb-proxy` |
+| `metadbd` Server Daemon & `metadb-ctl` CLI | **crate-tested**. The all-in-one binaries live in `crates/metadb-server/src/bin/`. `open_and_serve` accepts only `all-in-one`. | `metadb-server` |
 
 ---
 
