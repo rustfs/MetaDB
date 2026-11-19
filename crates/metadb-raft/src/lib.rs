@@ -15,7 +15,8 @@ pub use backup::{
 };
 pub use conf_change::{ConfChangeOrchestrator, DEFAULT_LEARNER_CATCHUP_THRESHOLD_ENTRIES};
 pub use group_host::{
-    ProposalShutdownGate, RaftNodeOptions, RegistryShardState, ShardGroupHost, ShardRaftGroup,
+    replay_still_pending, ProposalShutdownGate, RaftNodeOptions, RegistryShardState,
+    ShardGroupHost, ShardRaftGroup, ShardServeView,
 };
 pub use log_store::SegmentedRaftLogStore;
 pub use network::{

@@ -73,7 +73,7 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 
 ## Metrics
 
-Set `node.metrics_listen_addr` (for example `127.0.0.1:9100`). `open_and_serve` accepts TCP connections on that address. `GET /metrics` returns Prometheus text. Any other path returns 404, and any other method returns 405. When `[security].shared_secret` contains a non-whitespace character, every request on this listener must send `Authorization: Bearer <shared_secret>`. A missing, empty, or wrong bearer returns HTTP 401 and a body that is not the metric text, including a request for `/status`. An empty secret refuses to start on every address, including loopback, unless `allow_unauthenticated` is set. That flag still refuses a non-loopback metrics address. A whitespace-only secret refuses to start even when the flag is set. This listener does not terminate TLS.
+Set `node.metrics_listen_addr` (for example `127.0.0.1:9100`). `open_and_serve` accepts TCP connections on that address before join finishes, so a probe can observe `starting`. `GET /metrics` returns Prometheus text even when the process is not ready. `GET /livez` is liveness. `GET /readyz` and `GET /healthz` are readiness: HTTP 200 only when startup has finished, shutdown has not started, and every local shard has recovered its committed prefix, applied a log entry, is a voter, and knows a leader. A bound socket is not enough. Any other path returns 404, and any other method returns 405. When `[security].shared_secret` contains a non-whitespace character, every request on this listener must send `Authorization: Bearer <shared_secret>`. A missing, empty, or wrong bearer returns HTTP 401 and a body that is not the metric text, including a request for `/status` or `/readyz`. A whitespace-only secret is rejected before that compare, so a bearer that repeats the spaces is still 401. An empty secret refuses to start on every address, including loopback, unless `allow_unauthenticated` is set. That flag still refuses a non-loopback metrics address. A whitespace-only secret refuses to start even when the flag is set. This listener does not terminate TLS. The exact reason tokens and the checks that are intentionally omitted are in [Operability](./operability.md).
 
 Gauges and counters from `render_prometheus_metrics`:
 
@@ -88,8 +88,24 @@ Gauges and counters from `render_prometheus_metrics`:
 | `metadb_tombstones_traversed_on_scans_total` | counter |
 | `metadb_locality_compactions_total` | counter |
 | `metadb_min_raft_safe_purge_index` | gauge |
+| `metadb_ready` | gauge, 1 only when `/readyz` is 200 |
+| `metadb_live` | gauge, 1 when `/livez` is 200 |
+| `metadb_process_phase` | gauge, 0 starting, 1 serving, 2 shutting down, 3 failed |
+| `metadb_shards_leader_known` | gauge, local groups with a known leader |
+| `metadb_shards_leader_unknown` | gauge |
+| `metadb_shards_recovery_pending` | gauge |
+| `metadb_shards_log_not_applied` | gauge |
+| `metadb_shards_not_voter` | gauge |
+| `metadb_shards_storage_unrecoverable` | gauge |
+| `metadb_shards_raft_stopped` | gauge |
+| `metadb_shards_raft_fatal` | gauge |
+| `metadb_raft_heartbeat_interval_ms` | gauge, configured value |
+| `metadb_raft_election_timeout_min_ms` | gauge, configured value |
+| `metadb_raft_election_timeout_max_ms` | gauge, configured value |
+| `metadb_raft_max_in_snapshot_log_to_keep` | gauge, configured value |
+| `metadb_raft_max_segment_bytes` | gauge, configured value |
 
-There is no `metadb_raft_watermark_lag_entries` series. `metadb_cells_total` counts cells registered inside this process, which `open_and_serve` sets to one.
+There is no `metadb_raft_watermark_lag_entries` series and no per-shard label. `metadb_cells_total` counts cells registered inside this process, which `open_and_serve` sets to one. `metadb_process_phase 1` does not by itself mean `metadb_ready 1`.
 
 ## Scale-out
 
@@ -141,8 +157,8 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 - Quota cursor rows are written after the outbox lock is released, so a flush that already holds the memtable lock can still take the outbox lock.
 - Jumbo isolation is a route flag plus a node id chosen from the local node map. It does not evict other shards from a disk.
 - Heartbeats are an RPC with no sender in `metadbd`. `StoreHeartbeat` does not persist.
-- A non-empty shared secret authenticates Raft, the other three gRPC services, and the metrics listener with the same bearer. An empty secret does not start the process. `allow_unauthenticated = true` is the explicit exception for literal loopback IPs (`127.0.0.0/8` or `::1`) and still refuses a wildcard bind. The hostname `localhost` is not accepted for that exception. A whitespace-only secret is rejected. The process does not terminate TLS.
-- `memtable_size_bytes` seals and flushes the active memtable. `max_imm_memtables` caps queued immutable tables. Raft timer fields do not change runtime behavior through TOML.
+- A secret that contains a non-whitespace character authenticates Raft, the other three gRPC services, and the metrics listener, including `/livez`, `/readyz`, and `/healthz`, with the same bearer. An empty secret does not start the process. `allow_unauthenticated = true` is the explicit exception for literal loopback IPs (`127.0.0.0/8` or `::1`) and still refuses a wildcard bind. The hostname `localhost` is not accepted for that exception. The bound socket is checked again after listen. A whitespace-only secret is rejected and is not compared as a bearer. The process does not terminate TLS.
+- `memtable_size_bytes` seals and flushes the active memtable. `max_imm_memtables` caps queued immutable tables. `[raft]` timers and `max_segment_bytes` apply when a group starts. They are not reloaded from a changed file, and the segment size does not rewrite segments already on disk.
 - `metadb-ctl bench` for `hotspot-create` and `bulk-ttl-delete` prints JSON lines: a header with `bench_pid`, then phase reports with attempted, succeeded, failed, and latency percentiles. The process exits non-zero unless every requested operation succeeds. `--workload mixed` or `--embedded` runs the in-process stress harness. `sql` prints the response as JSON and exits non-zero on an application error.
 
 ## Backup and restore
@@ -198,5 +214,5 @@ These items are missing from the product, so this guide cannot describe a proced
 2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
 3. Placing a jumbo shard on its own machine and moving other shards off that machine.
 4. Native TLS. This process does not terminate TLS. Config keys that ask for TLS or a certificate are rejected instead of serving plaintext. Put termination in an external proxy. Raft and metrics use the same bearer as the other services when a secret is set; that bearer is not mutual TLS. A heartbeat-driven control loop is not implemented.
-5. A Raft timer that operators can set and observe.
+5. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. See [Operability](./operability.md).
 6. A checked-in service-level result for `metadb-ctl bench`. The command prints numbers for the machine you run it on. This repository does not record one. See [Tests and benches](./testing.md).
