@@ -241,7 +241,12 @@ async fn backup_restore_reads_committed_keys_and_rejects_a_truncated_artifact() 
 
     let restored = tempdir().unwrap();
     let data = restored.path().join("data");
-    backup::restore_backup(&artifact, &data, &metadb_server::check_backup_tree).unwrap();
+    set_files_readonly(&artifact, true);
+    let restore_result =
+        backup::restore_backup(&artifact, &data, &metadb_server::check_backup_tree);
+    set_files_readonly(&artifact, false);
+    restore_result
+        .expect("read-only artifact must restore without opening its MANIFEST for append");
     let cfg = persistent_cfg(&data);
     let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
     for name in ["a.dat", "b.dat", "c.dat", "d.dat", "e.dat", "tail.dat"] {
@@ -265,6 +270,60 @@ async fn backup_restore_reads_committed_keys_and_rejects_a_truncated_artifact() 
             "list missing {name}: {names:?}"
         );
     }
+    cluster.shutdown().await.unwrap();
+}
+
+fn set_files_readonly(root: &Path, readonly: bool) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        if current.is_dir() {
+            for entry in std::fs::read_dir(&current).unwrap() {
+                stack.push(entry.unwrap().path());
+            }
+            continue;
+        }
+        let mut permissions = std::fs::metadata(&current).unwrap().permissions();
+        permissions.set_readonly(readonly);
+        std::fs::set_permissions(&current, permissions).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn released_hold_purges_a_short_tail_without_a_new_snapshot() {
+    let dir = tempdir().unwrap();
+    let cfg = persistent_cfg(dir.path());
+    let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
+    for i in 0..3 {
+        cluster
+            .create_file_auto_id(ROOT_INODE_ID, &format!("warm-{i}.dat"), 3, 0o644, 16)
+            .await
+            .unwrap();
+    }
+    cluster.run_maintenance_tick().await.unwrap();
+    let hold = cluster
+        .acquire_backup_hold(Duration::from_secs(120))
+        .unwrap();
+    cluster
+        .create_file_auto_id(ROOT_INODE_ID, "after-hold.dat", 3, 0o644, 16)
+        .await
+        .unwrap();
+    cluster.run_maintenance_tick().await.unwrap();
+    let (shard_id, purged_while_held) = purged_index(&cluster).await;
+    let floor = floor_for(&hold, shard_id).max_purge_index;
+    assert!(purged_while_held <= floor);
+    let (_, group, _) = cluster
+        .global_manager()
+        .route_user_key(&MetaKey::dir_attr(ROOT_INODE_ID).encode())
+        .unwrap();
+    let retained = group.log_store().retained_entry_count();
+    assert!(retained > 0 && retained < 64, "retained {retained}");
+    cluster.release_backup_hold().unwrap();
+    cluster.run_background_maintenance_tick().await.unwrap();
+    let (_, purged) = purged_index(&cluster).await;
+    assert!(
+        purged > floor,
+        "idle tick left purge at {purged}, hold floor was {floor}"
+    );
     cluster.shutdown().await.unwrap();
 }
 
