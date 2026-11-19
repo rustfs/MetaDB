@@ -133,6 +133,29 @@ impl ProposalShutdownGate {
     }
 }
 
+fn legacy_proposal_not_retried() -> MetaDbError {
+    MetaDbError::ConsensusError(
+        "legacy proposal has no receipt; refusing to retry because the commit outcome is unknown"
+            .to_string(),
+    )
+}
+
+/// A forwarded raw proposal must not come back as a retryable discarded-log error.
+pub(crate) fn normalize_discarded_legacy(payload: &[u8], error: MetaDbError) -> MetaDbError {
+    if matches!(
+        error,
+        MetaDbError::RetryableConsensus {
+            kind: metadb_core::RetryableConsensusKind::LogDiscarded,
+            ..
+        }
+    ) && !metadb_core::proposal_payload_is_enveloped(payload)
+    {
+        legacy_proposal_not_retried()
+    } else {
+        error
+    }
+}
+
 /// Active Multi-Raft group hosting one shard's consensus log, state machine, and `ReadIndexBatcher`.
 pub struct ShardRaftGroup {
     shard_id: ShardId,
@@ -149,6 +172,7 @@ pub struct ShardRaftGroup {
     testing_not_leader: std::sync::Mutex<(u32, Option<NodeId>)>,
     testing_epoch_mismatch: std::sync::atomic::AtomicU32,
     testing_log_discarded: std::sync::atomic::AtomicU32,
+    testing_read_quorum: std::sync::atomic::AtomicU32,
 }
 
 impl ShardRaftGroup {
@@ -234,6 +258,7 @@ impl ShardRaftGroup {
             testing_not_leader: std::sync::Mutex::new((0, None)),
             testing_epoch_mismatch: std::sync::atomic::AtomicU32::new(0),
             testing_log_discarded: std::sync::atomic::AtomicU32::new(0),
+            testing_read_quorum: std::sync::atomic::AtomicU32::new(0),
         });
         router.register_local_proposer(shard_id, group.clone());
         Ok(group)
@@ -253,6 +278,12 @@ impl ShardRaftGroup {
     /// The next `count` proposals fail as a discarded log entry before reaching Raft.
     pub fn testing_fail_next_log_discarded(&self, count: u32) {
         self.testing_log_discarded
+            .store(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The next `count` linearizable reads fail with `QuorumUnavailable`.
+    pub fn testing_fail_next_read_quorum(&self, count: u32) {
+        self.testing_read_quorum
             .store(count, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -557,6 +588,9 @@ impl ShardRaftGroup {
         {
             self.testing_log_discarded
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if !metadb_core::proposal_payload_is_enveloped(&payload) {
+                return Err(legacy_proposal_not_retried());
+            }
             return Err(MetaDbError::RetryableConsensus {
                 shard_id: self.shard_id,
                 leader_hint: Some(self.node_id),
@@ -577,9 +611,19 @@ impl ShardRaftGroup {
                     .await
             }
             Err(MetaDbError::RetryableConsensus {
+                kind: metadb_core::RetryableConsensusKind::LogDiscarded,
+                ..
+            }) if !metadb_core::proposal_payload_is_enveloped(&payload) => {
+                Err(legacy_proposal_not_retried())
+            }
+            Err(MetaDbError::RetryableConsensus {
                 leader_hint: Some(leader),
+                kind: metadb_core::RetryableConsensusKind::LogDiscarded,
                 ..
             }) if leader != self.node_id => {
+                if !metadb_core::proposal_payload_is_enveloped(&payload) {
+                    return Err(legacy_proposal_not_retried());
+                }
                 let request = MetaDbRaftRequest {
                     expected_epoch,
                     hlc: caller_hlc,
@@ -687,7 +731,10 @@ impl ShardRaftGroup {
         )
         .await
         {
-            Ok(result) => result?,
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                return Err(normalize_discarded_legacy(&request.payload, error));
+            }
             Err(_) => {
                 return Err(MetaDbError::RpcError(
                     "forwarded proposal timed out".to_string(),
@@ -703,6 +750,19 @@ impl ShardRaftGroup {
         &self,
         expected_epoch: ShardEpoch,
     ) -> Result<(ReadToken, SnapshotGuard)> {
+        if self
+            .testing_read_quorum
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            self.testing_read_quorum
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(MetaDbError::RetryableConsensus {
+                shard_id: self.shard_id,
+                leader_hint: None,
+                kind: metadb_core::RetryableConsensusKind::QuorumUnavailable,
+            });
+        }
         self.read_batcher
             .acquire_linearizable_guard(expected_epoch, &self.state_machine)
             .await
@@ -1022,5 +1082,20 @@ mod tests {
             voter_ids_from_joint_configs([BTreeSet::from([1, 2, 3])]),
             BTreeSet::from([1, 2, 3])
         );
+    }
+
+    #[test]
+    fn forwarded_raw_discard_is_not_retried() {
+        let discarded = MetaDbError::RetryableConsensus {
+            shard_id: 1,
+            leader_hint: Some(2),
+            kind: metadb_core::RetryableConsensusKind::LogDiscarded,
+        };
+        let raw = normalize_discarded_legacy(b"not-an-envelope", discarded.clone());
+        assert!(!raw.is_retryable_write_consensus(), "{raw}");
+        let mut enveloped = b"MDBP0001".to_vec();
+        enveloped.extend_from_slice(&[0; 24]);
+        let kept = normalize_discarded_legacy(&enveloped, discarded);
+        assert!(kept.is_retryable_write_consensus(), "{kept}");
     }
 }

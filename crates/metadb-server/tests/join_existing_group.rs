@@ -814,6 +814,96 @@ async fn concurrent_joiners_both_become_voters() {
     );
     assert!(create_named(&node2, "concurrent.dat", 130, 530).await);
     wait_visible(&node3, "concurrent.dat").await;
+    for node in [&node1, &node2, &node3] {
+        for route in node.cell_manager().list_routes() {
+            assert_eq!(
+                route.epoch.conf_ver,
+                node.cell_manager()
+                    .lookup_local_handle(route.shard_id)
+                    .unwrap()
+                    .1
+                    .current_epoch()
+                    .conf_ver
+            );
+        }
+    }
+    node1.shutdown().await.unwrap();
+    node2.shutdown().await.unwrap();
+    node3.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_scale_overlaps_learner_promotion() {
+    let dir = tempdir().unwrap();
+    let (node1, addr1) =
+        PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n1"), 1, ""))
+            .await
+            .unwrap();
+    node1
+        .tx_router()
+        .mkdir(ROOT_INODE_ID, "bucket", BUCKET_ID, 7, 0o755)
+        .await
+        .unwrap();
+    let leader_for_two = Arc::clone(&node1);
+    let leader_for_three = Arc::clone(&node1);
+    let scale_two = async move {
+        let mut last = String::from("scale of node 2 was not attempted");
+        for _ in 0..80 {
+            match leader_for_two
+                .cell_manager()
+                .scale_out_replicas_ensuring(3, Some(2))
+                .await
+            {
+                Ok(_) => return,
+                Err(error) => last = error.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("concurrent scale of node 2 failed: {last}");
+    };
+    let scale_three = async move {
+        let mut last = String::from("scale of node 3 was not attempted");
+        for _ in 0..80 {
+            match leader_for_three
+                .cell_manager()
+                .scale_out_replicas_ensuring(3, Some(3))
+                .await
+            {
+                Ok(_) => return,
+                Err(error) => last = error.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("concurrent scale of node 3 failed: {last}");
+    };
+    let (node2, node3, _, _) = tokio::join!(
+        PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n2"), 2, &addr1)),
+        PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n3"), 3, &addr1)),
+        scale_two,
+        scale_three,
+    );
+    let (node2, _) = node2.expect("node 2 join");
+    let (node3, _) = node3.expect("node 3 join");
+    let expected = BTreeSet::from([1, 2, 3]);
+    assert_eq!(voter_set(&node1), expected);
+    assert_eq!(voter_set(&node2), expected);
+    assert_eq!(voter_set(&node3), expected);
+    for route in node1.cell_manager().list_routes() {
+        let (_, group, _) = node1
+            .cell_manager()
+            .lookup_local_handle(route.shard_id)
+            .unwrap();
+        assert_eq!(route.epoch.conf_ver, group.current_epoch().conf_ver);
+        assert_eq!(
+            route
+                .peers
+                .iter()
+                .filter(|(_, (_, voter))| *voter)
+                .map(|(id, _)| *id)
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+    }
     node1.shutdown().await.unwrap();
     node2.shutdown().await.unwrap();
     node3.shutdown().await.unwrap();

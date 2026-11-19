@@ -72,7 +72,13 @@ where
                     ..
                 },
             ) => return Err(error),
-            Err(error @ MetaDbError::NotLeader { .. }) => {
+            Err(
+                error @ (MetaDbError::NotLeader { .. }
+                | MetaDbError::RetryableConsensus {
+                    kind: metadb_core::RetryableConsensusKind::QuorumUnavailable,
+                    ..
+                }),
+            ) => {
                 let now = tokio::time::Instant::now();
                 let limit = deadline.min(election_deadline);
                 if now >= limit {
@@ -1761,6 +1767,42 @@ impl DistributedTxRouter {
     /// Directory partition on `shard_id`. A follower that knows the leader forwards
     /// this read and does not return `NotLeader` to the caller.
     pub async fn dir_partition_stat(
+        &self,
+        shard_id: u64,
+        epoch: ShardEpoch,
+        pid: InodeId,
+        barrier: Option<HlcTimestamp>,
+    ) -> Result<DirPartitionStat> {
+        // The caller already chose this shard and epoch. Retry only a missing
+        // quorum or an election with no leader hint. An epoch or routing error
+        // must return immediately so the caller can refresh the route.
+        let deadline = tokio::time::Instant::now() + ELECTION_RETRY_TIMEOUT;
+        loop {
+            match self
+                .dir_partition_stat_once(shard_id, epoch, pid, barrier)
+                .await
+            {
+                Err(
+                    error @ (MetaDbError::RetryableConsensus {
+                        kind: metadb_core::RetryableConsensusKind::QuorumUnavailable,
+                        ..
+                    }
+                    | MetaDbError::NotLeader {
+                        leader_hint: None, ..
+                    }),
+                ) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(ROUTE_RETRY_INTERVAL.min(deadline - now)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn dir_partition_stat_once(
         &self,
         shard_id: u64,
         epoch: ShardEpoch,
