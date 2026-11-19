@@ -67,7 +67,9 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ### `bench`
 
-Voir [Tests et bancs](./testing.md#metadb-ctl-bench). C'est un client contre un serveur en cours d'exécution. Ce n'est pas une cible de banc Cargo. Le dépôt n'enregistre pas de nombre de débit pour cette commande.
+See [Tests and benches](./testing.md#metadb-ctl-bench). Remote `hotspot-create` and `bulk-ttl-delete` are a client against a running server. They print JSON with `attempted`, `succeeded`, and `failed`, and the process exits non-zero unless `succeeded` equals `--ops`. `--embedded` and `--workload mixed` run the [in-process stress harness](./testing.md#in-process-stress-harness) instead of dialing the endpoint. That path passes when `errors` and `correctness_errors` are both zero, and it prints latency percentiles in microseconds. Neither path is a Cargo benchmark target. The repository does not check in a throughput number for either path. A printed line is not a service-level result and is not the official 1,000,000-create profile.
+
+The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `SetAttr` overwrites, then 100,000 deletes, concurrency 64) is documented in [Tests and benches](../en/testing.md#prefix-load). GitHub Actions runs only the small profile. It does not run the 1,000,000-create profile.
 
 ## Métriques
 
@@ -105,7 +107,7 @@ Ce qui ne fonctionne pas comme procédure d'exploitation :
 3. `metadb-ctl cell register` ne crée pas une seconde cellule. `open_and_serve` n'enregistre que la cellule locale sur le gestionnaire global.
 4. Le chemin en mémoire `MetaDbEngine::new_single_node` utilisé par les tests `T1`–`T6` peut porter un compteur de votants en mémoire à 3. Cet objet n'a ni disque ni Raft. Ce n'est pas une montée en charge de `metadbd`.
 
-La [pull request ouverte n° 2](https://github.com/rustfs/MetaDB/pull/2) (non fusionnée) énonce la même frontière : son test distribué appelle `DurableCellManager::scale_out_replicas` avec trois votants Raft sur localhost dans un seul processus du système d'exploitation. Il ne lance pas trois processus `metadbd`. Les rôles désagrégés et une seconde cellule n'y sont pas non plus testés comme déploiements vivants. L'isolation jumbo sur nœud dédié dans cette pull request reste le comportement du simulateur en mémoire.
+`topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. Disaggregated roles and a second Cell are still not live deployments. Jumbo dedicated-node isolation remains a route flag, not a move of shards onto another machine.
 
 ## Erreurs que l'on peut rencontrer
 
@@ -131,7 +133,7 @@ Les variantes sont définies dans `crates/metadb-core/src/error.rs`. Les méthod
 
 ## Limites connues
 
-- Un seul processus du système d'exploitation, rôle `all-in-one` seulement.
+- Role `all-in-one` only. `be`, `proxy`, `cell-manager`, and `global-manager` are rejected before listen.
 - Un second processus all-in-one peut rejoindre la même cellule avec `[cluster] join`. Cela ne crée pas une seconde cellule. `RegisterCell` renvoie une erreur.
 - `GetRoutes` échoue fermé pour un `cell_id` non nul inconnu. `StoreHeartbeat` ne remplace pas les routes en cache.
 - L'isolation jumbo est un indicateur de route plus un identifiant de nœud choisi dans la table locale. Elle n'évince pas d'autres shards d'un disque.
@@ -145,9 +147,8 @@ Les variantes sont définies dans `crates/metadb-core/src/error.rs`. Les méthod
 Ces éléments manquent au produit, donc ce guide ne peut pas décrire de procédure pour eux :
 
 1. Une disposition multi-processus pour `be`, `proxy`, `cell-manager` et `global-manager`.
-2. L'ajout d'un second et d'un troisième processus `metadbd` du système d'exploitation à un groupe Raft existant.
-3. La création et le routage vers une seconde cellule.
-4. Le placement d'un shard jumbo sur sa propre machine et le déplacement des autres shards hors de cette machine.
-5. Le TLS natif. Ce processus ne termine pas TLS. Les clés de configuration qui demandent TLS ou un certificat sont rejetées au lieu de servir en clair. Placer la terminaison dans un proxy externe. Raft et les métriques utilisent le même bearer que les autres services lorsqu'un secret est défini ; ce n'est pas du TLS mutuel. Une boucle de contrôle pilotée par les battements de cœur n'est pas implémentée.
-6. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. A leader election makes `/readyz` and `/healthz` return 503 on replicas that do not know a leader. `[raft]` is loaded. Its values apply when a group starts and are not reloaded. See [Operability](../en/operability.md).
-7. Un résultat de niveau service enregistré pour `metadb-ctl bench`. La commande imprime des nombres pour la machine sur laquelle on l'exécute. Ce dépôt n'en enregistre pas. La pull request non fusionnée n° 2 rapporte un harnais embarqué distinct ; ces commandes ne sont pas dans cet arbre. Voir [Tests et bancs](./testing.md).
+2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
+3. Le placement d'un shard jumbo sur sa propre machine et le déplacement des autres shards hors de cette machine.
+4. Le TLS natif. Ce processus ne termine pas TLS. Les clés de configuration qui demandent TLS ou un certificat sont rejetées au lieu de servir en clair. Placer la terminaison dans un proxy externe. Raft et les métriques utilisent le même bearer que les autres services lorsqu'un secret est défini ; ce n'est pas du TLS mutuel. Une boucle de contrôle pilotée par les battements de cœur n'est pas implémentée.
+5. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. A leader election makes `/readyz` and `/healthz` return 503 on replicas that do not know a leader. `[raft]` is loaded and is not `#[serde(skip)]`. Its values apply when a group starts and are not reloaded. See [Operability](../en/operability.md).
+6. A checked-in service-level result for `metadb-ctl bench`. The command prints numbers for the machine you run it on. This repository does not record one. See [Tests and benches](./testing.md).

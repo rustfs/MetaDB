@@ -67,7 +67,9 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ### `bench`
 
-见 [测试与压测](./testing.md#metadb-ctl-bench)。这是针对正在运行的服务器的客户端。它不是 Cargo 基准目标。本仓库没有为它登记吞吐量数字。
+See [Tests and benches](./testing.md#metadb-ctl-bench). Remote `hotspot-create` and `bulk-ttl-delete` are a client against a running server. They print JSON with `attempted`, `succeeded`, and `failed`, and the process exits non-zero unless `succeeded` equals `--ops`. `--embedded` and `--workload mixed` run the [in-process stress harness](./testing.md#in-process-stress-harness) instead of dialing the endpoint. That path passes when `errors` and `correctness_errors` are both zero, and it prints latency percentiles in microseconds. Neither path is a Cargo benchmark target. The repository does not check in a throughput number for either path. A printed line is not a service-level result and is not the official 1,000,000-create profile.
+
+The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `SetAttr` overwrites, then 100,000 deletes, concurrency 64) is documented in [Tests and benches](../en/testing.md#prefix-load). GitHub Actions runs only the small profile. It does not run the 1,000,000-create profile.
 
 ## 指标
 
@@ -105,7 +107,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 3. `metadb-ctl cell register` 不创建第二个单元。`open_and_serve` 只把本地单元注册到全局管理器。
 4. 测试 `T1`–`T6` 使用的内存路径 `MetaDbEngine::new_single_node` 可以把内存中的投票者计数加到 3。那个对象没有磁盘，也没有 Raft。它不是 `metadbd` 的扩容。
 
-[未合并的拉取请求 2](https://github.com/rustfs/MetaDB/pull/2) 陈述了同一边界：它的分布式测试在一个操作系统进程里，用三个 localhost Raft 投票者调用 `DurableCellManager::scale_out_replicas`。它不启动三个 `metadbd` 进程。拆开的角色和第二个单元在那里也没有作为真实部署被测试。该拉取请求中的巨型分片专用节点隔离仍是内存模拟器的行为。
+`topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. Disaggregated roles and a second Cell are still not live deployments. Jumbo dedicated-node isolation remains a route flag, not a move of shards onto another machine.
 
 ## 会遇到的错误
 
@@ -131,7 +133,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ## 已知限制
 
-- 一个操作系统进程，角色只能是 `all-in-one`。
+- Role `all-in-one` only. `be`, `proxy`, `cell-manager`, and `global-manager` are rejected before listen.
 - 第二个 all-in-one 进程可以用 `[cluster] join` 加入同一个单元。这不会创建第二个单元。`RegisterCell` 返回错误。
 - 未知且非零的 `cell_id` 上，`GetRoutes` 失败关闭。`StoreHeartbeat` 不会替换缓存路由。
 - 巨型隔离是路由标志加上从本地节点表选出的节点标识。它不会把其他分片从磁盘上赶走。
@@ -145,9 +147,8 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 下列能力产品里没有，因此本指南无法为它们写出步骤：
 
 1. `be`、`proxy`、`cell-manager` 和 `global-manager` 的多进程布局。
-2. 把第二个和第三个 `metadbd` 操作系统进程加入已有 Raft 组。
-3. 创建第二个单元并路由到它。
-4. 把巨型分片放到独立机器上，并把其他分片从那台机器移走。
-5. 本进程内的 TLS。进程不终结 TLS。要求 TLS 或证书的配置键会被拒绝，而不是以明文提供服务。请在外部代理终结 TLS。密钥非空时，Raft 和指标与其他服务使用同一个持有者令牌；这不是双向 TLS。由心跳驱动的控制循环没有实现。
-6. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. A leader election makes `/readyz` and `/healthz` return 503 on replicas that do not know a leader. `[raft]` is loaded. Its values apply when a group starts and are not reloaded. See [Operability](../en/operability.md).
-7. 记入仓库的 `metadb-ctl bench` 服务级结果。该命令打印你运行它的那台机器上的数字。本仓库没有记录一份。未合并的拉取请求 2 报告了另一套嵌入式工具；那些命令不在本树中。见 [测试与压测](./testing.md)。
+2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
+3. 把巨型分片放到独立机器上，并把其他分片从那台机器移走。
+4. 本进程内的 TLS。进程不终结 TLS。要求 TLS 或证书的配置键会被拒绝，而不是以明文提供服务。请在外部代理终结 TLS。密钥非空时，Raft 和指标与其他服务使用同一个持有者令牌；这不是双向 TLS。由心跳驱动的控制循环没有实现。
+5. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. A leader election makes `/readyz` and `/healthz` return 503 on replicas that do not know a leader. `[raft]` is loaded and is not `#[serde(skip)]`. Its values apply when a group starts and are not reloaded. See [Operability](../en/operability.md).
+6. A checked-in service-level result for `metadb-ctl bench`. The command prints numbers for the machine you run it on. This repository does not record one. See [Tests and benches](./testing.md).

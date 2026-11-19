@@ -67,7 +67,9 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ### `bench`
 
-[テストとベンチ](./testing.md#metadb-ctl-bench) を参照してください。これは起動中のサーバに対するクライアントです。Cargo のベンチターゲットではありません。このリポジトリは、このコマンドのスループット数値を記録していません。
+See [Tests and benches](./testing.md#metadb-ctl-bench). Remote `hotspot-create` and `bulk-ttl-delete` are a client against a running server. They print JSON with `attempted`, `succeeded`, and `failed`, and the process exits non-zero unless `succeeded` equals `--ops`. `--embedded` and `--workload mixed` run the [in-process stress harness](./testing.md#in-process-stress-harness) instead of dialing the endpoint. That path passes when `errors` and `correctness_errors` are both zero, and it prints latency percentiles in microseconds. Neither path is a Cargo benchmark target. The repository does not check in a throughput number for either path. A printed line is not a service-level result and is not the official 1,000,000-create profile.
+
+The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `SetAttr` overwrites, then 100,000 deletes, concurrency 64) is documented in [Tests and benches](../en/testing.md#prefix-load). GitHub Actions runs only the small profile. It does not run the 1,000,000-create profile.
 
 ## メトリクス
 
@@ -105,7 +107,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 3. `metadb-ctl cell register` は 2 つ目のセルを作りません。`open_and_serve` はグローバルマネージャへローカルセルだけを登録します。
 4. テスト `T1`–`T6` が使うメモリ内の `MetaDbEngine::new_single_node` は、メモリ上の投票者数を 3 に増やせます。そのオブジェクトにはディスクも Raft もありません。`metadbd` のスケールアウトではありません。
 
-[未マージのプルリクエスト 2](https://github.com/rustfs/MetaDB/pull/2) は同じ境界を述べています。その分散テストは、1 つの OS プロセスの中で localhost の Raft 投票者 3 つに対し `DurableCellManager::scale_out_replicas` を呼びます。`metadbd` を 3 プロセス起動しません。分離されたロールと 2 つ目のセルも、そこでは稼働中の配備としてはテストされていません。そのプルリクエストのジャンボ専用ノード隔離は、メモリ内シミュレータの挙動のままです。
+`topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. Disaggregated roles and a second Cell are still not live deployments. Jumbo dedicated-node isolation remains a route flag, not a move of shards onto another machine.
 
 ## 遭遇しうるエラー
 
@@ -131,7 +133,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ## 既知の制限
 
-- OS プロセスは 1 つ、ロールは `all-in-one` だけ。
+- Role `all-in-one` only. `be`, `proxy`, `cell-manager`, and `global-manager` are rejected before listen.
 - 2 つ目の all-in-one プロセスは `[cluster] join` で同じセルに参加できる。これは 2 つ目のセルを作らない。`RegisterCell` はエラーを返す。
 - 未知で非ゼロの `cell_id` に対する `GetRoutes` は失敗して閉じる。`StoreHeartbeat` はキャッシュ済みルートを置き換えない。
 - ジャンボ隔離はルートフラグと、ローカルノード表から選んだノード ID である。他のシャードをディスクから追い出すことはしない。
@@ -145,9 +147,8 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 次の項目は製品に無いため、このガイドは手順を書けません。
 
 1. `be`、`proxy`、`cell-manager`、`global-manager` の複数プロセス配置。
-2. 既存の Raft グループへ 2 つ目と 3 つ目の `metadbd` OS プロセスを加えること。
-3. 2 つ目のセルを作り、そこへルーティングすること。
-4. ジャンボシャードを専用マシンに置き、他のシャードをそのマシンから移すこと。
-5. プロセス内の TLS。このプロセスは TLS を終端しない。TLS や証明書を求める設定キーは、平文で提供する代わりに拒否される。終端は外部プロキシに置く。シークレットがあるとき、Raft とメトリクスは他のサービスと同じベアラを使う。これは相互 TLS ではない。ハートビート駆動の制御ループは未実装である。
-6. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. A leader election makes `/readyz` and `/healthz` return 503 on replicas that do not know a leader. `[raft]` is loaded. Its values apply when a group starts and are not reloaded. See [Operability](../en/operability.md).
-7. `metadb-ctl bench` のチェックインされたサービス水準の結果。コマンドは実行したマシンの数値を印字します。このリポジトリはそれを記録していません。未マージのプルリクエスト 2 は別の組み込みハーネスを報告しています。それらのコマンドはこのツリーにはありません。 [テストとベンチ](./testing.md) を参照してください。
+2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
+3. ジャンボシャードを専用マシンに置き、他のシャードをそのマシンから移すこと。
+4. プロセス内の TLS。このプロセスは TLS を終端しない。TLS や証明書を求める設定キーは、平文で提供する代わりに拒否される。終端は外部プロキシに置く。シークレットがあるとき、Raft とメトリクスは他のサービスと同じベアラを使う。これは相互 TLS ではない。ハートビート駆動の制御ループは未実装である。
+5. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. A leader election makes `/readyz` and `/healthz` return 503 on replicas that do not know a leader. `[raft]` is loaded and is not `#[serde(skip)]`. Its values apply when a group starts and are not reloaded. See [Operability](../en/operability.md).
+6. A checked-in service-level result for `metadb-ctl bench`. The command prints numbers for the machine you run it on. This repository does not record one. See [Tests and benches](./testing.md).
