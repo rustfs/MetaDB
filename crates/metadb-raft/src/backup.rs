@@ -1095,6 +1095,18 @@ fn copy_node_metadata(
                 files,
             )?;
         }
+        let identity = entry.path().join("CLUSTER_IDENTITY");
+        if !identity.is_file() {
+            return Err(backup_error(format!(
+                "{name}/CLUSTER_IDENTITY is missing; refusing a backup that cannot reopen this node's instance id"
+            )));
+        }
+        copy_verified_frame(
+            &identity,
+            &tree.join(&name).join("CLUSTER_IDENTITY"),
+            &format!("{name}/CLUSTER_IDENTITY"),
+            files,
+        )?;
         cells += 1;
     }
     if cells == 0 {
@@ -1267,6 +1279,17 @@ fn validate_manifest_tree(tree: &Path, manifest: &BackupManifest) -> Result<()> 
         .any(|file| file.path.starts_with("cell_") && file.path.ends_with("/CELL_MANAGER_STATE"))
     {
         return Err(restore_error("CELL_MANAGER_STATE is missing"));
+    }
+    for file in &manifest.files {
+        if !(file.path.starts_with("cell_") && file.path.ends_with("/CELL_MANAGER_STATE")) {
+            continue;
+        }
+        let identity = file.path.replace("CELL_MANAGER_STATE", "CLUSTER_IDENTITY");
+        if !listed.contains(identity.as_str()) {
+            return Err(restore_error(format!(
+                "{identity} is missing; refusing a restore that would mint a new node instance id"
+            )));
+        }
     }
     for shard in &manifest.shards {
         let prefix = format!("be/shards/{:020}", shard.shard_id);

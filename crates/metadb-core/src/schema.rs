@@ -46,6 +46,14 @@ pub const SYSTEM_PREFIX_SPILLED_AUX_OUTBOX: u8 = 0x07;
 /// Per-origin-shard last emitted quota cursor. Stays on the origin shard across splits.
 pub const SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR: u8 = 0x08;
 
+/// Prefix of a replicated write that carries a proposal id.
+pub const PROPOSAL_ENVELOPE_MAGIC: &[u8] = b"MDBP0001";
+
+/// True when `payload` is a current write envelope rather than a legacy command.
+pub fn proposal_payload_is_enveloped(payload: &[u8]) -> bool {
+    payload.starts_with(PROPOSAL_ENVELOPE_MAGIC)
+}
+
 /// Total-order version tuple `(hlc, origin_shard_id, origin_raft_index, task_ordinal)`
 /// used by `SecondaryIndexTable` to break cross-shard HLC ties deterministically.
 pub type AuxOrderingTuple = (HlcTimestamp, ShardId, u64, u16);

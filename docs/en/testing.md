@@ -31,6 +31,8 @@ cargo test -p metadb-proxy --test sql_templates_tests
 cargo test -p metadb-storage --test lsm_recovery_tests
 cargo test -p metadb-storage --test mvcc_snapshot_tests
 cargo test -p metadb-storage --test locality_compaction_tests
+cargo test -p metadb-server --test auth_fail_closed
+cargo test -p metadb-server --test prefix_load
 ```
 
 ## What each suite actually exercises
@@ -110,6 +112,90 @@ Behavior from `crates/metadb-server/src/bin/metadb-ctl.rs` for the remote worklo
 - A second run allocates a new `bench_pid`. It does not reuse a fixed inode, and it does not report rejected creates as successes.
 
 Do not treat a number from this command as a repository result. It depends on the machine, the build profile, and the server you pointed at. This tree does not record a sample.
+
+## Fail-closed auth leftovers
+
+`cargo test -p metadb-server --test auth_fail_closed` covers the listener checks from the fail-closed startup work, plus the cases a loopback run with an empty secret does not prove.
+
+| Test | What it locks |
+| :--- | :--- |
+| `wildcard_without_a_secret_does_not_listen` | Wildcard gRPC or metrics bind with an empty or whitespace secret does not listen |
+| `misspelled_secret_and_tls_options_do_not_start` | A misspelled `shared_secret`, or a TLS key, fails parsing |
+| `configured_secret_rejects_missing_and_wrong_credentials` | Missing, empty, and wrong bearers are rejected on cluster status, lookup, Raft, and metrics |
+| `empty_secret_on_loopback_serves_without_credentials` | `127.0.0.1` with an empty secret serves `GetRoutes`, `CreateFile`, `TransactionService.Rename`, and `GET /metrics` with no `Authorization` header. A `Basic` header and a garbage bearer are also accepted. This is the current local-development path |
+| `configured_secret_rejects_basic_auth_without_applying_the_write` | On loopback, with a secret set, a missing header, `Authorization: Basic ...`, a lowercase `bearer` scheme, the raw secret, and a wrong bearer return `Unauthenticated`. The rejected `CreateFile` is not visible to an authenticated lookup. Metrics with `Basic` returns HTTP 401 and no metric text |
+| `whitespace_secret_on_loopback_rejects_anonymous_calls` | A whitespace secret still starts on loopback, and an anonymous call is rejected |
+| `unknown_toml_keys_are_ignored_and_loopback_still_serves` | `grpc_listen_addrr`, `memtable_size_bytez`, and `joinn` are ignored. The process starts with the defaults and serves. `token_file` and `tls_mode` still fail parsing |
+
+The empty-secret loopback result is a gap, not a pass of fail-closed authentication. A machine run that used `127.0.0.1` and an empty `shared_secret` did not exercise the wildcard refusal or a configured bearer. Unknown non-secret keys are also a gap: a typo in a storage or join field does not fail startup. This suite does not add TLS, mutual TLS, RBAC, a second metrics credential, or an audit log. Listeners stay plaintext.
+
+## Prefix load
+
+`crates/metadb-server/tests/prefix_load.rs` is a client harness. It allocates directory, file-inode, and file-id blocks, creates one directory per prefix, then runs three phases: create, `SetAttr` size overwrite, and delete. It fails if any RPC fails or if the sample lookups disagree with those phases. It does not change memtable, cache, or Raft settings. A line it prints is a result for that process and those endpoints. This repository does not check that line in, and it is not a figure from arXiv:2610.32247v1.
+
+| Profile | Creates | SetAttr | Deletes | Concurrency | When it runs |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `ci` | 2 prefixes × 8 | 8 | 8 | 4 | `cargo test -p metadb-server --test prefix_load`, including GitHub Actions |
+| `official` | 100 prefixes × 10,000 (1,000,000) | 100,000 | 100,000 | 64 | Ignored. Refused when `GITHUB_ACTIONS=true` |
+
+The CI test starts one in-process node on `127.0.0.1:0` and ignores `METADB_LOAD_*`. Do not point the CI job at the official counts.
+
+### Official load on three VMs
+
+Run `metadbd` on three virtual machines in one cell. Bind each process to an address the other machines can dial. `0.0.0.0` is stored as the advertise address and is not a usable peer address. A non-loopback bind requires the same non-empty `[security].shared_secret` on every node. Use a fresh data directory on the joining nodes. `--join` must reach the current leader. A follower does not forward that membership change.
+
+```toml
+# /etc/metadb/node1.toml
+[node]
+node_id = 1
+cell_id = 1
+role = "all-in-one"
+data_dir = "/var/lib/metadb"
+grpc_listen_addr = "10.0.0.11:7800"
+
+[security]
+shared_secret = "replace-with-a-long-random-string"
+```
+
+```bash
+# VM 1
+metadbd --config /etc/metadb/node1.toml
+
+# VM 2, after VM 1 is serving. Same cell_id and shared_secret. Fresh data_dir.
+metadbd --config /etc/metadb/node2.toml --node-id 2 --listen 10.0.0.12:7800 --join 10.0.0.11:7800
+
+# VM 3, still joining the leader (VM 1, unless leadership has moved).
+metadbd --config /etc/metadb/node3.toml --node-id 3 --listen 10.0.0.13:7800 --join 10.0.0.11:7800
+```
+
+`node2.toml` and `node3.toml` are the same shape as node 1 with their own `node_id`, `data_dir`, and `grpc_listen_addr`. Confirm three voters before the load:
+
+```bash
+metadb-ctl --endpoint 10.0.0.11:7800 --auth-token "$SECRET" cluster status
+```
+
+From a machine that can reach all three listeners, unset any `METADB_LOAD_PREFIXES`, `METADB_LOAD_CREATES_PER_PREFIX`, `METADB_LOAD_SETATTR`, `METADB_LOAD_DELETES`, or `METADB_LOAD_CONCURRENCY` left over from a dry run. A variable that is set to an empty string or a non-integer fails the run before any endpoint is dialed. The first endpoint grants the id blocks. Each create, `SetAttr`, delete, and prefix `mkdir` starts on `index % endpoint_count` and rotates to the next endpoint after `NotLeader` or an unavailable response. An application error fails the run. Prefix directory names are `loadp<allocated-dir-id>`, so a dry run can leave its directories in place and a later run still creates new ones.
+
+```bash
+METADB_LOAD_ENDPOINTS=http://10.0.0.11:7800,http://10.0.0.12:7800,http://10.0.0.13:7800 \
+METADB_LOAD_TOKEN="$SECRET" \
+cargo test -p metadb-server --test prefix_load -- --ignored --nocapture --test-threads=1 official_prefix_load
+```
+
+A dry run against the same voters uses the override variables and prints `profile=official-override`. It is not the official load:
+
+```bash
+METADB_LOAD_ENDPOINTS=http://10.0.0.11:7800,http://10.0.0.12:7800,http://10.0.0.13:7800 \
+METADB_LOAD_TOKEN="$SECRET" \
+METADB_LOAD_PREFIXES=2 \
+METADB_LOAD_CREATES_PER_PREFIX=10 \
+METADB_LOAD_SETATTR=5 \
+METADB_LOAD_DELETES=5 \
+METADB_LOAD_CONCURRENCY=2 \
+cargo test -p metadb-server --test prefix_load -- --ignored --nocapture --test-threads=1 official_prefix_load
+```
+
+The harness does not start the three servers. Joining two voters is the procedure above. It is not a second cell, and `metadb-ctl cell register` still does not create one.
 
 ## Persistent topology and join
 

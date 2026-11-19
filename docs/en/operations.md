@@ -69,6 +69,8 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 See [Tests and benches](./testing.md#metadb-ctl-bench). This is a client against a running server. It is not a Cargo benchmark target. The repository does not check in a throughput number for it.
 
+The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `SetAttr` overwrites, then 100,000 deletes, concurrency 64) is documented in [Tests and benches](./testing.md#prefix-load). GitHub Actions runs only the small profile. It does not run the 1,000,000-create profile.
+
 ## Metrics
 
 Set `node.metrics_listen_addr` (for example `127.0.0.1:9100`). `open_and_serve` accepts TCP connections on that address. `GET /metrics` returns Prometheus text. Any other path returns 404, and any other method returns 405. When `[security].shared_secret` is non-empty, every request on this listener must send `Authorization: Bearer <shared_secret>`. A missing, empty, or wrong bearer returns HTTP 401 and a body that is not the metric text, including a request for `/status`. A non-loopback metrics address with an empty secret refuses to start. This listener does not terminate TLS.
@@ -120,7 +122,7 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 | `TransactionTimeout` | Snapshot HLC older than the in-memory MVCC window |
 | `ClockSkewExceeded` | Remote HLC ahead of local wall time by more than `max_clock_drift_ms` |
 | `EpochMismatch` / `NotLeader` | Stale route epoch, or this replica is not the leader. Follower reads with a known leader are forwarded. `EpochMismatch` on a multi-key prepare aborts that round and regroups; it is not proposed again as the same batch |
-| `RetryableConsensus` | A write's log entry was discarded on a leader change, or a quorum did not answer. Same-shard writes and 2PC retry these inside the existing routing budget. Each logical write keeps one proposal id. If that id already committed, the shard returns the original result and does not execute the command again. Storage failure and a stopped Raft node stay `ConsensusError` and are not retried |
+| `RetryableConsensus` | A write's log entry was discarded on a leader change, or a quorum did not answer. Same-shard writes and 2PC retry an enveloped proposal inside the existing routing budget, reusing one proposal id. If that id already committed, the shard returns the original result and does not execute the command again. A receipt is removed once a later committed HLC is more than 10 minutes ahead of the receipt, which is longer than the 30-second write retry budget. Each command cleans a bounded batch of expired receipts, not the whole set. A receipt written before it carried a timestamp is stamped on a later commit and then ages out on the same window. A payload without that envelope is applied at most once: a discarded-log retry of those bytes, including one returned by a forwarded leader, returns `ConsensusError` and is not attempted again. A read that misses a quorum is retried only until the 2-second election budget, then returned. Storage failure and a stopped Raft node stay `ConsensusError` and are not retried |
 | `UnsplittableJumboShard` | In-memory splitter (`shard.rs`), not the durable jumbo path, which sets `JumboIsolated` and returns success with no child shard |
 | `WriteIntentConflict` / `TransactionAborted` | 2PC conflict, or a directory-rename lease already held |
 | `InvalidRenameCycle` | Rename of a directory into itself or a descendant |

@@ -1,0 +1,56 @@
+name: Security adversarial regressions
+
+# Runs only the regression tests added for fail-closed restart, bearer
+# comparison, uid, and restore refusal. A green run is not a first-ship pass,
+# an official load, or a throughput result.
+
+on:
+  push:
+    branches: ["main", "**"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: security-adversarial-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  regressions:
+    name: Security and restore regression tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Protobuf Compiler (protoc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Setup pinned Rust toolchain (rust-toolchain.toml, 1.100.0)
+        uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.arch }}-security-adversarial
+
+      - name: Run security adversarial regressions
+        run: cargo test -p metadb-server --test security_adversarial_regressions --locked -- --test-threads=1
+
+      - name: Run restore safety regressions
+        run: cargo test -p metadb-server --test restore_safety --locked -- --test-threads=1

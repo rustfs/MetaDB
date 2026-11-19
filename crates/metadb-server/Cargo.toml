@@ -39,6 +39,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+wincode = { workspace = true }
 openraft = { workspace = true }
 metadb-core = { workspace = true }
 metadb-cluster = { workspace = true }

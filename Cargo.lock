@@ -932,6 +932,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "wincode",
 ]
 
 [[package]]

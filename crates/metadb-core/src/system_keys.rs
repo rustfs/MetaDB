@@ -6,8 +6,8 @@
 //! - `0x06`: `TxnRecord` (Primary-Anchored 2PC commit/abort source of truth)
 //! - `0x07`: `SpilledAuxOutbox` (`[0x07][origin_raft_index: 8B BE][task_ordinal: 2B BE]`)
 //! - `0x08`: `OriginQuotaCursor` (`[0x08][uid: 8B BE]`), retained after the task is acknowledged
-//! - `0x0A`: committed write-proposal receipt (`[0x0A][proposal_id: 16B BE]`), retained so a
-//!   discarded-log retry returns the original result instead of applying the command again
+//! - `0x0A`: committed write-proposal receipt (`[0x0A][proposal_id: 16B BE]`). A receipt is
+//!   deleted once a later committed HLC is more than 10 minutes ahead of the receipt's HLC.
 
 use std::collections::{BTreeMap, BTreeSet};
 

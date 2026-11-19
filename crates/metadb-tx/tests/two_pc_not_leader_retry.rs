@@ -5,14 +5,18 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
+use metadb_core::codec;
 use metadb_core::{
-    CompositeKeyRange, HybridLogicalClock, InodeId, MetaDbError, Result, ShardEpoch, ROOT_INODE_ID,
+    CompositeKeyRange, HlcTimestamp, HybridLogicalClock, InodeId, MetaDbError, Result, ShardEpoch,
+    ROOT_INODE_ID,
 };
 use metadb_raft::{
     ChannelPool, MultiRaftRouter, RaftNodeOptions, ShardRaftGroup, ShardWatermarkTracker,
 };
 use metadb_storage::{LsmEngineConfig, ShardedBlockCache};
-use metadb_tx::{DirRenameLease, DistributedTxRouter, ShardDirectory, TxStateMachineHandler};
+use metadb_tx::{
+    DirRenameLease, DistributedTxRouter, ShardDirectory, TxRaftCmd, TxStateMachineHandler,
+};
 use tempfile::tempdir;
 
 struct TwoShard {
@@ -156,6 +160,57 @@ async fn cross_shard_prepare_and_commit_retry_known_not_leader() {
     tx.create_file(100, "again.dat", 43, 43, 7, 0o644, 8)
         .await
         .expect("a same-shard write must retry a discarded log entry");
-    let found = tx.lookup(ROOT_INODE_ID, "dst").await.unwrap();
+    left_group.testing_fail_next_read_quorum(1);
+    let found = tx
+        .lookup(ROOT_INODE_ID, "dst")
+        .await
+        .expect("a single missing read quorum is retried inside the election budget");
     assert!(found.is_some());
+
+    let epoch = left_group.current_epoch();
+    let raw = codec::serialize(&TxRaftCmd::CreateFile {
+        pid: ROOT_INODE_ID,
+        name: "legacy.dat".to_string(),
+        inode_id: 44,
+        fid: 44,
+        uid: 7,
+        mode: 0o644,
+        size_bytes: 1,
+    })
+    .unwrap();
+    left_group.testing_fail_next_log_discarded(1);
+    let rejected = left_group
+        .propose(epoch, HlcTimestamp::ZERO, raw.clone())
+        .await
+        .unwrap_err();
+    assert!(!rejected.is_retryable_write_consensus(), "{rejected}");
+    assert!(
+        rejected.to_string().contains("legacy proposal"),
+        "{rejected}"
+    );
+    assert!(tx
+        .lookup(ROOT_INODE_ID, "legacy.dat")
+        .await
+        .unwrap()
+        .is_none());
+    left_group
+        .propose(epoch, HlcTimestamp::ZERO, raw.clone())
+        .await
+        .unwrap();
+    assert!(tx
+        .lookup(ROOT_INODE_ID, "legacy.dat")
+        .await
+        .unwrap()
+        .is_some());
+    left_group.testing_fail_next_log_discarded(1);
+    let second = left_group
+        .propose(epoch, HlcTimestamp::ZERO, raw)
+        .await
+        .unwrap_err();
+    assert!(!second.is_retryable_write_consensus(), "{second}");
+    assert!(tx
+        .lookup(ROOT_INODE_ID, "legacy.dat")
+        .await
+        .unwrap()
+        .is_some());
 }
