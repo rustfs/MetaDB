@@ -946,7 +946,11 @@ pub fn disk_floor(shard_id: ShardId, raft_dir: &Path) -> Result<ShardHoldFloor> 
 
 pub fn list_shard_ids(data_dir: &Path) -> Result<Vec<ShardId>> {
     let root = open_plain_dir(data_dir)?;
-    let dir = match open_under(&root, "be/shards") {
+    shard_ids_in_anchor(&root)
+}
+
+fn shard_ids_in_anchor(root: &File) -> Result<Vec<ShardId>> {
+    let dir = match open_under(root, "be/shards") {
         Ok(dir) => dir,
         Err(error) if is_not_found(&error) => return Ok(Vec::new()),
         Err(error) => return Err(error),
@@ -970,6 +974,48 @@ pub fn list_shard_ids(data_dir: &Path) -> Result<Vec<ShardId>> {
     }
     ids.sort_unstable();
     Ok(ids)
+}
+
+/// `CELL_MANAGER_STATE` frames under `root`, read through that directory handle.
+///
+/// A symlink cell directory or a symlink state file fails the read. The bytes are
+/// what the publish-time shard-reference check receives. It does not open a path.
+fn read_cell_states(root: &File) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut states = Vec::new();
+    for entry in list_plain_dir(root)? {
+        if !entry.name.starts_with("cell_") {
+            continue;
+        }
+        if entry.kind != EntryKind::Dir {
+            return Err(backup_error(format!(
+                "refusing to follow symlink {}",
+                entry.name
+            )));
+        }
+        let cell = open_child(root, &entry.name, true)?;
+        let listed = list_plain_dir(&cell)?;
+        let Some(state) = listed.iter().find(|item| item.name == "CELL_MANAGER_STATE") else {
+            continue;
+        };
+        if state.kind != EntryKind::File {
+            return Err(backup_error(format!(
+                "refusing to follow symlink {}/CELL_MANAGER_STATE",
+                entry.name
+            )));
+        }
+        let bytes = read_listed_file(&cell, "CELL_MANAGER_STATE")?;
+        states.push((entry.name, bytes));
+    }
+    Ok(states)
+}
+
+fn check_anchored_tree(
+    root: &File,
+    check_tree: &dyn Fn(&[ShardId], &[(String, Vec<u8>)]) -> Result<()>,
+) -> Result<()> {
+    let shard_ids = shard_ids_in_anchor(root)?;
+    let cells = read_cell_states(root)?;
+    check_tree(&shard_ids, &cells)
 }
 
 /// Exclusive lock covering shard-directory creation and registry publication.
@@ -1042,7 +1088,7 @@ pub fn create_online_backup(
     data_dir: &Path,
     destination: &Path,
     shards: &[OnlineShard<'_>],
-    check_tree: &dyn Fn(&Path) -> Result<()>,
+    check_tree: &dyn Fn(&[ShardId], &[(String, Vec<u8>)]) -> Result<()>,
 ) -> Result<BackupSummary> {
     let hold = require_active_hold(data_dir)?;
     reject_destination(data_dir, destination)?;
@@ -1082,7 +1128,7 @@ pub fn create_online_backup(
 pub fn create_offline_backup(
     data_dir: &Path,
     destination: &Path,
-    check_tree: &dyn Fn(&Path) -> Result<()>,
+    check_tree: &dyn Fn(&[ShardId], &[(String, Vec<u8>)]) -> Result<()>,
 ) -> Result<BackupSummary> {
     if lsm_directory_is_locked(data_dir) {
         return Err(backup_error(
@@ -1124,7 +1170,7 @@ pub fn create_offline_backup(
 pub fn restore_backup(
     artifact: &Path,
     destination: &Path,
-    check_tree: &dyn Fn(&Path) -> Result<()>,
+    check_tree: &dyn Fn(&[ShardId], &[(String, Vec<u8>)]) -> Result<()>,
 ) -> Result<BackupSummary> {
     inspect_restore_destination(destination)?;
     let manifest = read_manifest(artifact)?;
@@ -1185,7 +1231,8 @@ pub fn restore_backup(
     }
     // Open MANIFEST on the writable staging copy. The source artifact stays read-only.
     validate_manifest_tree(&staging_dir, &manifest)?;
-    check_tree(&staging.path).map_err(|error| restore_error(error.to_string()))?;
+    check_anchored_tree(&staging_dir, check_tree)
+        .map_err(|error| restore_error(error.to_string()))?;
     sync_tree(&staging.path)?;
     match inspect_restore_destination(destination)? {
         RestoreDestination::Missing => {
@@ -1620,7 +1667,7 @@ fn finish_manifest(
     staging: &Path,
     destination: &Path,
     staging_guard: &mut Staging,
-    check_tree: &dyn Fn(&Path) -> Result<()>,
+    check_tree: &dyn Fn(&[ShardId], &[(String, Vec<u8>)]) -> Result<()>,
 ) -> Result<BackupSummary> {
     let current = require_active_hold(data_dir)?;
     if current.hold_id != hold.hold_id {
@@ -1655,7 +1702,7 @@ fn finish_manifest(
             Err(error) => return Err(error),
         }
     }
-    check_tree(&staging.join(BACKUP_TREE_DIR))?;
+    check_anchored_tree(&tree, check_tree)?;
     shards.sort_by_key(|shard| shard.shard_id);
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let manifest = BackupManifest {
@@ -2600,7 +2647,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("be").join("shards")).unwrap();
         let destination = dir.path().join("out");
-        let error = create_offline_backup(dir.path(), &destination, &|_| Ok(())).unwrap_err();
+        let error = create_offline_backup(dir.path(), &destination, &|_, _| Ok(())).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -2915,7 +2962,7 @@ mod tests {
         std::os::unix::fs::symlink(&external, &dest).unwrap();
         let artifact = dir.path().join("artifact");
         write_min_manifest(&artifact, b"hello").unwrap();
-        let error = restore_backup(&artifact, &dest, &|_| Ok(())).unwrap_err();
+        let error = restore_backup(&artifact, &dest, &|_, _| Ok(())).unwrap_err();
         assert!(
             error.to_string().contains("refusing to follow symlink"),
             "{error}"
@@ -2940,7 +2987,7 @@ mod tests {
         )
         .unwrap();
         let dest = dir.path().join("restored");
-        let error = restore_backup(&artifact, &dest, &|_| Ok(())).unwrap_err();
+        let error = restore_backup(&artifact, &dest, &|_, _| Ok(())).unwrap_err();
         assert!(
             error.to_string().contains("refusing to follow symlink"),
             "{error}"
@@ -2960,7 +3007,7 @@ mod tests {
         std::os::unix::fs::symlink(&external, artifact.join(BACKUP_TREE_DIR).join("escape"))
             .unwrap();
         let dest = dir.path().join("restored");
-        let error = restore_backup(&artifact, &dest, &|_| Ok(())).unwrap_err();
+        let error = restore_backup(&artifact, &dest, &|_, _| Ok(())).unwrap_err();
         assert!(
             error.to_string().contains("refusing to follow symlink"),
             "{error}"
@@ -3099,6 +3146,71 @@ mod tests {
         assert!(
             !opened.load(std::sync::atomic::Ordering::SeqCst),
             "external CURRENT target was opened"
+        );
+        let _ = File::open(&fifo);
+        let _ = writer.join();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cell_state_symlink_is_rejected_before_the_external_file_is_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("outside.fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fifo_for_writer = fifo.clone();
+        let opened_for_writer = opened.clone();
+        let writer = thread::spawn(move || {
+            if OpenOptions::new()
+                .write(true)
+                .open(&fifo_for_writer)
+                .is_ok()
+            {
+                opened_for_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let linked_cell = dir.path().join("linked-cell");
+        fs::create_dir(&linked_cell).unwrap();
+        std::os::unix::fs::symlink(&fifo, linked_cell.join("CELL_MANAGER_STATE")).unwrap();
+        let link_root = dir.path().join("link-root");
+        fs::create_dir(&link_root).unwrap();
+        std::os::unix::fs::symlink(&linked_cell, link_root.join("cell_1")).unwrap();
+        let error =
+            check_anchored_tree(&open_plain_dir(&link_root).unwrap(), &|_, _| Ok(())).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to follow symlink"),
+            "cell directory symlink: {error}"
+        );
+
+        let file_root = dir.path().join("file-root");
+        let cell = file_root.join("cell_1");
+        fs::create_dir_all(&cell).unwrap();
+        std::os::unix::fs::symlink(&fifo, cell.join("CELL_MANAGER_STATE")).unwrap();
+        let error =
+            check_anchored_tree(&open_plain_dir(&file_root).unwrap(), &|_, _| Ok(())).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to follow symlink"),
+            "state file symlink: {error}"
+        );
+
+        let link = dir.path().join("reparse");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        let meta = fs::symlink_metadata(&link).unwrap();
+        let error = reject_reparse(&meta, "reparse").unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to follow symlink"),
+            "reparse: {error}"
+        );
+
+        assert!(
+            !opened.load(std::sync::atomic::Ordering::SeqCst),
+            "external CELL_MANAGER_STATE target was opened"
         );
         let _ = File::open(&fifo);
         let _ = writer.join();
