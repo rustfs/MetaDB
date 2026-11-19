@@ -119,11 +119,13 @@ Do not treat a number from this command as a repository result. It depends on th
 
 ## Fail-closed auth leftovers
 
-`cargo test -p metadb-server --test auth_fail_closed` covers the listener checks from the fail-closed startup work, plus the cases a loopback run with an empty secret does not prove.
+`cargo test -p metadb-server --test auth_fail_closed` covers the listener checks from the fail-closed startup work. `persisted_non_loopback_advertise_without_secret_fails_closed` and `default_empty_secret_is_rejected_before_any_listener` are in `security_adversarial_regressions.rs`.
 
 | Test | What it locks |
 | :--- | :--- |
 | `wildcard_without_a_secret_does_not_listen` | Wildcard gRPC or metrics bind with an empty or whitespace secret does not listen |
+| `persisted_non_loopback_advertise_without_secret_fails_closed` | After a `0.0.0.0` process with a secret shuts down, restarting that directory with an empty secret and `allow_unauthenticated = true` on `127.0.0.1:0` still refuses the saved non-loopback address |
+| `default_empty_secret_is_rejected_before_any_listener` | Default empty secret on `127.0.0.1` fails with the implicit-exception error and does not mention a recovered listener |
 | `misspelled_secret_and_tls_options_do_not_start` | A misspelled `shared_secret`, or a TLS key, fails parsing |
 | `configured_secret_rejects_missing_and_wrong_credentials` | Missing, empty, and wrong bearers are rejected on cluster status, lookup, Raft, and metrics |
 | `empty_secret_on_loopback_does_not_listen` | `127.0.0.1` with an empty secret and `allow_unauthenticated = false` does not listen |
@@ -132,7 +134,7 @@ Do not treat a number from this command as a repository result. It depends on th
 | `whitespace_secret_on_loopback_does_not_listen` | A whitespace-only secret does not start, including when `allow_unauthenticated` is set |
 | `unknown_toml_keys_are_ignored_and_loopback_still_serves` | `grpc_listen_addrr`, `memtable_size_bytez`, and `joinn` are ignored. The process starts and serves only because that fixture sets `allow_unauthenticated = true` with an empty secret and then binds `127.0.0.1`. Those unknown keys are not what opens the listener. `token_file` and `tls_mode` still fail parsing |
 
-An empty secret on loopback no longer serves. The opt-in above is the only unauthenticated path, and it is loopback-only. Unknown keys that do not name a secret, authentication, or TLS setting are still ignored: a typo in a storage or join field does not fail startup. This suite does not add TLS, mutual TLS, RBAC, a second metrics credential, or an audit log. Listeners stay plaintext.
+An empty secret on loopback no longer serves. The opt-in above is the only unauthenticated path, and it accepts only literal loopback IPs, not the hostname `localhost`. Unknown keys that do not name a secret, authentication, or TLS setting are still ignored: a typo in a storage or join field does not fail startup. This suite does not add TLS, mutual TLS, RBAC, a second metrics credential, or an audit log. Listeners stay plaintext.
 
 ## Prefix load
 

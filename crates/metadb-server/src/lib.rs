@@ -591,12 +591,17 @@ impl PersistentMetaDbCluster {
                 if error.kind() == std::io::ErrorKind::AddrInUse && persisted_addr.is_some() =>
             {
                 // The saved port is busy. A sole voter can move; several voters cannot.
-                // `boot_local_shards` checks that after this bind.
+                // `boot_local_shards` checks that after this bind. Re-check the fallback
+                // string before binding it; do not resolve a hostname a second time.
+                config.reject_unauthenticated_bind(&config.node.grpc_listen_addr)?;
                 TcpListener::bind(&config.node.grpc_listen_addr).await?
             }
             Err(error) => return Err(error.into()),
         };
         let bound_addr = listener.local_addr()?.to_string();
+        // The socket is already the address that was validated. This rejects a
+        // bound IP that is not literal loopback when no bearer is configured.
+        config.reject_unauthenticated_bind(&bound_addr)?;
 
         let clock = Arc::new(HybridLogicalClock::with_max_drift_ms(
             config.clock.max_clock_drift_ms,
@@ -769,6 +774,11 @@ impl PersistentMetaDbCluster {
                     return Err(error.into());
                 }
             };
+            if let Err(error) = cluster.config.reject_unauthenticated_bind(&metrics_bound) {
+                drop(metrics_listener);
+                let _ = cluster.shutdown().await;
+                return Err(error);
+            }
             let _ = cluster.metrics_addr.set(metrics_bound.clone());
             tracing::info!(
                 metrics_addr = %metrics_bound,

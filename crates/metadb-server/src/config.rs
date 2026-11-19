@@ -236,16 +236,13 @@ impl ServerTomlConfig {
     }
 }
 
-/// `true` only for an explicit loopback bind: `localhost`, `127.0.0.0/8`, or `::1`.
+/// `true` only for a literal loopback IP: `127.0.0.0/8` or `::1`.
 ///
-/// Wildcard addresses (`0.0.0.0`, `::`) and unparseable hosts are not loopback.
-/// `localhost` is accepted as a name and is not resolved, so a hosts-file alias
-/// is not detected here.
+/// Hostnames, including `localhost`, are not loopback. They are not resolved, so
+/// a hosts file cannot widen the unauthenticated opt-in, and startup does not
+/// look the name up again at bind time.
 fn is_loopback_bind(addr: &str) -> bool {
     let host = bind_host(addr.trim());
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
     match host.parse::<IpAddr>() {
         Ok(ip) => ip.is_loopback(),
         Err(_) => false,
@@ -286,7 +283,7 @@ fn normalize_key(key: &str) -> String {
 fn is_tls_key(key: &str) -> bool {
     let key = normalize_key(key);
     [
-        "tls", "ssl", "cert", "x509", "mtls", "cipher", "keystore", "https",
+        "tls", "ssl", "cert", "x509", "mtls", "cipher", "keystore", "https", "ca_file", "cafile",
     ]
     .iter()
     .any(|needle| key.contains(needle))
@@ -303,6 +300,15 @@ fn is_secret_key(key: &str) -> bool {
         "auth",
         "anonymous",
         "insecure",
+        "api_key",
+        "apikey",
+        "bearer",
+        "jwt",
+        "private_key",
+        "privatekey",
+        "encryption",
+        "encrypt",
+        "anon",
     ]
     .iter()
     .any(|needle| key.contains(needle))
@@ -428,12 +434,7 @@ mod tests {
         whitespace.security.shared_secret = "   ".into();
         let mut configured = ServerTomlConfig::default();
         configured.security.shared_secret = "secret".into();
-        for addr in [
-            "127.0.0.1:7800",
-            "127.0.0.1:0",
-            "localhost:7800",
-            "[::1]:7800",
-        ] {
+        for addr in ["127.0.0.1:7800", "127.0.0.1:0", "[::1]:7800"] {
             assert!(is_loopback_bind(addr), "{addr}");
             assert!(opted_in.reject_unauthenticated_bind(addr).is_ok(), "{addr}");
             let implicit_err = implicit.reject_unauthenticated_bind(addr).unwrap_err();
@@ -454,6 +455,7 @@ mod tests {
             "[::]:7800",
             "10.1.2.3:7800",
             "db.internal:7800",
+            "localhost:7800",
         ] {
             assert!(!is_loopback_bind(addr), "{addr}");
             let err = opted_in.reject_unauthenticated_bind(addr).unwrap_err();
@@ -467,6 +469,34 @@ mod tests {
             .reject_unauthenticated_bind("127.0.0.1:7800")
             .unwrap_err();
         assert!(both.to_string().contains("both set"), "{both}");
+    }
+
+    #[test]
+    fn security_sensitive_aliases_fail_closed_and_storage_keys_do_not() {
+        for key in [
+            "api_key",
+            "bearer",
+            "jwt",
+            "private_key",
+            "ca_file",
+            "encryption",
+            "anon",
+        ] {
+            let parsed = ServerTomlConfig::from_toml_str(&format!("[node]\n{key} = \"x\"\n"));
+            let err = parsed.unwrap_err().to_string();
+            assert!(
+                err.contains("refusing to start") && err.contains(key),
+                "{key}: {err}"
+            );
+        }
+        let cfg = ServerTomlConfig::from_toml_str(
+            r#"
+            [storage]
+            bloom_bits_per_key = 12
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.storage.bloom_bits_per_key, 12);
     }
 
     #[test]

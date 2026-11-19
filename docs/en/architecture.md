@@ -9,7 +9,7 @@ This page follows the code in `crates/`. It does not describe a multi-process Ce
 `PersistentMetaDbCluster::open_and_serve` (`crates/metadb-server/src/lib.rs`):
 
 1. Rejects any `node.role` other than `all-in-one`.
-2. An empty `shared_secret` listens only when `allow_unauthenticated` is explicitly set, and only for loopback `grpc_listen_addr` and `metrics_listen_addr`. A whitespace-only secret is rejected even when that flag is set. The flag does not permit a wildcard or any other non-loopback address. Then binds `node.grpc_listen_addr` (default `127.0.0.1:7800`; `127.0.0.1:0` asks the OS for a port).
+2. An empty `shared_secret` listens only when `allow_unauthenticated` is explicitly set, and only when every listener address is a literal loopback IP (`127.0.0.0/8` or `::1`). The hostname `localhost` is not accepted and is not resolved. A whitespace-only secret is rejected even when that flag is set. The flag does not permit a wildcard or any other address. The process then binds that same literal address (`grpc_listen_addr` defaults to `127.0.0.1:7800`; port `0` asks the OS for a port). After the socket is bound, the bound IP is checked again.
 3. Opens `DurableIdAllocator` at `<data_dir>/global_allocator`.
 4. Opens `ShardGroupHost` at `<data_dir>/be`.
 5. Opens or bootstraps `DurableCellManager` at `<data_dir>/cell_<cell_id>`.

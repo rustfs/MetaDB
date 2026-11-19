@@ -40,6 +40,9 @@ async fn persisted_non_loopback_advertise_without_secret_fails_closed() {
     restart = with_data_dir(restart, dir.path());
     restart.node.grpc_listen_addr = "127.0.0.1:0".into();
     restart.security.shared_secret.clear();
+    // Opt in so startup is not rejected for a missing secret before the saved
+    // non-loopback advertise address is considered.
+    restart.security.allow_unauthenticated = true;
     let err = match PersistentMetaDbCluster::open_and_serve(restart).await {
         Ok((cluster, _)) => {
             let _ = cluster.shutdown().await;
@@ -55,6 +58,31 @@ async fn persisted_non_loopback_advertise_without_secret_fails_closed() {
     assert!(
         message.contains(&persisted) || message.contains("unauthenticated listener"),
         "fail-closed error did not name the persisted bind: {message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_empty_secret_is_rejected_before_any_listener() {
+    let mut cfg = ServerTomlConfig::default();
+    cfg.node.data_dir = std::env::temp_dir().join("metadb-default-empty-secret");
+    cfg.node.grpc_listen_addr = "127.0.0.1:9".into();
+    cfg.security.shared_secret.clear();
+    cfg.security.allow_unauthenticated = false;
+    let err = match PersistentMetaDbCluster::open_and_serve(cfg).await {
+        Ok((cluster, _)) => {
+            let _ = cluster.shutdown().await;
+            panic!("default empty secret must not start");
+        }
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("not an implicit exception"),
+        "empty-secret rejection was: {message}"
+    );
+    assert!(
+        !message.contains("unauthenticated listener"),
+        "missing secret must fail before a recovered bind is considered: {message}"
     );
 }
 
