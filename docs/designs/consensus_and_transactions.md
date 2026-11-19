@@ -195,7 +195,7 @@ To support directory-rename cycle detection and deterministic Raft reconciliatio
 
 ### 8.1 Keys & Records
 * `txn_id`: `u128` (`[coord_node_id: u64][monotonic_seq_or_hlc: u64]`).
-* `ttl_ms`: `3,000ms` (`expire_hlc = HlcTimestamp::new(start_hlc.physical_ms() + 3_000, 0)`), strictly shorter than `mvcc_retention_ms` (`5,000ms`).
+* `ttl_ms`: `3,000ms`. The first `expire_hlc` is `start_hlc.physical_ms() + ttl_ms`. A coordinator that still holds `txn_id` and is still in `Pending` replicates `Extend2pcLease` before that deadline, updating the primary `TxnRecord`, every participant `WriteIntent`, and any `DirExistsFence` holder. Renewal stops at `start_hlc + 60,000ms` (two routing budgets). A renewal after expiry or abort is rejected. `Committed` is not aborted because `expire_hlc` passed. Default `mvcc_retention_ms` stays `5,000ms`; while the lease is open the participant shard pins MVCC history back to `start_hlc` so lookup and rollback of those keys still see the pre-image after 5 seconds. The pin is released on commit, abort, or expiry.
 * **Primary Key Assignment & Split-Resilient Routing**:
   * Cross-shard `Rename`: `primary_key = MetaKey::child(src_pid, src_name).encode()`.
   * Cross-shard `Mkdir` / `Rmdir`: `primary_key = MetaKey::child(parent_pid, name).encode()`.
@@ -242,7 +242,7 @@ To support directory-rename cycle detection and deterministic Raft reconciliatio
     * `Committed { commit_hlc }` -> roll forward secondary intent locally via `CommitSecondary2pc` and evaluate visibility (`commit_hlc <= read_hlc`).
     * `Aborted` -> clean up secondary intent locally and continue read.
     * `Pending` -> if `now_hlc > intent.expire_hlc`, `CheckTxnStatus` atomically aborts `TxnStatusRecord -> Aborted` on `PrimaryShard` and cleans up! Otherwise wait briefly (`<= 50ms` notify on intent removal) and re-check.
-* **Background `TxnRecoveryWorker`**: Runs every `1,000ms` on each shard leader, scanning `[0x06]` (`Pending` past `expire_hlc` -> abort; `Committed` older than `2s` -> re-drive `CommitSecondary2pc` + cleanup) and orphaned `[0x05]` intents past `expire_hlc` (`CheckTxnStatus` -> roll-forward or abort).
+* **Background `TxnRecoveryWorker`**: Runs on the maintenance tick, scanning `[0x06]` (`Pending` past `expire_hlc` -> abort; `Committed` or `Aborted` with participant keys still unacked -> re-drive commit or abort) and orphaned `[0x05]` intents past `expire_hlc` (`CheckTxnStatus` -> roll-forward or abort). A crash after `CommitPrimary` still rolls forward when `expire_hlc` has passed. A restarted coordinator may renew a still-`Pending` lease from the durable `expire_hlc` until the cap.
 
 ---
 

@@ -27,9 +27,9 @@ fn independently_opened_allocators_must_share_rename_lease_exclusion() {
         Err(_) => return,
     };
     let lease = first
-        .acquire_dir_rename_lease(HlcTimestamp::new(1000, 0), 3000)
+        .acquire_dir_rename_lease(HlcTimestamp::new(1000, 0), 3000, 60_000)
         .unwrap();
-    let conflicting = second.acquire_dir_rename_lease(HlcTimestamp::new(1000, 0), 3000);
+    let conflicting = second.acquire_dir_rename_lease(HlcTimestamp::new(1000, 0), 3000, 60_000);
     assert!(
         conflicting.is_err(),
         "two authorities granted overlapping leases: {lease:?}, {conflicting:?}"
@@ -183,4 +183,47 @@ fn version_two_allocator_cannot_be_misread_as_legacy_counters() {
         allocator.allocate_block(0, AllocIdKind::FileId, 1).unwrap(),
         (129, 1)
     );
+}
+
+#[test]
+fn rename_lease_renewal_is_capped_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let allocator = DurableIdAllocator::open(dir.path()).unwrap();
+    let (token, expire) = allocator
+        .acquire_dir_rename_lease(HlcTimestamp::new(10_000, 0), 1_000, 5_000)
+        .unwrap();
+    assert_eq!(expire, HlcTimestamp::new(11_000, 0));
+    let extended = allocator
+        .extend_dir_rename_lease(token, HlcTimestamp::new(10_500, 0), 1_000)
+        .unwrap();
+    assert_eq!(extended, HlcTimestamp::new(11_500, 0));
+    assert!(allocator
+        .acquire_dir_rename_lease(HlcTimestamp::new(10_500, 0), 1_000, 5_000)
+        .is_err());
+    assert!(allocator
+        .extend_dir_rename_lease(token + 1, HlcTimestamp::new(10_500, 0), 1_000)
+        .is_err());
+    let mut expire = extended;
+    while expire.physical_ms() < 15_000 {
+        let now = expire.physical_ms() - 100;
+        expire = allocator
+            .extend_dir_rename_lease(token, HlcTimestamp::new(now, 0), 1_000)
+            .unwrap();
+    }
+    assert_eq!(expire, HlcTimestamp::new(15_000, 0));
+    assert!(allocator
+        .extend_dir_rename_lease(token, HlcTimestamp::new(15_001, 0), 1_000)
+        .is_err());
+    drop(allocator);
+    let reopened = DurableIdAllocator::open(dir.path()).unwrap();
+    let still = reopened
+        .extend_dir_rename_lease(token, HlcTimestamp::new(14_900, 0), 1_000)
+        .unwrap();
+    assert_eq!(still, HlcTimestamp::new(15_000, 0));
+    assert!(reopened
+        .acquire_dir_rename_lease(HlcTimestamp::new(14_900, 0), 1_000, 5_000)
+        .is_err());
+    assert!(reopened
+        .extend_dir_rename_lease(token, HlcTimestamp::new(15_001, 0), 1_000)
+        .is_err());
 }

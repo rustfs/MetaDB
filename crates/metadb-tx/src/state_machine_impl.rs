@@ -182,7 +182,25 @@ pub enum TxRaftCmd {
         instance_id: u128,
         grpc_addr: String,
     },
+    /// Renew a pending 2PC lease. Appended so earlier command tags stay stable.
+    /// The new `expire_hlc` is replicated with the command; it is not a memory-only update.
+    Extend2pcLease {
+        txn_id: TxnId,
+        /// Must equal the high 64 bits of `txn_id` (the coordinator that allocated it).
+        coord_node_id: u64,
+        expire_hlc: HlcTimestamp,
+        /// Transaction start. On the primary this must match the durable record.
+        start_hlc: HlcTimestamp,
+        rename_fence_token: Option<u64>,
+        target_user_keys: Vec<Vec<u8>>,
+    },
 }
+
+/// Longest a renewed cross-shard lease may reach past the transaction's `start_hlc`.
+///
+/// This is two 30s routing budgets (prepare, then commit). A shorter cap would
+/// expire a Prepare that is still retrying inside `ROUTE_RETRY_TIMEOUT`.
+pub const MAX_2PC_LEASE_LIFETIME_MS: u64 = 60_000;
 
 /// Typed output serialized inside `MetaDbRaftResponse.result`.
 #[derive(
@@ -1784,7 +1802,9 @@ impl TxStateMachineHandler {
 
                 // Validate all local intents before writing any mutation!
                 let mut encoded_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(intents.len());
+                let mut hold_keys = Vec::with_capacity(intents.len());
                 for (user_key, op) in intents {
+                    hold_keys.push(user_key.clone());
                     self.ensure_user_key_in_range(&user_key)?;
                     let intent_raw_key = WriteIntentKey::new(user_key.clone()).encode();
                     let existing_intent = match Self::read_latest_in_apply(engine, &intent_raw_key)?
@@ -1975,6 +1995,9 @@ impl TxStateMachineHandler {
 
                 self.outbox
                     .record_entry_specs(raft_index, commit_hlc, vec![]);
+                self.install_lease_hold(
+                    engine, txn_id, start_hlc, expire_hlc, commit_hlc, &hold_keys,
+                );
                 Ok(TxRaftOutput::Prepared {
                     prepared_hlc: commit_hlc,
                 })
@@ -2015,6 +2038,7 @@ impl TxStateMachineHandler {
                 {
                     txn_rec.state = TxnState::Aborted;
                     engine.apply_committed_put(tk, txn_rec.encode(), commit_hlc, raft_index);
+                    self.release_lease_hold(engine, txn_id);
                     return Err(MetaDbError::TransactionAborted(
                         "DirRenameLease expired or fence token mismatch at commit".to_string(),
                     ));
@@ -2052,6 +2076,7 @@ impl TxStateMachineHandler {
 
                 self.outbox
                     .record_entry_specs(raft_index, final_commit_hlc, aux_specs);
+                self.release_lease_hold(engine, txn_id);
                 Ok(TxRaftOutput::Committed {
                     commit_hlc: final_commit_hlc,
                     already_applied: false,
@@ -2113,6 +2138,7 @@ impl TxStateMachineHandler {
                         }
                     }
                 }
+                self.release_lease_hold(engine, txn_id);
                 self.outbox
                     .record_entry_specs(raft_index, commit_hlc, vec![]);
                 Ok(TxRaftOutput::Unit)
@@ -2160,10 +2186,34 @@ impl TxStateMachineHandler {
                     } else {
                         engine.apply_committed_put(tk, txn_rec.encode(), commit_hlc, raft_index);
                     }
+                    self.release_lease_hold(engine, txn_id);
                 }
                 self.outbox
                     .record_entry_specs(raft_index, commit_hlc, vec![]);
                 Ok(TxRaftOutput::TxnStatus(Some(txn_rec.state)))
+            }
+            TxRaftCmd::Extend2pcLease {
+                txn_id,
+                coord_node_id,
+                expire_hlc,
+                start_hlc,
+                rename_fence_token,
+                target_user_keys,
+            } => {
+                self.apply_extend_lease(
+                    engine,
+                    raft_index,
+                    commit_hlc,
+                    txn_id,
+                    coord_node_id,
+                    expire_hlc,
+                    start_hlc,
+                    rename_fence_token,
+                    &target_user_keys,
+                )?;
+                self.outbox
+                    .record_entry_specs(raft_index, commit_hlc, vec![]);
+                Ok(TxRaftOutput::Unit)
             }
             TxRaftCmd::FenceShardRangeForSplit {
                 new_range,
@@ -2344,6 +2394,193 @@ impl TxStateMachineHandler {
         Ok((children, bytes, mtime))
     }
 
+    fn lease_cap_ms(start_hlc: HlcTimestamp) -> Result<u64> {
+        start_hlc
+            .physical_ms()
+            .checked_add(MAX_2PC_LEASE_LIFETIME_MS)
+            .ok_or_else(|| {
+                MetaDbError::TransactionAborted("2PC lease renewal exceeds lifetime cap".into())
+            })
+    }
+
+    fn install_lease_hold(
+        &self,
+        engine: &LifecycleStorageEngine,
+        txn_id: TxnId,
+        start_hlc: HlcTimestamp,
+        expire_hlc: HlcTimestamp,
+        commit_hlc: HlcTimestamp,
+        keys: &[Vec<u8>],
+    ) {
+        let remain_ms = expire_hlc
+            .physical_ms()
+            .saturating_sub(commit_hlc.physical_ms())
+            .max(1);
+        engine.mvcc().snapshot_registry().renew_lease_hold(
+            txn_id,
+            start_hlc,
+            std::time::Instant::now() + std::time::Duration::from_millis(remain_ms),
+            keys,
+        );
+    }
+
+    fn release_lease_hold(&self, engine: &LifecycleStorageEngine, txn_id: TxnId) {
+        engine.mvcc().snapshot_registry().release_lease_hold(txn_id);
+    }
+
+    /// Renews a pending lease. Reads the durable record and intents at apply time,
+    /// so an abort that Raft already ordered ahead of this command wins.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_extend_lease(
+        &self,
+        engine: &LifecycleStorageEngine,
+        raft_index: u64,
+        commit_hlc: HlcTimestamp,
+        txn_id: TxnId,
+        coord_node_id: u64,
+        expire_hlc: HlcTimestamp,
+        start_hlc: HlcTimestamp,
+        rename_fence_token: Option<u64>,
+        target_user_keys: &[Vec<u8>],
+    ) -> Result<()> {
+        if (txn_id >> 64) as u64 != coord_node_id {
+            return Err(MetaDbError::TransactionAborted(
+                "2PC lease renewal is not held by this coordinator".into(),
+            ));
+        }
+        for key in target_user_keys {
+            self.ensure_user_key_in_range(key)?;
+        }
+
+        let record_key = TxnRecordKey { txn_id }.encode().to_vec();
+        let existing_record = Self::read_latest_in_apply(engine, &record_key)?
+            .map(|raw| TxnStatusRecord::decode(&raw))
+            .transpose()?;
+
+        let mut record_to_write: Option<TxnStatusRecord> = None;
+        let mut pending_anchor = false;
+        if let Some(rec) = &existing_record {
+            match rec.state {
+                TxnState::Aborted => {
+                    return Err(MetaDbError::TransactionAborted(
+                        "2PC lease renewal cannot revive an aborted transaction".into(),
+                    ));
+                }
+                // Commit already won. Expiry no longer decides the transaction.
+                TxnState::Committed { .. } => return Ok(()),
+                TxnState::Pending => {
+                    if rec.rename_fence_token != rename_fence_token || rec.start_hlc != start_hlc {
+                        return Err(MetaDbError::TransactionAborted(
+                            "2PC lease renewal fence token or start mismatch".into(),
+                        ));
+                    }
+                    // Re-read of the durable deadline. A concurrent abort is ordered
+                    // by Raft; if it applied first, the state match above rejected us.
+                    if commit_hlc > rec.expire_hlc {
+                        return Err(MetaDbError::TransactionAborted(
+                            "2PC lease renewal rejected after expiry".into(),
+                        ));
+                    }
+                    let cap = Self::lease_cap_ms(rec.start_hlc)?;
+                    if expire_hlc.physical_ms() > cap {
+                        return Err(MetaDbError::TransactionAborted(
+                            "2PC lease renewal exceeds lifetime cap".into(),
+                        ));
+                    }
+                    pending_anchor = true;
+                    if expire_hlc > rec.expire_hlc {
+                        let mut updated = rec.clone();
+                        updated.expire_hlc = expire_hlc;
+                        record_to_write = Some(updated);
+                    }
+                }
+            }
+        }
+
+        let mut intent_writes: Vec<(Vec<u8>, WriteIntentRecord)> = Vec::new();
+        let mut saw_participant = pending_anchor;
+        for user_key in target_user_keys {
+            let intent_key = WriteIntentKey::new(user_key.clone()).encode();
+            let Some(raw) = Self::read_latest_in_apply(engine, &intent_key)? else {
+                continue;
+            };
+            let mut intent = WriteIntentRecord::decode(&raw)?;
+            let mut write_intent = false;
+            if let IntentOp::DirExistsFenceSet { holders } = &mut intent.op {
+                let Some((primary_key, holder_expire)) = holders.get(&txn_id).cloned() else {
+                    continue;
+                };
+                if commit_hlc > holder_expire {
+                    return Err(MetaDbError::TransactionAborted(
+                        "2PC lease renewal rejected after expiry".into(),
+                    ));
+                }
+                let cap = Self::lease_cap_ms(start_hlc)?;
+                if expire_hlc.physical_ms() > cap {
+                    return Err(MetaDbError::TransactionAborted(
+                        "2PC lease renewal exceeds lifetime cap".into(),
+                    ));
+                }
+                saw_participant = true;
+                if expire_hlc > holder_expire {
+                    holders.insert(txn_id, (primary_key, expire_hlc));
+                    write_intent = true;
+                }
+            } else if intent.txn_id == txn_id {
+                if intent.rename_fence_token != rename_fence_token || intent.start_hlc != start_hlc
+                {
+                    return Err(MetaDbError::TransactionAborted(
+                        "2PC lease renewal fence token or start mismatch".into(),
+                    ));
+                }
+                if commit_hlc > intent.expire_hlc {
+                    return Err(MetaDbError::TransactionAborted(
+                        "2PC lease renewal rejected after expiry".into(),
+                    ));
+                }
+                let cap = Self::lease_cap_ms(intent.start_hlc)?;
+                if expire_hlc.physical_ms() > cap {
+                    return Err(MetaDbError::TransactionAborted(
+                        "2PC lease renewal exceeds lifetime cap".into(),
+                    ));
+                }
+                saw_participant = true;
+                if expire_hlc > intent.expire_hlc {
+                    intent.expire_hlc = expire_hlc;
+                    write_intent = true;
+                }
+            }
+            if write_intent {
+                if intent.txn_id == txn_id && expire_hlc > intent.expire_hlc {
+                    intent.expire_hlc = expire_hlc;
+                }
+                intent_writes.push((intent_key, intent));
+            }
+        }
+
+        if !saw_participant {
+            return Err(MetaDbError::TransactionAborted(
+                "2PC lease renewal found no live transaction".into(),
+            ));
+        }
+
+        if let Some(updated) = record_to_write {
+            engine.apply_committed_put(record_key, updated.encode(), commit_hlc, raft_index);
+        }
+        for (key, intent) in intent_writes {
+            engine.apply_committed_put(key, intent.encode(), commit_hlc, raft_index);
+        }
+        self.install_lease_hold(
+            engine,
+            txn_id,
+            start_hlc,
+            expire_hlc,
+            commit_hlc,
+            target_user_keys,
+        );
+        Ok(())
+    }
+
     /// Materializes `[0x05][user_key]` if held by `txn_id` (`Resolution B12` exact-once check).
     fn materialize_intent_for_key(
         &self,
@@ -2499,6 +2736,30 @@ impl TxStateMachineHandler {
                 .record_delta(s.pid, raft_index, hlc, s.delta_children, s.delta_bytes);
         }
     }
+
+    /// After log purge, replay will not see the original Prepare. Pending leases
+    /// still live in the snapshot, so rebuild their MVCC holds from that state.
+    fn rehydrate_lease_holds(&self, engine: &LifecycleStorageEngine) {
+        let latest = engine.mvcc().latest_watermarks().1;
+        let Ok(rows) = Self::scan_latest_in_apply(engine, &[0x06], &[0x07]) else {
+            return;
+        };
+        for (_, raw) in rows {
+            let Ok(rec) = TxnStatusRecord::decode(&raw) else {
+                continue;
+            };
+            if matches!(rec.state, TxnState::Pending) && latest <= rec.expire_hlc {
+                self.install_lease_hold(
+                    engine,
+                    rec.txn_id,
+                    rec.start_hlc,
+                    rec.expire_hlc,
+                    latest,
+                    &rec.participant_keys,
+                );
+            }
+        }
+    }
 }
 
 impl PreFlushHook for TxStateMachineHandler {
@@ -2606,5 +2867,6 @@ impl ShardApplyHandler for TxStateMachineHandler {
             checkpoint.flushed_raft_index,
             engine,
         );
+        self.rehydrate_lease_holds(engine);
     }
 }

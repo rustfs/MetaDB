@@ -164,10 +164,22 @@ impl SnapshotSlot {
 }
 
 /// Registry of active point-in-time `SnapshotGuard`s gating unversioned L0 SSTable collapse-flushes.
+struct LeaseHold {
+    /// Oldest HLC a reader of this transaction may still need.
+    retain_not_before: HlcTimestamp,
+    /// Wall-clock end of the hold. Renewals push this forward with `expire_hlc`.
+    until: Instant,
+    /// Participant user keys whose pre-image must stay readable.
+    keys: Vec<Vec<u8>>,
+}
+
 pub struct ActiveSnapshotRegistry {
     next_id: AtomicU64,
     retention: Duration,
     slots: Mutex<BTreeMap<u64, Arc<SnapshotSlot>>>,
+    /// In-flight 2PC leases. While one is active, flush and the retention window
+    /// keep versions back to `retain_not_before` even after the default 5s window.
+    lease_holds: Mutex<BTreeMap<u128, LeaseHold>>,
     flush_mu: Mutex<()>,
     flush_cv: Condvar,
 }
@@ -178,9 +190,75 @@ impl ActiveSnapshotRegistry {
             next_id: AtomicU64::new(1),
             retention: Duration::from_millis(retention_ms.max(1)),
             slots: Mutex::new(BTreeMap::new()),
+            lease_holds: Mutex::new(BTreeMap::new()),
             flush_mu: Mutex::new(()),
             flush_cv: Condvar::new(),
         }
+    }
+
+    /// Keeps the pre-image of `keys` readable back to `retain_not_before` until `until`.
+    /// A later renewal may only move the floor earlier and the deadline later.
+    /// This does not block memtable flush: the latest value is still written to
+    /// the LSM so a restarted process can read it after log purge.
+    pub fn renew_lease_hold(
+        &self,
+        txn_id: u128,
+        retain_not_before: HlcTimestamp,
+        until: Instant,
+        keys: &[Vec<u8>],
+    ) {
+        let mut holds = self.lease_holds.lock().unwrap();
+        holds
+            .entry(txn_id)
+            .and_modify(|hold| {
+                if retain_not_before < hold.retain_not_before {
+                    hold.retain_not_before = retain_not_before;
+                }
+                if until > hold.until {
+                    hold.until = until;
+                }
+                for key in keys {
+                    if !hold.keys.iter().any(|existing| existing == key) {
+                        hold.keys.push(key.clone());
+                    }
+                }
+            })
+            .or_insert(LeaseHold {
+                retain_not_before,
+                until,
+                keys: keys.to_vec(),
+            });
+    }
+
+    /// Drops the hold for `txn_id` after commit or abort.
+    pub fn release_lease_hold(&self, txn_id: u128) {
+        self.lease_holds.lock().unwrap().remove(&txn_id);
+        self.notify_flush_waiters();
+    }
+
+    /// Earliest retain-not-before among holds whose deadline has not passed.
+    pub fn lease_retain_floor(&self) -> Option<HlcTimestamp> {
+        let now = Instant::now();
+        let mut holds = self.lease_holds.lock().unwrap();
+        holds.retain(|_, hold| now < hold.until);
+        holds.values().map(|hold| hold.retain_not_before).min()
+    }
+
+    /// `read_hlc` is inside an open lease that names `key`.
+    pub fn lease_covers_key(&self, key: &[u8], read_hlc: HlcTimestamp) -> bool {
+        let now = Instant::now();
+        let holds = self.lease_holds.lock().unwrap();
+        holds.values().any(|hold| {
+            now < hold.until
+                && read_hlc.physical_ms() >= hold.retain_not_before.physical_ms()
+                && hold.keys.iter().any(|held| held == key)
+        })
+    }
+
+    /// Some open lease still needs reads at `read_hlc` (used by range scans).
+    pub fn lease_covers_read(&self, read_hlc: HlcTimestamp) -> bool {
+        self.lease_retain_floor()
+            .is_some_and(|floor| read_hlc.physical_ms() >= floor.physical_ms())
     }
 
     pub fn register(
@@ -622,7 +700,8 @@ impl MemMvccStore {
     pub fn get_at(&self, key: &[u8], read_hlc: HlcTimestamp) -> Result<Option<MvccValue>> {
         let guard = self.inner.read().unwrap();
         self.check_retention_window(&guard, read_hlc)?;
-        if read_hlc < guard.disk_flushed_max_hlc {
+        let covered = self.registry.lease_covers_key(key, read_hlc);
+        if read_hlc < guard.disk_flushed_max_hlc && !covered {
             return Err(MetaDbError::TransactionTimeout {
                 snapshot_hlc: read_hlc.as_u64(),
                 oldest_retained_hlc: guard.disk_flushed_max_hlc.as_u64(),
@@ -657,7 +736,7 @@ impl MemMvccStore {
     ) -> Result<BTreeMap<Vec<u8>, MvccValue>> {
         let guard = self.inner.read().unwrap();
         self.check_retention_window(&guard, read_hlc)?;
-        if read_hlc < guard.disk_flushed_max_hlc {
+        if read_hlc < guard.disk_flushed_max_hlc && !self.registry.lease_covers_read(read_hlc) {
             return Err(MetaDbError::TransactionTimeout {
                 snapshot_hlc: read_hlc.as_u64(),
                 oldest_retained_hlc: guard.disk_flushed_max_hlc.as_u64(),
@@ -911,14 +990,17 @@ impl MemMvccStore {
 
     fn check_retention_window(&self, guard: &MemMvccInner, read_hlc: HlcTimestamp) -> Result<()> {
         let latest_phys = guard.latest_hlc.physical_ms();
-        if latest_phys > self.retention_ms {
-            let oldest_phys = latest_phys - self.retention_ms;
-            if read_hlc.physical_ms() < oldest_phys {
-                return Err(MetaDbError::TransactionTimeout {
-                    snapshot_hlc: read_hlc.as_u64(),
-                    oldest_retained_hlc: HlcTimestamp::new(oldest_phys, 0).as_u64(),
-                });
-            }
+        let mut oldest_phys = latest_phys.saturating_sub(self.retention_ms);
+        // An open 2PC lease pushes the floor back to the transaction start so a
+        // read or rollback at that HLC still works after the default 5s window.
+        if let Some(floor) = self.registry.lease_retain_floor() {
+            oldest_phys = oldest_phys.min(floor.physical_ms());
+        }
+        if latest_phys > oldest_phys && read_hlc.physical_ms() < oldest_phys {
+            return Err(MetaDbError::TransactionTimeout {
+                snapshot_hlc: read_hlc.as_u64(),
+                oldest_retained_hlc: HlcTimestamp::new(oldest_phys, 0).as_u64(),
+            });
         }
         Ok(())
     }
