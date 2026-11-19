@@ -910,12 +910,11 @@ impl DurableCellManager {
                     )
                 })
         })?;
-        let payload = metadb_core::codec::serialize(&metadb_tx::TxRaftCmd::BindNodeInstance {
+        let payload = metadb_tx::command_payload(&metadb_tx::TxRaftCmd::BindNodeInstance {
             node_id,
             instance_id,
             grpc_addr,
-        })
-        .map_err(|error| MetaDbError::CodecError(error.to_string()))?;
+        })?;
         let epoch = group.current_epoch();
         group
             .propose_until(
@@ -1724,8 +1723,7 @@ impl DurableCellManager {
                 restored_range: route.range.clone(),
                 new_epoch: epoch,
             };
-            let payload =
-                codec::serialize(&cmd).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+            let payload = metadb_tx::command_payload(&cmd)?;
             group
                 .propose(epoch, self.host.clock().now(), payload)
                 .await?;

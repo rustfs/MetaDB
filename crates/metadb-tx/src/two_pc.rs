@@ -23,7 +23,10 @@ use metadb_storage::{ScanControl, SnapshotGuard};
 use crate::leader_forward::{forward_op, ForwardedRouterOp, ForwardedRouterOut};
 use crate::recovery_worker::TxnRecoveryWorker;
 use crate::rename_cycle::RenameCycleWalker;
-use crate::state_machine_impl::{SetAttrPatch, TxRaftCmd, TxRaftOutput, TxStateMachineHandler};
+use crate::state_machine_impl::{
+    encode_proposed_command, fresh_proposal_id, SetAttrPatch, TxRaftCmd, TxRaftOutput,
+    TxStateMachineHandler,
+};
 
 pub const DEFAULT_2PC_TTL_MS: u64 = 3_000;
 
@@ -258,8 +261,9 @@ impl DistributedTxRouter {
         hlc: HlcTimestamp,
         cmd: &TxRaftCmd,
         deadline: tokio::time::Instant,
+        proposal_id: u128,
     ) -> Result<(HlcTimestamp, TxRaftOutput)> {
-        let payload = codec::serialize(cmd).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        let payload = encode_proposed_command(proposal_id, cmd)?;
         let resp = group.propose_until(epoch, hlc, payload, deadline).await?;
         let bytes = resp.result?;
         let decoded: TxRaftOutput =
@@ -277,6 +281,18 @@ impl DistributedTxRouter {
         cmd: &TxRaftCmd,
         hlc: HlcTimestamp,
     ) -> Result<(ShardEpoch, Arc<ShardRaftGroup>, HlcTimestamp, TxRaftOutput)> {
+        let proposal_id = fresh_proposal_id();
+        self.propose_participant_id(user_key, cmd, hlc, proposal_id)
+            .await
+    }
+
+    async fn propose_participant_id(
+        &self,
+        user_key: &[u8],
+        cmd: &TxRaftCmd,
+        hlc: HlcTimestamp,
+        proposal_id: u128,
+    ) -> Result<(ShardEpoch, Arc<ShardRaftGroup>, HlcTimestamp, TxRaftOutput)> {
         let deadline = tokio::time::Instant::now() + ROUTE_RETRY_TIMEOUT;
         let mut last = None;
         while tokio::time::Instant::now() < deadline {
@@ -291,7 +307,7 @@ impl DistributedTxRouter {
                 }
                 Err(error) => return Err(error),
             };
-            match Self::propose_cmd(&group, epoch, hlc, cmd, deadline).await {
+            match Self::propose_cmd(&group, epoch, hlc, cmd, deadline, proposal_id).await {
                 Ok((applied_hlc, decoded)) => {
                     return Ok((epoch, group, applied_hlc, decoded));
                 }
@@ -317,9 +333,13 @@ impl DistributedTxRouter {
         hlc: HlcTimestamp,
     ) -> Result<(ShardEpoch, Arc<ShardRaftGroup>, HlcTimestamp, TxRaftOutput)> {
         let deadline = tokio::time::Instant::now() + ROUTE_RETRY_TIMEOUT;
+        let proposal_id = fresh_proposal_id();
         let mut last = None;
         while tokio::time::Instant::now() < deadline {
-            match self.propose_participant(user_key, cmd, hlc).await {
+            match self
+                .propose_participant_id(user_key, cmd, hlc, proposal_id)
+                .await
+            {
                 Err(
                     error @ (MetaDbError::EpochMismatch { .. } | MetaDbError::ShardRoutingError(_)),
                 ) => {
@@ -342,10 +362,11 @@ impl DistributedTxRouter {
         cmd: &TxRaftCmd,
     ) -> Result<TxRaftOutput> {
         let deadline = tokio::time::Instant::now() + ROUTE_RETRY_TIMEOUT;
+        let proposal_id = fresh_proposal_id();
         for attempt in 0..12usize {
             let result = retry_routing_until(deadline, || async {
                 let (epoch, group, _) = self.route_user_key_once(user_key)?;
-                Self::propose_cmd(&group, epoch, self.clock.now(), cmd, deadline).await
+                Self::propose_cmd(&group, epoch, self.clock.now(), cmd, deadline, proposal_id).await
             })
             .await;
             match result {

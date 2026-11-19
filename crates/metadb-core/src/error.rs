@@ -104,10 +104,11 @@ pub enum MetaDbError {
     ///
     /// Appended after `IdentityRejected` so earlier variant tags stay stable.
     /// Same-shard writes and 2PC may retry this inside the existing routing budget.
-    /// `AlreadyExists`, `EpochMismatch`, and other application results are not this
-    /// variant. A discarded log entry may already have committed through another
-    /// leader, so a retry that then hits an application error returns that error.
-    /// Storage corruption and a stopped Raft node stay [`ConsensusError`](Self::ConsensusError).
+    /// The retry repeats the same proposal id. If that id already committed, the
+    /// state machine returns the stored result and does not execute the command
+    /// again. `AlreadyExists`, `EpochMismatch`, and other application results are
+    /// not this variant. Storage corruption and a stopped Raft node stay
+    /// [`ConsensusError`](Self::ConsensusError).
     RetryableConsensus {
         shard_id: u64,
         leader_hint: Option<u64>,

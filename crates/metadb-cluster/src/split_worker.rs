@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
 
-use metadb_core::codec;
 use metadb_core::{
     affinity_key_for_raw_entry, saturating_add_i64, CompositeKeyRange, DirShardDeltaKey,
     DirShardDeltaRecord, EntryType, HlcTimestamp, InodeAttr, InodeId, MetaDbError, MetaKey, Result,
@@ -269,8 +268,7 @@ impl RaftShardSplitWorker {
                 new_range: left_range.clone(),
                 new_epoch: new_parent_epoch,
             };
-            let fence_payload =
-                codec::serialize(&fence_cmd).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+            let fence_payload = metadb_tx::command_payload(&fence_cmd)?;
             parent_group
                 .propose(
                     parent_group.current_epoch(),
@@ -556,8 +554,7 @@ impl RaftShardSplitWorker {
             updated_anchor_attr: updated_parent_anchor,
             updated_shard_delta: updated_parent_delta,
         };
-        let payload =
-            codec::serialize(&update_cmd).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        let payload = metadb_tx::command_payload(&update_cmd)?;
         parent_group
             .propose(parent_group.current_epoch(), host.clock().now(), payload)
             .await?;

@@ -219,6 +219,100 @@ pub struct NodeInstanceRecord {
     pub grpc_addr: String,
 }
 
+/// Prefix for a committed proposal receipt. Not a user-table key.
+const PROPOSAL_RECEIPT_PREFIX: u8 = 0x0A;
+const PROPOSAL_ENVELOPE_MAGIC: &[u8] = b"MDBP0001";
+
+/// Allocates an id for one logical client write. Zero is reserved for legacy payloads.
+pub fn fresh_proposal_id() -> u128 {
+    let mut bytes = [0u8; 16];
+    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
+        if std::io::Read::read_exact(&mut file, &mut bytes).is_ok() {
+            let id = u128::from_le_bytes(bytes);
+            if id != 0 {
+                return id;
+            }
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(1);
+    let mixed = nanos ^ ((std::process::id() as u128) << 96);
+    if mixed == 0 {
+        1
+    } else {
+        mixed
+    }
+}
+
+pub fn proposal_receipt_key(proposal_id: u128) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(PROPOSAL_RECEIPT_PREFIX);
+    key.extend_from_slice(&proposal_id.to_be_bytes());
+    key
+}
+
+/// Bytes replicated for `cmd`. A retry of the same `proposal_id` must send these bytes again.
+pub fn encode_proposed_command(proposal_id: u128, cmd: &TxRaftCmd) -> Result<Vec<u8>> {
+    if proposal_id == 0 {
+        return Err(MetaDbError::CodecError(
+            "proposal id 0 is reserved for a legacy command".to_string(),
+        ));
+    }
+    let cmd_bytes = codec::serialize(cmd).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+    let mut out = Vec::with_capacity(8 + 16 + 4 + cmd_bytes.len());
+    out.extend_from_slice(PROPOSAL_ENVELOPE_MAGIC);
+    out.extend_from_slice(&proposal_id.to_le_bytes());
+    out.extend_from_slice(&(cmd_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&cmd_bytes);
+    Ok(out)
+}
+
+/// A new logical write. Retries of one write must reuse [`encode_proposed_command`] instead.
+pub fn command_payload(cmd: &TxRaftCmd) -> Result<Vec<u8>> {
+    encode_proposed_command(fresh_proposal_id(), cmd)
+}
+
+fn decode_proposed_command(payload: &[u8]) -> Result<(u128, TxRaftCmd)> {
+    if !payload.starts_with(PROPOSAL_ENVELOPE_MAGIC) {
+        let cmd =
+            codec::deserialize(payload).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        return Ok((0, cmd));
+    }
+    let rest = &payload[PROPOSAL_ENVELOPE_MAGIC.len()..];
+    if rest.len() < 20 {
+        return Err(MetaDbError::CodecError(
+            "truncated write proposal envelope".to_string(),
+        ));
+    }
+    let mut id_bytes = [0u8; 16];
+    id_bytes.copy_from_slice(&rest[..16]);
+    let proposal_id = u128::from_le_bytes(id_bytes);
+    let cmd_len = u32::from_le_bytes(rest[16..20].try_into().unwrap()) as usize;
+    let cmd_end = 20usize.checked_add(cmd_len).ok_or_else(|| {
+        MetaDbError::CodecError("write proposal envelope length overflow".to_string())
+    })?;
+    if cmd_end != rest.len() {
+        return Err(MetaDbError::CodecError(
+            "write proposal envelope length does not match its command".to_string(),
+        ));
+    }
+    let cmd = codec::deserialize(&rest[20..cmd_end])
+        .map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+    Ok((proposal_id, cmd))
+}
+
+fn committed_proposal_result(
+    engine: &LifecycleStorageEngine,
+    proposal_id: u128,
+) -> Result<Option<Vec<u8>>> {
+    if proposal_id == 0 {
+        return Ok(None);
+    }
+    TxStateMachineHandler::read_latest_in_apply(engine, &proposal_receipt_key(proposal_id))
+}
+
 pub fn node_instance_key(node_id: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(9);
     key.push(0x09);
@@ -2291,6 +2385,15 @@ impl ShardApplyHandler for TxStateMachineHandler {
         codec::serialize(&*self.meta.read().unwrap()).unwrap_or_default()
     }
 
+    fn previously_committed_proposal(
+        &self,
+        request: &MetaDbRaftRequest,
+        engine: &LifecycleStorageEngine,
+    ) -> Result<Option<Vec<u8>>> {
+        let (proposal_id, _) = decode_proposed_command(&request.payload)?;
+        committed_proposal_result(engine, proposal_id)
+    }
+
     fn apply_command(
         &self,
         raft_index: u64,
@@ -2298,12 +2401,23 @@ impl ShardApplyHandler for TxStateMachineHandler {
         request: &MetaDbRaftRequest,
         engine: &LifecycleStorageEngine,
     ) -> Result<Vec<u8>> {
-        let cmd: TxRaftCmd = codec::deserialize(&request.payload)
-            .map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        let (proposal_id, cmd) = decode_proposed_command(&request.payload)?;
+        if let Some(prior) = committed_proposal_result(engine, proposal_id)? {
+            return Ok(prior);
+        }
         let out = self.apply_tx_cmd(raft_index, commit_hlc, cmd, engine)?;
         self.outbox
             .persist_quota_cursors(engine, commit_hlc, raft_index);
-        codec::serialize(&out).map_err(|e| MetaDbError::CodecError(e.to_string()))
+        let bytes = codec::serialize(&out).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        if proposal_id != 0 {
+            engine.apply_committed_put(
+                proposal_receipt_key(proposal_id),
+                bytes.clone(),
+                commit_hlc,
+                raft_index,
+            );
+        }
+        Ok(bytes)
     }
 
     fn pre_flush_hook(&self) -> Option<&dyn PreFlushHook> {

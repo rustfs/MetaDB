@@ -120,7 +120,7 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 | `TransactionTimeout` | Snapshot HLC older than the in-memory MVCC window |
 | `ClockSkewExceeded` | Remote HLC ahead of local wall time by more than `max_clock_drift_ms` |
 | `EpochMismatch` / `NotLeader` | Stale route epoch, or this replica is not the leader. Follower reads with a known leader are forwarded. `EpochMismatch` on a multi-key prepare aborts that round and regroups; it is not proposed again as the same batch |
-| `RetryableConsensus` | A write's log entry was discarded on a leader change, or a quorum did not answer. Same-shard writes and 2PC retry these inside the existing routing budget. A discarded entry may already have committed through another leader, so a later `AlreadyExists` or `EpochMismatch` is returned as that application error. Storage failure and a stopped Raft node stay `ConsensusError` and are not retried |
+| `RetryableConsensus` | A write's log entry was discarded on a leader change, or a quorum did not answer. Same-shard writes and 2PC retry these inside the existing routing budget. Each logical write keeps one proposal id. If that id already committed, the shard returns the original result and does not execute the command again. Storage failure and a stopped Raft node stay `ConsensusError` and are not retried |
 | `UnsplittableJumboShard` | In-memory splitter (`shard.rs`), not the durable jumbo path, which sets `JumboIsolated` and returns success with no child shard |
 | `WriteIntentConflict` / `TransactionAborted` | 2PC conflict, or a directory-rename lease already held |
 | `InvalidRenameCycle` | Rename of a directory into itself or a descendant |

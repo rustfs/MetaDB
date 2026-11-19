@@ -120,7 +120,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 | `TransactionTimeout` | 快照 HLC 早于内存 MVCC 窗口 |
 | `ClockSkewExceeded` | 远端 HLC 领先本地墙钟超过 `max_clock_drift_ms` |
 | `EpochMismatch` / `NotLeader` | 过期的路由纪元，或本副本不是 leader。已知 leader 的 follower 读会转发。多键 Prepare 上的 `EpochMismatch` 会放弃这一轮并重新分组，不会把同一批再提议一次 |
-| `RetryableConsensus` | 写日志在换主时被丢弃，或法定人数没有应答。同分片写和 2PC 会在现有路由预算内重试。被丢弃的条目可能已由另一个 leader 提交，因此随后的 `AlreadyExists` 或 `EpochMismatch` 按应用错误返回。存储失败和已停止的 Raft 节点仍是 `ConsensusError`，不会重试 |
+| `RetryableConsensus` | 写日志在换主时被丢弃，或法定人数没有应答。同分片写和 2PC 会在现有路由预算内重试。每次逻辑写使用同一个提案 id。若该 id 已经提交，分片返回原来的结果，不再执行这条命令。存储失败和已停止的 Raft 节点仍是 `ConsensusError`，不会重试 |
 | `UnsplittableJumboShard` | 内存分裂器（`shard.rs`），不是持久巨型路径。持久路径设置 `JumboIsolated` 并在没有子分片时返回成功 |
 | `WriteIntentConflict` / `TransactionAborted` | 2PC 冲突，或目录重命名租约已被持有 |
 | `InvalidRenameCycle` | 把目录重命名到自身或后代 |
