@@ -7,24 +7,26 @@
 //! server data directory so a crash does not depend on a live process, and it
 //! expires on the wall clock so a missed release cannot pin purge forever.
 //!
-//! On Linux, copy and restore anchor at the operator-supplied data directory,
-//! artifact directory, or staging directory this process created. Each component
-//! below that anchor is opened with `O_DIRECTORY|O_NOFOLLOW` through
-//! `/proc/self/fd`. A symlink, a non-UTF-8 name, or any other non-regular entry
-//! fails the command. Ancestors of the operator path are still resolved. A
-//! regular file can still be replaced by a concurrent local writer. Other
-//! platforms compile, and backup copy or restore returns an explicit unsupported
-//! error instead of using Linux flag values.
+//! Copy and restore anchor at the operator-supplied data directory, artifact
+//! directory, or staging directory this process created. Each component below
+//! that anchor is one relative name, checked before it is opened, and opened
+//! without following a symlink (`cap-primitives` on Unix and Windows). A
+//! symlink, a non-UTF-8 name, or any other non-regular entry fails the command.
+//! Ancestors of the operator path are still resolved. A regular file can still
+//! be replaced by a concurrent local writer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
+
+use cap_fs_ext::OpenOptionsFollowExt;
+use cap_primitives::fs::{
+    open as cap_open, open_dir_nofollow, read_base_dir, remove_dir as cap_remove_dir,
+    remove_file as cap_remove_file, rename as cap_rename, stat, FollowSymlinks,
+    OpenOptions as CapOptions,
+};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -54,30 +56,12 @@ fn write_serialized(path: &Path, payload: Vec<u8>) -> Result<()> {
     fs::create_dir_all(&parent)?;
     refuse_existing_symlink(&parent.join(&tmp_name))?;
     refuse_existing_symlink(path)?;
-    #[cfg(target_os = "linux")]
-    {
-        let dir = open_plain_dir(&parent)?;
-        write_child_truncating(&dir, &tmp_name, &bytes)?;
-        let from = proc_dir(&dir).join(&tmp_name);
-        let to = proc_dir(&dir).join(name);
-        fs::rename(&from, &to).map_err(|error| open_error(path, error))?;
-        sync_dir(&proc_dir(&dir))?;
-        return Ok(());
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let tmp = parent.join(tmp_name);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_data()?;
-        fs::rename(&tmp, path)?;
-        sync_dir(&parent)?;
-        Ok(())
-    }
+    let dir = open_plain_dir(&parent)?;
+    write_child_truncating(&dir, &tmp_name, &bytes)?;
+    cap_rename(&dir, Path::new(&tmp_name), &dir, Path::new(name))
+        .map_err(|error| map_child_error(name, error))?;
+    dir.sync_all()?;
+    Ok(())
 }
 
 fn refuse_existing_symlink(path: &Path) -> Result<()> {
@@ -307,35 +291,62 @@ fn backup_error(message: impl AsRef<str>) -> MetaDbError {
     MetaDbError::StorageIoError(format!("backup rejected: {}", message.as_ref()))
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
-fn unsupported_backup() -> MetaDbError {
-    backup_error(
-        "symlink-safe backup copy is supported on Linux only; refusing to run it with another platform's filesystem flags",
-    )
-}
-
 fn is_not_found(error: &MetaDbError) -> bool {
     let text = error.to_string();
     text.contains("os error 2") || text.contains("No such file")
 }
 
-/// Linux `O_DIRECTORY` (`00200000`). The final component must be a directory.
-#[cfg(target_os = "linux")]
-const O_DIRECTORY: i32 = 0x10000;
-/// Linux `O_NOFOLLOW` (`00400000`). The final component must not be a symlink.
-#[cfg(target_os = "linux")]
-const O_NOFOLLOW: i32 = 0x20000;
-
-fn is_eloop(error: &std::io::Error) -> bool {
-    // Linux ELOOP. `ErrorKind::FilesystemLoop` is still unstable.
-    error.raw_os_error() == Some(40)
-}
-
-fn open_error(path: &Path, error: std::io::Error) -> MetaDbError {
-    if is_eloop(&error) {
-        backup_error(format!("refusing to follow symlink {}", path.display()))
+fn map_child_error(name: &str, error: std::io::Error) -> MetaDbError {
+    let raw = error.raw_os_error();
+    let text = error.to_string().to_ascii_lowercase();
+    // ELOOP is 40 on Linux and 62 on macOS/BSD. Windows stopped-on-symlink is 681.
+    // ENOTDIR (20) is what a directory open reports for a symlink on Linux.
+    if matches!(raw, Some(20 | 40 | 62 | 681))
+        || text.contains("symbolic link")
+        || text.contains("reparse")
+    {
+        backup_error(format!("refusing to follow symlink {name}"))
     } else {
         error.into()
+    }
+}
+
+fn reject_reparse(meta: &std::fs::Metadata, name: &str) -> Result<()> {
+    if meta.file_type().is_symlink() {
+        return Err(backup_error(format!("refusing to follow symlink {name}")));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(backup_error(format!(
+                "refusing to follow reparse point {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn nofollow_read() -> CapOptions {
+    let mut options = CapOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    options
+}
+
+/// `open_dir_nofollow` on Linux returns an `O_PATH` descriptor. Opening
+/// `/proc/self/fd/<n>` names that same inode; it does not walk the original path.
+fn materialize_dir(dir: File) -> Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+        return File::open(path).map_err(Into::into);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(dir)
     }
 }
 
@@ -351,6 +362,7 @@ fn component_name(name: &OsStr) -> Result<String> {
         || text.contains('/')
         || text.contains('\\')
         || text.contains('\0')
+        || text.contains(':')
     {
         return Err(backup_error(format!(
             "backup directory entry {text:?} is not a single path component"
@@ -359,65 +371,51 @@ fn component_name(name: &OsStr) -> Result<String> {
     Ok(text.to_string())
 }
 
-#[cfg(target_os = "linux")]
-fn proc_dir(dir: &File) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
-}
-
 /// Opens `path` without following a symlink in its final component.
 ///
 /// This is the anchor. Components above `path` are the operator-supplied path
-/// and are still resolved. Components below the returned fd must use `open_under`.
+/// and are still resolved. Components below the returned handle must use `open_under`.
 fn open_plain_dir(path: &Path) -> Result<File> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = path;
-        return Err(unsupported_backup());
+    if path == Path::new(".") || path.as_os_str().is_empty() {
+        return open_plain_dir(&std::env::current_dir()?);
     }
-    #[cfg(target_os = "linux")]
-    {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(O_DIRECTORY | O_NOFOLLOW)
-            .open(path)
-            .map_err(|error| open_error(path, error))?;
-        let meta = file.metadata()?;
-        if meta.file_type().is_symlink() || !meta.is_dir() {
-            return Err(backup_error(format!(
-                "{} is not a plain directory; refusing to follow it",
-                path.display()
-            )));
-        }
-        Ok(file)
+    let Some(raw_name) = path.file_name() else {
+        return Err(backup_error(format!("{} has no file name", path.display())));
+    };
+    let name = component_name(raw_name)?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => std::env::current_dir()?,
+    };
+    let parent = File::open(parent)?;
+    let dir = open_dir_nofollow(&parent, Path::new(&name))
+        .map_err(|error| map_child_error(&name, error))?;
+    let meta = dir.metadata()?;
+    reject_reparse(&meta, &name)?;
+    if !meta.is_dir() {
+        return Err(backup_error(format!(
+            "{} is not a plain directory; refusing to follow it",
+            path.display()
+        )));
     }
+    materialize_dir(dir)
 }
 
 fn open_child(dir: &File, name: &str, directory: bool) -> Result<File> {
-    // Reject absolute paths and `..` before any join. `Path::join` drops the
-    // directory fd when `name` is absolute, and `../` leaves that directory.
+    // Reject absolute paths and `..` before any open. `Path::join` would drop
+    // the directory handle when `name` is absolute, and `../` would leave it.
     let name = component_name(OsStr::new(name))?;
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (dir, name, directory);
-        return Err(unsupported_backup());
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let path = proc_dir(dir).join(&name);
-        let mut opts = OpenOptions::new();
-        opts.read(true);
-        if directory {
-            opts.custom_flags(O_DIRECTORY | O_NOFOLLOW);
-        } else {
-            opts.custom_flags(O_NOFOLLOW);
-        }
-        opts.open(&path).map_err(|error| {
-            if directory && error.raw_os_error() == Some(20) {
-                backup_error(format!("refusing to follow symlink {name}"))
-            } else {
-                open_error(Path::new(&name), error)
-            }
-        })
+    let child = Path::new(&name);
+    if directory {
+        let opened =
+            open_dir_nofollow(dir, child).map_err(|error| map_child_error(&name, error))?;
+        reject_reparse(&opened.metadata()?, &name)?;
+        materialize_dir(opened)
+    } else {
+        let opened = cap_open(dir, child, &nofollow_read())
+            .map_err(|error| map_child_error(&name, error))?;
+        reject_reparse(&opened.metadata()?, &name)?;
+        Ok(opened)
     }
 }
 
@@ -449,21 +447,8 @@ pub(crate) struct ListedEntry {
 
 /// Lists one directory fd. A symlink fails the listing instead of being followed.
 pub(crate) fn list_plain_dir(dir: &File) -> Result<Vec<ListedEntry>> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = dir;
-        return Err(unsupported_backup());
-    }
-    #[cfg(target_os = "linux")]
-    {
-        list_plain_dir_linux(dir)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn list_plain_dir_linux(dir: &File) -> Result<Vec<ListedEntry>> {
     let mut out = Vec::new();
-    for entry in fs::read_dir(proc_dir(dir))? {
+    for entry in read_base_dir(dir)? {
         let entry = entry?;
         let name = component_name(&entry.file_name())?;
         let file_type = entry
@@ -500,28 +485,21 @@ pub(crate) fn read_listed_file(dir: &File, name: &str) -> Result<Vec<u8>> {
 
 fn create_child_dir(dir: &File, name: &str) -> Result<File> {
     let name = component_name(OsStr::new(name))?;
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (dir, name);
-        return Err(unsupported_backup());
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let path = proc_dir(dir).join(&name);
-        match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-                return Err(backup_error(format!(
-                    "refusing to follow symlink or non-directory {name}"
-                )));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&path).map_err(|error| open_error(Path::new(&name), error))?;
-            }
-            Err(error) => return Err(error.into()),
+    let child = Path::new(&name);
+    match stat(dir, child, FollowSymlinks::No) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(backup_error(format!(
+                "refusing to follow symlink or non-directory {name}"
+            )));
         }
-        open_child(dir, &name, true)
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            cap_primitives::fs::create_dir(dir, child, &cap_primitives::fs::DirOptions::new())
+                .map_err(|error| map_child_error(&name, error))?;
+        }
+        Err(error) => return Err(map_child_error(&name, error)),
     }
+    open_child(dir, &name, true)
 }
 
 pub(crate) fn write_child_file(dir: &File, name: &str, bytes: &[u8]) -> Result<()> {
@@ -534,31 +512,21 @@ fn write_child_truncating(dir: &File, name: &str, bytes: &[u8]) -> Result<()> {
 
 fn write_child_bytes(dir: &File, name: &str, bytes: &[u8], exclusive: bool) -> Result<()> {
     let name = component_name(OsStr::new(name))?;
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (dir, name, bytes, exclusive);
-        return Err(unsupported_backup());
+    let mut opts = CapOptions::new();
+    opts.write(true).create(true).follow(FollowSymlinks::No);
+    if exclusive {
+        opts.create_new(true);
+    } else {
+        opts.truncate(true);
     }
-    #[cfg(target_os = "linux")]
-    {
-        let path = proc_dir(dir).join(&name);
-        let mut opts = OpenOptions::new();
-        opts.write(true).create(true).custom_flags(O_NOFOLLOW);
-        if exclusive {
-            opts.create_new(true);
-        } else {
-            opts.truncate(true);
-        }
-        let mut file = opts
-            .open(&path)
-            .map_err(|error| open_error(Path::new(&name), error))?;
-        file.write_all(bytes)?;
-        file.sync_data()?;
-        if exclusive {
-            sync_dir(&proc_dir(dir))?;
-        }
-        Ok(())
+    let mut file =
+        cap_open(dir, Path::new(&name), &opts).map_err(|error| map_child_error(&name, error))?;
+    file.write_all(bytes)?;
+    file.sync_data()?;
+    if exclusive {
+        dir.sync_all()?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -575,7 +543,14 @@ fn ensure_dest_dir(dest: &Path) -> Result<File> {
                     fs::create_dir_all(parent)?;
                 }
             }
-            fs::create_dir(dest).map_err(|error| open_error(dest, error))?;
+            fs::create_dir(dest).map_err(|error| {
+                map_child_error(
+                    dest.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("dest"),
+                    error,
+                )
+            })?;
             open_plain_dir(dest)
         }
         Err(error) => Err(error.into()),
@@ -1051,21 +1026,13 @@ pub fn lsm_directory_is_locked(data_dir: &Path) -> bool {
         let Ok(lsm) = open_child(&shard, "lsm", true) else {
             continue;
         };
-        #[cfg(target_os = "linux")]
-        {
-            let lock_path = proc_dir(&lsm).join("LOCK");
-            let mut options = OpenOptions::new();
-            options.read(true).write(true).custom_flags(O_NOFOLLOW);
-            let Ok(file) = options.open(&lock_path) else {
-                continue;
-            };
-            if file.try_lock().is_err() {
-                return true;
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = lsm;
+        let mut options = CapOptions::new();
+        options.read(true).write(true).follow(FollowSymlinks::No);
+        let Ok(file) = cap_open(&lsm, Path::new("LOCK"), &options) else {
+            continue;
+        };
+        if file.try_lock().is_err() {
+            return true;
         }
     }
     false
@@ -1784,18 +1751,17 @@ struct CheckpointScratchGuard {
 }
 
 fn lock_checkpoint_scratch(data_dir: &Path, shard_id: ShardId) -> Result<CheckpointScratchGuard> {
-    let mut options = OpenOptions::new();
-    options.create(true).read(true).write(true).truncate(false);
-    #[cfg(target_os = "linux")]
-    options.custom_flags(O_NOFOLLOW);
-    let file = options
-        .open(data_dir.join(checkpoint_scratch_lock_name(shard_id)))
-        .map_err(|error| {
-            open_error(
-                &data_dir.join(checkpoint_scratch_lock_name(shard_id)),
-                error,
-            )
-        })?;
+    let dir = open_plain_dir(data_dir)?;
+    let name = checkpoint_scratch_lock_name(shard_id);
+    let mut options = CapOptions::new();
+    options
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .follow(FollowSymlinks::No);
+    let file = cap_open(&dir, Path::new(&name), &options)
+        .map_err(|error| map_child_error(&name, error))?;
     file.lock().map_err(|error| {
         backup_error(format!(
             "checkpoint scratch lock for shard {shard_id}: {error}"
@@ -2344,15 +2310,28 @@ fn sync_plain_dir(dir: &File) -> Result<()> {
             )));
         }
     }
-    #[cfg(target_os = "linux")]
-    {
-        sync_dir(&proc_dir(dir))?;
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = dir;
-    }
+    dir.sync_all()?;
     Ok(())
+}
+
+pub(crate) fn same_opened_file(opened: &std::fs::Metadata, named: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        opened.dev() == named.dev() && opened.ino() == named.ino()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        opened.file_index().is_some()
+            && opened.volume_serial_number() == named.volume_serial_number()
+            && opened.file_index() == named.file_index()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (opened, named);
+        false
+    }
 }
 
 fn remove_plain_dir(path: &Path) -> Result<()> {
@@ -2367,55 +2346,58 @@ fn remove_plain_dir(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     }
-    #[cfg(target_os = "linux")]
-    {
-        let dir = open_plain_dir(path)?;
-        remove_dir_fd(&dir)?;
-        match fs::symlink_metadata(path) {
-            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+    let dir = open_plain_dir(path)?;
+    remove_dir_fd(&dir)?;
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(backup_error(format!(
+                "refusing to delete {}",
+                path.display()
+            )));
+        }
+        Ok(meta) => {
+            let opened = dir.metadata()?;
+            if !same_opened_file(&opened, &meta) {
                 return Err(backup_error(format!(
                     "refusing to delete {}",
                     path.display()
                 )));
             }
-            Ok(meta) => {
-                use std::os::unix::fs::MetadataExt;
-                let opened = dir.metadata()?;
-                if meta.dev() != opened.dev() || meta.ino() != opened.ino() {
-                    return Err(backup_error(format!(
-                        "refusing to delete {}",
-                        path.display()
-                    )));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
         }
-        // `rmdir` is by name. A different empty directory that replaces this
-        // path after the inode check can still be removed. There is no
-        // std rmdir-by-inode. The children deleted above are the inode that
-        // was opened, not that replacement.
-        fs::remove_dir(path)?;
-        return Ok(());
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        fs::remove_dir_all(path)?;
-        Ok(())
-    }
+    // Removal is by name. A different empty directory that replaces this
+    // path after the identity check can still be removed. The children
+    // deleted above belong to the directory that was opened.
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(backup_error(format!(
+            "refusing to delete {}",
+            path.display()
+        )));
+    };
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => std::env::current_dir()?,
+    };
+    let parent = File::open(parent)?;
+    cap_remove_dir(&parent, Path::new(name)).map_err(|error| map_child_error(name, error))?;
+    Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn remove_dir_fd(dir: &File) -> Result<()> {
     for entry in list_plain_dir(dir)? {
-        let child = proc_dir(dir).join(&entry.name);
         match entry.kind {
             EntryKind::Dir => {
                 let nested = open_child(dir, &entry.name, true)?;
                 remove_dir_fd(&nested)?;
-                fs::remove_dir(child)?;
+                cap_remove_dir(dir, Path::new(&entry.name))
+                    .map_err(|error| map_child_error(&entry.name, error))?;
             }
-            EntryKind::File => fs::remove_file(child)?,
+            EntryKind::File => {
+                cap_remove_file(dir, Path::new(&entry.name))
+                    .map_err(|error| map_child_error(&entry.name, error))?;
+            }
             EntryKind::Other => {
                 return Err(backup_error(format!(
                     "refusing to delete special file {}",

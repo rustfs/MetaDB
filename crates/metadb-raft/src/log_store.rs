@@ -647,7 +647,6 @@ impl LogStoreInner {
         Self::inspect_loaded(hard_state, seg_bytes)
     }
 
-    #[cfg(target_os = "linux")]
     fn inspect_fd(dir: &File) -> io::Result<RaftLogInspection> {
         let listing =
             crate::backup::list_plain_dir(dir).map_err(|error| io_backup(error.to_string()))?;
@@ -683,17 +682,7 @@ impl LogStoreInner {
     }
 
     pub(crate) fn inspect_copied_dir(dir: &File) -> io::Result<RaftLogInspection> {
-        #[cfg(target_os = "linux")]
-        {
-            Self::inspect_fd(dir)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = dir;
-            Err(io_backup(
-                "symlink-safe raft inspection is supported on Linux only",
-            ))
-        }
+        Self::inspect_fd(dir)
     }
 
     pub(crate) fn purged_index_from_hard_state_bytes(raw: &[u8]) -> io::Result<u64> {
@@ -897,26 +886,14 @@ impl SegmentedRaftLogStore {
     }
 
     pub fn copy_durable_log(&self, source: &File, dest: &File) -> io::Result<RaftLogInspection> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (source, dest);
-            return Err(io_backup(
-                "symlink-safe live raft copy is supported on Linux only",
-            ));
-        }
-        #[cfg(target_os = "linux")]
-        {
-            self.copy_durable_log_anchored(source, dest)
-        }
+        self.copy_durable_log_anchored(source, dest)
     }
 
-    #[cfg(target_os = "linux")]
     fn copy_durable_log_anchored(
         &self,
         source: &File,
         dest: &File,
     ) -> io::Result<RaftLogInspection> {
-        use std::os::unix::fs::MetadataExt;
         let guard = self.inner.lock().unwrap();
         if let Some(active) = guard.active_file.as_ref() {
             active.sync_data()?;
@@ -928,7 +905,7 @@ impl SegmentedRaftLogStore {
             ));
         }
         let opened = source.metadata()?;
-        if opened.dev() != live.dev() || opened.ino() != live.ino() {
+        if !crate::backup::same_opened_file(&opened, &live) {
             return Err(io_backup(
                 "live raft copy was not anchored at the log's raft directory",
             ));
