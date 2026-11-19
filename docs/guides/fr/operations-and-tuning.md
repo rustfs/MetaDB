@@ -31,7 +31,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 bench --workload hotspot-create --concurren
 
 ## 2. Gestion des Répertoires Géants (Jumbo Shards & Dual-Mode)
 
-1. **Isolation automatique sur nœud dédié (`JumboIsolated`)** : Lorsqu'un unique `PID` représente `>80 %` d'un shard dépassant le seuil de découpage, `CellLocalManager` évacue les autres shards du serveur BE afin de lui réserver 100 % des IOPS NVMe et du CPU.
+1. **`JumboIsolated` route flag**: When one parent owns more than 85% of the shard's `MetaTable` bytes, or the shard has a single parent, `JumboIsolationPlanner` writes `dedicated_node` from nodes already registered in this cell. It does not migrate co-hosted peer shards onto another host. With one node, the flag names this process.
 2. **Découpage fin `DualModeFineGrained` `(PID, name)`** : Si ce répertoire dépasse la capacité d'un serveur dédié, l'activation du mode `DualModeFineGrained` découpe la plage `(PID, name)` tout en maintenant un compteur local `[0x04] DirShardDelta` sur chaque sous-shard : `create_file` et `unlink` restent en `1 RTT` sans verrouillage inter-shards, tandis que `dirstat` effectue une collecte parallèle en `1` saut réseau.
 
 ---

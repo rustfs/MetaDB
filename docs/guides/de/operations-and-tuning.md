@@ -31,7 +31,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 bench --workload hotspot-create --concurren
 
 ## 2. Umgang mit Jumbo Shards & Dual-Mode-Splitting
 
-1. **Automatische Knoten-Isolierung (`JumboIsolated`)**: Macht ein einzelnes Verzeichnis (`PID`) mehr als `80 %` eines übergroßen Shards aus, verschiebt der `CellLocalManager` benachbarte Shards auf andere Knoten, damit das Jumbo-Verzeichnis die gesamte NVMe- und CPU-Kapazität eines dedizierten Hosts erhält.
+1. **`JumboIsolated` route flag**: When one parent owns more than 85% of the shard's `MetaTable` bytes, or the shard has a single parent, `JumboIsolationPlanner` writes `dedicated_node` from nodes already registered in this cell. It does not migrate co-hosted peer shards onto another host. With one node, the flag names this process.
 2. **Feingranulares `DualModeFineGrained`-Splitting `(PID, name)`**: Überschreitet ein Verzeichnis selbst einen dedizierten Host, teilt `DualModeFineGrained` den Bereich entlang `(PID, name)` auf. Dank lokaler `[0x04] DirShardDelta`-Einträge bleiben `create_file` und `unlink` sperrfreie `1-RTT`-Einzel-Shard-Operationen, während `dirstat` per `1-Hop`-Scatter-Gather exakt zusammengeführt wird.
 
 ---

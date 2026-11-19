@@ -2,7 +2,7 @@
 
 * **ガイド目次へ戻る**: [日本語概要](./README.md) | [ハブ](../../README.md)
 
-MetaDB はシングルノード構成から 1,000 台超の分散クラスターまで **完全に同一の WAL レス LSM エンジンと OpenRaft ステートマシン** を実行し、データ移行なしで段階的にスケールアウトできます。
+The current binary runs a persistent deployment only as `all-in-one`. A second `all-in-one` process can join the same cell. Role-split processes and the multi-cell topology are a design target, not a deployment this repository runs. The `100B`–`10T+` range is a design model, not a measurement of this repository. Trillion-scale figures in `arXiv:2610.32247v1` are Baidu production metrics, not results of this repository.
 
 ---
 
@@ -48,22 +48,29 @@ metadbd --config /etc/metadb/standalone.toml
 
 ---
 
-## Stage 3：`3-Voter` Multi-Raft および Multi-Cell 分散クラスターへの無停止拡張 `[実装済]`
+## Stage 3: Intended multi-cell topology (not deployable today)
 
-### 3.1 `1-Voter` から `3-Voter` への無停止レプリカ昇格
+Stage 3 is a design target. The current binary does not deploy it.
 
-```bash
-# 新規 BE ノード 2 台を起動
-metadbd --role be --node-id 2 --listen 10.0.1.12:7800 --cell-manager 10.0.1.11:7800 --data-dir /var/lib/metadb
-metadbd --role be --node-id 3 --listen 10.0.1.13:7800 --cell-manager 10.0.1.11:7800 --data-dir /var/lib/metadb
+`metadbd` only runs `--role all-in-one`. `PersistentMetaDbCluster::open_and_serve` in `crates/metadb-server/src/lib.rs` rejects `be`, `proxy`, `cell-manager`, and `global-manager` before it listens. `RegisterCell` in `crates/metadb-server/src/grpc_services.rs` returns an application error and does not store a second cell. This tree has no live multi-process multi-Cell deployment.
 
-# Learner 追加 -> SSTable スナップショット転送 -> Joint Consensus による Voter 昇格
-metadb-ctl raft scale-replicas --cell-id 1 --target-voters 3
-```
+A second `metadbd --role all-in-one` can join the **same** cell when `--join` or `--cell-manager` names the current leader and the data directory is fresh. That path is covered by `crates/metadb-server/tests/join_existing_group.rs`. The joiner is still an all-in-one process. It is not a role-trimmed backend, and the join does not create another cell. See [Operations](../../ja/operations.md).
 
-### 3.2 Multi-Cell 2 階層コントロールプレーン構成（1,000 億〜10 兆+ レコード）
+### Step 3.1: Voters inside one cell
 
-* **`global-manager`**：キー範囲と `CellId` の対応表（`<1,000` エントリ）および `65,536` 単位のグローバル ID ブロック割当てを管理。
-* **`cell-manager`**：各 Cell 内のシャードハートビート（Cell あたり `20K–50K` シャード）、`PID` 分割、Jumbo 専用ノード分離を制御。
-* **`be`**：Multi-Raft グループ、`MemMvccStore`、`LsmStorageBackend`、`PushdownExecutor` を実行。
-* **`proxy`**：`MetaCache` による 1 ホップルーティング、20 種類の SQL テンプレートコンパイル、クロスシャード 2PC を担当。
+Do not start `metadbd --role be`. That role exits in `open_and_serve`, so those commands are not a runbook. `metadb-ctl raft scale-replicas` calls `ScaleShardReplicas` and requires the requested voter count to already be registered in the cell. A fresh all-in-one cell has one node, so `--target-voters 3` fails until those nodes exist. The constraints are in [Operations](../../ja/operations.md).
+
+### Step 3.2: Design model for a disaggregated topology (`100B – 10T+` records)
+
+`100B – 10T+` is a design-model range: arithmetic for how a future multi-cell topology might be sized. It is not a record count this repository has stored. It is also not a Baidu production figure claimed as a result of `rustfs/MetaDB`. Baidu's published sizes, including the BOS2 figure of 1.848 trillion records in `arXiv:2610.32247v1`, are Baidu production metrics, not results of this repository.
+
+The table is the intended role split. This binary does not run those roles. Jumbo isolation in this tree is a route flag. It does not move peer shards onto a dedicated host.
+
+| Role | Design `--role` | Intended responsibility |
+| :--- | :--- | :--- |
+| **Global Manager** | `global-manager` | Would map coarse `[start_key, end_key)` intervals to `CellId`, allocate `65,536`-ID blocks, and coordinate cross-Cell directory rename leases. |
+| **Cell Local Manager** | `cell-manager` | Would process BE heartbeats (`20K–50K` shards/Cell) and orchestrate `PID` splits and membership changes. |
+| **Backend Storage (`BE`)** | `be` | Would host Multi-Raft shard groups and the LSM engine on NVMe hosts. |
+| **Stateless Proxy** | `proxy` | Would embed `MetaCache`, compile the 20 SQL templates, and coordinate cross-shard 2PC. |
+
+`metadb-ctl cell register` calls `RegisterCell` and exits non-zero. It does not register a cell. Do not use it as a federation step.

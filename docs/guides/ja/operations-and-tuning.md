@@ -31,7 +31,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 bench --workload hotspot-create --concurren
 
 ## 2. Jumbo Shard（巨大単一ディレクトリ）の運用設計
 
-1. **専用ノード自動分離 (`JumboIsolated`)**：単一 `PID` がシャード容量の `80%` 超を占める場合、`CellLocalManager` が他シャードを退避させ、1 台の NVMe ノードを該当ディレクトリ専用に割り当てます。
+1. **`JumboIsolated` route flag**: When one parent owns more than 85% of the shard's `MetaTable` bytes, or the shard has a single parent, `JumboIsolationPlanner` writes `dedicated_node` from nodes already registered in this cell. It does not migrate co-hosted peer shards onto another host. With one node, the flag names this process.
 2. **デュアルモード細粒度分割 (`DualModeFineGrained`)**：1 台の物理容量を超える場合のみ `(PID, name)` 境界での分割を有効化します。各サブシャードが `[0x04] DirShardDelta` を保持するため、`create_file` / `unlink` は `1-RTT` ロックフリーのまま動作し、`dirstat` は `1-hop` 並列集約で正確な値を返します。
 
 ---
