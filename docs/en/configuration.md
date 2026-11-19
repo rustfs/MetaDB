@@ -83,5 +83,5 @@ Unknown keys that do not name a secret or TLS setting remain a fail-open hole. `
 - Per-role subsystem trimming. The role field is an allow/deny switch, not a feature set.
 - A voter list in TOML. The first process bootstraps alone. A later all-in-one process joins with `[cluster] join = "host:port"` (or `--join` / `--cell-manager`) pointing at the current leader, and only when its data directory does not already own a cell. The leader must be reached directly; a follower does not forward the membership change. That join is the same cell, not a second cell. See [Operations](./operations.md).
 - A second cell's key range. `RegisterCell` returns an error and stores nothing.
-- Memtable byte limit, Raft timers, or locality-compaction on/off.
+- Raft timers or locality-compaction on/off.
 - Native TLS certificates. A TLS key in this file is rejected. Termination belongs in an external proxy.

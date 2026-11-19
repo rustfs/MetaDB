@@ -151,7 +151,7 @@ flowchart TB
    * Sealed `ImmMemTable`s wait until `min_active_snapshot_hlc >= imm.max_hlc`, then write **only** the collapsed latest value (`Put`) or a single unversioned physical LSM `Delete` tombstone to a generation-ordered (`flush_generation`) L0 SSTable—mathematically preventing phantom/future-read anomalies while eliminating persisted MVCC tombstones (`~60%` fewer KV writes).
 3. **Bottommost-Safe Locality-Aware Compaction (`LocalityCompactor`)**:
    * Tracks physical tombstone counts and tombstone-to-live ratios per 9-byte `[table_prefix][group_key: 8B]` spatial bucket.
-   * When a bucket crosses `tombstone_density_threshold` (e.g., consecutive TTL expirations), `LocalityCompactor` triggers a targeted range compaction over `[bucket, bucket + 1)` spanning all overlapping SSTables down to the bottommost level for that range—legally dropping physical tombstones without rewriting cold neighboring directories and keeping `listdir` P99 latency flat (`<4ms`).
+   * When a bucket crosses `tombstone_density_threshold` (e.g., consecutive TTL expirations), `LocalityCompactor` triggers a targeted range compaction over `[bucket, bucket + 1)` spanning all overlapping SSTables down to the bottommost level for that range—legally dropping physical tombstones without rewriting cold neighboring directories. A flat `listdir` P99 of `<4ms` is a paper/design target from `arXiv:2610.32247v1`, not a latency measured by this repository.
 
 ---
 
@@ -279,15 +279,17 @@ Detailed Zero-Decision subsystem blueprints are maintained under [`docs/designs/
 
 ## 12. Implementation Status Matrix (Paper vs. Repository)
 
-| Capability / Subsystem | Baidu Paper (`arXiv:2610.32247v1`) | Current Repository Status (Phases 0–6 Verified) | Crate / Binary |
+The paper column is a design claim, or a Baidu production figure, from `arXiv:2610.32247v1`. It is not a measurement from this repository. The repository column is what crate tests in this tree cover. Where a cell says multi-process unverified, this tree does not treat that behavior as delivered. A green crate test is not a first-launch pass.
+
+| Capability / Subsystem | Baidu paper design claim (`arXiv:2610.32247v1`) | Repository status (crate-tested / multi-process) | Crate / Binary |
 | :--- | :--- | :--- | :--- |
-| `(PID, "_attr_")` Colocation, `0x01..0x07` Codecs & `HLC` | Production (C++) | **Implemented & Tested** (88B CRC32C `InodeAttr`, 500ms drift & `u16` overflow guards) | `metadb-core` |
-| Protobuf v1 / `tonic` gRPC Wire Contracts | Production RPC | **Implemented & Tested** (`MetadataService`, `TransactionService`, `RaftTransportService`, `ControlPlaneService`) | `metadb-proto` |
-| Pure-Rust WAL-less Disk LSM (SSTable, Manifest, Bloom, Cache) | Production RocksDB (WAL off) | **Implemented & Tested** (`LsmStorageBackend`, 64B footer, `flush_generation`, 16-shard LRU `BlockCache`) | `metadb-storage` |
-| `SnapshotGuard` `ReadCut` MVCC & `LocalityCompactor` | Production (`5s` window) | **Implemented & Tested** (`ActiveSnapshotRegistry` Safe-Flush Gate + bottommost range compaction) | `metadb-storage` |
-| Multi-Raft Consensus (`1-Voter -> 3-Voter` + `ReadIndex`) | Production Baidu `braft` | **Implemented & Tested** (`openraft` 0.10 + segmented CRC32C `.raftlog` + 3-watermark purge + SSTable snapshots) | `metadb-raft` |
-| `1-RTT` Pushdown, Coordinated `AttrAgg` & `AuxOutbox` Spill | Production | **Implemented & Tested** (`TxStateMachineHandler`, `ViewAtRaftIndex`, `[0x07]` `task_ordinal` spill & `AckAuxTasks`) | `metadb-tx` |
-| Crash-Recoverable 2PC (`Rename`, Cross-Shard `Mkdir`/`Rmdir`) | Production 2PC | **Implemented & Tested** (Primary-Anchored `TxnRecord` + `WriteIntent`, POSIX overwrite, `DirRenameLease`) | `metadb-tx` |
-| Epoch-Fenced `PID` Split, Jumbo Isolation & `DualMode` | Production | **Implemented & Tested** (3-stage `ExecuteSplit`, `JumboIsolationPlanner`, `DualModeFineGrained` scatter-gather) | `metadb-cluster` |
-| Two-Tier Control Plane (`GlobalManager` + `CellLocalManager`) | Production (575+ nodes/cluster) | **Implemented & Tested** (`DurableGlobalManager`, `DurableCellManager`, `CompositeMetaCache`, `DurableIdAllocator`) | `metadb-cluster` |
-| 20 Parameterized SQL Templates + `metadbd` & `metadb-ctl` | Production (~20 SQL patterns) | **Implemented & Tested** (`SqlTemplateParser` 20 templates + `PersistentMetaDbCluster` + `metadbd` + `metadb-ctl`) | `metadb-proxy` / `metadb-server` |
+| `(PID, "_attr_")` Colocation, `0x01..0x07` Codecs & `HLC` | Design claim: production (C++) | **Crate-tested** (88B CRC32C `InodeAttr`, 500ms drift & `u16` overflow guards) | `metadb-core` |
+| Protobuf v1 / `tonic` gRPC Wire Contracts | Design claim: production RPC | **Crate-tested** (`MetadataService`, `TransactionService`, `RaftTransportService`, `ControlPlaneService`) | `metadb-proto` |
+| Pure-Rust WAL-less Disk LSM (SSTable, Manifest, Bloom, Cache) | Design claim: production RocksDB (WAL off) | **Crate-tested** (`LsmStorageBackend`, 64B footer, `flush_generation`, 16-shard LRU `BlockCache`) | `metadb-storage` |
+| `SnapshotGuard` `ReadCut` MVCC & `LocalityCompactor` | Design claim: production (`5s` window) | **Crate-tested** (`ActiveSnapshotRegistry` Safe-Flush Gate + bottommost range compaction) | `metadb-storage` |
+| Multi-Raft Consensus (`1-Voter -> 3-Voter` + `ReadIndex`) | Design claim: production Baidu `braft` | **Crate-tested** (`openraft` 0.10 + segmented CRC32C `.raftlog` + 3-watermark purge + SSTable snapshots). The `1-Voter -> 3-Voter` failover test runs inside one OS process. | `metadb-raft` |
+| `1-RTT` Pushdown, Coordinated `AttrAgg` & `AuxOutbox` Spill | Design claim: production | **Crate-tested** (`TxStateMachineHandler`, `ViewAtRaftIndex`, `[0x07]` `task_ordinal` spill & `AckAuxTasks`) | `metadb-tx` |
+| Crash-Recoverable 2PC (`Rename`, Cross-Shard `Mkdir`/`Rmdir`) | Design claim: production 2PC | **Crate-tested** (Primary-Anchored `TxnRecord` + `WriteIntent`, POSIX overwrite, `DirRenameLease`) | `metadb-tx` |
+| Epoch-Fenced `PID` Split, Jumbo Isolation & `DualMode` | Design claim: production | **Crate-tested** in-process `ExecuteSplit` and `DualModeFineGrained` scatter-gather. `JumboIsolationPlanner` writes a route flag and does not move shard directories. Dedicated-node evacuation is not delivered. Multi-process unverified. | `metadb-cluster` |
+| Two-Tier Control Plane (`GlobalManager` + `CellLocalManager`) | Design claim: Baidu production (575+ nodes/cluster). That node count is from `arXiv:2610.32247v1`, not a result of this repository. | **Crate-tested** inside one process (`DurableGlobalManager`, `DurableCellManager`, `CompositeMetaCache`, `DurableIdAllocator`). `RegisterCell` returns an error and does not store a second Cell. Role-split processes are not delivered. Multi-process unverified. | `metadb-cluster` |
+| 20 Parameterized SQL Templates + `metadbd` & `metadb-ctl` | Design claim: production (~20 SQL patterns) | **Crate-tested** (`SqlTemplateParser` 20 templates + `PersistentMetaDbCluster` + `metadbd` + `metadb-ctl`, role `all-in-one` only). Role-split processes are not delivered. | `metadb-proxy` / `metadb-server` |

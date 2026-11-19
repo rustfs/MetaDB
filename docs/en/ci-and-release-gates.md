@@ -2,15 +2,15 @@
 
 [Overview](./README.md)
 
-This page describes the gates that exist in this tree today. A green GitHub Actions run is not production readiness, and it is not evidence that the official million-operation load passed.
+This page describes the gates checked into this tree. Enabling or disabling workflows is an operator action outside this pull request. A green run of these jobs is not a first-launch pass, is not production readiness, and is not evidence that the official million-operation load passed.
 
 ## Current CI
 
-[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) is the test and package workflow. It runs on pull requests to `main`, on pushes to every branch, and on tags that start with `v`.
+[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) is the test and package workflow file. Its triggers are pull requests to `main`, pushes to every branch, and tags that start with `v`.
 
 ### Format, Clippy, and tests
 
-Job `rust-check-lint-test` runs on `ubuntu-24.04` with a **45-minute** timeout. In order, it:
+Job `rust-check-lint-test` is configured for `ubuntu-24.04` with `timeout-minutes: 90` (a **90-minute** timeout). In order, it:
 
 1. Rejects `#[ignore]` tests that have an empty reason (`python3 .github/scripts/reject-bare-ignore.py --self-test crates`).
 2. Installs `protobuf-compiler`.
@@ -30,7 +30,7 @@ No separate CI job was added for those tests. They run because the existing lock
 
 ### Packaging
 
-Job `package` also has a **45-minute** timeout. It runs on pull requests, on pushes to `main`, and on `v*` tags. The matrix builds release binaries with `cargo build --release --locked -p metadb-server --bins` for:
+Job `package` still has `timeout-minutes: 45` (a **45-minute** timeout). Its triggers are pull requests, pushes to `main`, and `v*` tags. The matrix builds release binaries with `cargo build --release --locked -p metadb-server --bins` for:
 
 - `x86_64-unknown-linux-gnu` on `ubuntu-24.04`
 - `aarch64-unknown-linux-gnu` on `ubuntu-24.04-arm`
@@ -57,7 +57,7 @@ That restart is same-machine and in-process. It does **not** replace three-VM sc
 
 ## Dependency audit workflow
 
-[`.github/workflows/dependency-audit.yml`](../../.github/workflows/dependency-audit.yml) is a separate workflow. It runs on `pull_request` and `push`. It installs `cargo-audit` 0.23.0 and `cargo-deny` 0.21.0, then runs both against this workspace. `cargo audit -D unmaintained -D unsound -D yanked` fails the job on a vulnerability or on an unmaintained, unsound, or yanked advisory. `cargo deny --locked check` still runs when that audit step has already failed, so a license, ban, or source finding is not hidden. The job stays failed if either command fails. `cargo deny` fails on a vulnerability advisory, on an unmaintained advisory anywhere in the graph, on an unsound advisory in a workspace crate, on a license outside the allow list, or on an unknown registry or git source. Yanked crates and duplicate crate versions are warnings in `cargo deny` and do not by themselves fail that command.
+[`.github/workflows/dependency-audit.yml`](../../.github/workflows/dependency-audit.yml) is a separate workflow file. Its triggers are `pull_request` and `push`. It installs `cargo-audit` 0.23.0 and `cargo-deny` 0.21.0, then runs both against this workspace. `cargo audit -D unmaintained -D unsound -D yanked` fails the job on a vulnerability or on an unmaintained, unsound, or yanked advisory. `cargo deny --locked check` still runs when that audit step has already failed, so a license, ban, or source finding is not hidden. The job stays failed if either command fails. `cargo deny` fails on a vulnerability advisory, on an unmaintained advisory anywhere in the graph, on an unsound advisory in a workspace crate, on a license outside the allow list, or on an unknown registry or git source. Yanked crates and duplicate crate versions are warnings in `cargo deny` and do not by themselves fail that command.
 
 This is an **initial reporting job**. It is not a production-grade supply-chain program. It does not review transitive maintainers, pin a private advisory mirror, attest build provenance, or change who can merge. A green audit job is not proof that the tree is production ready, and a green `ci.yml` run is not that proof either. A red audit job means the tools reported a finding; it does not by itself say the workspace tests failed.
 
