@@ -15,7 +15,7 @@
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | する。バインドアドレス |
 | `node.metrics_listen_addr` | 未設定 | 設定されたときだけする。別の TCP リスナー。ループバック以外は空でないシークレットが必要 |
 | `clock.max_clock_drift_ms` | `500` | する。`HybridLogicalClock::with_max_drift_ms` |
-| `storage.memtable_size_bytes` | `33554432`（32 MiB） | **しない。** フィールドは保持されるが読まれない |
+| `storage.memtable_size_bytes` | `33554432` (32 MiB) | Yes. Seals and flushes the active memtable once its accounted bytes reach this size. Values below 1 are treated as 1 |
 | `storage.block_cache_bytes` | `67108864`（64 MiB） | する。16 分割ブロックキャッシュの合計予算 |
 | `storage.mvcc_retention_ms` | `5000` | する |
 | `storage.bloom_bits_per_key` | `10` | する |
@@ -31,7 +31,7 @@
 
 ## 例
 
-このファイルは、明示的なデータディレクトリ、メトリクスポート、シークレット以外は既定値です。`memtable_size_bytes` は、コピーした設定が驚かないように書いてあります。変えてもフラッシュの挙動は変わりません。
+This file matches the defaults except for an explicit data directory, a metrics port, and a secret. `memtable_size_bytes` is the active memtable flush threshold. `max_imm_memtables` is the immutable-table backpressure cap.
 
 ```toml
 [node]

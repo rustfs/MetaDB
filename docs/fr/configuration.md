@@ -15,7 +15,7 @@
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | Oui. Adresse de liaison |
 | `node.metrics_listen_addr` | non défini | Oui, seulement s'il est défini. Écouteur TCP séparé. Une adresse non locale exige un secret non vide |
 | `clock.max_clock_drift_ms` | `500` | Oui. `HybridLogicalClock::with_max_drift_ms` |
-| `storage.memtable_size_bytes` | `33554432` (32 Mio) | **Non.** Le champ est stocké et jamais lu |
+| `storage.memtable_size_bytes` | `33554432` (32 MiB) | Yes. Seals and flushes the active memtable once its accounted bytes reach this size. Values below 1 are treated as 1 |
 | `storage.block_cache_bytes` | `67108864` (64 Mio) | Oui. Budget total du cache de blocs à 16 voies |
 | `storage.mvcc_retention_ms` | `5000` | Oui |
 | `storage.bloom_bits_per_key` | `10` | Oui |
@@ -31,7 +31,7 @@ Il n'y a pas de table `[raft]`. `ServerTomlConfig.raft_options` est ignoré par 
 
 ## Exemple
 
-Ce fichier correspond aux valeurs par défaut, sauf un répertoire de données explicite, un port de métriques et un secret. `memtable_size_bytes` est montré pour qu'une configuration copiée ne surprenne pas ; le modifier ne change pas le comportement de vidage.
+This file matches the defaults except for an explicit data directory, a metrics port, and a secret. `memtable_size_bytes` is the active memtable flush threshold. `max_imm_memtables` is the immutable-table backpressure cap.
 
 ```toml
 [node]

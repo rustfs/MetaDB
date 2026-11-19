@@ -82,7 +82,7 @@
 
 MVCC の版は `storage.mvcc_retention_ms`（既定 5,000）のあいだメモリに留まります。協調フラッシュは memtable を封印し、属性集約フックを実行し、L0 SSTable を書きます。ユーザ KV 用の別 WAL はありません。クラッシュ回復は Raft ログと LSM マニフェストです。`LocalityCompactor` は 9 バイト接頭辞のバケットごとにトゥームストーンを追い、`locality_tombstone_threshold` と `locality_tombstone_ratio` の両方を超えたときにホットな削除範囲をコンパクトします。`ServerTomlConfig::to_lsm_config` は `auto_locality_compaction` を常に `true` にします。TOML では消せません。
 
-`storage.memtable_size_bytes` はデシリアライズされますが読まれません。フラッシュサイズはこの項目から取りません。
+`storage.memtable_size_bytes` is the active memtable flush threshold. `storage.max_imm_memtables` (default 4) is the immutable-table backpressure cap: a writer waits until an immutable table flushes instead of queueing another one.
 
 ## Raft
 

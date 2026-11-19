@@ -137,7 +137,7 @@ Die Varianten sind in `crates/metadb-core/src/error.rs` definiert. gRPC-Methoden
 - Jumbo-Isolation ist ein Routenflag plus eine Knotenkennung aus der lokalen Knotentabelle. Sie verdrängt andere Shards nicht von einer Platte.
 - Heartbeats sind ein RPC ohne Sender in `metadbd`. `StoreHeartbeat` speichert nicht dauerhaft.
 - Ein nicht leeres gemeinsames Geheimnis authentifiziert Raft, die drei anderen gRPC-Dienste und den Metrik-Listener mit demselben Bearer. Ein leeres Geheimnis wird nur für Loopback-Binds akzeptiert und lässt diese Listener unauthentifiziert. Ein Wildcard-Bind mit leerem Geheimnis verweigert den Start. Der Prozess beendet TLS nicht.
-- `memtable_size_bytes` und alle Raft-Zeitgeberfelder ändern das Laufzeitverhalten über TOML nicht.
+- `memtable_size_bytes` seals and flushes the active memtable. `max_imm_memtables` caps queued immutable tables. Raft timer fields do not change runtime behavior through TOML.
 - `metadb-ctl bench` für `hotspot-create` und `bulk-ttl-delete` druckt JSON-Zeilen: einen Kopf mit `bench_pid`, dann Phasenberichte mit attempted, succeeded, failed und Latenzperzentilen. Der Prozess endet mit einem Fehler, wenn nicht jede angeforderte Operation gelingt. `--workload mixed` oder `--embedded` startet den prozessinternen Stress-Harness. `sql` druckt die Antwort als JSON und endet bei einem Anwendungsfehler mit einem Fehlerstatus.
 
 ## Dokumentationslücken

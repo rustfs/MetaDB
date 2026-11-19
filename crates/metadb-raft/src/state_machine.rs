@@ -239,6 +239,9 @@ struct StateMachineShared {
     last_applied_hlc: RwLock<HlcTimestamp>,
     last_membership: RwLock<StoredMembershipOf<MetaDbTypeConfig>>,
     frontier_tx: watch::Sender<AppliedFrontier>,
+    /// Set when a required snapshot cannot be rebuilt. Cluster status must not
+    /// keep reporting this process as a live voter after RaftCore has failed.
+    unrecoverable: Mutex<Option<String>>,
 }
 
 impl StateMachineShared {
@@ -425,23 +428,45 @@ impl StateMachineShared {
         })
     }
 
+    fn clear_unrecoverable(&self) {
+        *self.unrecoverable.lock().unwrap() = None;
+    }
+
+    fn fail_unrecoverable<T>(&self, reason: impl Into<String>) -> io::Result<T> {
+        let reason = reason.into();
+        *self.unrecoverable.lock().unwrap() = Some(reason.clone());
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("snapshot unrecoverable: {reason}"),
+        ))
+    }
+
+    /// True when this process has published a snapshot that is no longer a complete directory.
+    fn published_snapshot_missing(&self) -> bool {
+        let index = self.watermarks.snapshot_values().2;
+        if index == 0 {
+            return false;
+        }
+        let dir = self
+            .shard_dir
+            .join(format!("raft/snapshots/snap_{index:020}"));
+        !snapshot_dir_is_complete(&dir)
+    }
+
     fn load_current_snapshot_sync(
         &self,
     ) -> io::Result<Option<SnapshotOf<MetaDbTypeConfig, SnapshotArchive>>> {
         let snaps_root = self.shard_dir.join("raft/snapshots");
+        let candidates = snapshot_candidates(&snaps_root);
         // A missing file used to return `NotFound`. OpenRaft maps that to
         // `StorageError { subject: Snapshot(None), verb: Read }` and stops RaftCore,
-        // after which every later read repeats the same error. Skip a broken
-        // directory and use the newest complete snapshot instead, including the
-        // `.bak` copy left by an in-progress replace.
-        for (_, snap_dir) in snapshot_candidates(&snaps_root) {
-            match load_snapshot_dir(&snap_dir) {
-                Ok(snapshot) => return Ok(Some(snapshot)),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    tracing::warn!(
-                        path = %snap_dir.display(),
-                        "skipping raft snapshot directory with a missing file"
-                    );
+        // while the process kept answering cluster status from cached membership.
+        // Skip a broken directory, including a `.bak` left by an in-progress replace.
+        for (_, snap_dir) in &candidates {
+            match load_snapshot_dir(snap_dir) {
+                Ok(snapshot) => {
+                    self.clear_unrecoverable();
+                    return Ok(Some(snapshot));
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -452,7 +477,51 @@ impl StateMachineShared {
                 }
             }
         }
-        Ok(None)
+
+        let applied = self
+            .last_applied_log_id
+            .read()
+            .unwrap()
+            .map(|id| id.index)
+            .unwrap_or(0);
+        let flushed = self
+            .current_engine()
+            .durable_checkpoint()
+            .flushed_raft_index;
+        let raft_dir = self.shard_dir.join("raft");
+        let purged = crate::log_store::read_persisted_purged_index(&raft_dir).unwrap_or(0);
+        let snapshot_required =
+            purged > 0 || self.watermarks.snapshot_values().2 > 0 || !candidates.is_empty();
+        // The segmented raft log is the WAL until it is purged. Before that,
+        // a missing snapshot file is not fatal: restart replays the log.
+        if !snapshot_required {
+            self.clear_unrecoverable();
+            return Ok(None);
+        }
+
+        // After purge, the LSM is the only remaining copy. Rewrite the snapshot
+        // from it before returning, so a live process does not keep serving
+        // with the snapshot file gone.
+        match self.build_snapshot_sync() {
+            Ok(snapshot) => {
+                let covered = snapshot
+                    .meta
+                    .last_log_id
+                    .as_ref()
+                    .map(|id| id.index)
+                    .unwrap_or(0);
+                if purged > covered {
+                    return self.fail_unrecoverable(format!(
+                        "rebuilt snapshot index {covered} does not cover purged raft log {purged}. The segmented raft log is the WAL only until it is purged. A missing snapshot is rebuilt from the LSM. If that LSM is also missing, committed data is not reconstructed"
+                    ));
+                }
+                self.clear_unrecoverable();
+                Ok(Some(snapshot))
+            }
+            Err(error) => self.fail_unrecoverable(format!(
+                "cannot rebuild a missing snapshot from the LSM ({error}). purged log index is {purged}, flushed LSM index is {flushed}, applied index is {applied}. The segmented raft log is the WAL only until it is purged. If the log and the LSM are both gone, committed data is not reconstructed"
+            )),
+        }
     }
 }
 
@@ -758,6 +827,7 @@ impl ShardStateMachine {
             last_applied_hlc: RwLock::new(cp.flushed_max_hlc),
             last_membership: RwLock::new(initial_membership),
             frontier_tx,
+            unrecoverable: Mutex::new(None),
         });
 
         Ok((Self { shared }, frontier_rx))
@@ -765,6 +835,16 @@ impl ShardStateMachine {
 
     pub fn engine(&self) -> Arc<LifecycleStorageEngine> {
         self.shared.current_engine()
+    }
+
+    /// Reason this process must not be advertised as a live voter.
+    pub fn storage_unrecoverable(&self) -> Option<String> {
+        self.shared.unrecoverable.lock().unwrap().clone()
+    }
+
+    /// The snapshot index already published in memory has no complete directory.
+    pub fn published_snapshot_missing(&self) -> bool {
+        self.shared.published_snapshot_missing()
     }
 
     pub fn handler(&self) -> &Arc<dyn ShardApplyHandler> {

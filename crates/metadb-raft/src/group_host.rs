@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use openraft::async_runtime::watch::WatchReceiver;
 use openraft::errors::RaftError;
+use openraft::storage::RaftStateMachine;
 use openraft::{BasicNode, Config};
 use serde::{Deserialize, Serialize};
 
@@ -358,6 +359,33 @@ impl ShardRaftGroup {
         &self.state_machine
     }
 
+    /// `Some` when this process must not be reported as a live voter.
+    pub fn storage_unrecoverable(&self) -> Option<String> {
+        self.state_machine.storage_unrecoverable()
+    }
+
+    /// Rewrite a published snapshot that disappeared, or refuse to serve.
+    ///
+    /// A missing in-use snapshot used to stop RaftCore while cluster status
+    /// still answered from the cached voter set. Repair from the LSM when it
+    /// can cover the purged log. Otherwise leave an explicit unrecoverable
+    /// error so status and later reads do not pretend the voter is healthy.
+    pub async fn repair_published_snapshot(&self) -> Result<()> {
+        if let Some(reason) = self.storage_unrecoverable() {
+            return Err(MetaDbError::StorageIoError(format!(
+                "snapshot unrecoverable: {reason}"
+            )));
+        }
+        if !self.state_machine.published_snapshot_missing() {
+            return Ok(());
+        }
+        let mut state_machine = self.state_machine.clone();
+        match state_machine.get_current_snapshot().await {
+            Ok(_) => Ok(()),
+            Err(error) => Err(MetaDbError::StorageIoError(error.to_string())),
+        }
+    }
+
     pub fn engine(&self) -> Arc<LifecycleStorageEngine> {
         self.state_machine.engine()
     }
@@ -527,6 +555,7 @@ impl ShardRaftGroup {
         payload: Vec<u8>,
         deadline: tokio::time::Instant,
     ) -> Result<MetaDbRaftResponse> {
+        self.repair_published_snapshot().await?;
         {
             let mut hook = self.testing_not_leader.lock().unwrap();
             if hook.0 > 0 {
@@ -703,6 +732,7 @@ impl ShardRaftGroup {
         &self,
         expected_epoch: ShardEpoch,
     ) -> Result<(ReadToken, SnapshotGuard)> {
+        self.repair_published_snapshot().await?;
         self.read_batcher
             .acquire_linearizable_guard(expected_epoch, &self.state_machine)
             .await
@@ -718,6 +748,7 @@ impl ShardRaftGroup {
         expected_epoch: ShardEpoch,
         barrier_hlc: HlcTimestamp,
     ) -> Result<(ReadToken, SnapshotGuard)> {
+        self.repair_published_snapshot().await?;
         let _ = self.clock.update_checked(barrier_hlc)?;
         let token = self.read_batcher.linearizable_token(expected_epoch).await?;
         let snap = self.state_machine.acquire_snapshot(

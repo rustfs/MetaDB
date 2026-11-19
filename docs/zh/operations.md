@@ -137,7 +137,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 - 巨型隔离是路由标志加上从本地节点表选出的节点标识。它不会把其他分片从磁盘上赶走。
 - 心跳是一个 RPC，`metadbd` 里没有发送方。`StoreHeartbeat` 不持久化。
 - 非空共享密钥用同一个持有者令牌认证 Raft、另外三个 gRPC 服务和指标监听器。空密钥只接受环回绑定，这些监听器不认证。通配绑定加上空密钥会拒绝启动。进程不终结 TLS。
-- `memtable_size_bytes` 和所有 Raft 计时字段不会通过 TOML 改变运行行为。
+- `memtable_size_bytes` seals and flushes the active memtable. `max_imm_memtables` caps queued immutable tables. Raft timer fields do not change runtime behavior through TOML.
 - `hotspot-create` 和 `bulk-ttl-delete` 的 `metadb-ctl bench` 打印 JSON 行：先是带 `bench_pid` 的头，然后是包含 attempted、succeeded、failed 和延迟分位数的阶段报告。只要有一次请求的操作失败，进程就以非零状态退出。`--workload mixed` 或 `--embedded` 运行进程内的压力工具。`sql` 把响应打印成 JSON，遇到应用错误时以非零状态退出。
 
 ## 文档缺口

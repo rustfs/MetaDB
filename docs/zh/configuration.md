@@ -15,7 +15,7 @@
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | 是。绑定地址 |
 | `node.metrics_listen_addr` | 未设置 | 仅在设置时应用。单独的 TCP 监听器。非环回地址要求非空密钥 |
 | `clock.max_clock_drift_ms` | `500` | 是。`HybridLogicalClock::with_max_drift_ms` |
-| `storage.memtable_size_bytes` | `33554432`（32 MiB） | **否。** 字段被保存，从不读取 |
+| `storage.memtable_size_bytes` | `33554432` (32 MiB) | Yes. Seals and flushes the active memtable once its accounted bytes reach this size. Values below 1 are treated as 1 |
 | `storage.block_cache_bytes` | `67108864`（64 MiB） | 是。16 路块缓存的总预算 |
 | `storage.mvcc_retention_ms` | `5000` | 是 |
 | `storage.bloom_bits_per_key` | `10` | 是 |
@@ -31,7 +31,7 @@
 
 ## 示例
 
-除了明确的数据目录、指标端口和密钥，这个文件与默认值一致。写出 `memtable_size_bytes` 是为了避免抄来的配置让人意外；改它不会改变刷盘行为。
+This file matches the defaults except for an explicit data directory, a metrics port, and a secret. `memtable_size_bytes` is the active memtable flush threshold. `max_imm_memtables` is the immutable-table backpressure cap.
 
 ```toml
 [node]

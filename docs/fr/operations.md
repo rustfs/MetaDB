@@ -137,7 +137,7 @@ Les variantes sont définies dans `crates/metadb-core/src/error.rs`. Les méthod
 - L'isolation jumbo est un indicateur de route plus un identifiant de nœud choisi dans la table locale. Elle n'évince pas d'autres shards d'un disque.
 - Les battements de cœur sont un RPC sans émetteur dans `metadbd`. `StoreHeartbeat` ne persiste pas.
 - Un secret partagé non vide authentifie Raft, les trois autres services gRPC et l'écouteur de métriques avec le même bearer. Un secret vide n'est accepté que pour les liaisons en boucle locale et laisse ces écouteurs non authentifiés. Une liaison joker avec un secret vide refuse de démarrer. Le processus ne termine pas TLS.
-- `memtable_size_bytes` et tous les champs de temporisation Raft ne changent pas le comportement d'exécution via le TOML.
+- `memtable_size_bytes` seals and flushes the active memtable. `max_imm_memtables` caps queued immutable tables. Raft timer fields do not change runtime behavior through TOML.
 - `metadb-ctl bench` pour `hotspot-create` et `bulk-ttl-delete` imprime des lignes JSON : un en-tête avec `bench_pid`, puis des rapports de phase avec attempted, succeeded, failed et des percentiles de latence. Le processus se termine en erreur si une opération demandée échoue. `--workload mixed` ou `--embedded` lance le harnais de stress dans le processus. `sql` imprime la réponse en JSON et se termine en erreur sur une erreur d'application.
 
 ## Lacunes de documentation

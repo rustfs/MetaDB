@@ -1016,12 +1016,30 @@ impl ControlPlaneService for MetaDbGrpcService {
             };
             let mut routes = Vec::new();
             for cell in &cells {
-                routes.extend(cell.list_routes());
+                match cell.routes_for_live_status() {
+                    Ok(live) => routes.extend(live),
+                    Err(error) => {
+                        return Ok(Response::new(GetRoutesResponse {
+                            error: Some(ErrorDetailProto::from(&error)),
+                            shards: Vec::new(),
+                            cluster_id: Vec::new(),
+                        }));
+                    }
+                }
             }
             (routes, cluster_id)
         } else if let Some(cell) = self.global_manager.get_cell(req.cell_id) {
             let cluster_id = cell.cluster_id();
-            (cell.list_routes(), cluster_id)
+            match cell.routes_for_live_status() {
+                Ok(routes) => (routes, cluster_id),
+                Err(error) => {
+                    return Ok(Response::new(GetRoutesResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        shards: Vec::new(),
+                        cluster_id: Vec::new(),
+                    }));
+                }
+            }
         } else {
             let e = MetaDbError::ShardRoutingError(format!("unknown cell {}", req.cell_id));
             return Ok(Response::new(GetRoutesResponse {
