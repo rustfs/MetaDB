@@ -137,7 +137,7 @@ Les variantes sont définies dans `crates/metadb-core/src/error.rs`. Les méthod
 - L'isolation jumbo est un indicateur de route plus un identifiant de nœud choisi dans la table locale. Elle n'évince pas d'autres shards d'un disque.
 - Les battements de cœur sont un RPC sans émetteur dans `metadbd`. `StoreHeartbeat` ne persiste pas.
 - Un secret partagé non vide authentifie Raft, les trois autres services gRPC et l'écouteur de métriques avec le même bearer. Un secret vide n'est accepté que pour les liaisons en boucle locale et laisse ces écouteurs non authentifiés. Une liaison joker avec un secret vide refuse de démarrer. Le processus ne termine pas TLS.
-- `memtable_size_bytes` et tous les champs de temporisation Raft ne changent pas le comportement d'exécution via le TOML.
+- `memtable_size_bytes` scelle et vide le memtable actif. `max_imm_memtables` limite les tables immuables en file. Les champs de temporisation Raft ne changent pas le comportement d'exécution via le TOML.
 - `metadb-ctl bench` pour `hotspot-create` et `bulk-ttl-delete` imprime des lignes JSON : un en-tête avec `bench_pid`, puis des rapports de phase avec attempted, succeeded, failed et des percentiles de latence. Le processus se termine en erreur si une opération demandée échoue. `--workload mixed` ou `--embedded` lance le harnais de stress dans le processus. `sql` imprime la réponse en JSON et se termine en erreur sur une erreur d'application.
 
 ## Lacunes de documentation
@@ -149,5 +149,5 @@ Ces éléments manquent au produit, donc ce guide ne peut pas décrire de procé
 3. La création et le routage vers une seconde cellule.
 4. Le placement d'un shard jumbo sur sa propre machine et le déplacement des autres shards hors de cette machine.
 5. Le TLS natif. Ce processus ne termine pas TLS. Les clés de configuration qui demandent TLS ou un certificat sont rejetées au lieu de servir en clair. Placer la terminaison dans un proxy externe. Raft et les métriques utilisent le même bearer que les autres services lorsqu'un secret est défini ; ce n'est pas du TLS mutuel. Une boucle de contrôle pilotée par les battements de cœur n'est pas implémentée.
-6. Une taille de memtable ou une temporisation Raft que l'exploitant peut régler et observer.
+6. Une temporisation Raft que l'exploitant peut régler et observer.
 7. Un résultat de niveau service enregistré pour `metadb-ctl bench`. La commande imprime des nombres pour la machine sur laquelle on l'exécute. Ce dépôt n'en enregistre pas. La pull request non fusionnée n° 2 rapporte un harnais embarqué distinct ; ces commandes ne sont pas dans cet arbre. Voir [Tests et bancs](./testing.md).

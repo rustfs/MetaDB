@@ -15,7 +15,8 @@
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | する。バインドアドレス |
 | `node.metrics_listen_addr` | 未設定 | 設定されたときだけする。別の TCP リスナー。ループバック以外は空でないシークレットが必要 |
 | `clock.max_clock_drift_ms` | `500` | する。`HybridLogicalClock::with_max_drift_ms` |
-| `storage.memtable_size_bytes` | `33554432`（32 MiB） | **しない。** フィールドは保持されるが読まれない |
+| `storage.memtable_size_bytes` | `33554432`（32 MiB） | する。計上バイトがこの大きさに達したとき、アクティブな memtable を封印してフラッシュする。1 未満は 1 として扱う |
+| `storage.max_imm_memtables` | `4` | する。書き手はこの上限を超える不変 memtable をキューに積まず、待つ |
 | `storage.block_cache_bytes` | `67108864`（64 MiB） | する。16 分割ブロックキャッシュの合計予算 |
 | `storage.mvcc_retention_ms` | `5000` | する |
 | `storage.bloom_bits_per_key` | `10` | する |
@@ -31,7 +32,7 @@
 
 ## 例
 
-このファイルは、明示的なデータディレクトリ、メトリクスポート、シークレット以外は既定値です。`memtable_size_bytes` は、コピーした設定が驚かないように書いてあります。変えてもフラッシュの挙動は変わりません。
+このファイルは、明示的なデータディレクトリ、メトリクスポート、シークレット以外は既定値です。`memtable_size_bytes` はアクティブな memtable のフラッシュしきい値です。`max_imm_memtables` は不変テーブルのバックプレッシャー上限です。
 
 ```toml
 [node]
@@ -47,6 +48,7 @@ max_clock_drift_ms = 500
 
 [storage]
 memtable_size_bytes = 33554432
+max_imm_memtables = 4
 block_cache_bytes = 67108864
 mvcc_retention_ms = 5000
 bloom_bits_per_key = 10
@@ -78,5 +80,5 @@ CLI フラグはファイルを解析したあとで上書きします。`--node
 - ロールごとのサブシステム切り出し。ロール項目は許可と拒否のスイッチであり、機能セットではありません。
 - ピア一覧、投票者集合、参加トークン。メンバーシップはこのプロセス 1 つから始まります。追加のピアは `RegisterNode` と `ScaleShardReplicas` のあとでのみ現れ、そのピアは同じシャードログに対してすでに `RaftTransportService` を話す Raft メンバーでなければなりません。2 つ目の all-in-one プロセスはそれをしません。 [運用](./operations.md) を参照してください。
 - 2 つ目のセルのキー範囲。`RegisterCell` はエラーを返し、何も保存しません。空ディレクトリの 2 つ目の all-in-one は `[cluster] join` で現在のリーダーに参加します。これは同じセルです。
-- memtable のバイト上限、Raft のタイマ、局所性コンパクションのオンとオフ。
+- Raft のタイマ、または局所性コンパクションのオンとオフ。
 - このプロセス内の TLS 証明書。設定中の TLS キーは拒否される。終端は外部プロキシで行う。

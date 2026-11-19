@@ -82,7 +82,7 @@ La machine d'état de chaque shard ouvre un LSM sans WAL dans `<data_dir>/be/sha
 
 Les versions MVCC vivent en mémoire pendant `storage.mvcc_retention_ms` (défaut 5 000). Un vidage coordonné scelle le memtable, exécute le crochet d'agrégation d'attributs et écrit une SSTable L0. Il n'y a pas de WAL KV utilisateur séparé. La reprise après plantage est le journal Raft plus le manifeste LSM. `LocalityCompactor` suit les tombstones par seau de préfixe de 9 octets et compacte un intervalle de suppression chaud lorsque `locality_tombstone_threshold` et `locality_tombstone_ratio` sont tous deux franchis. `auto_locality_compaction` est toujours mis à `true` par `ServerTomlConfig::to_lsm_config` ; le fichier TOML ne peut pas le désactiver.
 
-`storage.memtable_size_bytes` est désérialisé et jamais lu. La taille de vidage ne vient pas de ce champ.
+`storage.memtable_size_bytes` est le seuil de vidage du memtable actif. `storage.max_imm_memtables` (défaut 4) est le plafond de contre-pression des tables immuables : une écriture attend qu'une table immuable soit vidée au lieu d'en mettre une autre en file.
 
 ## Raft
 

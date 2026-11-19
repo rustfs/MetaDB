@@ -198,5 +198,5 @@ These items are missing from the product, so this guide cannot describe a proced
 2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
 3. Placing a jumbo shard on its own machine and moving other shards off that machine.
 4. Native TLS. This process does not terminate TLS. Config keys that ask for TLS or a certificate are rejected instead of serving plaintext. Put termination in an external proxy. Raft and metrics use the same bearer as the other services when a secret is set; that bearer is not mutual TLS. A heartbeat-driven control loop is not implemented.
-5. A memtable size or Raft timer that operators can set and observe.
+5. A Raft timer that operators can set and observe.
 6. A checked-in service-level result for `metadb-ctl bench`. The command prints numbers for the machine you run it on. This repository does not record one. See [Tests and benches](./testing.md).
