@@ -15,9 +15,10 @@ use metadb_core::{
     negate_accounted_size, saturating_add_i64, validate_dir_inode_id, validate_file_size,
     AttrDeltaSpec, AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, CompositeKeyRange,
     DirShardDeltaKey, DirShardDeltaRecord, EntryType, FileId, HlcTimestamp, InodeAttr, InodeId,
-    IntentOp, MetaDbError, MetaEntry, MetaKey, QuotaKey, QuotaRecord, Result, SecondaryIndexKey,
-    SecondaryIndexRecord, ShardEpoch, ShardId, TxnId, TxnRecordKey, TxnState, TxnStatusRecord,
-    UserId, WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME, PROPOSAL_ENVELOPE_MAGIC,
+    IntentOp, LeaseRenewReject, MetaDbError, MetaEntry, MetaKey, QuotaKey, QuotaRecord, Result,
+    SecondaryIndexKey, SecondaryIndexRecord, ShardEpoch, ShardId, TxnId, TxnRecordKey, TxnState,
+    TxnStatusRecord, UserId, WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME,
+    PROPOSAL_ENVELOPE_MAGIC,
 };
 use metadb_raft::{MetaDbRaftRequest, ShardApplyHandler, ShardWatermarkTracker};
 use metadb_storage::{
@@ -2398,9 +2399,9 @@ impl TxStateMachineHandler {
         start_hlc
             .physical_ms()
             .checked_add(MAX_2PC_LEASE_LIFETIME_MS)
-            .ok_or_else(|| {
-                MetaDbError::TransactionAborted("2PC lease renewal exceeds lifetime cap".into())
-            })
+            .ok_or(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::LifetimeCap,
+            ))
     }
 
     fn install_lease_hold(
@@ -2444,9 +2445,7 @@ impl TxStateMachineHandler {
         target_user_keys: &[Vec<u8>],
     ) -> Result<()> {
         if (txn_id >> 64) as u64 != coord_node_id {
-            return Err(MetaDbError::TransactionAborted(
-                "2PC lease renewal is not held by this coordinator".into(),
-            ));
+            return Err(MetaDbError::LeaseRenewRejected(LeaseRenewReject::NotHolder));
         }
         for key in target_user_keys {
             self.ensure_user_key_in_range(key)?;
@@ -2462,29 +2461,29 @@ impl TxStateMachineHandler {
         if let Some(rec) = &existing_record {
             match rec.state {
                 TxnState::Aborted => {
-                    return Err(MetaDbError::TransactionAborted(
-                        "2PC lease renewal cannot revive an aborted transaction".into(),
+                    return Err(MetaDbError::LeaseRenewRejected(
+                        LeaseRenewReject::AlreadyAborted,
                     ));
                 }
                 // Commit already won. Expiry no longer decides the transaction.
                 TxnState::Committed { .. } => return Ok(()),
                 TxnState::Pending => {
                     if rec.rename_fence_token != rename_fence_token || rec.start_hlc != start_hlc {
-                        return Err(MetaDbError::TransactionAborted(
-                            "2PC lease renewal fence token or start mismatch".into(),
+                        return Err(MetaDbError::LeaseRenewRejected(
+                            LeaseRenewReject::FenceMismatch,
                         ));
                     }
                     // Re-read of the durable deadline. A concurrent abort is ordered
                     // by Raft; if it applied first, the state match above rejected us.
                     if commit_hlc > rec.expire_hlc {
-                        return Err(MetaDbError::TransactionAborted(
-                            "2PC lease renewal rejected after expiry".into(),
+                        return Err(MetaDbError::LeaseRenewRejected(
+                            LeaseRenewReject::AfterExpiry,
                         ));
                     }
                     let cap = Self::lease_cap_ms(rec.start_hlc)?;
                     if expire_hlc.physical_ms() > cap {
-                        return Err(MetaDbError::TransactionAborted(
-                            "2PC lease renewal exceeds lifetime cap".into(),
+                        return Err(MetaDbError::LeaseRenewRejected(
+                            LeaseRenewReject::LifetimeCap,
                         ));
                     }
                     pending_anchor = true;
@@ -2511,14 +2510,14 @@ impl TxStateMachineHandler {
                     continue;
                 };
                 if commit_hlc > holder_expire {
-                    return Err(MetaDbError::TransactionAborted(
-                        "2PC lease renewal rejected after expiry".into(),
+                    return Err(MetaDbError::LeaseRenewRejected(
+                        LeaseRenewReject::AfterExpiry,
                     ));
                 }
                 let cap = Self::lease_cap_ms(start_hlc)?;
                 if expire_hlc.physical_ms() > cap {
-                    return Err(MetaDbError::TransactionAborted(
-                        "2PC lease renewal exceeds lifetime cap".into(),
+                    return Err(MetaDbError::LeaseRenewRejected(
+                        LeaseRenewReject::LifetimeCap,
                     ));
                 }
                 saw_participant = true;
@@ -2529,19 +2528,19 @@ impl TxStateMachineHandler {
             } else if intent.txn_id == txn_id {
                 if intent.rename_fence_token != rename_fence_token || intent.start_hlc != start_hlc
                 {
-                    return Err(MetaDbError::TransactionAborted(
-                        "2PC lease renewal fence token or start mismatch".into(),
+                    return Err(MetaDbError::LeaseRenewRejected(
+                        LeaseRenewReject::FenceMismatch,
                     ));
                 }
                 if commit_hlc > intent.expire_hlc {
-                    return Err(MetaDbError::TransactionAborted(
-                        "2PC lease renewal rejected after expiry".into(),
+                    return Err(MetaDbError::LeaseRenewRejected(
+                        LeaseRenewReject::AfterExpiry,
                     ));
                 }
                 let cap = Self::lease_cap_ms(intent.start_hlc)?;
                 if expire_hlc.physical_ms() > cap {
-                    return Err(MetaDbError::TransactionAborted(
-                        "2PC lease renewal exceeds lifetime cap".into(),
+                    return Err(MetaDbError::LeaseRenewRejected(
+                        LeaseRenewReject::LifetimeCap,
                     ));
                 }
                 saw_participant = true;
@@ -2738,25 +2737,73 @@ impl TxStateMachineHandler {
     }
 
     /// After log purge, replay will not see the original Prepare. Pending leases
-    /// still live in the snapshot, so rebuild their MVCC holds from that state.
+    /// still live in the snapshot, so rebuild MVCC holds from that state.
+    /// Participant shards have `WriteIntent`s and no `TxnRecord`.
     fn rehydrate_lease_holds(&self, engine: &LifecycleStorageEngine) {
         let latest = engine.mvcc().latest_watermarks().1;
-        let Ok(rows) = Self::scan_latest_in_apply(engine, &[0x06], &[0x07]) else {
+        if let Ok(rows) = Self::scan_latest_in_apply(engine, &[0x06], &[0x07]) {
+            for (_, raw) in rows {
+                let Ok(rec) = TxnStatusRecord::decode(&raw) else {
+                    continue;
+                };
+                if matches!(rec.state, TxnState::Pending) && latest <= rec.expire_hlc {
+                    self.install_lease_hold(
+                        engine,
+                        rec.txn_id,
+                        rec.start_hlc,
+                        rec.expire_hlc,
+                        latest,
+                        &rec.participant_keys,
+                    );
+                }
+            }
+        }
+        let Ok(rows) = Self::scan_latest_in_apply(engine, &[0x05], &[0x06]) else {
             return;
         };
-        for (_, raw) in rows {
-            let Ok(rec) = TxnStatusRecord::decode(&raw) else {
+        for (key_bytes, raw) in rows {
+            let Ok(intent) = WriteIntentRecord::decode(&raw) else {
                 continue;
             };
-            if matches!(rec.state, TxnState::Pending) && latest <= rec.expire_hlc {
-                self.install_lease_hold(
+            let Ok(user_key) = WriteIntentKey::decode(&key_bytes).map(|key| key.target_user_key)
+            else {
+                continue;
+            };
+            match intent.op {
+                IntentOp::DirExistsFenceSet { holders } => {
+                    for (txn_id, (_, expire_hlc)) in holders {
+                        if latest > expire_hlc {
+                            continue;
+                        }
+                        let start_hlc = if txn_id == intent.txn_id {
+                            intent.start_hlc
+                        } else {
+                            HlcTimestamp::new(
+                                expire_hlc
+                                    .physical_ms()
+                                    .saturating_sub(MAX_2PC_LEASE_LIFETIME_MS),
+                                0,
+                            )
+                        };
+                        self.install_lease_hold(
+                            engine,
+                            txn_id,
+                            start_hlc,
+                            expire_hlc,
+                            latest,
+                            std::slice::from_ref(&user_key),
+                        );
+                    }
+                }
+                _ if latest <= intent.expire_hlc => self.install_lease_hold(
                     engine,
-                    rec.txn_id,
-                    rec.start_hlc,
-                    rec.expire_hlc,
+                    intent.txn_id,
+                    intent.start_hlc,
+                    intent.expire_hlc,
                     latest,
-                    &rec.participant_keys,
-                );
+                    std::slice::from_ref(&user_key),
+                ),
+                _ => {}
             }
         }
     }

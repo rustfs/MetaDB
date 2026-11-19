@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use metadb_core::codec;
 use metadb_core::{
     append_crc32c_le, make_file_inode_id, verify_crc32c_le, FileId, HlcTimestamp, InodeId,
-    MetaDbError, Result, ShardId,
+    LeaseRenewReject, MetaDbError, Result, ShardId,
 };
 use metadb_storage::sstable::sync_dir;
 
@@ -473,24 +473,24 @@ impl DurableIdAllocator {
     ) -> Result<HlcTimestamp> {
         let mut guard = self.state.lock().unwrap();
         let Some(active) = guard.active_rename_lease.clone() else {
-            return Err(MetaDbError::TransactionAborted(
-                "directory rename lease is not active".into(),
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameLeaseNotActive,
             ));
         };
         if active.token != token {
-            return Err(MetaDbError::TransactionAborted(
-                "directory rename lease fence token mismatch".into(),
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameLeaseTokenMismatch,
             ));
         }
         if now_hlc > active.expire_hlc {
-            return Err(MetaDbError::TransactionAborted(
-                "directory rename lease expired".into(),
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameLeaseExpired,
             ));
         }
         let deadline_ms = active.deadline_hlc.physical_ms();
         if now_hlc.physical_ms() >= deadline_ms {
-            return Err(MetaDbError::TransactionAborted(
-                "directory rename lease exceeds lifetime cap".into(),
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameLeaseCap,
             ));
         }
         let expire_ms = now_hlc

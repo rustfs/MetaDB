@@ -4,14 +4,14 @@
 //! three-node evidence, and they are not a first-ship pass.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use metadb_core::{
-    CompositeKeyRange, HlcTimestamp, HybridLogicalClock, InodeId, IntentOp, MetaDbError, MetaKey,
-    Result, ShardEpoch, TxnState, TxnStatusRecord, WriteIntentRecord, ROOT_INODE_ID,
-    SYSTEM_PREFIX_TXN_RECORD, SYSTEM_PREFIX_WRITE_INTENT,
+    CompositeKeyRange, HlcTimestamp, HybridLogicalClock, InodeId, IntentOp, LeaseRenewReject,
+    MetaDbError, MetaKey, Result, ShardEpoch, TxnState, TxnStatusRecord, WriteIntentRecord,
+    ROOT_INODE_ID, SYSTEM_PREFIX_TXN_RECORD, SYSTEM_PREFIX_WRITE_INTENT,
 };
 use metadb_raft::{
     ChannelPool, MultiRaftRouter, RaftNodeOptions, ShardRaftGroup, ShardWatermarkTracker,
@@ -102,23 +102,23 @@ impl ShardDirectory for MultiShardTestCluster {
         let now = self.clock.now();
         let mut guard = self.rename_lease.lock().unwrap();
         let Some(lease) = guard.as_mut() else {
-            return Err(MetaDbError::TransactionAborted(
-                "directory rename lease is not active".into(),
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameLeaseNotActive,
             ));
         };
         if lease.token != token {
-            return Err(MetaDbError::TransactionAborted(
-                "directory rename lease fence token mismatch".into(),
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameLeaseTokenMismatch,
             ));
         }
         if now.physical_ms() > lease.expire_ms {
-            return Err(MetaDbError::TransactionAborted(
-                "directory rename lease expired".into(),
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameLeaseExpired,
             ));
         }
         if now.physical_ms() >= lease.deadline_ms {
-            return Err(MetaDbError::TransactionAborted(
-                "directory rename lease exceeds lifetime cap".into(),
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameLeaseCap,
             ));
         }
         let expire_ms = now
@@ -442,7 +442,10 @@ async fn progressing_rename_commits_past_the_initial_three_second_ttl() {
         pending.participant_keys.clone(),
     )
     .await;
-    assert!(wrong.unwrap_err().to_string().contains("not held"));
+    assert!(matches!(
+        wrong,
+        Err(MetaDbError::LeaseRenewRejected(LeaseRenewReject::NotHolder))
+    ));
 
     recover(&cluster).await;
     assert!(matches!(
@@ -454,6 +457,48 @@ async fn progressing_rename_commits_past_the_initial_three_second_ttl() {
     rename.await.unwrap().unwrap();
     assert!(tx.lookup(100, "live.txt").await.unwrap().is_none());
     assert!(tx.lookup(600, "moved.txt").await.unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_renew_does_not_publish_ahead_of_the_durable_expire() {
+    let dir = tempdir().unwrap();
+    let cluster = boot_cluster(dir.path()).await;
+    let tx = DistributedTxRouter::new(1, cluster.clock.clone(), cluster.directory.clone());
+    seed_dirs(&tx).await;
+    tx.create_file(100, "partial.txt", 1008, 8008, 10, 0o644, 4)
+        .await
+        .unwrap();
+    let gate = Arc::new(TwoPcPrepareGate::new());
+    let probe = Arc::new(AtomicU64::new(0));
+    let faults = Arc::new(AtomicU32::new(64));
+    let rename = {
+        let tx = DistributedTxRouter::new(1, cluster.clock.clone(), cluster.directory.clone())
+            .with_ttl_ms(800)
+            .with_post_prepare_gate(gate.clone())
+            .with_lease_publish_probe(probe.clone())
+            .with_renew_transient_faults(faults.clone());
+        tokio::spawn(async move {
+            tx.rename(100, "partial.txt", 600, "partial-dst.txt", false)
+                .await
+        })
+    };
+    gate.wait_prepared().await;
+    let prepared = txn_records(&cluster.shard1).await.remove(0);
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    let still = txn_records(&cluster.shard1).await.remove(0);
+    assert_eq!(still.expire_hlc, prepared.expire_hlc);
+    let published = probe.load(Ordering::Acquire);
+    assert!(published > 0, "prepare must record a durable deadline");
+    assert!(
+        published <= still.expire_hlc.physical_ms(),
+        "in-memory deadline {published} moved ahead of durable {}",
+        still.expire_hlc.physical_ms()
+    );
+    assert!(cluster.clock.now() < still.expire_hlc);
+    faults.store(0, Ordering::Release);
+    gate.release();
+    rename.await.unwrap().unwrap();
+    assert!(tx.lookup(600, "partial-dst.txt").await.unwrap().is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -496,7 +541,10 @@ async fn abandoned_prepare_expires_and_renew_after_expiry_is_rejected() {
     .await
     .unwrap_err();
     assert!(
-        extend.to_string().contains("rejected after expiry"),
+        matches!(
+            extend,
+            MetaDbError::LeaseRenewRejected(LeaseRenewReject::AfterExpiry)
+        ),
         "{extend}"
     );
     let after = txn_records(&cluster.shard1).await;
@@ -517,9 +565,12 @@ async fn abandoned_prepare_expires_and_renew_after_expiry_is_rejected() {
     .await
     .unwrap_err();
     assert!(
-        revived.to_string().contains("cannot revive")
-            || revived.to_string().contains("no live transaction")
-            || revived.to_string().contains("rejected after expiry"),
+        matches!(
+            revived,
+            MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::AlreadyAborted | LeaseRenewReject::AfterExpiry
+            ) | MetaDbError::TransactionAborted(_)
+        ),
         "{revived}"
     );
     assert!(intent_records(&cluster.shard1).await.is_empty());
@@ -647,6 +698,11 @@ async fn lookup_and_rollback_remain_correct_past_default_mvcc_retention() {
         tokio::spawn(async move { tx.rename(100, "kept.txt", 600, "lost.txt", false).await })
     };
     gate.wait_prepared().await;
+    tx.create_file(100, "later.txt", 1016, 8016, 10, 0o644, 1)
+        .await
+        .unwrap();
+    cluster.shard1.flush_snapshot_and_purge().await.unwrap();
+    cluster.shard2.flush_snapshot_and_purge().await.unwrap();
     tokio::time::sleep(Duration::from_millis(5_200)).await;
 
     let records = txn_records(&cluster.shard1).await;
@@ -757,7 +813,7 @@ async fn extended_expire_hlc_survives_restart_after_flush_and_purge() {
         .unwrap_err();
     assert!(matches!(error, MetaDbError::RpcError(_)));
     let pending = txn_records(&cluster.shard1).await.remove(0);
-    let extended = HlcTimestamp::new(cluster.clock.now().physical_ms().saturating_add(8_000), 0);
+    let extended = HlcTimestamp::new(cluster.clock.now().physical_ms().saturating_add(20_000), 0);
     for (group, handler) in [
         (&cluster.shard1, &cluster.handler1),
         (&cluster.shard2, &cluster.handler2),
@@ -849,6 +905,25 @@ async fn extended_expire_hlc_survives_restart_after_flush_and_purge() {
     assert_eq!(restored.len(), 1, "TxnRecord must survive purge");
     assert_eq!(restored[0].expire_hlc.physical_ms(), extended.physical_ms());
     assert!(matches!(restored[0].state, TxnState::Pending));
+    let start_hlc = restored[0].start_hlc;
+    let source_key = MetaKey::child(100, "durable.txt").encode();
+    let fence_key = MetaKey::dir_attr(600).encode();
+    tokio::time::sleep(Duration::from_millis(5_200)).await;
+    let source_hist = restarted
+        .shard1
+        .engine()
+        .get(&source_key, start_hlc)
+        .expect("primary pre-image stays readable past the 5s MVCC window");
+    assert!(source_hist.is_some());
+    let fence_hist = restarted
+        .shard2
+        .engine()
+        .get(&fence_key, start_hlc)
+        .expect("participant intent hold must be rebuilt without a TxnRecord");
+    assert!(
+        fence_hist.is_some(),
+        "directory attr pre-image must survive flush, purge, and restart"
+    );
     let resumed = DistributedTxRouter::new(1, clock.clone(), restarted.directory.clone())
         .resume_pending_lease(&restored[0].primary_key, restored[0].txn_id)
         .await

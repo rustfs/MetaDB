@@ -114,6 +114,42 @@ pub enum MetaDbError {
         leader_hint: Option<u64>,
         kind: RetryableConsensusKind,
     },
+    /// A 2PC lease renewal was rejected. Appended so earlier variant tags stay stable.
+    /// Routing and codec failures are not this variant; the coordinator retries those.
+    LeaseRenewRejected(LeaseRenewReject),
+}
+
+/// Why a replicated 2PC lease renewal must not be retried as progress.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
+pub enum LeaseRenewReject {
+    /// `commit_hlc` is already past the durable `expire_hlc`.
+    AfterExpiry,
+    /// The transaction is `Aborted`. Renewal must not make it pending again.
+    AlreadyAborted,
+    /// `coord_node_id` is not the coordinator encoded in `txn_id`.
+    NotHolder,
+    /// The requested deadline is past `start_hlc + MAX_2PC_LEASE_LIFETIME_MS`.
+    LifetimeCap,
+    /// Fence token or `start_hlc` does not match the durable record.
+    FenceMismatch,
+    /// The directory-rename lease is no longer the active token.
+    RenameLeaseNotActive,
+    /// The directory-rename token does not match the active lease.
+    RenameLeaseTokenMismatch,
+    /// The directory-rename lease's own expiry has passed.
+    RenameLeaseExpired,
+    /// The directory-rename lease is already at its lifetime cap.
+    RenameLeaseCap,
 }
 
 /// Why a consensus operation can be proposed again without hiding a durable loss.
@@ -255,6 +291,9 @@ impl fmt::Display for MetaDbError {
                 "retryable consensus error on shard {} ({:?}, leader_hint: {:?})",
                 shard_id, kind, leader_hint
             ),
+            MetaDbError::LeaseRenewRejected(reason) => {
+                write!(f, "2PC lease renewal rejected: {reason:?}")
+            }
         }
     }
 }

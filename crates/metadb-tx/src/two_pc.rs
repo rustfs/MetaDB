@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -224,20 +224,40 @@ struct LeaseKeeper {
     cancel: AtomicBool,
     failed: AtomicBool,
     prepared: Mutex<Vec<PreparedShardBatch>>,
-    published_expire_ms: AtomicU64,
+    /// One durable `expire_hlc` per prepared participant batch. Empty before the
+    /// first successful Prepare. The commit check uses the minimum.
+    durable_expire_ms: Mutex<Vec<u64>>,
+    /// Deadline assumed before any participant is prepared. Not raised by a renew
+    /// that has not been applied.
+    initial_expire_ms: AtomicU64,
     deadline_ms: u64,
     rename_cap_ms: AtomicU64,
+    /// Mirrors the minimum durable deadline after each successful Prepare or a
+    /// renew that every prepared participant applied. Tests read this.
+    publish_probe: Option<Arc<AtomicU64>>,
+    /// Test hook. Each remaining count skips one participant proposal as a
+    /// transient failure and does not advance the in-memory deadline.
+    transient_faults: Option<Arc<AtomicU32>>,
 }
 
 impl LeaseKeeper {
-    fn new(published_expire_ms: u64, deadline_ms: u64, rename_cap_ms: u64) -> Self {
+    fn new(
+        initial_expire_ms: u64,
+        deadline_ms: u64,
+        rename_cap_ms: u64,
+        publish_probe: Option<Arc<AtomicU64>>,
+        transient_faults: Option<Arc<AtomicU32>>,
+    ) -> Self {
         Self {
             cancel: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             prepared: Mutex::new(Vec::new()),
-            published_expire_ms: AtomicU64::new(published_expire_ms),
+            durable_expire_ms: Mutex::new(Vec::new()),
+            initial_expire_ms: AtomicU64::new(initial_expire_ms),
             deadline_ms,
             rename_cap_ms: AtomicU64::new(rename_cap_ms),
+            publish_probe,
+            transient_faults,
         }
     }
 
@@ -251,25 +271,59 @@ impl LeaseKeeper {
 
     fn clear(&self) {
         self.prepared.lock().unwrap().clear();
+        self.durable_expire_ms.lock().unwrap().clear();
+    }
+
+    fn note_prepared_expire(&self, expire_ms: u64) {
+        let mut floors = self.durable_expire_ms.lock().unwrap();
+        floors.push(expire_ms);
+        let min = floors.iter().copied().min().unwrap_or(expire_ms);
+        drop(floors);
+        self.record_published(min);
+    }
+
+    /// Raises every prepared participant's remembered deadline only after each
+    /// of those participants has applied the same `expire_ms`.
+    fn publish_durable(&self, expire_ms: u64) {
+        let mut floors = self.durable_expire_ms.lock().unwrap();
+        if floors.is_empty() {
+            return;
+        }
+        for floor in floors.iter_mut() {
+            *floor = expire_ms.max(*floor);
+        }
+        let min = floors.iter().copied().min().unwrap_or(expire_ms);
+        drop(floors);
+        self.record_published(min);
+    }
+
+    fn record_published(&self, expire_ms: u64) {
+        if let Some(probe) = &self.publish_probe {
+            probe.store(expire_ms, Ordering::Release);
+        }
+    }
+
+    fn durable_floor_ms(&self) -> Option<u64> {
+        self.durable_expire_ms.lock().unwrap().iter().copied().min()
     }
 
     fn expire_for(&self, now: HlcTimestamp, ttl_ms: u64) -> HlcTimestamp {
+        let base = self
+            .durable_floor_ms()
+            .unwrap_or_else(|| self.initial_expire_ms.load(Ordering::Acquire));
         let proposed = now
             .physical_ms()
             .saturating_add(ttl_ms)
             .min(self.deadline_ms)
             .min(self.rename_cap_ms.load(Ordering::Acquire));
-        let published = self.published_expire_ms.load(Ordering::Acquire);
-        HlcTimestamp::new(proposed.max(published), 0)
-    }
-
-    fn publish(&self, expire_ms: u64) {
-        self.published_expire_ms
-            .fetch_max(expire_ms, Ordering::AcqRel);
+        HlcTimestamp::new(proposed.max(base), 0)
     }
 
     fn published(&self) -> HlcTimestamp {
-        HlcTimestamp::new(self.published_expire_ms.load(Ordering::Acquire), 0)
+        let ms = self
+            .durable_floor_ms()
+            .unwrap_or_else(|| self.initial_expire_ms.load(Ordering::Acquire));
+        HlcTimestamp::new(ms, 0)
     }
 }
 
@@ -320,8 +374,12 @@ async fn renew_open_lease(
         }
     }
     let proposed_ms = now.physical_ms().saturating_add(ttl_ms).min(cap_ms);
-    let published = keeper.published_expire_ms.load(Ordering::Acquire);
-    if now.physical_ms() >= published && proposed_ms <= published {
+    let Some(published) = keeper.durable_floor_ms() else {
+        // Nothing is prepared yet, so there is no durable deadline to move.
+        return true;
+    };
+    if now.physical_ms() >= published {
+        // The durable expire has passed. A late Extend2pcLease cannot revive it.
         return false;
     }
     if proposed_ms <= published {
@@ -329,16 +387,27 @@ async fn renew_open_lease(
     }
     let shards = keeper.prepared.lock().unwrap().clone();
     if shards.is_empty() {
-        keeper.publish(proposed_ms);
         return true;
     }
     let expire_hlc = HlcTimestamp::new(proposed_ms, 0);
+    let mut all_applied = true;
     for (_epoch, _group, keys) in shards {
+        if keeper.transient_faults.as_ref().is_some_and(|faults| {
+            faults
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        }) {
+            all_applied = false;
+            continue;
+        }
         let route_key = keys
             .first()
             .cloned()
             .unwrap_or_else(|| primary_key.to_vec());
         let Ok((epoch, group, _)) = directory.route_user_key(&route_key) else {
+            all_applied = false;
             continue;
         };
         let cmd = TxRaftCmd::Extend2pcLease {
@@ -350,33 +419,30 @@ async fn renew_open_lease(
             target_user_keys: keys,
         };
         let Ok(payload) = encode_proposed_command(fresh_proposal_id(), &cmd) else {
+            all_applied = false;
             continue;
         };
         match group.propose(epoch, now, payload).await {
             Ok(response) => match response.result {
                 Ok(_) => {}
                 Err(error) if lease_renew_is_fatal(&error) => return false,
-                Err(_) => {}
+                Err(_) => all_applied = false,
             },
             Err(error) if lease_renew_is_fatal(&error) => return false,
-            Err(_) => {}
+            Err(_) => all_applied = false,
         }
     }
-    keeper.publish(proposed_ms);
+    if all_applied {
+        keeper.publish_durable(proposed_ms);
+    }
     true
 }
 
+/// Fatal renew results are the typed [`MetaDbError::LeaseRenewRejected`] variant.
+/// A missing record (`TransactionAborted`) and transport or routing errors are
+/// retried and must not move the in-memory deadline.
 fn lease_renew_is_fatal(error: &MetaDbError) -> bool {
-    let text = error.to_string();
-    text.contains("rejected after expiry")
-        || text.contains("cannot revive")
-        || text.contains("not held by this coordinator")
-        || text.contains("exceeds lifetime cap")
-        || text.contains("fence token or start mismatch")
-        || text.contains("directory rename lease expired")
-        || text.contains("directory rename lease exceeds lifetime cap")
-        || text.contains("directory rename lease fence token mismatch")
-        || text.contains("directory rename lease is not active")
+    matches!(error, MetaDbError::LeaseRenewRejected(_))
 }
 
 /// Executes both `1-RTT` single-shard pushdown and Primary-Anchored `2PC` across `ShardRaftGroup`s.
@@ -391,6 +457,8 @@ pub struct DistributedTxRouter {
     pre_prepare_hold: Duration,
     post_prepare_gate: Option<Arc<TwoPcPrepareGate>>,
     abandon_after_prepare_gate: bool,
+    lease_publish_probe: Option<Arc<AtomicU64>>,
+    renew_transient_faults: Option<Arc<AtomicU32>>,
 }
 
 impl DistributedTxRouter {
@@ -409,7 +477,22 @@ impl DistributedTxRouter {
             pre_prepare_hold: Duration::ZERO,
             post_prepare_gate: None,
             abandon_after_prepare_gate: false,
+            lease_publish_probe: None,
+            renew_transient_faults: None,
         }
+    }
+
+    /// Records the minimum durable participant `expire_hlc` after Prepare and
+    /// after a renew that every prepared participant applied.
+    pub fn with_lease_publish_probe(mut self, probe: Arc<AtomicU64>) -> Self {
+        self.lease_publish_probe = Some(probe);
+        self
+    }
+
+    /// Skips this many participant renew proposals as transient failures.
+    pub fn with_renew_transient_faults(mut self, faults: Arc<AtomicU32>) -> Self {
+        self.renew_transient_faults = Some(faults);
+        self
     }
 
     /// Lowers the renewal cap for tests. The value is clamped to the protocol
@@ -1430,6 +1513,8 @@ impl DistributedTxRouter {
             initial_expire_ms,
             deadline_ms,
             rename_cap_ms.min(deadline_ms),
+            self.lease_publish_probe.clone(),
+            self.renew_transient_faults.clone(),
         ));
         // Renewal starts before the first Prepare so a NotLeader retry that
         // outlasts the initial TTL can refresh expire_hlc and extend any shard
@@ -1570,7 +1655,7 @@ impl DistributedTxRouter {
                         max_prepared_hlc = max_prepared_hlc.max(prepared_hlc);
                         let batch = (epoch, group, shard_keys);
                         keeper.observe(batch.clone());
-                        keeper.publish(attempt_expire.physical_ms());
+                        keeper.note_prepared_expire(attempt_expire.physical_ms());
                         prepared_this_round.push(batch);
                     }
                     Ok(_) => {
