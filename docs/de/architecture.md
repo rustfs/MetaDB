@@ -82,7 +82,7 @@ Die Zustandsmaschine jedes Shards öffnet ein WAL-loses LSM unter `<data_dir>/be
 
 MVCC-Versionen leben `storage.mvcc_retention_ms` (Vorgabe 5.000) lang im Speicher. Ein koordinierter Flush versiegelt die Memtable, führt den Attribut-Aggregationshaken aus und schreibt eine L0-SSTable. Es gibt kein separates Nutzer-KV-WAL. Absturzrecovery ist das Raft-Log plus das LSM-Manifest. `LocalityCompactor` zählt Tombstones je 9-Byte-Präfix-Eimer und kompaktiert einen heißen Löschbereich, wenn sowohl `locality_tombstone_threshold` als auch `locality_tombstone_ratio` überschritten sind. `auto_locality_compaction` setzt `ServerTomlConfig::to_lsm_config` immer auf `true`; die TOML-Datei kann es nicht abschalten.
 
-`storage.memtable_size_bytes` wird deserialisiert und nie gelesen. Die Flush-Größe kommt nicht aus diesem Feld.
+`storage.memtable_size_bytes` ist die Flush-Schwelle der aktiven Memtable. `storage.max_imm_memtables` (Vorgabe 4) ist die Gegendruck-Obergrenze für unveränderliche Tabellen: ein Schreiber wartet, bis eine unveränderliche Tabelle ausgeschrieben ist, statt eine weitere einzureihen.
 
 ## Raft
 

@@ -48,6 +48,7 @@ max_clock_drift_ms = 500
 
 [storage]
 memtable_size_bytes = 33554432
+max_imm_memtables = 4
 block_cache_bytes = 67108864
 mvcc_retention_ms = 5000
 bloom_bits_per_key = 10
