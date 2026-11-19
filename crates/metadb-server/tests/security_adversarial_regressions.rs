@@ -5,12 +5,10 @@
 //! of that gap, not a first-ship security pass.
 
 use metadb_core::ROOT_INODE_ID;
-use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::metadata_service_client::MetadataServiceClient;
-use metadb_proto::{CreateFileRequest, GetRoutesRequest, LookupRequest};
+use metadb_proto::{CreateFileRequest, LookupRequest};
 use metadb_server::{BearerAuthClient, PersistentMetaDbCluster, ServerTomlConfig};
 use tonic::transport::Endpoint;
-use tonic::Code;
 
 fn with_data_dir(mut cfg: ServerTomlConfig, dir: &std::path::Path) -> ServerTomlConfig {
     cfg.node.data_dir = dir.to_path_buf();
@@ -61,49 +59,22 @@ async fn persisted_non_loopback_advertise_without_secret_fails_closed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn loopback_whitespace_secret_is_not_treated_as_empty() {
-    // `reject_unauthenticated_bind` trims the secret, so a whitespace-only value
-    // still lets a loopback listener start. `BearerAuth` does not trim: it
-    // compares the secret as stored. A missing bearer is rejected, a different
-    // whitespace bearer is rejected, and only the literal whitespace bearer is
-    // accepted. This is a consistency gap. A green result is not a first-ship pass.
+async fn loopback_whitespace_secret_does_not_start() {
+    // A whitespace-only secret used to start on loopback and accept only the
+    // literal whitespace bearer. Startup now refuses that value.
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = ServerTomlConfig::default();
     cfg = with_data_dir(cfg, dir.path());
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
     cfg.security.shared_secret = "   ".into();
-    let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(cfg)
-        .await
-        .expect("loopback plus a whitespace secret still starts");
-    let channel = Endpoint::from_shared(format!("http://{grpc_addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    let missing = ControlPlaneServiceClient::new(channel.clone())
-        .get_routes(GetRoutesRequest { cell_id: 0 })
-        .await;
-    let mut other =
-        ControlPlaneServiceClient::with_interceptor(channel.clone(), BearerAuthClient::new(" "));
-    let other = other.get_routes(GetRoutesRequest { cell_id: 0 }).await;
-    let mut literal =
-        ControlPlaneServiceClient::with_interceptor(channel, BearerAuthClient::new("   "));
-    let accepted = literal.get_routes(GetRoutesRequest { cell_id: 0 }).await;
-    cluster.shutdown().await.unwrap();
-    assert_eq!(
-        missing.unwrap_err().code(),
-        Code::Unauthenticated,
-        "a missing bearer must be rejected when the stored secret is whitespace"
-    );
-    assert_eq!(
-        other.unwrap_err().code(),
-        Code::Unauthenticated,
-        "a different whitespace bearer must be rejected"
-    );
-    assert!(
-        accepted.is_ok(),
-        "only the literal whitespace bearer should authenticate: {accepted:?}"
-    );
+    let err = match PersistentMetaDbCluster::open_and_serve(cfg).await {
+        Ok((cluster, _)) => {
+            let _ = cluster.shutdown().await;
+            panic!("whitespace secret must not start");
+        }
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("whitespace-only"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

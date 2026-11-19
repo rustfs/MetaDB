@@ -41,6 +41,9 @@ shard_split_threshold_bytes = 4294967296
 
 [cluster]
 join = "{join}"
+
+[security]
+allow_unauthenticated = true
 "#,
         dir.display()
     );

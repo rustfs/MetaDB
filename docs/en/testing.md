@@ -126,12 +126,13 @@ Do not treat a number from this command as a repository result. It depends on th
 | `wildcard_without_a_secret_does_not_listen` | Wildcard gRPC or metrics bind with an empty or whitespace secret does not listen |
 | `misspelled_secret_and_tls_options_do_not_start` | A misspelled `shared_secret`, or a TLS key, fails parsing |
 | `configured_secret_rejects_missing_and_wrong_credentials` | Missing, empty, and wrong bearers are rejected on cluster status, lookup, Raft, and metrics |
-| `empty_secret_on_loopback_serves_without_credentials` | `127.0.0.1` with an empty secret serves `GetRoutes`, `CreateFile`, `TransactionService.Rename`, and `GET /metrics` with no `Authorization` header. A `Basic` header and a garbage bearer are also accepted. This is the current local-development path |
+| `empty_secret_on_loopback_does_not_listen` | `127.0.0.1` with an empty secret and `allow_unauthenticated = false` does not listen |
+| `explicit_unauthenticated_loopback_serves_without_credentials` | The same loopback bind with `allow_unauthenticated = true` serves `GetRoutes`, `CreateFile`, `TransactionService.Rename`, and `GET /metrics` with no `Authorization` header. A `Basic` header is not consulted. This is the explicit local-development opt-in |
 | `configured_secret_rejects_basic_auth_without_applying_the_write` | On loopback, with a secret set, a missing header, `Authorization: Basic ...`, a lowercase `bearer` scheme, the raw secret, and a wrong bearer return `Unauthenticated`. The rejected `CreateFile` is not visible to an authenticated lookup. Metrics with `Basic` returns HTTP 401 and no metric text |
-| `whitespace_secret_on_loopback_rejects_anonymous_calls` | A whitespace secret still starts on loopback, and an anonymous call is rejected |
+| `whitespace_secret_on_loopback_does_not_listen` | A whitespace-only secret does not start, including when `allow_unauthenticated` is set |
 | `unknown_toml_keys_are_ignored_and_loopback_still_serves` | `grpc_listen_addrr`, `memtable_size_bytez`, and `joinn` are ignored. The process starts with the defaults and serves. `token_file` and `tls_mode` still fail parsing |
 
-The empty-secret loopback result is a gap, not a pass of fail-closed authentication. A machine run that used `127.0.0.1` and an empty `shared_secret` did not exercise the wildcard refusal or a configured bearer. Unknown non-secret keys are also a gap: a typo in a storage or join field does not fail startup. This suite does not add TLS, mutual TLS, RBAC, a second metrics credential, or an audit log. Listeners stay plaintext.
+An empty secret on loopback no longer serves. The opt-in above is the only unauthenticated path, and it is loopback-only. Unknown keys that do not name a secret, authentication, or TLS setting are still ignored: a typo in a storage or join field does not fail startup. This suite does not add TLS, mutual TLS, RBAC, a second metrics credential, or an audit log. Listeners stay plaintext.
 
 ## Prefix load
 

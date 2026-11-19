@@ -27,9 +27,11 @@ use tonic::service::Interceptor;
 use tonic::transport::{Endpoint, Server};
 use tonic::{Request, Status};
 
-/// Server interceptor for metadata, transaction, and control-plane RPCs.
-/// An empty secret allows the call (loopback deployments without auth).
-/// A non-empty secret requires `authorization: Bearer <secret>` on the incoming request.
+/// Server interceptor for metadata, transaction, control-plane, and Raft RPCs.
+///
+/// An empty secret allows the call. `open_and_serve` only reaches that state when
+/// `allow_unauthenticated` is set. A whitespace-only secret rejects every call.
+/// Any other secret requires `authorization: Bearer <secret>` exactly.
 #[derive(Clone)]
 pub struct BearerAuth {
     secret: std::sync::Arc<str>,
@@ -58,28 +60,49 @@ pub(crate) fn bearer_header_matches(presented: &str, secret: &str) -> bool {
     diff == 0
 }
 
+pub(crate) enum SecretMaterial {
+    Absent,
+    WhitespaceOnly,
+    Configured,
+}
+
+pub(crate) fn classify_secret(secret: &str) -> SecretMaterial {
+    if secret.is_empty() {
+        SecretMaterial::Absent
+    } else if secret.trim().is_empty() {
+        SecretMaterial::WhitespaceOnly
+    } else {
+        SecretMaterial::Configured
+    }
+}
+
 impl Interceptor for BearerAuth {
     fn call(&mut self, request: Request<()>) -> std::result::Result<Request<()>, Status> {
-        if self.secret.is_empty() {
-            return Ok(request);
-        }
-        let presented = request
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        if bearer_header_matches(presented, &self.secret) {
-            Ok(request)
-        } else {
-            Err(Status::unauthenticated(
-                "missing or invalid authorization bearer token",
-            ))
+        match classify_secret(&self.secret) {
+            SecretMaterial::Absent => Ok(request),
+            SecretMaterial::WhitespaceOnly => Err(Status::unauthenticated(
+                "whitespace-only shared secret is not accepted",
+            )),
+            SecretMaterial::Configured => {
+                let presented = request
+                    .metadata()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("");
+                if bearer_header_matches(presented, &self.secret) {
+                    Ok(request)
+                } else {
+                    Err(Status::unauthenticated(
+                        "missing or invalid authorization bearer token",
+                    ))
+                }
+            }
         }
     }
 }
 
 /// Client interceptor. Attaches `authorization: Bearer <secret>` to outgoing RPCs.
-/// An empty secret leaves the request unchanged.
+/// An empty secret leaves the request unchanged. A whitespace-only secret is rejected.
 #[derive(Clone)]
 pub struct BearerAuthClient {
     secret: std::sync::Arc<str>,
@@ -95,8 +118,14 @@ impl BearerAuthClient {
 
 impl Interceptor for BearerAuthClient {
     fn call(&mut self, mut request: Request<()>) -> std::result::Result<Request<()>, Status> {
-        if self.secret.is_empty() {
-            return Ok(request);
+        match classify_secret(&self.secret) {
+            SecretMaterial::Absent => return Ok(request),
+            SecretMaterial::WhitespaceOnly => {
+                return Err(Status::unauthenticated(
+                    "whitespace-only shared secret is not a credential",
+                ));
+            }
+            SecretMaterial::Configured => {}
         }
         let mut token = String::from("Bearer ");
         token.push_str(&self.secret);
@@ -660,10 +689,8 @@ impl PersistentMetaDbCluster {
         if shared_secret.is_empty() {
             tracing::warn!(
                 listen = %bound_addr,
-                "gRPC and metrics listeners have no authentication and this process does not terminate TLS. \
-                 An empty shared_secret is accepted only for loopback binds. \
-                 A wildcard or other non-loopback address refuses to serve. \
-                 RaftTransport on this listener requires the same bearer when the secret is set."
+                "allow_unauthenticated is set. Loopback gRPC and metrics listeners have no authentication. \
+                 This process does not terminate TLS. Non-loopback binds are still refused."
             );
         }
         let grpc_handle =
@@ -1471,5 +1498,13 @@ mod auth_tests {
         let mut client = BearerAuthClient::new("");
         let outgoing = client.call(Request::new(())).unwrap();
         assert!(authorization(&outgoing).is_none());
+    }
+
+    #[test]
+    fn whitespace_secret_is_rejected_by_client_and_server() {
+        let mut server = BearerAuth::new("   ");
+        assert!(server.call(Request::new(())).is_err());
+        let mut client = BearerAuthClient::new(" \t ");
+        assert!(client.call(Request::new(())).is_err());
     }
 }

@@ -14,8 +14,10 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::bearer_header_matches;
+use crate::classify_secret;
 use crate::render_prometheus_metrics;
 use crate::PersistentMetaDbCluster;
+use crate::SecretMaterial;
 
 const METRICS_MAX_CONNECTIONS: usize = 64;
 const METRICS_MAX_HEADER_BYTES: usize = 8192;
@@ -99,14 +101,20 @@ fn metrics_decision(
     cluster: &Weak<PersistentMetaDbCluster>,
     shared_secret: &str,
 ) -> (StatusCode, String, bool) {
-    if !shared_secret.is_empty() {
-        let presented = request
-            .headers()
-            .get(hyper::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        if !bearer_header_matches(presented, shared_secret) {
+    match classify_secret(shared_secret) {
+        SecretMaterial::Absent => {}
+        SecretMaterial::WhitespaceOnly => {
             return (StatusCode::UNAUTHORIZED, "unauthorized\n".to_owned(), false);
+        }
+        SecretMaterial::Configured => {
+            let presented = request
+                .headers()
+                .get(hyper::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            if !bearer_header_matches(presented, shared_secret) {
+                return (StatusCode::UNAUTHORIZED, "unauthorized\n".to_owned(), false);
+            }
         }
     }
     if request.method() != Method::GET {
