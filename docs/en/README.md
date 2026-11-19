@@ -18,7 +18,7 @@ The workspace version is `0.1.0` (Apache-2.0). The Rust toolchain is pinned to *
 - one cell (`node.cell_id`, default `1`)
 - one OpenRaft voter per shard (this process)
 - one gRPC listener that serves `MetadataService`, `TransactionService`, `ControlPlaneService`, and `RaftTransportService`
-- a background loop every 250 ms that drains auxiliary outboxes, runs 2PC recovery, checks split policy, and snapshots Raft logs
+- a background loop every 250 ms that drains auxiliary outboxes, runs 2PC recovery, checks split policy, and snapshots Raft logs. About every 3 seconds that loop also persists a control-plane heartbeat and, when this process is not the Raft leader, sends that liveness record to the leader. The heartbeat does not install routes.
 
 `ServerRole` also parses `be`, `proxy`, `cell-manager`, and `global-manager`. `open_and_serve` rejects every role except `all-in-one`. A second `metadbd` with an empty data directory and `[cluster] join` (or `--join` / `--cell-manager`) set to the current leader joins that cell's Raft groups: the leader adds it as a learner and then promotes it to a voter. A directory that already has cell state reopens local Raft and does not join again. `RegisterCell` returns an application error and does not add a cell; `metadb-ctl cell register` exits non-zero. `GetRoutes` for an unknown non-zero `cell_id` returns an error. `cell_id = 0` still lists every cached route.
 
@@ -33,6 +33,7 @@ Shard splits, dual-mode `(PID, name)` splits, and jumbo route flags do run insid
 | [Configuration](./configuration.md) | TOML fields, defaults, and fields the process does not apply |
 | [Operations](./operations.md) | `metadb-ctl`, metrics, scale-out, splits, limitations, documentation gaps |
 | [Operability](./operability.md) | `/livez`, `/readyz`, `/healthz`, phase codes, and the `[raft]` table |
+| [Scale control plane](./scale-control-plane-status.md) | What multi-cell routing, roles, jumbo placement, heartbeats, and membership safety do in this tree, and what is still missing |
 | [Tests and benches](./testing.md) | `cargo test`, what each suite actually exercises, `metadb-ctl bench` |
 | [Simulation testing](./simulation-testing.md) | Seeded workload catalog, and how it relates to FoundationDB's testing design |
 

@@ -2,13 +2,15 @@
 
 * **返回指南首页**: [简体中文概览](./README.md) | [文档中心](../../README.md)
 
-MetaDB 在单机模式与千节点分布式集群中使用**完全相同的无 WAL LSM 存储引擎与 OpenRaft 状态机**，支持从单机平滑在线演进至百亿—十万亿级元数据集群，无需停机迁移数据格式。
+The current binary runs a persistent deployment only as `all-in-one`. A second `all-in-one` process can join the same cell. Role-split processes and the multi-cell topology are a design target, not a deployment this repository runs. The `100B`–`10T+` range is a design model, not a measurement of this repository. Trillion-scale figures in `arXiv:2610.32247v1` are Baidu production metrics, not results of this repository.
 
-> **实现状态说明**：无 WAL SSTable 持久化 LSM 引擎、`openraft` Multi-Raft（`1-Voter -> 3-Voter` 在线扩容）、带 `ShardEpoch` 围栏的 `PID` 边界与 `DualModeFineGrained` 分片分裂、Jumbo 分片隔离、守护进程 `metadbd` 以及运维工具 `metadb-ctl` 均已在当前 8-Crate 工作区中完整实现并通过测试验证。
+> **What this tree runs**: persistent LSM, Raft replication, same-process shard splits, and all-in-one gRPC/CLI have tests in this workspace. Only `all-in-one` starts a daemon. `be`, `proxy`, `cell-manager`, `global-manager`, and remote `RegisterCell` are rejected. Jumbo isolation is a route flag and does not move peer shards. See [correctness notes](../../designs/correctness_hardening.md).
 
 ---
 
 ## 阶段一：独立单节点部署 (`metadbd --role all-in-one`) `[已实现]`
+
+`[已实现]` means one `metadbd --role all-in-one` process in current source. It is not a multi-cell deployment. `MetaDbEngine::new_single_node` is an in-memory simulator with no disk and no Raft, not this process.
 
 在单机一体化模式下，`GlobalManager`、`CellLocalManager`、`MetaCache`、`Proxy` 与 `BE` 存储引擎运行于同一进程，底层采用 **`1-Voter` OpenRaft**。由于分段 CRC32C `.raftlog` 已经提供顺序写崩溃持久化保障，底层 LSM 引擎彻底关闭本地 KV WAL，避免双重写日志开销。
 
@@ -36,21 +38,34 @@ locality_tombstone_ratio = 0.50
 [sharding]
 bootstrap_table_shards = true           # 初始化表前缀根分片：1(Meta)、2(Quota)、3(SecondaryIndex)
 shard_split_threshold_bytes = 4294967296 # 4 GiB 分片分裂阈值
+
+[security]
+# Loopback development only. Literal 127.0.0.1. Remove this flag when you set shared_secret.
+allow_unauthenticated = true
 ```
 
 ### 启动单机服务
 
 工具链固定为 Rust **1.100.0**（`rust-toolchain.toml`）。当前只有 `all-in-one` 会真正启动；`be` / `proxy` / `cell-manager` / `global-manager` 会被拒绝，而不是静默变成全功能进程。
 
-gRPC 的 metadata、transaction、control-plane、Raft 传输以及指标监听器**都不终结 TLS**。`[security].shared_secret` 为空时也没有应用层认证，并且只接受环回绑定。通配或其他非环回地址如果没有非空密钥，会拒绝启动。默认 `grpc_listen_addr` 是 `127.0.0.1:7800`。文件里的 TLS 或证书键会被拒绝，而不是当作明文服务。非空 `shared_secret` 要求 metadata、transaction、control-plane、同一端口上的 Raft 传输以及 `GET /metrics` 都携带 `authorization: Bearer <secret>`。对等 Raft 客户端发送同一个令牌。
+The `[security]` block above is the explicit loopback development opt-in. It is not a credential. `grpc_listen_addr` and `metrics_listen_addr` stay on the literal IP `127.0.0.1`. The hostname `localhost` is not accepted for `allow_unauthenticated`. An empty secret without that flag does not start the process.
 
 ```bash
 metadbd --config /etc/metadb/standalone.toml
 ```
 
+To require `authorization: Bearer <secret>` on metadata, transaction, control-plane, Raft transport, and `GET /metrics`, replace that `[security]` block. Do not leave `allow_unauthenticated` in the file. Both together are rejected. A whitespace-only `shared_secret` is rejected even if the flag remains. Peer Raft clients send the same token. `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --join` / `--cell-manager` send that header.
+
+```toml
+[security]
+shared_secret = "replace-with-a-long-random-string"
+```
+
 ---
 
 ## 阶段二：单节点动态 `PID` 边界分片分裂 `[已实现]`
+
+`[已实现]` means in-process PID-boundary splits inside that same all-in-one process. It is not a multi-host topology. Jumbo isolation is a route flag and does not move peer shards.
 
 当分片容量超过 `shard_split_threshold_bytes` 时，`PolicyShardSplitter` 会扫描 SSTable 块索引中点并严格沿着 `group_key = PID`（`[0x01][pid: 8B BE]`）边界执行原子分裂：
 * 同一目录的属性记录 `(PID, "_attr_")` 与所有直接子项 `(PID, child_name)` 始终保持在同一分片内。
@@ -58,31 +73,29 @@ metadbd --config /etc/metadb/standalone.toml
 
 ---
 
-## 阶段三：在线扩展至 `3-Voter` Multi-Raft 与多单元集群 `[已实现]`
+## Stage 3: Intended multi-cell topology (not deployable today)
 
-### 3.1 零停机高可用升级（`1-Voter -> Learner -> 3-Voter`）
+Stage 3 is a design target. The current binary does not deploy it.
 
-1. 启动两台新的存储后端节点（`--role be`）接入当前控制面：
-   ```bash
-   metadbd --role be --node-id 2 --listen 10.0.1.12:7800 --cell-manager 10.0.1.11:7800 --data-dir /var/lib/metadb
-   metadbd --role be --node-id 3 --listen 10.0.1.13:7800 --cell-manager 10.0.1.11:7800 --data-dir /var/lib/metadb
-   ```
-2. 通过 `metadb-ctl` 在线提升副本数：
-   ```bash
-   metadb-ctl raft scale-replicas --cell-id 1 --target-voters 3
-   ```
-   **内部演进流程**：
-   * `ConfChangeOrchestrator` 先将节点 `2`、`3` 添加为无投票权的 `Learner`。
-   * Leader 触发协同刷盘屏障，创建硬链接 SSTable 快照并通过 `InstallSnapshot` 与增量日志追平进度。
-   * 当复制延迟低于 `64` 条日志后，通过 OpenRaft 联合共识（Joint Consensus）将其平滑提升为 `Voter`，全程**零写入中断**。
+`metadbd` only runs `--role all-in-one`. `PersistentMetaDbCluster::open_and_serve` in `crates/metadb-server/src/lib.rs` rejects `be`, `proxy`, `cell-manager`, and `global-manager` before it listens. `RegisterCell` in `crates/metadb-server/src/grpc_services.rs` returns an application error and does not store a second cell. This tree has no live multi-process multi-Cell deployment.
 
-### 3.2 多单元（Multi-Cell）存算与控制面分离拓扑（百亿—十万亿级规模）
+A second `metadbd --role all-in-one` can join the **same** cell when `--join` or `--cell-manager` names the current leader and the data directory is fresh. That path is covered by `crates/metadb-server/tests/join_existing_group.rs`. The joiner is still an all-in-one process. It is not a role-trimmed backend, and the join does not create another cell. See [Operations](../../zh/operations.md).
 
-当单集群规模超过 `~50,000` 个分片时，可将各角色独立部署并划分为多个自治 **Cell**：
+### Step 3.1: Voters inside one cell
 
-| 组件角色 | `--role` 参数 | 推荐部署方式 | 核心职责 |
-| :--- | :--- | :--- | :--- |
-| **全局管理器 (`GlobalManager`)** | `global-manager` | 3 副本 Raft 组 | 维护粗粒度 `[start_key, end_key) -> CellId` 映射、分配 `65,536` 步长全局 ID 号段、管理跨目录移动租约。 |
-| **单元管理器 (`CellLocalManager`)** | `cell-manager` | 每 Cell 独立 3 副本组 | 承载本 Cell 内 BE 节点心跳（每 Cell `20K–50K` 分片）、`PID` 分裂调度、Jumbo 独占隔离与副本变更。 |
-| **存储后端 (`BE`)** | `be` | 每 Cell `12 – 60+` 台 NVMe 节点 | 承载 Multi-Raft 分片、`MemMvccStore`、`LsmStorageBackend`、`1-RTT` 下推执行与异步发件箱。 |
-| **无状态代理 (`Proxy`)** | `proxy` | 弹性扩缩容 / 与 RustFS 同机部署 | 内嵌 `MetaCache`（`>99.9%` 单跳命中率）、编译 20 条 SQL 模板并协调跨分片 2PC 事务。 |
+Do not start `metadbd --role be`. That role exits in `open_and_serve`, so those commands are not a runbook. `metadb-ctl raft scale-replicas` calls `ScaleShardReplicas` and requires the requested voter count to already be registered in the cell. A fresh all-in-one cell has one node, so `--target-voters 3` fails until those nodes exist. The constraints are in [Operations](../../zh/operations.md).
+
+### Step 3.2: Design model for a disaggregated topology (`100B – 10T+` records)
+
+`100B – 10T+` is a design-model range: arithmetic for how a future multi-cell topology might be sized. It is not a record count this repository has stored. It is also not a Baidu production figure claimed as a result of `rustfs/MetaDB`. Baidu's published sizes, including the BOS2 figure of 1.848 trillion records in `arXiv:2610.32247v1`, are Baidu production metrics, not results of this repository.
+
+The table is the intended role split. This binary does not run those roles. Jumbo isolation in this tree is a route flag. It does not move peer shards onto a dedicated host.
+
+| Role | Design `--role` | Intended responsibility |
+| :--- | :--- | :--- |
+| **Global Manager** | `global-manager` | Would map coarse `[start_key, end_key)` intervals to `CellId`, allocate `65,536`-ID blocks, and coordinate cross-Cell directory rename leases. |
+| **Cell Local Manager** | `cell-manager` | Would process BE heartbeats (`20K–50K` shards/Cell) and orchestrate `PID` splits and membership changes. |
+| **Backend Storage (`BE`)** | `be` | Would host Multi-Raft shard groups and the LSM engine on NVMe hosts. |
+| **Stateless Proxy** | `proxy` | Would embed `MetaCache`, compile the 20 SQL templates, and coordinate cross-shard 2PC. |
+
+`metadb-ctl cell register` calls `RegisterCell` and exits non-zero. It does not register a cell. Do not use it as a federation step.

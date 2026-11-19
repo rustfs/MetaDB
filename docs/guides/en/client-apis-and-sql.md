@@ -5,11 +5,13 @@
 MetaDB exposes three client access surfaces tailored to different integration needs:
 1. **Embedded Rust SDK (`metadb-server`)** — Zero-serialization direct calls for co-located Rust services (`PersistentMetaDbCluster` async persistent API and `MetaDbEngine` synchronous API).
 2. **Typed `tonic` gRPC APIs (`metadb-proto` & `metadb-server`)** — High-throughput multiplexed RPCs for networked RustFS data nodes and proxies (`MetadataService`, `TransactionService`, `ControlPlaneService`, `RaftTransportService`).
-3. **20 Lightweight SQL Templates (`metadb-proxy`)** — Sub-5µs pattern compilation without general-purpose SQL optimizer overhead (all 20 literal, `?`-parameterized, and single-quote-escaped templates implemented and verified).
+3. **20 Lightweight SQL Templates (`metadb-proxy`)** — `sql_templates_tests` covers all 20 literal, `?`-parameterized, and escaped templates. A compile time under `5µs` is not a measurement of this repository.
 
 ---
 
 ## 1. gRPC Service Surface (`metadb.v1`) `[Implemented]`
+
+`[Implemented]` means one all-in-one process serves these RPCs. `RegisterCell` returns an error and stores nothing. Roles other than `all-in-one` are rejected before listen.
 
 ### `MetadataService` (`proto/metadb/v1/metadata.proto`)
 * **Namespace Mutations (`1-RTT` Pushdown)**: `CreateFile`, `Mkdir`, `Unlink`, `Rmdir`, `SetAttr` (`chmod`, `chown`, `truncate`, `utimes`).
