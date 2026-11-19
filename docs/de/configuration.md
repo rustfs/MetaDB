@@ -29,7 +29,7 @@ A key fails parsing when its normalized form (lowercase, hyphens become undersco
 | `security.shared_secret` | `""` | Empty does not start the process. Loopback without credentials requires `allow_unauthenticated = true`. A non-empty secret requires the same bearer on gRPC and metrics. A whitespace-only secret is rejected |
 | `security.allow_unauthenticated` | `false` | Explicit opt-in for an empty secret on a literal loopback IP (`127.0.0.1` or `::1`) only. The hostname `localhost` is not accepted. Rejected together with a usable secret. Rejected on a wildcard or any other non-loopback bind. A whitespace-only secret is rejected even with this flag |
 
-Es gibt keine Tabelle `[raft]`. `ServerTomlConfig.raft_options` wird von serde übersprungen und bleibt bei `RaftNodeOptions::default()` (Heartbeat 150 ms, Wahl 450–900 ms, Snapshot-Log-Behalten 0, Segment 64 MiB).
+`[raft]` is loaded. `ServerTomlConfig.raft_options` is not `#[serde(skip)]`. Omitted fields use heartbeat 150 ms, election timeout 450–900 ms, `max_in_snapshot_log_to_keep` 0, and segment size 64 MiB (`67108864`). Unknown keys inside `[raft]` fail parsing. `election_timeout_min_ms` must be greater than `heartbeat_interval_ms` and less than `election_timeout_max_ms`. `max_segment_bytes = 0` is rejected. The values apply when each local Raft group starts and are not reloaded. `max_segment_bytes` does not rewrite segments already on disk. `join_timeout` is not a TOML field. There is no gRPC health RPC. `/livez`, `/readyz`, and `/healthz` exist only when `metrics_listen_addr` is set. `/readyz` does not wait for the 250 ms 2PC recovery pass. See [Operability](../en/operability.md).
 
 
 `to_lsm_config` setzt immer `auto_locality_compaction: true`.
@@ -84,5 +84,5 @@ An empty secret does not start the process. Loopback is not an implicit exceptio
 - Zuschneiden der Teilsysteme nach Rolle. Das Rollenfeld ist ein Zulassen/Ablehnen-Schalter, keine Funktionsmenge.
 - Peer-Listen, Wählermengen oder ein Join-Token. Die Membership beginnt als dieser eine Prozess. Weitere Peers erscheinen erst nach `RegisterNode` plus `ScaleShardReplicas`, und diese Peers müssen bereits Raft-Mitglieder sein, die `RaftTransportService` für dieselben Shard-Logs sprechen. Ein zweiter all-in-one-Prozess tut das nicht. Siehe [Betrieb](./operations.md).
 - Den Schlüsselbereich einer zweiten Zelle. `RegisterCell` liefert einen Fehler und speichert nichts. Ein zweiter all-in-one-Prozess mit leerem Verzeichnis tritt dem aktuellen Leader mit `[cluster] join` bei; das bleibt dieselbe Zelle.
-- Raft-Zeitgeber oder Locality-Compaction an/aus.
+- Locality-compaction on/off. `to_lsm_config` always enables it. Raft timers are the `[raft]` table; see [Operability](../en/operability.md).
 - Native TLS-Zertifikate. Ein TLS-Schlüssel in dieser Datei wird abgelehnt. Die Terminierung gehört in einen externen Proxy.

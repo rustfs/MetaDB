@@ -9,6 +9,7 @@ async fn cross_origin_quota_deltas_must_conserve_totals_under_reordered_delivery
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.path().to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
     let (_, quota_group, _) = cluster.cell_manager().lookup_local_handle(2).unwrap();
     // Valid causal history: create on origin 1, rename to origin 4, unlink there.

@@ -29,7 +29,7 @@ A key fails parsing when its normalized form (lowercase, hyphens become undersco
 | `security.shared_secret` | `""` | Empty does not start the process. Loopback without credentials requires `allow_unauthenticated = true`. A non-empty secret requires the same bearer on gRPC and metrics. A whitespace-only secret is rejected |
 | `security.allow_unauthenticated` | `false` | Explicit opt-in for an empty secret on a literal loopback IP (`127.0.0.1` or `::1`) only. The hostname `localhost` is not accepted. Rejected together with a usable secret. Rejected on a wildcard or any other non-loopback bind. A whitespace-only secret is rejected even with this flag |
 
-`[raft]` テーブルはありません。`ServerTomlConfig.raft_options` は serde がスキップし、`RaftNodeOptions::default()` のままです（ハートビート 150 ms、選挙 450–900 ms、スナップショットログ保持 0、セグメント 64 MiB）。
+`[raft]` is loaded. `ServerTomlConfig.raft_options` is not `#[serde(skip)]`. Omitted fields use heartbeat 150 ms, election timeout 450–900 ms, `max_in_snapshot_log_to_keep` 0, and segment size 64 MiB (`67108864`). Unknown keys inside `[raft]` fail parsing. `election_timeout_min_ms` must be greater than `heartbeat_interval_ms` and less than `election_timeout_max_ms`. `max_segment_bytes = 0` is rejected. The values apply when each local Raft group starts and are not reloaded. `max_segment_bytes` does not rewrite segments already on disk. `join_timeout` is not a TOML field. There is no gRPC health RPC. `/livez`, `/readyz`, and `/healthz` exist only when `metrics_listen_addr` is set. `/readyz` does not wait for the 250 ms 2PC recovery pass. See [Operability](../en/operability.md).
 
 
 `to_lsm_config` は常に `auto_locality_compaction: true` を設定します。
@@ -84,5 +84,5 @@ An empty secret does not start the process. Loopback is not an implicit exceptio
 - ロールごとのサブシステム切り出し。ロール項目は許可と拒否のスイッチであり、機能セットではありません。
 - ピア一覧、投票者集合、参加トークン。メンバーシップはこのプロセス 1 つから始まります。追加のピアは `RegisterNode` と `ScaleShardReplicas` のあとでのみ現れ、そのピアは同じシャードログに対してすでに `RaftTransportService` を話す Raft メンバーでなければなりません。2 つ目の all-in-one プロセスはそれをしません。 [運用](./operations.md) を参照してください。
 - 2 つ目のセルのキー範囲。`RegisterCell` はエラーを返し、何も保存しません。空ディレクトリの 2 つ目の all-in-one は `[cluster] join` で現在のリーダーに参加します。これは同じセルです。
-- Raft のタイマ、または局所性コンパクションのオンとオフ。
+- Locality-compaction on/off. `to_lsm_config` always enables it. Raft timers are the `[raft]` table; see [Operability](../en/operability.md).
 - このプロセス内の TLS 証明書。設定中の TLS キーは拒否される。終端は外部プロキシで行う。

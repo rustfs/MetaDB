@@ -136,6 +136,9 @@ mvcc_retention_ms = 5000
 [sharding]
 bootstrap_table_shards = true
 shard_split_threshold_bytes = {shard_split_threshold_bytes}
+
+[security]
+allow_unauthenticated = true
 "#,
         data_dir.display()
     );

@@ -86,7 +86,7 @@ MVCC 版本在内存中保留 `storage.mvcc_retention_ms`（默认 5,000）。�
 
 ## Raft
 
-每个本地分片是一个 `openraft` 0.10 组。日志是 `.../shards/<id>/raft` 下的分段 CRC32C 文件。下列默认值 **不** 从 TOML 加载（`raft_options` 为 `#[serde(skip)]`）：
+每个本地分片是一个 `openraft` 0.10 组。日志是 `.../shards/<id>/raft` 下的分段 CRC32C 文件。Defaults are loaded from `[raft]` when that table or a field is omitted. `raft_options` is not `#[serde(skip)]`. Unknown keys in `[raft]` fail parsing. Values apply at group start and are not reloaded. `max_segment_bytes` does not rewrite segments already on disk. `/readyz` is 200 only after startup has finished, shutdown has not started, and every local Raft group has finished startup replay, applied a log entry, is a voter, and has a known leader. A bound socket is not enough. There is no gRPC health RPC. See [Operability](../en/operability.md).
 
 
 | 字段 | 默认 |

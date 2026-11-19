@@ -136,8 +136,8 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 - 未知で非ゼロの `cell_id` に対する `GetRoutes` は失敗して閉じる。`StoreHeartbeat` はキャッシュ済みルートを置き換えない。
 - ジャンボ隔離はルートフラグと、ローカルノード表から選んだノード ID である。他のシャードをディスクから追い出すことはしない。
 - ハートビートは RPC であり、`metadbd` に送信側はない。`StoreHeartbeat` は永続化しない。
-- A non-empty shared secret authenticates Raft, the other three gRPC services, and the metrics listener with the same bearer. An empty secret does not start the process, including on loopback. `allow_unauthenticated = true` is the explicit opt-in for empty-secret loopback development and still refuses a wildcard or any other non-loopback bind. A whitespace-only secret is rejected even with that opt-in. A usable secret combined with the opt-in is rejected. The process does not terminate TLS.
-- `memtable_size_bytes` はアクティブな memtable を封印してフラッシュする。`max_imm_memtables` はキューに積まれた不変テーブルの数を抑える。Raft のタイマ項目は、TOML 経由で実行時の挙動を変えない。
+- A secret that contains a non-whitespace character authenticates Raft, the other three gRPC services, and the metrics listener, including `/livez`, `/readyz`, and `/healthz`, with the same bearer. An empty secret does not start the process. `allow_unauthenticated = true` is the explicit exception for literal loopback IPs (`127.0.0.0/8` or `::1`) and still refuses a wildcard bind. The hostname `localhost` is not accepted for that exception. The bound socket is checked again after listen. A whitespace-only secret is rejected and is not compared as a bearer. A usable secret combined with the flag is rejected. The process does not terminate TLS.
+- `memtable_size_bytes` はアクティブな memtable を封印してフラッシュする。`max_imm_memtables` はキューに積まれた不変テーブルの数を抑える。`[raft]` timers and `max_segment_bytes` apply when a group starts. They are not reloaded from a changed file, and the segment size does not rewrite segments already on disk.
 - `hotspot-create` と `bulk-ttl-delete` の `metadb-ctl bench` は JSON 行を印字する。`bench_pid` を含むヘッダのあと、attempted、succeeded、failed とレイテンシのパーセンタイルを持つフェーズ報告が続く。要求した操作がすべて成功しない限り、プロセスは非ゼロで終了する。`--workload mixed` または `--embedded` はプロセス内のストレステストを実行する。`sql` は応答を JSON で印字し、アプリケーションエラーでは非ゼロで終了する。
 
 ## 文書化できない欠落
@@ -149,5 +149,5 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 3. 2 つ目のセルを作り、そこへルーティングすること。
 4. ジャンボシャードを専用マシンに置き、他のシャードをそのマシンから移すこと。
 5. プロセス内の TLS。このプロセスは TLS を終端しない。TLS や証明書を求める設定キーは、平文で提供する代わりに拒否される。終端は外部プロキシに置く。シークレットがあるとき、Raft とメトリクスは他のサービスと同じベアラを使う。これは相互 TLS ではない。ハートビート駆動の制御ループは未実装である。
-6. 運用者が設定して観測できる Raft タイマ。
+6. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. A leader election makes `/readyz` and `/healthz` return 503 on replicas that do not know a leader. `[raft]` is loaded. Its values apply when a group starts and are not reloaded. See [Operability](../en/operability.md).
 7. `metadb-ctl bench` のチェックインされたサービス水準の結果。コマンドは実行したマシンの数値を印字します。このリポジトリはそれを記録していません。未マージのプルリクエスト 2 は別の組み込みハーネスを報告しています。それらのコマンドはこのツリーにはありません。 [テストとベンチ](./testing.md) を参照してください。

@@ -32,6 +32,7 @@ Shard splits, dual-mode `(PID, name)` splits, and jumbo route flags do run insid
 | [Build and run](./build-and-run.md) | Toolchain, binaries, embedded library, shutdown |
 | [Configuration](./configuration.md) | TOML fields, defaults, and fields the process does not apply |
 | [Operations](./operations.md) | `metadb-ctl`, metrics, scale-out, splits, limitations, documentation gaps |
+| [Operability](./operability.md) | `/livez`, `/readyz`, `/healthz`, phase codes, and the `[raft]` table |
 | [Tests and benches](./testing.md) | `cargo test`, what each suite actually exercises, `metadb-ctl bench` |
 | [Simulation testing](./simulation-testing.md) | Seeded workload catalog, and how it relates to FoundationDB's testing design |
 

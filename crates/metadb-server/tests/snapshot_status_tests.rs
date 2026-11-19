@@ -12,6 +12,7 @@ async fn unrecoverable_snapshot_is_not_reported_as_a_live_voter() {
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.path().to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     cfg.sharding.bootstrap_table_shards = false;
     let (cluster, _address) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
     cluster
@@ -68,6 +69,7 @@ async fn routes_for_live_status_detects_missing_snapshot_without_prior_get_curre
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.path().to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     cfg.sharding.bootstrap_table_shards = false;
     let (cluster, _address) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
     cluster

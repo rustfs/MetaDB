@@ -12,6 +12,7 @@ fn config(dir: &std::path::Path) -> ServerTomlConfig {
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     cfg
 }
 
@@ -123,6 +124,7 @@ async fn configured_secret_protects_raft_transport() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config(dir.path());
     cfg.security.shared_secret = "test-secret".into();
+    cfg.security.allow_unauthenticated = false;
     let (cluster, addr) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .unwrap()

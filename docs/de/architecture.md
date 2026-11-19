@@ -86,7 +86,7 @@ MVCC-Versionen leben `storage.mvcc_retention_ms` (Vorgabe 5.000) lang im Speiche
 
 ## Raft
 
-Jeder lokale Shard ist eine `openraft`-0.10-Gruppe. Das Log ist eine segmentierte CRC32C-Datei unter `.../shards/<id>/raft`. Vorgaben, die **nicht** aus TOML geladen werden (`raft_options` ist `#[serde(skip)]`):
+Jeder lokale Shard ist eine `openraft`-0.10-Gruppe. Das Log ist eine segmentierte CRC32C-Datei unter `.../shards/<id>/raft`. Defaults are loaded from `[raft]` when that table or a field is omitted. `raft_options` is not `#[serde(skip)]`. Unknown keys in `[raft]` fail parsing. Values apply at group start and are not reloaded. `max_segment_bytes` does not rewrite segments already on disk. `/readyz` is 200 only after startup has finished, shutdown has not started, and every local Raft group has finished startup replay, applied a log entry, is a voter, and has a known leader. A bound socket is not enough. There is no gRPC health RPC. See [Operability](../en/operability.md).
 
 
 | Feld | Vorgabe |

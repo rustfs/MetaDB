@@ -696,6 +696,7 @@ async fn ci_prefix_load() {
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.path().to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     let (cluster, addr) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
     let endpoints = vec![format!("http://{addr}")];
     let result = run_load(&endpoints, "", &profile).await;

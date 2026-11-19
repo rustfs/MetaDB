@@ -29,7 +29,7 @@ A key fails parsing when its normalized form (lowercase, hyphens become undersco
 | `security.shared_secret` | `""` | Empty does not start the process. Loopback without credentials requires `allow_unauthenticated = true`. A non-empty secret requires the same bearer on gRPC and metrics. A whitespace-only secret is rejected |
 | `security.allow_unauthenticated` | `false` | Explicit opt-in for an empty secret on a literal loopback IP (`127.0.0.1` or `::1`) only. The hostname `localhost` is not accepted. Rejected together with a usable secret. Rejected on a wildcard or any other non-loopback bind. A whitespace-only secret is rejected even with this flag |
 
-没有 `[raft]` 表。`ServerTomlConfig.raft_options` 被 serde 跳过，保持 `RaftNodeOptions::default()`（心跳 150 ms，选举 450–900 ms，快照日志保留 0，段大小 64 MiB）。
+`[raft]` is loaded. `ServerTomlConfig.raft_options` is not `#[serde(skip)]`. Omitted fields use heartbeat 150 ms, election timeout 450–900 ms, `max_in_snapshot_log_to_keep` 0, and segment size 64 MiB (`67108864`). Unknown keys inside `[raft]` fail parsing. `election_timeout_min_ms` must be greater than `heartbeat_interval_ms` and less than `election_timeout_max_ms`. `max_segment_bytes = 0` is rejected. The values apply when each local Raft group starts and are not reloaded. `max_segment_bytes` does not rewrite segments already on disk. `join_timeout` is not a TOML field. There is no gRPC health RPC. `/livez`, `/readyz`, and `/healthz` exist only when `metrics_listen_addr` is set. `/readyz` does not wait for the 250 ms 2PC recovery pass. See [Operability](../en/operability.md).
 
 
 `to_lsm_config` 总是把 `auto_locality_compaction` 设为 `true`。
@@ -84,5 +84,5 @@ An empty secret does not start the process. Loopback is not an implicit exceptio
 - 按角色裁剪子系统。角色字段是允许或拒绝的开关，不是功能集合。
 - 对等体列表、投票者集合或加入令牌。成员关系从这一个进程开始。额外对等体只在 `RegisterNode` 加上 `ScaleShardReplicas` 之后出现，而且这些对等体必须已经是同一分片日志上会说 `RaftTransportService` 的 Raft 成员。第二个 all-in-one 进程不会这样做。见 [运维](./operations.md)。
 - 第二个单元的键范围。`RegisterCell` 返回错误并且什么都不保存。空数据目录上的第二个 all-in-one 进程用 `[cluster] join` 加入当前 leader，这仍是同一个单元。
-- Raft 计时器，或局部性压缩的开关。
+- Locality-compaction on/off. `to_lsm_config` always enables it. Raft timers are the `[raft]` table; see [Operability](../en/operability.md).
 - 本进程内的 TLS 证书。配置中的 TLS 键会被拒绝。终结应放在外部代理。

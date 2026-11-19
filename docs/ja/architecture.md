@@ -86,7 +86,7 @@ MVCC の版は `storage.mvcc_retention_ms`（既定 5,000）のあいだメモ�
 
 ## Raft
 
-ローカルの各シャードは `openraft` 0.10 のグループです。ログは `.../shards/<id>/raft` 以下の分割された CRC32C ファイルです。既定値は TOML から **読み込まれません**（`raft_options` は `#[serde(skip)]`）:
+ローカルの各シャードは `openraft` 0.10 のグループです。ログは `.../shards/<id>/raft` 以下の分割された CRC32C ファイルです。Defaults are loaded from `[raft]` when that table or a field is omitted. `raft_options` is not `#[serde(skip)]`. Unknown keys in `[raft]` fail parsing. Values apply at group start and are not reloaded. `max_segment_bytes` does not rewrite segments already on disk. `/readyz` is 200 only after startup has finished, shutdown has not started, and every local Raft group has finished startup replay, applied a log entry, is a voter, and has a known leader. A bound socket is not enough. There is no gRPC health RPC. See [Operability](../en/operability.md).
 
 
 | 項目 | 既定 |

@@ -89,4 +89,4 @@ cargo test -p metadb-server --test topology_distributed three_voter_leader_loss_
   * *Fix*: Handled automatically by `metadb-proxy` and the Rust SDK via `MetaCache` refresh + retry. Persistent occurrences indicate an unreachable `CellLocalManager`.
 * **Growing `.raftlog` Disk Usage**:
   * *Cause*: `safe_purge_index = min(state_flushed_index, aux_outbox_durable_index, last_snapshot_index)` is pinned by stalled L0 disk I/O or a blocked snapshot transfer. (Note: unreachable remote `QuotaTable` shards do **not** pin `.raftlog` indefinitely because overdue `AuxOutbox` tasks spill to local `[0x07]` SSTables on L0 flush.)
-  * *Fix*: Inspect NVMe write latency and the exposed `metadb_min_raft_safe_purge_index` metric (`:9100/metrics`). Compare per-shard logs during diagnosis; no per-shard watermark-lag metric is currently exported.
+  * *Fix*: Inspect NVMe write latency and the exposed `metadb_min_raft_safe_purge_index` metric (`:9100/metrics`). Compare per-shard logs during diagnosis; no per-shard watermark-lag metric is currently exported. `metadb_ready` and `metadb_shards_leader_unknown` are unlabeled process gauges. See [Operability](../../en/operability.md).
