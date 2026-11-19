@@ -14,6 +14,8 @@ pub mod stress;
 mod metrics_http;
 
 use std::collections::BTreeSet;
+use std::fs::OpenOptions;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -123,6 +125,7 @@ use metadb_proto::raft_transport_service_server::RaftTransportServiceServer;
 use metadb_proto::transaction_service_server::TransactionServiceServer;
 use metadb_proto::{GetRoutesRequest, RegisterNodeRequest, ScaleShardReplicasRequest};
 use metadb_proxy::{MetadataSqlCommand, SqlTemplateParser, StatelessProxyRouter};
+use metadb_raft::backup::{self, OnlineShard};
 use metadb_raft::{
     MultiRaftRouter, MultiRaftTransportServer, ProposalShutdownGate, ShardGroupHost,
 };
@@ -582,6 +585,7 @@ impl PersistentMetaDbCluster {
             block_cache,
             clock.clone(),
         )?);
+        backup::register_runtime(&config.node.data_dir)?;
         host.set_shared_secret(Some(config.security.shared_secret.clone()));
         let raft_router = host.router().clone();
         let directory_role = if cell_dir.join("CELL_MANAGER_STATE").exists() {
@@ -804,6 +808,9 @@ impl PersistentMetaDbCluster {
     }
 
     async fn run_maintenance_tick_inner(&self, force_snapshot: bool) -> Result<()> {
+        // Operator backup jobs and pending holds are latched on this loop so a
+        // `metadb-ctl` process can ask the running server to copy under its log lock.
+        let _ = self.poll_backup_requests();
         for cell in self.global_manager.all_cells() {
             for (_, grp, handler) in cell.local_shard_handles() {
                 let _ = AuxDispatcher::drain_shard_outbox(
@@ -869,7 +876,9 @@ impl PersistentMetaDbCluster {
     pub async fn shutdown(&self) -> Result<()> {
         self.stop_tasks().await;
         self.flush_all().await?;
-        self.host.shutdown_all().await
+        let result = self.host.shutdown_all().await;
+        backup::unregister_runtime(&self.config.node.data_dir);
+        result
     }
 
     /// Installs `gate` on every local Raft group so a test can park `client_write`.
@@ -887,7 +896,101 @@ impl PersistentMetaDbCluster {
     /// released, but the memtable is not checkpointed first.
     pub async fn shutdown_without_flush(&self) -> Result<()> {
         self.stop_tasks().await;
-        self.host.shutdown_all_no_flush().await
+        let result = self.host.shutdown_all_no_flush().await;
+        backup::unregister_runtime(&self.config.node.data_dir);
+        result
+    }
+
+    /// Installs a backup hold. Purge and snapshot deletion stay at the latched floors until
+    /// [`release_backup_hold`](Self::release_backup_hold) or the hold's wall-clock expiry.
+    pub fn acquire_backup_hold(&self, ttl: Duration) -> Result<backup::BackupHoldRecord> {
+        match backup::begin_hold(&self.config.node.data_dir, ttl)? {
+            backup::BeginHold::AlreadyActive(record) => Ok(record),
+            backup::BeginHold::Pending => {
+                let floors = self.collect_backup_floors()?;
+                backup::finish_hold(&self.config.node.data_dir, floors)
+            }
+        }
+    }
+
+    pub fn release_backup_hold(&self) -> Result<()> {
+        backup::release_hold(&self.config.node.data_dir)
+    }
+
+    /// Copies a restorable image while a backup hold is active.
+    pub fn create_backup(&self, destination: &Path) -> Result<backup::BackupSummary> {
+        let groups = self.host.all_groups();
+        let mut raft_dirs = Vec::with_capacity(groups.len());
+        let mut engines = Vec::with_capacity(groups.len());
+        for group in &groups {
+            raft_dirs.push(self.host.shard_dir(group.shard_id()).join("raft"));
+            engines.push(group.engine());
+        }
+        let shards: Vec<OnlineShard<'_>> = groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| OnlineShard {
+                shard_id: group.shard_id(),
+                raft_dir: &raft_dirs[index],
+                log_store: group.log_store(),
+                engine: engines[index].as_ref(),
+            })
+            .collect();
+        backup::create_online_backup(&self.config.node.data_dir, destination, &shards)
+    }
+
+    /// Services an operator hold latch or `BACKUP_JOB` left by `metadb-ctl`.
+    pub fn poll_backup_requests(&self) -> Result<()> {
+        let data_dir = self.config.node.data_dir.clone();
+        let lock_path = data_dir.join("BACKUP_JOB.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        if lock_file.try_lock().is_err() {
+            return Ok(());
+        }
+        if matches!(
+            backup::read_hold(&data_dir)?,
+            Some(record) if record.phase == backup::HOLD_PHASE_PENDING
+        ) {
+            let floors = self.collect_backup_floors()?;
+            let _ = backup::finish_hold(&data_dir, floors)?;
+        }
+        let Some(job) = backup::claim_backup_job(&data_dir)? else {
+            return Ok(());
+        };
+        let outcome = self.create_backup(Path::new(&job.output_dir));
+        backup::complete_backup_job(
+            &data_dir,
+            &job.output_dir,
+            outcome.map_err(|error| error.to_string()),
+        )?;
+        Ok(())
+    }
+
+    fn collect_backup_floors(&self) -> Result<Vec<backup::ShardHoldFloor>> {
+        let mut by_id = std::collections::BTreeMap::new();
+        for group in self.host.all_groups() {
+            let raft_dir = self.host.shard_dir(group.shard_id()).join("raft");
+            by_id.insert(
+                group.shard_id(),
+                backup::floor_for_open_log(
+                    group.shard_id(),
+                    &raft_dir,
+                    group.log_store().last_purged_index(),
+                ),
+            );
+        }
+        for shard_id in backup::list_shard_ids(&self.config.node.data_dir)? {
+            if by_id.contains_key(&shard_id) {
+                continue;
+            }
+            let raft_dir = self.host.shard_dir(shard_id).join("raft");
+            by_id.insert(shard_id, backup::disk_floor(shard_id, &raft_dir)?);
+        }
+        Ok(by_id.into_values().collect())
     }
 
     async fn stop_tasks(&self) {

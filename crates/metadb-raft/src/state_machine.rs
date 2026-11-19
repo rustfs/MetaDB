@@ -445,12 +445,32 @@ impl StateMachineShared {
 
 /// Highest snapshot index whose directory is complete. Log purge must not pass this.
 pub(crate) fn highest_durable_snapshot_index(raft_dir: &Path) -> u64 {
+    newest_complete_snapshot(raft_dir)
+        .map(|snap| snap.index)
+        .unwrap_or(0)
+}
+
+/// Newest complete snapshot directory, preferring `snap_<index>` over `snap_<index>.bak`.
+pub(crate) fn newest_complete_snapshot(raft_dir: &Path) -> Option<CompleteSnapshot> {
     snapshot_candidates(&raft_dir.join("snapshots"))
         .into_iter()
-        .filter(|(_, path)| snapshot_dir_is_complete(path))
-        .map(|(index, _)| index)
-        .max()
-        .unwrap_or(0)
+        .find(|(_, path)| snapshot_dir_is_complete(path))
+        .map(|(index, path)| CompleteSnapshot { index, path })
+}
+
+/// Newest complete snapshot whose index is still covered by a backup hold.
+pub(crate) fn newest_snapshot_at_or_below(raft_dir: &Path, index: u64) -> Option<CompleteSnapshot> {
+    snapshot_candidates(&raft_dir.join("snapshots"))
+        .into_iter()
+        .filter(|(candidate, path)| *candidate <= index && snapshot_dir_is_complete(path))
+        .max_by_key(|(candidate, _)| *candidate)
+        .map(|(index, path)| CompleteSnapshot { index, path })
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompleteSnapshot {
+    pub index: u64,
+    pub path: PathBuf,
 }
 
 fn snapshot_candidates(snaps_root: &Path) -> Vec<(u64, PathBuf)> {
@@ -484,7 +504,7 @@ fn snapshot_candidates(snaps_root: &Path) -> Vec<(u64, PathBuf)> {
         .collect()
 }
 
-fn snapshot_dir_is_complete(snap_dir: &Path) -> bool {
+pub(crate) fn snapshot_dir_is_complete(snap_dir: &Path) -> bool {
     load_snapshot_meta(snap_dir)
         .map(|meta| snapshot_files_present(snap_dir, &meta))
         .unwrap_or(false)
@@ -541,7 +561,13 @@ fn load_snapshot_dir(snap_dir: &Path) -> io::Result<SnapshotOf<MetaDbTypeConfig,
 fn publish_snapshot_dir(snaps_root: &Path, index: u64, tmp_dir: &Path) -> io::Result<()> {
     let final_dir = snaps_root.join(format!("snap_{index:020}"));
     let bak_dir = snaps_root.join(format!("snap_{index:020}.bak"));
-    if bak_dir.exists() {
+    // A backup hold keeps the snapshot bytes an in-progress copy may be reading.
+    // Replacing or deleting that directory would make the backup unrestorable.
+    if snapshot_hold_protects(snaps_root, index) && (final_dir.exists() || bak_dir.exists()) {
+        let _ = fs::remove_dir_all(tmp_dir);
+        return Ok(());
+    }
+    if bak_dir.exists() && !snapshot_hold_protects(snaps_root, index) {
         fs::remove_dir_all(&bak_dir)?;
     }
     if final_dir.exists() {
@@ -549,7 +575,7 @@ fn publish_snapshot_dir(snaps_root: &Path, index: u64, tmp_dir: &Path) -> io::Re
     }
     fs::rename(tmp_dir, &final_dir)?;
     sync_dir(snaps_root).map_err(|e| io::Error::other(e.to_string()))?;
-    if bak_dir.exists() {
+    if bak_dir.exists() && !snapshot_hold_protects(snaps_root, index) {
         let _ = fs::remove_dir_all(&bak_dir);
     }
     if let Ok(entries) = fs::read_dir(snaps_root) {
@@ -560,16 +586,28 @@ fn publish_snapshot_dir(snaps_root: &Path, index: u64, tmp_dir: &Path) -> io::Re
             let Some(rest) = name.strip_prefix("snap_") else {
                 continue;
             };
-            if rest.ends_with(".tmp") || rest.ends_with(".bak") || rest.contains('.') {
+            let protected_name = if let Some(index_text) = rest.strip_suffix(".bak") {
+                index_text
+            } else if rest.ends_with(".tmp") || rest.contains('.') {
                 continue;
-            }
-            if rest.parse::<u64>().ok().is_some_and(|older| older < index) {
+            } else {
+                rest
+            };
+            if protected_name
+                .parse::<u64>()
+                .ok()
+                .is_some_and(|older| older < index && !snapshot_hold_protects(snaps_root, older))
+            {
                 let _ = fs::remove_dir_all(entry.path());
             }
         }
     }
     sync_dir(snaps_root).map_err(|e| io::Error::other(e.to_string()))?;
     Ok(())
+}
+
+fn snapshot_hold_protects(snaps_root: &Path, index: u64) -> bool {
+    crate::backup::snapshot_index_protected(snaps_root, index)
 }
 
 /// Writes an empty complete snapshot directory at `index`.
@@ -581,6 +619,12 @@ pub fn write_complete_snapshot_marker(raft_dir: &Path, index: u64) -> io::Result
     fs::create_dir_all(&snaps_root)?;
     let snap_dir = snaps_root.join(format!("snap_{index:020}"));
     if snap_dir.exists() {
+        if snapshot_hold_protects(&snaps_root, index) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "backup hold protects this snapshot directory",
+            ));
+        }
         fs::remove_dir_all(&snap_dir)?;
     }
     fs::create_dir_all(&snap_dir)?;

@@ -1,5 +1,6 @@
 //! OpenRaft Multi-Raft consensus integration for MetaDB (`consensus_and_transactions.md` §1–§5).
 
+pub mod backup;
 pub mod conf_change;
 pub mod group_host;
 pub mod log_store;
@@ -8,6 +9,9 @@ pub mod read_index;
 pub mod state_machine;
 pub mod types;
 
+pub use backup::{
+    restore_backup, BackupHoldRecord, BackupSummary, ShardHoldFloor, MAX_BACKUP_HOLD,
+};
 pub use conf_change::{ConfChangeOrchestrator, DEFAULT_LEARNER_CATCHUP_THRESHOLD_ENTRIES};
 pub use group_host::{
     ProposalShutdownGate, RaftNodeOptions, RegistryShardState, ShardGroupHost, ShardRaftGroup,

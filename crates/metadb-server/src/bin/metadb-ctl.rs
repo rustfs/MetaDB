@@ -55,6 +55,11 @@ enum Command {
     },
     /// Execute one of the 20 metadata SQL templates.
     Sql { query: String },
+    /// Take, release, create, or restore a single-node backup.
+    Backup {
+        #[command(subcommand)]
+        sub: BackupCmd,
+    },
     /// Run a concurrent synthetic metadata workload benchmark.
     ///
     /// `--workload hotspot-create` and `bulk-ttl-delete` call a remote `metadbd`.
@@ -117,6 +122,39 @@ enum RaftCmd {
         cell_id: u64,
         #[arg(long)]
         target_voters: u32,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BackupCmd {
+    /// Prevent log purge and snapshot deletion until release or expiry.
+    Hold {
+        /// Server data directory (`node.data_dir`).
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+        /// Wall-clock lifetime in seconds. Minimum 1, maximum 86400.
+        #[arg(long, default_value_t = 900)]
+        ttl_secs: u64,
+    },
+    /// Drop the hold file so purge can resume under the normal snapshot rules.
+    Release {
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+    },
+    /// Copy a restorable snapshot or flushed LSM plus the unpurged Raft log.
+    Create {
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+        /// New directory for the backup artifact. Must not already exist.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Restore an artifact into a data directory that does not already exist.
+    Restore {
+        #[arg(long)]
+        backup: std::path::PathBuf,
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
     },
 }
 
@@ -221,6 +259,126 @@ async fn run_embedded_bench(
         return Err(format!("embedded stress failed: {report}").into());
     }
     Ok(())
+}
+
+async fn run_backup(command: BackupCmd) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match command {
+        BackupCmd::Hold { data_dir, ttl_secs } => {
+            let ttl = std::time::Duration::from_secs(ttl_secs);
+            match metadb_raft::backup::begin_hold(&data_dir, ttl)? {
+                metadb_raft::backup::BeginHold::AlreadyActive(record) => {
+                    print_hold("backup hold already active", &record);
+                }
+                metadb_raft::backup::BeginHold::Pending => {
+                    if metadb_raft::backup::lsm_directory_is_locked(&data_dir) {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(15);
+                        loop {
+                            if let Some(record) = metadb_raft::backup::read_hold(&data_dir)? {
+                                if record.phase == metadb_raft::backup::HOLD_PHASE_ACTIVE {
+                                    print_hold("backup hold", &record);
+                                    return Ok(());
+                                }
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                return Err(
+                                    "backup hold: running server did not latch floors before the wait expired"
+                                        .into(),
+                                );
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    } else {
+                        let mut floors = Vec::new();
+                        for shard_id in metadb_raft::backup::list_shard_ids(&data_dir)? {
+                            let raft_dir = data_dir
+                                .join("be")
+                                .join("shards")
+                                .join(format!("{shard_id:020}"))
+                                .join("raft");
+                            floors.push(metadb_raft::backup::disk_floor(shard_id, &raft_dir)?);
+                        }
+                        let record = metadb_raft::backup::finish_hold(&data_dir, floors)?;
+                        print_hold("backup hold", &record);
+                    }
+                }
+            }
+        }
+        BackupCmd::Release { data_dir } => {
+            metadb_raft::backup::release_hold(&data_dir)?;
+            println!("backup hold released");
+        }
+        BackupCmd::Create { data_dir, output } => {
+            if metadb_raft::backup::lsm_directory_is_locked(&data_dir) {
+                metadb_raft::backup::write_backup_job(&data_dir, &output)?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                loop {
+                    if let Some(result) = metadb_raft::backup::read_backup_job_result(&data_dir)? {
+                        if result.output_dir == output.to_string_lossy() {
+                            if result.ok {
+                                println!("{}", result.message);
+                                return Ok(());
+                            }
+                            return Err(result.message.into());
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(
+                            "backup rejected: running server did not finish BACKUP_JOB before the wait expired"
+                                .into(),
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            } else {
+                let summary = metadb_raft::backup::create_offline_backup(&data_dir, &output)?;
+                println!(
+                    "backup wrote {} files={} shards={} hold_id={}",
+                    summary.destination.display(),
+                    summary.file_count,
+                    summary.shard_count,
+                    summary.hold_id
+                );
+            }
+        }
+        BackupCmd::Restore { backup, data_dir } => {
+            if data_dir.exists() && metadb_raft::backup::lsm_directory_is_locked(&data_dir) {
+                return Err(
+                    "backup restore rejected: destination is open by a running process".into(),
+                );
+            }
+            let summary = metadb_raft::backup::restore_backup(&backup, &data_dir)?;
+            println!(
+                "backup restore wrote {} files={} shards={} hold_id={}",
+                summary.destination.display(),
+                summary.file_count,
+                summary.shard_count,
+                summary.hold_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_hold(label: &str, record: &metadb_raft::backup::BackupHoldRecord) {
+    let phase = match record.phase {
+        metadb_raft::backup::HOLD_PHASE_PENDING => "pending",
+        metadb_raft::backup::HOLD_PHASE_ACTIVE => "active",
+        metadb_raft::backup::HOLD_PHASE_RELEASED => "released",
+        _ => "unknown",
+    };
+    println!(
+        "{label} id={} expires_unix_ms={} phase={phase} shards={}",
+        record.hold_id,
+        record.expires_unix_ms,
+        record.floors.len()
+    );
+    for floor in &record.floors {
+        println!(
+            "  shard={} max_purge_index={} retain_snapshots_through={}",
+            floor.shard_id, floor.max_purge_index, floor.retain_snapshots_through
+        );
+    }
 }
 
 fn normalize_url(ep: &str) -> String {
@@ -354,6 +512,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 resp.upgraded_shards, target_voters
             );
         }
+        Command::Backup { sub } => run_backup(sub).await?,
         Command::Cell {
             sub: CellCmd::Register { cell_id, endpoints },
         } => {
