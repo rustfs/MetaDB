@@ -73,7 +73,7 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 
 ## Metrics
 
-Set `node.metrics_listen_addr` (for example `127.0.0.1:9100`). `open_and_serve` accepts TCP connections on that address. `GET /metrics` returns Prometheus text. Any other path returns 404, and any other method returns 405. When `[security].shared_secret` is non-empty, every request on this listener must send `Authorization: Bearer <shared_secret>`. A missing, empty, or wrong bearer returns HTTP 401 and a body that is not the metric text, including a request for `/status`. An empty secret refuses to start on every address, including loopback, unless `allow_unauthenticated` is set. That flag still refuses a non-loopback metrics address. This listener does not terminate TLS.
+Set `node.metrics_listen_addr` (for example `127.0.0.1:9100`). `open_and_serve` accepts TCP connections on that address. `GET /metrics` returns Prometheus text. Any other path returns 404, and any other method returns 405. When `[security].shared_secret` contains a non-whitespace character, every request on this listener must send `Authorization: Bearer <shared_secret>`. A missing, empty, or wrong bearer returns HTTP 401 and a body that is not the metric text, including a request for `/status`. An empty secret refuses to start on every address, including loopback, unless `allow_unauthenticated` is set. That flag still refuses a non-loopback metrics address. A whitespace-only secret refuses to start even when the flag is set. This listener does not terminate TLS.
 
 Gauges and counters from `render_prometheus_metrics`:
 

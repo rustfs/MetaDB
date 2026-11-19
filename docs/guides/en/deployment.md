@@ -37,6 +37,10 @@ locality_tombstone_ratio = 0.50
 [sharding]
 bootstrap_table_shards = true           # Shards 1 (Meta), 2 (Quota), 3 (SecondaryIndex)
 shard_split_threshold_bytes = 4294967296 # 4 GiB
+
+[security]
+# Loopback development only. Remove this flag when you set shared_secret.
+allow_unauthenticated = true
 ```
 
 ### Launching Standalone Node
@@ -51,7 +55,7 @@ metadbd --config /etc/metadb/standalone.toml
 
 `MetadataService`, `TransactionService`, `ControlPlaneService`, `RaftTransportService`, and the metrics listener do **not** terminate TLS. An empty `[security].shared_secret` does not start the process, including on the default `127.0.0.1:7800` bind. Set `allow_unauthenticated = true` only for loopback development. A wildcard or other non-loopback address without a non-empty secret still refuses to start. A TLS, certificate, anonymous, or insecure key in this file is rejected rather than served as plaintext.
 
-Set a shared secret to require `authorization: Bearer <secret>` on metadata, transaction, control-plane, Raft transport, and `GET /metrics`. Peer Raft clients propagate the same token. `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --cell-manager` send that header:
+To require `authorization: Bearer <secret>` on metadata, transaction, control-plane, Raft transport, and `GET /metrics`, replace the `[security]` table above. Do not leave `allow_unauthenticated` in the file. A whitespace-only `shared_secret` is rejected even if that flag remains. Peer Raft clients propagate the same token. `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --cell-manager` send that header:
 
 ```toml
 [security]

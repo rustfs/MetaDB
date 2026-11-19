@@ -44,19 +44,22 @@ Debug builds use `cargo build -p metadb-server --bins` and write the same names 
 
 Any role other than `all-in-one` fails before the listener is bound, with `server role ... is not implemented; only all-in-one runs a process`.
 
-Example, loopback only:
+Example, loopback only. `metadbd` with no config file uses an empty `shared_secret` and `allow_unauthenticated = false`, so that process does not start. The file below is the explicit loopback opt-in. It is not a credential. Do not use it on a non-loopback address.
 
 ```bash
 mkdir -p /tmp/metadb-data
-cargo run -p metadb-server --bin metadbd -- \
-  --data-dir /tmp/metadb-data \
-  --listen 127.0.0.1:7800 \
-  --node-id 1 \
-  --cell-id 1 \
-  --role all-in-one
+cat > /tmp/metadb-loopback.toml <<'EOF'
+[node]
+data_dir = "/tmp/metadb-data"
+grpc_listen_addr = "127.0.0.1:7800"
+
+[security]
+allow_unauthenticated = true
+EOF
+cargo run -p metadb-server --bin metadbd -- --config /tmp/metadb-loopback.toml
 ```
 
-With a file, see [Configuration](./configuration.md):
+A usable secret is a different configuration. Put a secret you choose in `shared_secret` and do not set `allow_unauthenticated` in that same file. Both together are rejected. See [Configuration](./configuration.md).
 
 ```bash
 cargo run -p metadb-server --bin metadbd -- --config ./standalone.toml
