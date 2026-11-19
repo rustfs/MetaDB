@@ -31,15 +31,12 @@ fn purge_limit(raft_dir: &Path, watermark_safe: u64, requested: u64) -> u64 {
     limit
 }
 
-fn copy_raft_file(src: &Path, dest: &Path) -> io::Result<()> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let bytes = fs::read(src)?;
-    let mut file = OpenOptions::new().create_new(true).write(true).open(dest)?;
-    file.write_all(&bytes)?;
-    file.sync_data()?;
-    Ok(())
+fn io_backup(message: impl AsRef<str>) -> io::Error {
+    io::Error::other(message.as_ref())
+}
+
+pub(crate) fn purged_index_from_hard_state_bytes(raw: &[u8]) -> io::Result<u64> {
+    LogStoreInner::purged_index_from_hard_state_bytes(raw)
 }
 
 /// Read-only check used by backup restore. Does not truncate a torn tail.
@@ -626,8 +623,7 @@ impl LogStoreInner {
             ));
         }
         let hard_state = Self::load_hard_state_readonly(raft_dir)?;
-        let purged_idx = hard_state.last_purged_log_id.map(|id| id.index);
-        let mut seg_paths: Vec<(u64, PathBuf)> = Vec::new();
+        let mut seg_bytes: Vec<(u64, String, Vec<u8>)> = Vec::new();
         for entry in fs::read_dir(raft_dir)? {
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
@@ -635,7 +631,7 @@ impl LogStoreInner {
             };
             if let Some(mid) = name
                 .strip_prefix("segment_")
-                .and_then(|s| s.strip_suffix(".raftlog"))
+                .and_then(|rest| rest.strip_suffix(".raftlog"))
             {
                 let first_idx = mid.parse::<u64>().map_err(|_| {
                     io::Error::new(
@@ -643,23 +639,88 @@ impl LogStoreInner {
                         format!("invalid raft segment name {name}"),
                     )
                 })?;
-                seg_paths.push((first_idx, entry.path()));
+                let mut raw = Vec::new();
+                File::open(entry.path())?.read_to_end(&mut raw)?;
+                seg_bytes.push((first_idx, name, raw));
             }
         }
-        seg_paths.sort_by_key(|(idx, _)| *idx);
+        Self::inspect_loaded(hard_state, seg_bytes)
+    }
 
+    #[cfg(target_os = "linux")]
+    fn inspect_fd(dir: &File) -> io::Result<RaftLogInspection> {
+        let listing =
+            crate::backup::list_plain_dir(dir).map_err(|error| io_backup(error.to_string()))?;
+        let hard_bytes = crate::backup::read_listed_file(dir, "HARD_STATE")
+            .map_err(|error| io_backup(error.to_string()))?;
+        let hard_state = Self::hard_state_from_bytes(&hard_bytes)?;
+        let mut seg_bytes = Vec::new();
+        for entry in listing {
+            let Some(mid) = entry
+                .name
+                .strip_prefix("segment_")
+                .and_then(|rest| rest.strip_suffix(".raftlog"))
+            else {
+                continue;
+            };
+            if entry.kind != crate::backup::EntryKind::File {
+                return Err(io_backup(format!(
+                    "refusing to copy special file {}",
+                    entry.name
+                )));
+            }
+            let first_idx = mid.parse::<u64>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid raft segment name {}", entry.name),
+                )
+            })?;
+            let raw = crate::backup::read_listed_file(dir, &entry.name)
+                .map_err(|error| io_backup(error.to_string()))?;
+            seg_bytes.push((first_idx, entry.name, raw));
+        }
+        Self::inspect_loaded(hard_state, seg_bytes)
+    }
+
+    pub(crate) fn inspect_copied_dir(dir: &File) -> io::Result<RaftLogInspection> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::inspect_fd(dir)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = dir;
+            Err(io_backup(
+                "symlink-safe raft inspection is supported on Linux only",
+            ))
+        }
+    }
+
+    pub(crate) fn purged_index_from_hard_state_bytes(raw: &[u8]) -> io::Result<u64> {
+        let state = Self::hard_state_from_bytes(raw)?;
+        Ok(state.last_purged_log_id.map(|id| id.index).unwrap_or(0))
+    }
+
+    fn hard_state_from_bytes(raw: &[u8]) -> io::Result<PersistedHardState> {
+        let body = verify_crc32c_le(raw, "Raft HARD_STATE")
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        codec::deserialize(body)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    }
+
+    fn inspect_loaded(
+        hard_state: PersistedHardState,
+        mut seg_bytes: Vec<(u64, String, Vec<u8>)>,
+    ) -> io::Result<RaftLogInspection> {
+        let purged_idx = hard_state.last_purged_log_id.map(|id| id.index);
+        seg_bytes.sort_by_key(|(idx, _, _)| *idx);
         let mut entries: BTreeMap<u64, EntryOf<MetaDbTypeConfig>> = BTreeMap::new();
         let mut previous_index = None;
-        for (first_index, path) in seg_paths {
-            let mut raw = Vec::new();
-            File::open(&path)?.read_to_end(&mut raw)?;
+        for (first_index, name, raw) in seg_bytes {
             if raw.len() < 8 || &raw[0..8] != RAFT_SEGMENT_MAGIC {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "raft segment {} is incomplete or has a bad magic",
-                        path.display()
-                    ),
+                    format!("raft segment {} is incomplete or has a bad magic", name),
                 ));
             }
             let mut offset = 8usize;
@@ -670,7 +731,7 @@ impl LogStoreInner {
                         io::ErrorKind::InvalidData,
                         format!(
                             "torn raft frame in {} (backup images must not need tail repair)",
-                            path.display()
+                            name
                         ),
                     ));
                 }
@@ -682,7 +743,7 @@ impl LogStoreInner {
                 if frame_len < 8 || frame_end > raw.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("torn or short raft frame in {}", path.display()),
+                        format!("torn or short raft frame in {name}"),
                     ));
                 }
                 let frame_body = &raw[offset + 8..frame_end];
@@ -690,7 +751,7 @@ impl LogStoreInner {
                 if actual_crc != expected_crc {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("CRC32C mismatch in raft segment {}", path.display()),
+                        format!("CRC32C mismatch in raft segment {name}"),
                     ));
                 }
                 let log_index = u64::from_le_bytes(frame_body[0..8].try_into().unwrap());
@@ -703,10 +764,7 @@ impl LogStoreInner {
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!(
-                            "inconsistent raft frame index {log_index} in {}",
-                            path.display()
-                        ),
+                        format!("inconsistent raft frame index {log_index} in {}", name),
                     ));
                 }
                 previous_index = Some(log_index);
@@ -811,28 +869,92 @@ impl SegmentedRaftLogStore {
 
     /// Copies `HARD_STATE`, `INITIALIZED`, and segment files while appends are blocked.
     ///
-    /// The active segment is synced before the bytes are read, so the copy does not
-    /// include a torn tail and does not modify the live directory.
-    pub fn copy_durable_log(&self, dest: &Path) -> io::Result<RaftLogInspection> {
+    /// `source` must be the live raft directory opened from the data-directory anchor
+    /// without following `be`, `shards`, the shard directory, or `raft`. The active
+    /// segment is synced before those bytes are read. The live directory is not modified.
+    /// File names are read from `source`; segment paths stored in memory are not opened.
+    pub(crate) fn inspect_copied_dir(dir: &File) -> io::Result<RaftLogInspection> {
+        LogStoreInner::inspect_copied_dir(dir)
+    }
+
+    pub fn copy_durable_log(&self, source: &File, dest: &File) -> io::Result<RaftLogInspection> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (source, dest);
+            return Err(io_backup(
+                "symlink-safe live raft copy is supported on Linux only",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.copy_durable_log_anchored(source, dest)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn copy_durable_log_anchored(
+        &self,
+        source: &File,
+        dest: &File,
+    ) -> io::Result<RaftLogInspection> {
+        use std::os::unix::fs::MetadataExt;
         let guard = self.inner.lock().unwrap();
         if let Some(active) = guard.active_file.as_ref() {
             active.sync_data()?;
         }
-        fs::create_dir_all(dest)?;
-        copy_raft_file(&guard.raft_dir.join("HARD_STATE"), &dest.join("HARD_STATE"))?;
-        let initialized = guard.raft_dir.join("INITIALIZED");
-        if initialized.is_file() {
-            copy_raft_file(&initialized, &dest.join("INITIALIZED"))?;
+        let live = fs::symlink_metadata(&guard.raft_dir)?;
+        if live.file_type().is_symlink() || !live.is_dir() {
+            return Err(io_backup(
+                "refusing to follow symlink for the live raft directory",
+            ));
+        }
+        let opened = source.metadata()?;
+        if opened.dev() != live.dev() || opened.ino() != live.ino() {
+            return Err(io_backup(
+                "live raft copy was not anchored at the log's raft directory",
+            ));
+        }
+        let listing =
+            crate::backup::list_plain_dir(source).map_err(|error| io_backup(error.to_string()))?;
+        let mut copied_hard_state = false;
+        for entry in &listing {
+            let copy_name = entry.name == "HARD_STATE"
+                || entry.name == "INITIALIZED"
+                || (entry.name.starts_with("segment_") && entry.name.ends_with(".raftlog"));
+            if !copy_name {
+                continue;
+            }
+            if entry.kind != crate::backup::EntryKind::File {
+                return Err(io_backup(format!(
+                    "refusing to copy special file {}",
+                    entry.name
+                )));
+            }
+            let bytes = crate::backup::read_listed_file(source, &entry.name)
+                .map_err(|error| io_backup(error.to_string()))?;
+            crate::backup::write_child_file(dest, &entry.name, &bytes)
+                .map_err(|error| io_backup(error.to_string()))?;
+            if entry.name == "HARD_STATE" {
+                copied_hard_state = true;
+            }
+        }
+        if !copied_hard_state {
+            return Err(io_backup(
+                "HARD_STATE is missing from the live raft directory",
+            ));
         }
         for segment in &guard.segments {
-            let name = segment
-                .path
-                .file_name()
-                .ok_or_else(|| io::Error::other("raft segment path has no file name"))?;
-            copy_raft_file(&segment.path, &dest.join(name))?;
+            let Some(name) = segment.path.file_name().and_then(|name| name.to_str()) else {
+                return Err(io_backup("raft segment path has no utf-8 file name"));
+            };
+            if !listing.iter().any(|entry| entry.name == name) {
+                return Err(io_backup(format!(
+                    "refusing to follow raft segment {name}; it is not a regular file in the anchored directory"
+                )));
+            }
         }
         drop(guard);
-        LogStoreInner::inspect_dir(dest)
+        LogStoreInner::inspect_fd(dest)
     }
 
     /// Triggers opportunistic physical segment cleanup up to `watermarks.safe_purge_index()`

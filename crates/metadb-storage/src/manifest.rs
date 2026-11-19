@@ -315,7 +315,22 @@ impl ManifestLog {
     pub fn read_checkpoint_readonly(lsm_dir: &Path) -> Result<DurableShardCheckpoint> {
         let current_path = lsm_dir.join("CURRENT");
         let manifest_name = fs::read_to_string(&current_path)?.trim().to_string();
-        if manifest_name.contains('/')
+        let manifest_path = lsm_dir.join(&manifest_name);
+        let mut raw = Vec::new();
+        File::open(&manifest_path)?.read_to_end(&mut raw)?;
+        Self::checkpoint_from_manifest_bytes(&manifest_name, &raw)
+    }
+
+    /// Replays manifest bytes already read from an anchored directory.
+    ///
+    /// `manifest_name` must be a single path component. The caller supplies the
+    /// bytes so this function does not open `lsm_dir` again.
+    pub fn checkpoint_from_manifest_bytes(
+        manifest_name: &str,
+        raw: &[u8],
+    ) -> Result<DurableShardCheckpoint> {
+        if manifest_name.is_empty()
+            || manifest_name.contains('/')
             || manifest_name.contains('\\')
             || manifest_name.contains("..")
         {
@@ -323,10 +338,7 @@ impl ManifestLog {
                 "invalid CURRENT content '{manifest_name}'"
             )));
         }
-        let manifest_path = lsm_dir.join(&manifest_name);
-        let mut raw = Vec::new();
-        File::open(&manifest_path)?.read_to_end(&mut raw)?;
-        let (state, torn) = Self::replay_manifest_bytes(&raw)?;
+        let (state, torn) = Self::replay_manifest_bytes(raw)?;
         if torn.is_some() {
             return Err(MetaDbError::ManifestCorrupted(
                 "incomplete MANIFEST in existing checkpoint".to_string(),

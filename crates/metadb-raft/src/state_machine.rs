@@ -644,18 +644,11 @@ pub(crate) fn newest_complete_snapshot(raft_dir: &Path) -> Option<CompleteSnapsh
         .map(|(index, path)| CompleteSnapshot { index, path })
 }
 
-/// Newest complete snapshot whose index is still covered by a backup hold.
-pub(crate) fn newest_snapshot_at_or_below(raft_dir: &Path, index: u64) -> Option<CompleteSnapshot> {
-    snapshot_candidates(&raft_dir.join("snapshots"))
-        .into_iter()
-        .filter(|(candidate, path)| *candidate <= index && snapshot_dir_is_complete(path))
-        .max_by_key(|(candidate, _)| *candidate)
-        .map(|(index, path)| CompleteSnapshot { index, path })
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct CompleteSnapshot {
     pub index: u64,
+    /// Path recorded by the directory scan. Backup does not copy through this path.
+    #[allow(dead_code)]
     pub path: PathBuf,
 }
 

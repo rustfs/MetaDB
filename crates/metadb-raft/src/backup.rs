@@ -7,17 +7,22 @@
 //! server data directory so a crash does not depend on a live process, and it
 //! expires on the wall clock so a missed release cannot pin purge forever.
 //!
-//! Copy and restore open directories with `O_DIRECTORY|O_NOFOLLOW` and then
-//! walk `/proc/self/fd` so a symlink inside the tree is not followed. A symlink,
-//! a non-UTF-8 name, or any other non-regular entry fails the command. That
-//! does not freeze a regular file against a concurrent local writer, and a
-//! symlink in an ancestor of the operator-supplied path is still resolved.
+//! On Linux, copy and restore anchor at the operator-supplied data directory,
+//! artifact directory, or staging directory this process created. Each component
+//! below that anchor is opened with `O_DIRECTORY|O_NOFOLLOW` through
+//! `/proc/self/fd`. A symlink, a non-UTF-8 name, or any other non-regular entry
+//! fails the command. Ancestors of the operator path are still resolved. A
+//! regular file can still be replaced by a concurrent local writer. Other
+//! platforms compile, and backup copy or restore returns an explicit unsupported
+//! error instead of using Linux flag values.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -34,18 +39,36 @@ use metadb_storage::{LifecycleStorageEngine, ManifestLog};
 use crate::log_store::{
     inspect_raft_dir, read_persisted_purged_index, RaftLogInspection, SegmentedRaftLogStore,
 };
-use crate::state_machine::{
-    highest_durable_snapshot_index, newest_snapshot_at_or_below, snapshot_dir_is_complete,
-};
+use crate::state_machine::{highest_durable_snapshot_index, snapshot_dir_is_complete};
 
 fn write_serialized(path: &Path, payload: Vec<u8>) -> Result<()> {
     let mut bytes = payload;
     append_crc32c_le(&mut bytes);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(backup_error("backup record path is not a utf-8 file name"));
+    };
+    let tmp_name = format!("{name}.tmp");
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    refuse_existing_symlink(&parent)?;
+    fs::create_dir_all(&parent)?;
+    refuse_existing_symlink(&parent.join(&tmp_name))?;
+    refuse_existing_symlink(path)?;
+    #[cfg(target_os = "linux")]
     {
+        let dir = open_plain_dir(&parent)?;
+        write_child_truncating(&dir, &tmp_name, &bytes)?;
+        let from = proc_dir(&dir).join(&tmp_name);
+        let to = proc_dir(&dir).join(name);
+        fs::rename(&from, &to).map_err(|error| open_error(path, error))?;
+        sync_dir(&proc_dir(&dir))?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let tmp = parent.join(tmp_name);
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -53,12 +76,22 @@ fn write_serialized(path: &Path, payload: Vec<u8>) -> Result<()> {
             .open(&tmp)?;
         file.write_all(&bytes)?;
         file.sync_data()?;
+        fs::rename(&tmp, path)?;
+        sync_dir(&parent)?;
+        Ok(())
     }
-    fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent() {
-        sync_dir(parent)?;
+}
+
+fn refuse_existing_symlink(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(backup_error(format!(
+            "refusing to follow symlink {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
 fn read_serialized(path: &Path) -> Result<Vec<u8>> {
@@ -276,6 +309,18 @@ fn backup_error(message: impl AsRef<str>) -> MetaDbError {
     MetaDbError::StorageIoError(format!("backup rejected: {}", message.as_ref()))
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn unsupported_backup() -> MetaDbError {
+    backup_error(
+        "symlink-safe backup copy is supported on Linux only; refusing to run it with another platform's filesystem flags",
+    )
+}
+
+fn is_not_found(error: &MetaDbError) -> bool {
+    let text = error.to_string();
+    text.contains("os error 2") || text.contains("No such file")
+}
+
 /// Linux `O_DIRECTORY` (`00200000`). The final component must be a directory.
 const O_DIRECTORY: i32 = 0x10000;
 /// Linux `O_NOFOLLOW` (`00400000`). The final component must not be a symlink.
@@ -314,54 +359,106 @@ fn component_name(name: &OsStr) -> Result<String> {
     Ok(text.to_string())
 }
 
+#[cfg(target_os = "linux")]
 fn proc_dir(dir: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
 }
 
 /// Opens `path` without following a symlink in its final component.
+///
+/// This is the anchor. Components above `path` are the operator-supplied path
+/// and are still resolved. Components below the returned fd must use `open_under`.
 fn open_plain_dir(path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(O_DIRECTORY | O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| open_error(path, error))?;
-    let meta = file.metadata()?;
-    if meta.file_type().is_symlink() || !meta.is_dir() {
-        return Err(backup_error(format!(
-            "{} is not a plain directory; refusing to follow it",
-            path.display()
-        )));
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        return Err(unsupported_backup());
     }
-    Ok(file)
+    #[cfg(target_os = "linux")]
+    {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| open_error(path, error))?;
+        let meta = file.metadata()?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(backup_error(format!(
+                "{} is not a plain directory; refusing to follow it",
+                path.display()
+            )));
+        }
+        Ok(file)
+    }
 }
 
 fn open_child(dir: &File, name: &str, directory: bool) -> Result<File> {
-    let path = proc_dir(dir).join(name);
-    let mut opts = OpenOptions::new();
-    opts.read(true);
-    if directory {
-        opts.custom_flags(O_DIRECTORY | O_NOFOLLOW);
-    } else {
-        opts.custom_flags(O_NOFOLLOW);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (dir, name, directory);
+        return Err(unsupported_backup());
     }
-    opts.open(&path)
-        .map_err(|error| open_error(Path::new(name), error))
+    #[cfg(target_os = "linux")]
+    {
+        let path = proc_dir(dir).join(name);
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        if directory {
+            opts.custom_flags(O_DIRECTORY | O_NOFOLLOW);
+        } else {
+            opts.custom_flags(O_NOFOLLOW);
+        }
+        opts.open(&path).map_err(|error| {
+            if directory && error.raw_os_error() == Some(20) {
+                backup_error(format!("refusing to follow symlink {name}"))
+            } else {
+                open_error(Path::new(name), error)
+            }
+        })
+    }
+}
+
+fn open_under(root: &File, relative: &str) -> Result<File> {
+    let parts = relative_parts(Path::new(relative))?;
+    descend_dirs(root, parts.iter().map(String::as_str))
+}
+
+fn ensure_under(root: &File, relative: &str) -> Result<File> {
+    let parts = relative_parts(Path::new(relative))?;
+    let mut dir = root.try_clone()?;
+    for name in &parts {
+        dir = create_child_dir(&dir, name)?;
+    }
+    Ok(dir)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum EntryKind {
+pub(crate) enum EntryKind {
     File,
     Dir,
     Other,
 }
 
-struct ListedEntry {
-    name: String,
-    kind: EntryKind,
+pub(crate) struct ListedEntry {
+    pub(crate) name: String,
+    pub(crate) kind: EntryKind,
 }
 
 /// Lists one directory fd. A symlink fails the listing instead of being followed.
-fn list_plain_dir(dir: &File) -> Result<Vec<ListedEntry>> {
+pub(crate) fn list_plain_dir(dir: &File) -> Result<Vec<ListedEntry>> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        return Err(unsupported_backup());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        list_plain_dir_linux(dir)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn list_plain_dir_linux(dir: &File) -> Result<Vec<ListedEntry>> {
     let mut out = Vec::new();
     for entry in fs::read_dir(proc_dir(dir))? {
         let entry = entry?;
@@ -385,7 +482,7 @@ fn list_plain_dir(dir: &File) -> Result<Vec<ListedEntry>> {
     Ok(out)
 }
 
-fn read_listed_file(dir: &File, name: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_listed_file(dir: &File, name: &str) -> Result<Vec<u8>> {
     let mut file = open_child(dir, name, false)?;
     let meta = file.metadata()?;
     if meta.file_type().is_symlink() || !meta.is_file() {
@@ -399,34 +496,64 @@ fn read_listed_file(dir: &File, name: &str) -> Result<Vec<u8>> {
 }
 
 fn create_child_dir(dir: &File, name: &str) -> Result<File> {
-    let path = proc_dir(dir).join(name);
-    match fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-            return Err(backup_error(format!(
-                "refusing to follow symlink or non-directory {name}"
-            )));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(&path).map_err(|error| open_error(Path::new(name), error))?;
-        }
-        Err(error) => return Err(error.into()),
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (dir, name);
+        return Err(unsupported_backup());
     }
-    open_child(dir, name, true)
+    #[cfg(target_os = "linux")]
+    {
+        let path = proc_dir(dir).join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(backup_error(format!(
+                    "refusing to follow symlink or non-directory {name}"
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&path).map_err(|error| open_error(Path::new(name), error))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        open_child(dir, name, true)
+    }
 }
 
-fn write_child_file(dir: &File, name: &str, bytes: &[u8]) -> Result<()> {
-    let path = proc_dir(dir).join(name);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(&path)
-        .map_err(|error| open_error(Path::new(name), error))?;
-    file.write_all(bytes)?;
-    file.sync_data()?;
-    sync_dir(&proc_dir(dir))?;
-    Ok(())
+pub(crate) fn write_child_file(dir: &File, name: &str, bytes: &[u8]) -> Result<()> {
+    write_child_bytes(dir, name, bytes, true)
+}
+
+fn write_child_truncating(dir: &File, name: &str, bytes: &[u8]) -> Result<()> {
+    write_child_bytes(dir, name, bytes, false)
+}
+
+fn write_child_bytes(dir: &File, name: &str, bytes: &[u8], exclusive: bool) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (dir, name, bytes, exclusive);
+        return Err(unsupported_backup());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let path = proc_dir(dir).join(name);
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).custom_flags(O_NOFOLLOW);
+        if exclusive {
+            opts.create_new(true);
+        } else {
+            opts.truncate(true);
+        }
+        let mut file = opts
+            .open(&path)
+            .map_err(|error| open_error(Path::new(name), error))?;
+        file.write_all(bytes)?;
+        file.sync_data()?;
+        if exclusive {
+            sync_dir(&proc_dir(dir))?;
+        }
+        Ok(())
+    }
 }
 
 fn ensure_dest_dir(dest: &Path) -> Result<File> {
@@ -837,22 +964,12 @@ pub fn disk_floor(shard_id: ShardId, raft_dir: &Path) -> Result<ShardHoldFloor> 
 }
 
 pub fn list_shard_ids(data_dir: &Path) -> Result<Vec<ShardId>> {
-    let shards = data_dir.join("be").join("shards");
-    let meta = match fs::symlink_metadata(&shards) {
-        Ok(meta) => meta,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
+    let root = open_plain_dir(data_dir)?;
+    let dir = match open_under(&root, "be/shards") {
+        Ok(dir) => dir,
+        Err(error) if is_not_found(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
-    if meta.file_type().is_symlink() {
-        return Err(backup_error(format!(
-            "refusing to follow symlink {}",
-            shards.display()
-        )));
-    }
-    if !meta.is_dir() {
-        return Ok(Vec::new());
-    }
-    let dir = open_plain_dir(&shards)?;
     let mut ids = Vec::new();
     for entry in list_plain_dir(&dir)? {
         if entry.name.len() == 20 && entry.name.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -909,19 +1026,40 @@ pub fn be_dir_for_shard(shard_dir: &Path) -> Option<PathBuf> {
 }
 
 pub fn lsm_directory_is_locked(data_dir: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(data_dir.join("be").join("shards")) else {
+    let Ok(root) = open_plain_dir(data_dir) else {
         return false;
     };
-    for entry in entries.flatten() {
-        let lock_path = entry.path().join("lsm").join("LOCK");
-        if !lock_path.is_file() {
+    let Ok(shards) = open_under(&root, "be/shards") else {
+        return false;
+    };
+    let Ok(entries) = list_plain_dir(&shards) else {
+        return true;
+    };
+    for entry in entries {
+        if entry.kind != EntryKind::Dir {
             continue;
         }
-        let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+        let Ok(shard) = open_child(&shards, &entry.name, true) else {
             return true;
         };
-        if file.try_lock().is_err() {
-            return true;
+        let Ok(lsm) = open_child(&shard, "lsm", true) else {
+            continue;
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let lock_path = proc_dir(&lsm).join("LOCK");
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).custom_flags(O_NOFOLLOW);
+            let Ok(file) = options.open(&lock_path) else {
+                continue;
+            };
+            if file.try_lock().is_err() {
+                return true;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = lsm;
         }
     }
     false
@@ -936,13 +1074,14 @@ pub fn create_online_backup(
     let hold = require_active_hold(data_dir)?;
     reject_destination(data_dir, destination)?;
     let mut staging = Staging::create(destination)?;
-    let tree = staging.path.join(BACKUP_TREE_DIR);
-    fs::create_dir_all(&tree)?;
+    let source = open_plain_dir(data_dir)?;
+    let staging_dir = open_plain_dir(&staging.path)?;
+    let tree_dir = ensure_under(&staging_dir, BACKUP_TREE_DIR)?;
     let mut files = Vec::new();
     let mut images = Vec::new();
     let mut covered = BTreeSet::new();
     for shard in shards {
-        let image = backup_online_shard(&hold, shard, data_dir, &tree, &mut files)?;
+        let image = backup_online_shard(&hold, shard, data_dir, &source, &tree_dir, &mut files)?;
         covered.insert(image.shard_id);
         images.push(image);
     }
@@ -950,11 +1089,10 @@ pub fn create_online_backup(
         if covered.contains(&shard_id) {
             continue;
         }
-        let shard_dir = shard_dir(data_dir, shard_id);
-        let image = backup_stopped_shard(&hold, shard_id, &shard_dir, &tree, &mut files)?;
+        let image = backup_stopped_shard(&hold, shard_id, &source, &tree_dir, &mut files)?;
         images.push(image);
     }
-    copy_node_metadata(data_dir, &tree, &mut files)?;
+    copy_node_metadata(&source, &tree_dir, &mut files)?;
     let staging_path = staging.path.clone();
     finish_manifest(
         data_dir,
@@ -981,8 +1119,9 @@ pub fn create_offline_backup(
     let hold = require_active_hold(data_dir)?;
     reject_destination(data_dir, destination)?;
     let mut staging = Staging::create(destination)?;
-    let tree = staging.path.join(BACKUP_TREE_DIR);
-    fs::create_dir_all(&tree)?;
+    let source = open_plain_dir(data_dir)?;
+    let staging_dir = open_plain_dir(&staging.path)?;
+    let tree_dir = ensure_under(&staging_dir, BACKUP_TREE_DIR)?;
     let mut files = Vec::new();
     let mut images = Vec::new();
     let shard_ids = list_shard_ids(data_dir)?;
@@ -992,16 +1131,10 @@ pub fn create_offline_backup(
         ));
     }
     for shard_id in shard_ids {
-        let image = backup_stopped_shard(
-            &hold,
-            shard_id,
-            &shard_dir(data_dir, shard_id),
-            &tree,
-            &mut files,
-        )?;
+        let image = backup_stopped_shard(&hold, shard_id, &source, &tree_dir, &mut files)?;
         images.push(image);
     }
-    copy_node_metadata(data_dir, &tree, &mut files)?;
+    copy_node_metadata(&source, &tree_dir, &mut files)?;
     let staging_path = staging.path.clone();
     finish_manifest(
         data_dir,
@@ -1033,7 +1166,9 @@ pub fn restore_backup(
             "manifest lists no shards or files; refusing an empty restore",
         ));
     }
-    let tree = open_plain_dir(&artifact.join(BACKUP_TREE_DIR)).map_err(|error| {
+    let artifact_dir = open_plain_dir(artifact)
+        .map_err(|error| restore_error(format!("backup artifact is missing or unsafe: {error}")))?;
+    let tree = open_child(&artifact_dir, BACKUP_TREE_DIR, true).map_err(|error| {
         restore_error(format!(
             "backup tree/ directory is missing or unsafe: {error}"
         ))
@@ -1189,7 +1324,8 @@ fn backup_online_shard(
     hold: &BackupHoldRecord,
     shard: &OnlineShard<'_>,
     data_dir: &Path,
-    tree: &Path,
+    source: &File,
+    tree_dir: &File,
     files: &mut Vec<BackupFileRecord>,
 ) -> Result<ShardImageRecord> {
     let floor = floor_for_shard(hold, shard.shard_id)?;
@@ -1201,13 +1337,14 @@ fn backup_online_shard(
         )));
     }
     let relative_raft = format!("be/shards/{:020}/raft", shard.shard_id);
+    let live_raft = open_under(source, &relative_raft)?;
     // Freeze the LSM or snapshot image before copying the log. Commits that land
     // during the checkpoint are still in the log copy, and the hold blocks purge.
     let live_index = shard.engine.durable_checkpoint().flushed_raft_index;
     let (kind, image_index) = if live_index >= purged_now {
         // Hard-linked checkpoints must stay on the source filesystem.
         let lsm_rel = format!("be/shards/{:020}/lsm", shard.shard_id);
-        let lsm_dest = tree.join(safe_relative(&lsm_rel).map_err(backup_error)?);
+        let lsm_dest = ensure_under(tree_dir, &lsm_rel)?;
         let checkpoint = with_checkpoint_scratch(data_dir, shard.shard_id, |temp| {
             let checkpoint = shard.engine.create_checkpoint(temp).map_err(|error| {
                 backup_error(format!(
@@ -1215,23 +1352,24 @@ fn backup_online_shard(
                     shard.shard_id
                 ))
             })?;
-            copy_dir_bytes(temp, &lsm_dest)?;
+            let scratch = open_plain_dir(temp)?;
+            copy_plain_tree(&scratch, &lsm_dest)?;
             Ok(checkpoint)
         })?;
-        record_tree_files(&lsm_dest, &lsm_rel, files)?;
+        record_tree_fd(&lsm_dest, &lsm_rel, files)?;
         (IMAGE_FLUSHED_LSM, checkpoint.flushed_raft_index)
     } else {
         (IMAGE_SNAPSHOT, 0)
     };
-    copy_protected_snapshot(shard.raft_dir, floor, &relative_raft, tree, files)?;
-    let dest_raft = tree.join(safe_relative(&relative_raft).map_err(backup_error)?);
+    copy_protected_snapshot(&live_raft, floor, &relative_raft, tree_dir, files)?;
+    let dest_raft = ensure_under(tree_dir, &relative_raft)?;
     let inspection = shard
         .log_store
-        .copy_durable_log(&dest_raft)
+        .copy_durable_log(&live_raft, &dest_raft)
         .map_err(|error| {
             backup_error(format!("shard {} log copy failed: {error}", shard.shard_id))
         })?;
-    record_log_files(&dest_raft, &relative_raft, files)?;
+    record_log_fd(&dest_raft, &relative_raft, files)?;
     if inspection.last_purged_index > floor.max_purge_index {
         return Err(backup_error(format!(
             "copied log for shard {} is purged past the hold",
@@ -1243,10 +1381,10 @@ fn backup_online_shard(
     }
     image_from_snapshot(
         shard.shard_id,
-        shard.raft_dir,
+        &live_raft,
         floor,
         &inspection,
-        tree,
+        tree_dir,
         files,
     )
 }
@@ -1254,16 +1392,18 @@ fn backup_online_shard(
 fn backup_stopped_shard(
     hold: &BackupHoldRecord,
     shard_id: ShardId,
-    shard_directory: &Path,
-    tree: &Path,
+    source: &File,
+    tree_dir: &File,
     files: &mut Vec<BackupFileRecord>,
 ) -> Result<ShardImageRecord> {
-    let raft_dir = shard_directory.join("raft");
+    let relative_raft = format!("be/shards/{shard_id:020}/raft");
+    let raft = open_under(source, &relative_raft)?;
     let floor = floor_for_shard(hold, shard_id)?;
-    let purged = if raft_dir.join("HARD_STATE").is_file() {
-        read_persisted_purged_index(&raft_dir)?
-    } else {
-        0
+    let purged = match read_listed_file(&raft, "HARD_STATE") {
+        Ok(bytes) => crate::log_store::purged_index_from_hard_state_bytes(&bytes)
+            .map_err(|error| backup_error(error.to_string()))?,
+        Err(error) if is_not_found(&error) => 0,
+        Err(error) => return Err(error),
     };
     if purged > floor.max_purge_index {
         return Err(backup_error(format!(
@@ -1271,67 +1411,101 @@ fn backup_stopped_shard(
             floor.max_purge_index
         )));
     }
-    let relative_raft = format!("be/shards/{shard_id:020}/raft");
-    let dest_raft = tree.join(safe_relative(&relative_raft).map_err(backup_error)?);
-    copy_raft_files_from_disk(&raft_dir, &dest_raft)?;
-    record_tree_files(&dest_raft, &relative_raft, files)?;
-    let inspection = inspect_raft_dir(&dest_raft).map_err(|error| {
-        backup_error(format!(
-            "shard {shard_id} log is not a complete backup image: {error}"
-        ))
-    })?;
-    copy_protected_snapshot(&raft_dir, floor, &relative_raft, tree, files)?;
-    let lsm_dir = shard_directory.join("lsm");
-    let live_index = if lsm_dir.join("CURRENT").is_file() {
-        ManifestLog::read_checkpoint_readonly(&lsm_dir)?.flushed_raft_index
-    } else {
-        0
+    let dest_raft = ensure_under(tree_dir, &relative_raft)?;
+    copy_raft_fd(&raft, &dest_raft)?;
+    record_log_fd(&dest_raft, &relative_raft, files)?;
+    let inspection = crate::log_store::SegmentedRaftLogStore::inspect_copied_dir(&dest_raft)
+        .map_err(|error| {
+            backup_error(format!(
+                "shard {shard_id} log is not a complete backup image: {error}"
+            ))
+        })?;
+    copy_protected_snapshot(&raft, floor, &relative_raft, tree_dir, files)?;
+    let lsm_rel = format!("be/shards/{shard_id:020}/lsm");
+    let live_index = match open_under(source, &lsm_rel) {
+        Ok(lsm) => read_lsm_index(&lsm)?,
+        Err(error) if is_not_found(&error) => None,
+        Err(error) => return Err(error),
     };
-    if live_index >= inspection.last_purged_index && lsm_dir.join("CURRENT").is_file() {
-        let lsm_rel = format!("be/shards/{shard_id:020}/lsm");
-        let lsm_dest = tree.join(safe_relative(&lsm_rel).map_err(backup_error)?);
-        copy_lsm_files(&lsm_dir, &lsm_dest)?;
-        record_tree_files(&lsm_dest, &lsm_rel, files)?;
-        let (manifest, recovered) = ManifestLog::open_existing(&lsm_dest)?;
-        drop(manifest);
-        return finish_image(
-            shard_id,
-            IMAGE_FLUSHED_LSM,
-            recovered.checkpoint.flushed_raft_index,
-            &inspection,
-        );
+    if live_index.is_some_and(|index| index >= inspection.last_purged_index) {
+        let lsm = open_under(source, &lsm_rel)?;
+        let lsm_dest = ensure_under(tree_dir, &lsm_rel)?;
+        copy_lsm_dir(&lsm, &lsm_dest)?;
+        record_tree_fd(&lsm_dest, &lsm_rel, files)?;
+        let index = read_lsm_index(&lsm_dest)?.unwrap_or(0);
+        return finish_image(shard_id, IMAGE_FLUSHED_LSM, index, &inspection);
     }
-    image_from_snapshot(shard_id, &raft_dir, floor, &inspection, tree, files)
+    image_from_snapshot(shard_id, &raft, floor, &inspection, tree_dir, files)
 }
 
 fn image_from_snapshot(
     shard_id: ShardId,
-    raft_dir: &Path,
+    raft: &File,
     floor: &ShardHoldFloor,
     inspection: &RaftLogInspection,
-    tree: &Path,
+    tree_dir: &File,
     files: &mut Vec<BackupFileRecord>,
 ) -> Result<ShardImageRecord> {
-    let Some(snapshot) = newest_snapshot_at_or_below(raft_dir, floor.retain_snapshots_through)
-    else {
+    let Some(index) = newest_anchored_snapshot(raft, floor.retain_snapshots_through)? else {
         return Err(backup_error(format!(
             "shard {shard_id} has no flushed LSM or complete snapshot covering purged index {}",
             inspection.last_purged_index
         )));
     };
-    if snapshot.index < inspection.last_purged_index {
+    if index < inspection.last_purged_index {
         return Err(backup_error(format!(
-            "shard {shard_id} snapshot {} does not cover purged index {}",
-            snapshot.index, inspection.last_purged_index
+            "shard {shard_id} snapshot {index} does not cover purged index {}",
+            inspection.last_purged_index
         )));
     }
     let lsm_rel = format!("be/shards/{shard_id:020}/lsm");
-    let lsm_dest = tree.join(safe_relative(&lsm_rel).map_err(backup_error)?);
-    if !lsm_dest.join("CURRENT").is_file() {
-        copy_lsm_files(&snapshot.path.join("lsm"), &lsm_dest)?;
-        record_tree_files(&lsm_dest, &lsm_rel, files)?;
+    if read_relative(tree_dir, Path::new(&format!("{lsm_rel}/CURRENT"))).is_err() {
+        let lsm = open_under(raft, &format!("snapshots/snap_{index:020}/lsm"))?;
+        let lsm_dest = ensure_under(tree_dir, &lsm_rel)?;
+        copy_lsm_dir(&lsm, &lsm_dest)?;
+        record_tree_fd(&lsm_dest, &lsm_rel, files)?;
     }
-    finish_image(shard_id, IMAGE_SNAPSHOT, snapshot.index, inspection)
+    finish_image(shard_id, IMAGE_SNAPSHOT, index, inspection)
+}
+
+fn newest_anchored_snapshot(raft: &File, max_index: u64) -> Result<Option<u64>> {
+    let snaps = match open_child(raft, "snapshots", true) {
+        Ok(dir) => dir,
+        Err(error) if is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut best: Option<(u64, u8)> = None;
+    for entry in list_plain_dir(&snaps)? {
+        if entry.kind != EntryKind::Dir {
+            continue;
+        }
+        let Some(rest) = entry.name.strip_prefix("snap_") else {
+            continue;
+        };
+        let (index_text, rank) = if let Some(index_text) = rest.strip_suffix(".bak") {
+            (index_text, 0u8)
+        } else if rest.ends_with(".tmp") || rest.contains('.') {
+            continue;
+        } else {
+            (rest, 1u8)
+        };
+        let Ok(index) = index_text.parse::<u64>() else {
+            continue;
+        };
+        if index > max_index {
+            continue;
+        }
+        let snap = open_child(&snaps, &entry.name, true)?;
+        if read_listed_file(&snap, "SNAPSHOT_META").is_err() {
+            continue;
+        }
+        match best {
+            Some((best_index, best_rank))
+                if best_index > index || (best_index == index && best_rank >= rank) => {}
+            _ => best = Some((index, rank)),
+        }
+    }
+    Ok(best.map(|(index, _)| index))
 }
 
 fn finish_image(
@@ -1366,44 +1540,47 @@ fn finish_image(
 }
 
 fn copy_protected_snapshot(
-    raft_dir: &Path,
+    raft: &File,
     floor: &ShardHoldFloor,
     relative_raft: &str,
-    tree: &Path,
+    tree_dir: &File,
     files: &mut Vec<BackupFileRecord>,
 ) -> Result<()> {
-    let Some(snapshot) = newest_snapshot_at_or_below(raft_dir, floor.retain_snapshots_through)
-    else {
+    let Some(index) = newest_anchored_snapshot(raft, floor.retain_snapshots_through)? else {
         return Ok(());
     };
-    let rel = format!("{relative_raft}/snapshots/snap_{:020}", snapshot.index);
-    let dest = tree.join(safe_relative(&rel).map_err(backup_error)?);
-    copy_dir_bytes(&snapshot.path, &dest)?;
-    record_tree_files(&dest, &rel, files)
+    let rel = format!("{relative_raft}/snapshots/snap_{index:020}");
+    let src = open_under(raft, &format!("snapshots/snap_{index:020}"))?;
+    let dest = ensure_under(tree_dir, &rel)?;
+    copy_plain_tree(&src, &dest)?;
+    record_tree_fd(&dest, &rel, files)
 }
 
 fn copy_node_metadata(
-    data_dir: &Path,
-    tree: &Path,
+    source: &File,
+    tree_dir: &File,
     files: &mut Vec<BackupFileRecord>,
 ) -> Result<()> {
-    let allocator = data_dir.join("global_allocator").join("ID_ALLOCATOR_STATE");
-    copy_verified_frame(
+    let allocator = open_under(source, "global_allocator")?;
+    let allocator_dest = ensure_under(tree_dir, "global_allocator")?;
+    copy_child_frame(
         &allocator,
-        &tree.join("global_allocator").join("ID_ALLOCATOR_STATE"),
+        "ID_ALLOCATOR_STATE",
+        &allocator_dest,
         "global_allocator/ID_ALLOCATOR_STATE",
         files,
     )?;
-    let registry = data_dir.join("be").join("NODE_SHARD_REGISTRY");
-    copy_verified_frame(
+    let registry = open_under(source, "be")?;
+    let registry_dest = ensure_under(tree_dir, "be")?;
+    copy_child_frame(
         &registry,
-        &tree.join("be").join("NODE_SHARD_REGISTRY"),
+        "NODE_SHARD_REGISTRY",
+        &registry_dest,
         "be/NODE_SHARD_REGISTRY",
         files,
     )?;
     let mut cells = 0usize;
-    let data = open_plain_dir(data_dir)?;
-    for entry in list_plain_dir(&data)? {
+    for entry in list_plain_dir(source)? {
         if !entry.name.starts_with("cell_") {
             continue;
         }
@@ -1413,15 +1590,16 @@ fn copy_node_metadata(
                 entry.name
             )));
         }
-        let cell = open_child(&data, &entry.name, true)?;
+        let cell = open_child(source, &entry.name, true)?;
         let listed = list_plain_dir(&cell)?;
         if !listed.iter().any(|item| item.name == "CELL_MANAGER_STATE") {
             continue;
         }
+        let cell_dest = ensure_under(tree_dir, &entry.name)?;
         copy_child_frame(
             &cell,
             "CELL_MANAGER_STATE",
-            &tree.join(&entry.name).join("CELL_MANAGER_STATE"),
+            &cell_dest,
             &format!("{}/CELL_MANAGER_STATE", entry.name),
             files,
         )?;
@@ -1429,7 +1607,7 @@ fn copy_node_metadata(
             copy_child_frame(
                 &cell,
                 "CELL_OWNER",
-                &tree.join(&entry.name).join("CELL_OWNER"),
+                &cell_dest,
                 &format!("{}/CELL_OWNER", entry.name),
                 files,
             )?;
@@ -1446,7 +1624,7 @@ fn copy_node_metadata(
         copy_child_frame(
             &cell,
             "CLUSTER_IDENTITY",
-            &tree.join(&entry.name).join("CLUSTER_IDENTITY"),
+            &cell_dest,
             &format!("{}/CLUSTER_IDENTITY", entry.name),
             files,
         )?;
@@ -1487,14 +1665,20 @@ fn finish_manifest(
             )));
         }
     }
+    let source = open_plain_dir(data_dir)?;
     for floor in &current.floors {
-        if !copied.contains(&floor.shard_id)
-            && plain_dir_exists(&shard_dir(data_dir, floor.shard_id))?
-        {
-            return Err(backup_error(format!(
-                "hold covers shard {} but that shard was not copied",
-                floor.shard_id
-            )));
+        if copied.contains(&floor.shard_id) {
+            continue;
+        }
+        match open_under(&source, &format!("be/shards/{:020}", floor.shard_id)) {
+            Ok(_) => {
+                return Err(backup_error(format!(
+                    "hold covers shard {} but that shard was not copied",
+                    floor.shard_id
+                )));
+            }
+            Err(error) if is_not_found(&error) => {}
+            Err(error) => return Err(error),
         }
     }
     check_tree(&tree)?;
@@ -1585,12 +1769,18 @@ struct CheckpointScratchGuard {
 }
 
 fn lock_checkpoint_scratch(data_dir: &Path, shard_id: ShardId) -> Result<CheckpointScratchGuard> {
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(data_dir.join(checkpoint_scratch_lock_name(shard_id)))?;
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(O_NOFOLLOW);
+    let file = options
+        .open(data_dir.join(checkpoint_scratch_lock_name(shard_id)))
+        .map_err(|error| {
+            open_error(
+                &data_dir.join(checkpoint_scratch_lock_name(shard_id)),
+                error,
+            )
+        })?;
     file.lock().map_err(|error| {
         backup_error(format!(
             "checkpoint scratch lock for shard {shard_id}: {error}"
@@ -1623,19 +1813,16 @@ fn with_checkpoint_scratch<T>(
 /// Removes one crash scratch directory. A symlink or a non-directory is left in place.
 fn clear_checkpoint_scratch(data_dir: &Path, shard_id: ShardId) -> Result<()> {
     let path = data_dir.join(checkpoint_scratch_name(shard_id));
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(backup_error(format!(
-            "checkpoint scratch {} is not a plain directory; refusing to delete it",
-            path.display()
-        )));
-    }
-    fs::remove_dir_all(&path)?;
-    Ok(())
+    remove_plain_dir(&path).map_err(|error| {
+        if error.to_string().contains("refusing to delete") {
+            backup_error(format!(
+                "checkpoint scratch {} is not a plain directory; refusing to delete it",
+                path.display()
+            ))
+        } else {
+            error
+        }
+    })
 }
 
 fn ensure_registry_matches(root: &Path, copied: &BTreeSet<ShardId>) -> Result<()> {
@@ -1871,21 +2058,7 @@ fn reject_destination(data_dir: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn shard_dir(data_dir: &Path, shard_id: ShardId) -> PathBuf {
-    data_dir
-        .join("be")
-        .join("shards")
-        .join(format!("{shard_id:020}"))
-}
-
-fn copy_raft_files_from_disk(raft_dir: &Path, dest: &Path) -> Result<()> {
-    let src = open_plain_dir(raft_dir).map_err(|error| {
-        backup_error(format!(
-            "HARD_STATE is missing from {}: {error}",
-            raft_dir.display()
-        ))
-    })?;
-    let dst = ensure_dest_dir(dest)?;
+fn copy_raft_fd(src: &File, dst: &File) -> Result<()> {
     let mut copied_hard_state = false;
     for entry in list_plain_dir(&src)? {
         let copy_name = entry.name == "HARD_STATE"
@@ -1907,10 +2080,9 @@ fn copy_raft_files_from_disk(raft_dir: &Path, dest: &Path) -> Result<()> {
         }
     }
     if !copied_hard_state {
-        return Err(backup_error(format!(
-            "HARD_STATE is missing from {}",
-            raft_dir.display()
-        )));
+        return Err(backup_error(
+            "HARD_STATE is missing from the anchored raft directory",
+        ));
     }
     Ok(())
 }
@@ -1923,6 +2095,10 @@ fn copy_lsm_files(source: &Path, dest: &Path) -> Result<()> {
         ))
     })?;
     let dst = ensure_dest_dir(dest)?;
+    copy_lsm_dir(&src, &dst)
+}
+
+fn copy_lsm_dir(src: &File, dst: &File) -> Result<()> {
     let mut saw_current = false;
     for entry in list_plain_dir(&src)? {
         if entry.name == "LOCK" || entry.name.ends_with(".tmp") {
@@ -1947,12 +2123,29 @@ fn copy_lsm_files(source: &Path, dest: &Path) -> Result<()> {
         }
     }
     if !saw_current {
-        return Err(backup_error(format!(
-            "CURRENT is missing from LSM image {}",
-            source.display()
-        )));
+        return Err(backup_error(
+            "CURRENT is missing from the anchored LSM image",
+        ));
     }
     Ok(())
+}
+
+fn read_lsm_index(lsm: &File) -> Result<Option<u64>> {
+    let current = match read_listed_file(lsm, "CURRENT") {
+        Ok(bytes) => bytes,
+        Err(error) if is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let name = String::from_utf8(current)
+        .map_err(|error| backup_error(format!("CURRENT is not utf-8: {error}")))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(backup_error("CURRENT is empty"));
+    }
+    let raw = read_listed_file(lsm, name)?;
+    Ok(Some(
+        ManifestLog::checkpoint_from_manifest_bytes(name, &raw)?.flushed_raft_index,
+    ))
 }
 
 fn copy_dir_bytes(source: &Path, dest: &Path) -> Result<()> {
@@ -1968,7 +2161,7 @@ fn copy_dir_bytes(source: &Path, dest: &Path) -> Result<()> {
 fn copy_child_frame(
     dir: &File,
     name: &str,
-    dest: &Path,
+    dest: &File,
     relative: &str,
     files: &mut Vec<BackupFileRecord>,
 ) -> Result<()> {
@@ -1977,7 +2170,7 @@ fn copy_child_frame(
         match read_listed_file(dir, name) {
             Ok(bytes) => match verify_crc32c_le(&bytes, "backup source") {
                 Ok(_) => {
-                    write_new_bytes(dest, &bytes)?;
+                    write_child_file(dest, name, &bytes)?;
                     files.push(BackupFileRecord {
                         path: relative.replace('\\', "/"),
                         len: bytes.len() as u64,
@@ -1997,29 +2190,12 @@ fn copy_child_frame(
     )))
 }
 
-fn copy_verified_frame(
-    source: &Path,
-    dest: &Path,
-    relative: &str,
-    files: &mut Vec<BackupFileRecord>,
-) -> Result<()> {
-    let Some(parent) = source.parent() else {
-        return Err(backup_error(format!("{relative} has no parent directory")));
-    };
-    let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
-        return Err(backup_error(format!("{relative} is not a utf-8 file name")));
-    };
-    let dir = open_plain_dir(parent)?;
-    copy_child_frame(&dir, name, dest, relative, files)
-}
-
-fn record_log_files(
-    raft_dir: &Path,
+fn record_log_fd(
+    dir: &File,
     relative_prefix: &str,
     files: &mut Vec<BackupFileRecord>,
 ) -> Result<()> {
-    let dir = open_plain_dir(raft_dir)?;
-    for entry in list_plain_dir(&dir)? {
+    for entry in list_plain_dir(dir)? {
         let copy_name = entry.name == "HARD_STATE"
             || entry.name == "INITIALIZED"
             || (entry.name.starts_with("segment_") && entry.name.ends_with(".raftlog"));
@@ -2032,7 +2208,7 @@ fn record_log_files(
                 entry.name
             )));
         }
-        let bytes = read_listed_file(&dir, &entry.name)?;
+        let bytes = read_listed_file(dir, &entry.name)?;
         record_bytes(&format!("{relative_prefix}/{}", entry.name), &bytes, files);
     }
     Ok(())
@@ -2046,34 +2222,21 @@ fn record_bytes(relative: &str, bytes: &[u8], files: &mut Vec<BackupFileRecord>)
     });
 }
 
-fn record_tree_files(
-    root: &Path,
+fn record_tree_fd(
+    dir: &File,
     relative_prefix: &str,
     files: &mut Vec<BackupFileRecord>,
 ) -> Result<()> {
-    let dir = open_plain_dir(root)?;
     let mut discovered = Vec::new();
-    walk_plain_dir(&dir, Path::new(""), &mut discovered)?;
+    walk_plain_dir(dir, Path::new(""), &mut discovered)?;
     discovered.sort();
     for path in discovered {
         let suffix = relative_string(&path)?;
         let relative = format!("{}/{}", relative_prefix.trim_end_matches('/'), suffix);
-        let bytes = read_relative(&dir, &path)?;
+        let bytes = read_relative(dir, &path)?;
         record_bytes(&relative, &bytes, files);
     }
     Ok(())
-}
-
-fn plain_dir_exists(path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-        Ok(meta) if meta.file_type().is_symlink() => Err(backup_error(format!(
-            "refusing to follow symlink {}",
-            path.display()
-        ))),
-        Ok(meta) => Ok(meta.is_dir()),
-    }
 }
 
 fn plain_file_exists(path: &Path) -> Result<bool> {
@@ -2100,20 +2263,6 @@ fn safe_relative(path: &str) -> std::result::Result<PathBuf, String> {
         out.push(part);
     }
     Ok(out)
-}
-
-fn write_new_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    let Some(name) = path.file_name() else {
-        return Err(backup_error("backup path has no file name"));
-    };
-    let name = component_name(name)?;
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    fs::create_dir_all(parent)?;
-    let dir = open_plain_dir(parent)?;
-    write_child_file(&dir, &name, bytes)
 }
 
 enum RestoreDestination {
@@ -2160,23 +2309,83 @@ fn sync_plain_dir(dir: &File) -> Result<()> {
             )));
         }
     }
-    sync_dir(&proc_dir(dir))?;
+    #[cfg(target_os = "linux")]
+    {
+        sync_dir(&proc_dir(dir))?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+    }
     Ok(())
 }
 
 fn remove_plain_dir(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => Err(backup_error(format!(
-            "refusing to delete {}",
-            path.display()
-        ))),
-        Ok(_) => {
-            fs::remove_dir_all(path)?;
-            Ok(())
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(backup_error(format!(
+                "refusing to delete {}",
+                path.display()
+            )));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
     }
+    #[cfg(target_os = "linux")]
+    {
+        let dir = open_plain_dir(path)?;
+        remove_dir_fd(&dir)?;
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(backup_error(format!(
+                    "refusing to delete {}",
+                    path.display()
+                )));
+            }
+            Ok(meta) => {
+                use std::os::unix::fs::MetadataExt;
+                let opened = dir.metadata()?;
+                if meta.dev() != opened.dev() || meta.ino() != opened.ino() {
+                    return Err(backup_error(format!(
+                        "refusing to delete {}",
+                        path.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        fs::remove_dir(path)?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        fs::remove_dir_all(path)?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn remove_dir_fd(dir: &File) -> Result<()> {
+    for entry in list_plain_dir(dir)? {
+        let child = proc_dir(dir).join(&entry.name);
+        match entry.kind {
+            EntryKind::Dir => {
+                let nested = open_child(dir, &entry.name, true)?;
+                remove_dir_fd(&nested)?;
+                fs::remove_dir(child)?;
+            }
+            EntryKind::File => fs::remove_file(child)?,
+            EntryKind::Other => {
+                return Err(backup_error(format!(
+                    "refusing to delete special file {}",
+                    entry.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_manifest(artifact: &Path) -> Result<BackupManifest> {
@@ -2503,6 +2712,7 @@ mod tests {
         assert!(!dir.path().join(checkpoint_scratch_name(1)).exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn crash_checkpoint_scratch_is_removed_without_touching_other_names() {
         let dir = tempfile::tempdir().unwrap();
@@ -2541,6 +2751,7 @@ mod tests {
         assert_eq!(next.output_dir, "/tmp/b");
     }
 
+    #[cfg(target_os = "linux")]
     fn external_sentinel(dir: &Path) -> PathBuf {
         let external = dir.join("external");
         fs::create_dir_all(external.join("nested")).unwrap();
@@ -2548,6 +2759,7 @@ mod tests {
         external
     }
 
+    #[cfg(target_os = "linux")]
     fn assert_sentinel_untouched(external: &Path) {
         assert_eq!(fs::read(external.join("SENTINEL")).unwrap(), b"keep-me");
         assert!(external.join("nested").is_dir());
@@ -2565,6 +2777,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     fn assert_no_sentinel_bytes(root: &Path) {
         if !root.exists() {
             return;
@@ -2587,6 +2800,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn copy_dir_bytes_rejects_a_file_symlink_and_keeps_the_external_sentinel() {
         let dir = tempfile::tempdir().unwrap();
@@ -2605,6 +2819,7 @@ mod tests {
         assert_no_sentinel_bytes(&dest);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn copy_dir_bytes_rejects_a_directory_symlink_and_keeps_the_external_sentinel() {
         let dir = tempfile::tempdir().unwrap();
@@ -2624,6 +2839,7 @@ mod tests {
         assert_no_sentinel_bytes(&dest);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn copy_lsm_files_rejects_a_file_symlink_and_keeps_the_external_sentinel() {
         let dir = tempfile::tempdir().unwrap();
@@ -2642,6 +2858,7 @@ mod tests {
         assert_no_sentinel_bytes(&dest);
     }
 
+    #[cfg(target_os = "linux")]
     fn write_min_manifest(artifact: &Path, body: &[u8]) -> Result<()> {
         let tree = artifact.join(BACKUP_TREE_DIR);
         fs::create_dir_all(&tree).unwrap();
@@ -2667,6 +2884,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn restore_rejects_a_symlink_destination_and_keeps_the_external_sentinel() {
         let dir = tempfile::tempdir().unwrap();
@@ -2687,6 +2905,7 @@ mod tests {
             .is_symlink());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn restore_rejects_a_file_symlink_in_the_artifact_and_keeps_the_external_sentinel() {
         let dir = tempfile::tempdir().unwrap();
@@ -2709,6 +2928,7 @@ mod tests {
         assert_no_sentinel_bytes(&dest);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn restore_rejects_a_directory_symlink_in_the_artifact_and_keeps_the_external_sentinel() {
         let dir = tempfile::tempdir().unwrap();
@@ -2726,5 +2946,86 @@ mod tests {
         assert_sentinel_untouched(&external);
         assert!(!dest.exists());
         assert!(!external.join("note").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_log_symlink_is_not_copied_and_the_sentinel_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let external = external_sentinel(dir.path());
+        let raft = dir.path().join("raft");
+        let store = crate::log_store::SegmentedRaftLogStore::open(
+            &raft,
+            std::sync::Arc::new(crate::types::ShardWatermarkTracker::default()),
+        )
+        .unwrap();
+        fs::remove_file(raft.join("HARD_STATE")).unwrap();
+        std::os::unix::fs::symlink(external.join("SENTINEL"), raft.join("HARD_STATE")).unwrap();
+        let source = open_plain_dir(&raft).unwrap();
+        let dest = dir.path().join("copied");
+        fs::create_dir(&dest).unwrap();
+        let dest_dir = open_plain_dir(&dest).unwrap();
+        let error = store.copy_durable_log(&source, &dest_dir).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to follow symlink"),
+            "{error}"
+        );
+        assert_sentinel_untouched(&external);
+        assert_no_sentinel_bytes(&dest);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn intermediate_shard_directory_symlink_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let external = external_sentinel(dir.path());
+        let real_shard = dir.path().join("real-shard");
+        fs::create_dir_all(real_shard.join("lsm")).unwrap();
+        fs::write(real_shard.join("lsm").join("CURRENT"), b"MANIFEST-000001\n").unwrap();
+        fs::copy(
+            external.join("SENTINEL"),
+            real_shard.join("lsm").join("SENTINEL"),
+        )
+        .unwrap();
+        let data = dir.path().join("data");
+        let shards = data.join("be").join("shards");
+        fs::create_dir_all(&shards).unwrap();
+        std::os::unix::fs::symlink(&real_shard, shards.join(format!("{:020}", 1u64))).unwrap();
+        let root = open_plain_dir(&data).unwrap();
+        let error = open_under(&root, &format!("be/shards/{:020}/lsm", 1u64)).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to follow symlink"),
+            "{error}"
+        );
+        assert_eq!(fs::read(external.join("SENTINEL")).unwrap(), b"keep-me");
+        assert_eq!(
+            fs::read(real_shard.join("lsm").join("SENTINEL")).unwrap(),
+            b"keep-me"
+        );
+        let listed = list_shard_ids(&data).unwrap_err();
+        assert!(
+            listed.to_string().contains("refusing to follow symlink"),
+            "{listed}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn manifest_tmp_symlink_is_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("SENTINEL");
+        fs::write(&sentinel, b"keep-me").unwrap();
+        let record = dir.path().join("BACKUP_MANIFEST");
+        std::os::unix::fs::symlink(&sentinel, dir.path().join("BACKUP_MANIFEST.tmp")).unwrap();
+        let error = write_serialized(&record, b"payload".to_vec()).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to follow symlink"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep-me");
+        assert!(fs::symlink_metadata(dir.path().join("BACKUP_MANIFEST.tmp"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }
