@@ -607,9 +607,23 @@ impl StateMachineShared {
                 self.clear_unrecoverable();
                 Ok(Some(snapshot))
             }
-            Err(error) => self.fail_unrecoverable(format!(
-                "cannot rebuild a missing snapshot from the LSM ({error}). required index is {required}, flushed LSM index is {flushed}, applied index is {applied}. The segmented raft log is the WAL only until it is purged. If the log and the LSM are both gone, committed data is not reconstructed"
-            )),
+            Err(error) => {
+                let text = error.to_string();
+                // A transient publish error must not stick. Latch only when the
+                // flushed LSM cannot cover the purged prefix, or the files
+                // needed to rebuild it are already gone.
+                let files_gone = text.contains("os error 2")
+                    || text.contains("No such file")
+                    || text.contains("does not cover required")
+                    || text.contains("not found");
+                if flushed < required || files_gone {
+                    self.fail_unrecoverable(format!(
+                        "cannot rebuild a missing snapshot from the LSM ({text}). required index is {required}, flushed LSM index is {flushed}, applied index is {applied}. After purge, reconstruction depends on the LSM. There is no fourth copy, so committed data is not reconstructed"
+                    ))
+                } else {
+                    Err(error)
+                }
+            }
         }
     }
 }
@@ -869,12 +883,24 @@ impl ShardStateMachine {
             }
         }
 
-        let engine = Arc::new(LifecycleStorageEngine::open_lsm(
+        let engine = match LifecycleStorageEngine::open_lsm(
             shard_id,
             &lsm_dir,
             block_cache.clone(),
             lsm_config.clone(),
-        )?);
+        ) {
+            Ok(engine) => Arc::new(engine),
+            Err(error) => {
+                let purged = crate::log_store::read_persisted_purged_index(&shard_dir.join("raft"))
+                    .unwrap_or(0);
+                if purged > 0 {
+                    return Err(MetaDbError::StorageIoError(format!(
+                        "snapshot unrecoverable: cannot open the LSM after the raft log was purged ({error}). committed data is not reconstructed"
+                    )));
+                }
+                return Err(error);
+            }
+        };
         attach_flush_hook(&engine, &handler);
         let cp = engine.durable_checkpoint();
 
@@ -920,6 +946,17 @@ impl ShardStateMachine {
             snapshot_cache: Mutex::new(None),
         });
 
+        // Rewrite a missing snapshot, or refuse to return a state machine that
+        // would serve an empty LSM over a purged log.
+        if let Err(error) = shared.load_current_snapshot_sync() {
+            return Err(MetaDbError::StorageIoError(error.to_string()));
+        }
+        if let Some(reason) = shared.unrecoverable.lock().unwrap().clone() {
+            return Err(MetaDbError::StorageIoError(format!(
+                "snapshot unrecoverable: {reason}"
+            )));
+        }
+
         Ok((Self { shared }, frontier_rx))
     }
 
@@ -935,6 +972,11 @@ impl ShardStateMachine {
     /// The snapshot index already published in memory has no complete directory.
     pub fn published_snapshot_missing(&self) -> bool {
         self.shared.published_snapshot_missing()
+    }
+
+    /// Rebuild a required snapshot from the LSM, or record that it cannot be covered.
+    pub fn ensure_durable_snapshot(&self) -> io::Result<()> {
+        self.shared.load_current_snapshot_sync().map(|_| ())
     }
 
     pub fn handler(&self) -> &Arc<dyn ShardApplyHandler> {

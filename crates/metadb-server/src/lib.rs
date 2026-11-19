@@ -847,6 +847,9 @@ impl PersistentMetaDbCluster {
         // `.raftlog` retention follows the 3-watermark gate in production (metadbd's loop).
         for cell in self.global_manager.all_cells() {
             for (_, grp, _) in cell.local_shard_handles() {
+                // Rewrite a missing snapshot from the LSM without waiting for a
+                // client read. A purged log has no other copy.
+                let _ = grp.repair_published_snapshot().await;
                 let retained = grp.log_store().retained_entry_count();
                 if retained == 0 {
                     continue;

@@ -977,12 +977,14 @@ impl DurableCellManager {
         let routes = self.list_routes();
         for route in &routes {
             if let Some(group) = self.host.get_group(route.shard_id) {
-                if let Some(reason) = group.storage_unrecoverable() {
-                    return Err(MetaDbError::StorageIoError(format!(
-                        "shard {} storage is unrecoverable, so it is not a live voter: {reason}",
+                // Probe the snapshot directory. The in-memory latch is still
+                // empty until something attempts repair.
+                group.ensure_published_snapshot_sync().map_err(|error| {
+                    MetaDbError::StorageIoError(format!(
+                        "shard {} storage is unrecoverable, so it is not a live voter: {error}",
                         route.shard_id
-                    )));
-                }
+                    ))
+                })?;
             }
         }
         Ok(routes)

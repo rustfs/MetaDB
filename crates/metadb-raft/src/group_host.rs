@@ -218,6 +218,12 @@ impl ShardRaftGroup {
             let _ = raft.wait_for_recovery(Some(Duration::from_secs(5))).await;
         }
 
+        if let Some(reason) = state_machine.storage_unrecoverable() {
+            return Err(MetaDbError::StorageIoError(format!(
+                "snapshot unrecoverable: {reason}"
+            )));
+        }
+
         router.register_group(shard_id, raft.clone());
         let read_batcher = Arc::new(ReadIndexBatcher::new(shard_id, raft.clone(), frontier_rx));
 
@@ -362,6 +368,30 @@ impl ShardRaftGroup {
     /// `Some` when this process must not be reported as a live voter.
     pub fn storage_unrecoverable(&self) -> Option<String> {
         self.state_machine.storage_unrecoverable()
+    }
+
+    /// Repair a missing published snapshot before cluster status returns.
+    ///
+    /// Status must not trust the in-memory latch alone. The files can disappear
+    /// before any `get_current_snapshot` call.
+    pub fn ensure_published_snapshot_sync(&self) -> Result<()> {
+        if let Some(reason) = self.storage_unrecoverable() {
+            return Err(MetaDbError::StorageIoError(format!(
+                "snapshot unrecoverable: {reason}"
+            )));
+        }
+        if !self.state_machine.published_snapshot_missing() {
+            return Ok(());
+        }
+        self.state_machine
+            .ensure_durable_snapshot()
+            .map_err(|error| MetaDbError::StorageIoError(error.to_string()))?;
+        if let Some(reason) = self.storage_unrecoverable() {
+            return Err(MetaDbError::StorageIoError(format!(
+                "snapshot unrecoverable: {reason}"
+            )));
+        }
+        Ok(())
     }
 
     /// Rewrite a published snapshot that disappeared, or refuse to serve.

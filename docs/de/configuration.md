@@ -15,7 +15,7 @@
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | Ja. Bind-Adresse |
 | `node.metrics_listen_addr` | nicht gesetzt | Ja, nur wenn gesetzt. Eigener TCP-Listener. Eine Nicht-Loopback-Adresse verlangt ein nicht leeres Geheimnis |
 | `clock.max_clock_drift_ms` | `500` | Ja. `HybridLogicalClock::with_max_drift_ms` |
-| `storage.memtable_size_bytes` | `33554432` (32 MiB) | Yes. Seals and flushes the active memtable once its accounted bytes reach this size. Values below 1 are treated as 1 |
+| `storage.memtable_size_bytes` | `33554432` (32 MiB) | **Nein.** Das Feld wird gespeichert und nie gelesen |
 | `storage.block_cache_bytes` | `67108864` (64 MiB) | Ja. Gesamtbudget des 16-fachen Blockcaches |
 | `storage.mvcc_retention_ms` | `5000` | Ja |
 | `storage.bloom_bits_per_key` | `10` | Ja |
@@ -31,7 +31,7 @@ Es gibt keine Tabelle `[raft]`. `ServerTomlConfig.raft_options` wird von serde �
 
 ## Beispiel
 
-This file matches the defaults except for an explicit data directory, a metrics port, and a secret. `memtable_size_bytes` is the active memtable flush threshold. `max_imm_memtables` is the immutable-table backpressure cap.
+Diese Datei entspricht den Vorgaben, außer einem ausdrücklichen Datenverzeichnis, einem Metrik-Port und einem Geheimnis. `memtable_size_bytes` steht hier, damit eine kopierte Konfiguration nicht überrascht; eine Änderung ändert das Flush-Verhalten nicht.
 
 ```toml
 [node]

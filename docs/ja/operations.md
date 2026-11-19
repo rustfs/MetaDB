@@ -137,7 +137,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 - ジャンボ隔離はルートフラグと、ローカルノード表から選んだノード ID である。他のシャードをディスクから追い出すことはしない。
 - ハートビートは RPC であり、`metadbd` に送信側はない。`StoreHeartbeat` は永続化しない。
 - 空でない共有シークレットは、Raft、他の 3 つの gRPC サービス、およびメトリクスリスナーを同じベアラで認証する。空のシークレットはループバックのバインドだけを受け付け、それらのリスナーは無認証のままである。空のシークレットでのワイルドカードバインドは起動を拒否する。プロセスは TLS を終端しない。
-- `memtable_size_bytes` seals and flushes the active memtable. `max_imm_memtables` caps queued immutable tables. Raft timer fields do not change runtime behavior through TOML.
+- `memtable_size_bytes` とすべての Raft タイマ項目は、TOML 経由で実行時の挙動を変えない。
 - `hotspot-create` と `bulk-ttl-delete` の `metadb-ctl bench` は JSON 行を印字する。`bench_pid` を含むヘッダのあと、attempted、succeeded、failed とレイテンシのパーセンタイルを持つフェーズ報告が続く。要求した操作がすべて成功しない限り、プロセスは非ゼロで終了する。`--workload mixed` または `--embedded` はプロセス内のストレステストを実行する。`sql` は応答を JSON で印字し、アプリケーションエラーでは非ゼロで終了する。
 
 ## 文書化できない欠落
