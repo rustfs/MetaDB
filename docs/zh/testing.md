@@ -12,7 +12,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-`cargo test --workspace` 会构建库、集成测试和两个二进制。没有 `[[bench]]` 目标，也没有 `benches/` 目录。本树自带的负载发生器是下面的 `metadb-ctl bench`。
+`cargo test --workspace` builds the library, the integration tests, and both binaries. There is no `[[bench]]` target and no `benches/` directory. The load generators that ship in this tree are `metadb-ctl bench` and `cargo test -p metadb-server --test stress_harness`, below.
 
 较窄的常用命令：
 
@@ -31,6 +31,7 @@ cargo test -p metadb-proxy --test sql_templates_tests
 cargo test -p metadb-storage --test lsm_recovery_tests
 cargo test -p metadb-storage --test mvcc_snapshot_tests
 cargo test -p metadb-storage --test locality_compaction_tests
+cargo test -p metadb-server --test stress_harness
 ```
 
 ## 每个套件实际覆盖什么
@@ -99,31 +100,61 @@ cargo run -p metadb-server --bin metadb-ctl -- \
   bench --workload bulk-ttl-delete --concurrency 16 --ops 1000
 ```
 
-标志：`--workload` 为 `hotspot-create`（默认）、`bulk-ttl-delete` 或 `mixed`。省略 `--concurrency` 时为 16。`--ops` 默认 1000。`--embedded` 或 `--workload mixed` 会启动一个临时的 all-in-one 节点和进程内压力工具，而不是拨号 `--endpoint`。
+Flags: `--workload` is `hotspot-create` (the default), `bulk-ttl-delete`, or `mixed`. For the remote workloads, omitted `--concurrency` is 16 and `--ops` defaults to 1000. `--profile` is read only when the command takes the embedded path. `--embedded` or `--workload mixed` does not dial `--endpoint` and does not use `--ops`. It starts a temporary all-in-one node and runs the in-process stress harness. See [In-process stress harness](#in-process-stress-harness).
 
-来自 `crates/metadb-server/src/bin/metadb-ctl.rs` 的远程负载行为：
+Behavior from `crates/metadb-server/src/bin/metadb-ctl.rs` for the remote workloads:
 
-- 客户端分配一个目录 id，再分配长度为 `--ops` 的文件 inode 和文件 id 块。数量或结尾溢出的授予会被拒绝。
-- 它打印一个包含 `bench_pid`、`workload` 和 `requested_ops` 的 JSON 对象，然后在新目录下创建同样数量的 4096 字节文件。
-- 每个阶段打印包含 `attempted`、`succeeded`、`failed`、`transport_failed`、`application_failed`、`errors_by_kind` 和延迟分位数的 JSON。若 `succeeded` 不等于 `--ops`，进程以非零状态退出。
-- `bulk-ttl-delete` 删除已创建的名字，再用 `limit = 1` 列举该目录。
-- 再跑一次会分配新的 `bench_pid`。被拒绝的创建不算成功。
+- The client allocates one directory id, then file-inode and file-id blocks of length `--ops`, and refuses a grant whose count or end overflows.
+- It prints one JSON object with `bench_pid`, `workload`, and `requested_ops`, then creates that many 4096-byte files under a new directory.
+- Each phase prints JSON with `attempted`, `succeeded`, `failed`, `transport_failed`, `application_failed`, `errors_by_kind`, and latency percentiles (`p50_ms`, `p99_ms`, `p999_ms`). The process exits non-zero unless `succeeded` equals `--ops`.
+- `bulk-ttl-delete` unlinks the names that were created, then lists the directory with `limit = 1` and prints whether that page is empty.
+- A second run allocates a new `bench_pid`. It does not reuse a fixed inode, and it does not report rejected creates as successes.
 
-不要把这条命令打出的数字当作仓库结果。它取决于机器、构建配置和你指向的服务器。本树没有记录样本。
+Do not treat a number from this command as a repository result. A remote run depends on the machine, the build profile, and the server you pointed at. An embedded run depends on the machine and the build profile. This tree does not record a sample of either.
 
-## 未合并的拉取请求 2
+## In-process stress harness
 
-[拉取请求 2](https://github.com/rustfs/MetaDB/pull/2) 处于打开状态，不属于本分支。它增加持久拓扑测试和一套嵌入式压力工具。它自己的说明写道：
+`crates/metadb-server/tests/stress_harness.rs` and `metadb-ctl bench --embedded` both call `metadb_server::stress` (`crates/metadb-server/src/stress.rs`). There is no third profile named `mixed`. `--workload mixed` selects this harness. Both profiles run the same mixed workload: create, lookup, dirstat, listdir, rename, and unlink against one persistent all-in-one node on a temporary data directory. After the timed loop the harness runs maintenance ticks, then checks directory listings, dirstat, and quota against the operations that succeeded. A failed maintenance tick adds one to `errors`, sets `correctness_errors` to 1, and skips that check. The run is one OS process and one data directory. It is not three `metadbd` processes, and it is not the [official prefix load](../en/testing.md#prefix-load).
 
-- 单节点测试在临时目录上调用 `PersistentMetaDbCluster::open_and_serve`。
-- 扩容测试在同一进程里强制一次 PID 边界分裂。
-- 分布式测试是一个进程、三个 localhost Raft 投票者。它调用 `DurableCellManager::scale_out_replicas`。它不启动三个 `metadbd` 操作系统进程。
-- `open_and_serve` 仍然拒绝除 `all-in-one` 以外的每个角色。拆开的角色和第二个单元仍未实现。
+| Profile | Test | Duration | Concurrency | Directories | When it runs |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `smoke` | `stress_smoke_mixed_workload` | 5 seconds | 4 | 4 | `cargo test -p metadb-server --test stress_harness`, including `cargo test --workspace`. Ignores `METADB_STRESS_*`. |
+| `local` | `stress_local_mixed_workload` | 30 seconds unless overridden | 8 unless overridden | 16 unless overridden | `#[ignore]`. Not part of `cargo test --workspace`. Reads `METADB_STRESS_DURATION_SECS`, `METADB_STRESS_CONCURRENCY`, `METADB_STRESS_KEYSPACE`, and `METADB_STRESS_SEED`. |
 
-该拉取请求的报告，在作者的虚拟机上、Rust 1.100.0（未写明硬件），包含本分支没有的那套工具的一行冒烟输出：
+```bash
+cargo test -p metadb-server --test stress_harness stress_smoke -- --nocapture
 
-```text
-metadb stress profile=smoke ops=12219 errors=0 correctness_errors=0 elapsed_ms=5221 ops_per_s=2340.3 latency_us p50=1318 p99=5207 max=12449
+METADB_STRESS_DURATION_SECS=120 \
+METADB_STRESS_CONCURRENCY=16 \
+METADB_STRESS_KEYSPACE=32 \
+METADB_STRESS_SEED=7 \
+  cargo test -p metadb-server --test stress_harness stress_local -- --ignored --nocapture
+
+cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile smoke
+cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile local
 ```
 
-这一行是一次未合并测试的单次运行。它不是服务目标，本分支上的 `metadb-ctl bench` 也不会复现它。`cargo test -p metadb-server --test topology_distributed` 和 `metadb-ctl bench --embedded` 这类命令只存在于该拉取请求的分支上。
+`METADB_STRESS_*` applies to the local profile, including `metadb-ctl bench --embedded --profile local`. On `metadb-ctl bench --embedded`, `--duration-secs`, `--concurrency`, `--keyspace`, and `--seed` override whichever profile was selected, after the environment is read. The `cargo test` local profile has no flag overrides; it reads only those variables. A duration, concurrency, or directory count below 1 is raised to 1. `--profile` defaults to `smoke`. `--profile ci` is the same smoke profile. Any other `--profile` value exits with an error. The smoke profile does not read `METADB_STRESS_*`. Remote `hotspot-create` and `bulk-ttl-delete` ignore `--profile`.
+
+The test prints one line and requires `errors = 0`, `correctness_errors = 0`, and `ops > 0`. `metadb-ctl bench --embedded` prints `embedded metadbd listening on <addr>` and the same line, and exits non-zero when `errors` or `correctness_errors` is greater than zero. The line fields are:
+
+```text
+metadb stress profile=<name> ops=<count> errors=<count> correctness_errors=<count> elapsed_ms=<ms> ops_per_s=<rate> latency_us p50=<us> p99=<us> max=<us>
+```
+
+`ops` counts only mixed-loop operations that succeeded. `ops_per_s` divides that count by the elapsed time. `errors` counts mixed-loop operations that did not succeed. A failed maintenance tick is also added to `errors`, and it sets `correctness_errors` to 1 instead of running the check. When the check runs, `correctness_errors` counts mismatched directory listings, dirstat, and quota, and it also counts failed verification calls (`dirstat`, `listdir`, and `get_quota`). `latency_us` `p50`, `p99`, and `max` are percentiles of every mixed-loop attempt, including failed attempts, in microseconds. They are not percentiles of `ops`. They are printed. This tree does not enforce a latency threshold.
+
+A line from either command is a result for the machine that printed it. This repository does not record that line. It is not a service-level result, not a first-ship pass, and not the official 1,000,000-create prefix load.
+
+## Persistent topology and join
+
+These commands are in this tree. CI runs them with `cargo test --workspace --locked`.
+
+- `cargo test -p metadb-server --test topology_single_node` opens `PersistentMetaDbCluster` on a temporary directory.
+- `cargo test -p metadb-server --test topology_scale_out` forces a PID-boundary split in that process.
+- `cargo test -p metadb-server --test topology_distributed` uses one process and `DurableCellManager::scale_out_replicas` for three localhost voters, including leader loss under create load.
+- `cargo test -p metadb-server --test stress_crash_restart` stops without flushing the memtable while a create is inside `propose`, then reopens the same `data_dir`.
+- `cargo test -p metadb-server --test join_existing_group` covers two different joins. `metadbd_processes_join_existing_group_and_fail_over` starts real `metadbd` processes, joins the first process's Raft group, and fails over. `join_sends_the_shared_secret` opens two `PersistentMetaDbCluster` servers inside the test process and checks that the shared secret is sent on that join. That case does not start two `metadbd` OS processes.
+- `open_and_serve` still rejects every role except `all-in-one`. A second Cell stays unimplemented. `RegisterCell` returns an error.
+
+The smoke profile and the ignored local profile are the [in-process stress harness](#in-process-stress-harness). `topology_distributed` is still one OS process with three localhost Raft voters, not three `metadbd` processes. Disaggregated roles and a second Cell are still not live deployments.
