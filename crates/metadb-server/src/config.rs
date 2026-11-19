@@ -98,14 +98,52 @@ impl Default for StorageSection {
 
 /// Application-level bearer auth. This process does not terminate TLS.
 ///
-/// An empty `shared_secret` is accepted only for loopback listeners. A wildcard or
-/// any other non-loopback bind with an empty secret refuses to start. When the
-/// secret is non-empty, gRPC and the metrics listener require the same bearer.
+/// An empty `shared_secret` does not start a listener. Loopback development
+/// without credentials requires `allow_unauthenticated = true`, and that flag
+/// still refuses every non-loopback bind. A whitespace-only secret is rejected.
+/// A non-empty secret requires the same bearer on gRPC and metrics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecuritySection {
-    /// When non-empty, gRPC and metrics require `authorization: Bearer <shared_secret>`.
+    /// When non-empty and not whitespace, gRPC and metrics require
+    /// `authorization: Bearer <shared_secret>` exactly, including any surrounding spaces
+    /// that are part of a secret which also contains other characters.
     pub shared_secret: String,
+    /// Explicit opt-in for unauthenticated loopback listeners.
+    ///
+    /// Default is `false`. Setting this does not allow `0.0.0.0`, `::`, or any
+    /// other non-loopback address. It cannot be combined with a usable secret.
+    pub allow_unauthenticated: bool,
+}
+
+impl SecuritySection {
+    /// Rejects whitespace-only secrets, a missing secret without the loopback opt-in,
+    /// and a usable secret combined with that opt-in.
+    pub fn validate_for_startup(&self) -> Result<()> {
+        if !self.shared_secret.is_empty() && self.shared_secret.trim().is_empty() {
+            return Err(MetaDbError::CodecError(
+                "refusing to serve: [security].shared_secret is whitespace-only. It is not a credential and it is not unauthenticated mode. Set a secret that contains a non-whitespace character, or leave the secret empty and set allow_unauthenticated = true for loopback development".to_string(),
+            ));
+        }
+        if self.shared_secret.is_empty() {
+            if self.allow_unauthenticated {
+                return Ok(());
+            }
+            return Err(MetaDbError::CodecError(
+                "refusing to serve without [security].shared_secret. Loopback is not an implicit exception. Set a non-empty shared_secret, or set allow_unauthenticated = true and bind only loopback addresses".to_string(),
+            ));
+        }
+        if self.allow_unauthenticated {
+            return Err(MetaDbError::CodecError(
+                "refusing to serve: [security].shared_secret and allow_unauthenticated are both set. Remove one of them".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn requires_bearer(&self) -> bool {
+        !self.shared_secret.trim().is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,37 +226,36 @@ impl ServerTomlConfig {
         })
     }
 
-    /// Refuses to start when a listener is not loopback and no secret is configured.
+    /// Refuses to start when authentication is missing, whitespace-only, or ambiguous,
+    /// and when an explicit unauthenticated opt-in is bound beyond loopback.
     ///
     /// Call this on the configured addresses and again on the address that will
     /// actually be bound (a restarted process may reuse a saved advertise address).
     pub fn reject_unauthenticated_bind(&self, addr: &str) -> Result<()> {
-        reject_unauthenticated_bind(addr, &self.security.shared_secret)
+        reject_unauthenticated_bind(addr, &self.security)
     }
 }
 
-/// `true` only for an explicit loopback bind: `localhost`, `127.0.0.0/8`, or `::1`.
+/// `true` only for a literal loopback IP: `127.0.0.0/8` or `::1`.
 ///
-/// Wildcard addresses (`0.0.0.0`, `::`) and unparseable hosts are not loopback.
-/// `localhost` is accepted as a name and is not resolved, so a hosts-file alias
-/// is not detected here.
+/// Hostnames, including `localhost`, are not loopback. They are not resolved, so
+/// a hosts file cannot widen the unauthenticated opt-in, and startup does not
+/// look the name up again at bind time.
 fn is_loopback_bind(addr: &str) -> bool {
     let host = bind_host(addr.trim());
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
     match host.parse::<IpAddr>() {
         Ok(ip) => ip.is_loopback(),
         Err(_) => false,
     }
 }
 
-fn reject_unauthenticated_bind(addr: &str, secret: &str) -> Result<()> {
-    if !secret.trim().is_empty() || is_loopback_bind(addr) {
+fn reject_unauthenticated_bind(addr: &str, security: &SecuritySection) -> Result<()> {
+    security.validate_for_startup()?;
+    if security.requires_bearer() || is_loopback_bind(addr) {
         return Ok(());
     }
     Err(MetaDbError::CodecError(format!(
-        "refusing to serve unauthenticated listener {addr}; a wildcard or non-loopback bind requires a non-empty [security].shared_secret. Empty, missing, and misspelled secrets fail closed. This process does not terminate TLS"
+        "refusing to serve unauthenticated listener {addr}; allow_unauthenticated is loopback-only. A wildcard or other non-loopback bind requires a non-empty [security].shared_secret. This process does not terminate TLS"
     )))
 }
 
@@ -246,7 +283,7 @@ fn normalize_key(key: &str) -> String {
 fn is_tls_key(key: &str) -> bool {
     let key = normalize_key(key);
     [
-        "tls", "ssl", "cert", "x509", "mtls", "cipher", "keystore", "https",
+        "tls", "ssl", "cert", "x509", "mtls", "cipher", "keystore", "https", "ca_file", "cafile",
     ]
     .iter()
     .any(|needle| key.contains(needle))
@@ -261,6 +298,17 @@ fn is_secret_key(key: &str) -> bool {
         "token",
         "credential",
         "auth",
+        "anonymous",
+        "insecure",
+        "api_key",
+        "apikey",
+        "bearer",
+        "jwt",
+        "private_key",
+        "privatekey",
+        "encryption",
+        "encrypt",
+        "anon",
     ]
     .iter()
     .any(|needle| key.contains(needle))
@@ -274,7 +322,7 @@ fn security_key_error(key: &str) -> MetaDbError {
         ))
     } else {
         MetaDbError::CodecError(format!(
-            "refusing to start: unrecognized security key `{key}`. A missing or misspelled shared_secret must not leave listeners open. The only accepted security key is [security].shared_secret"
+            "refusing to start: unrecognized security key `{key}`. A missing or misspelled shared_secret must not leave listeners open. The only accepted security keys are [security].shared_secret and [security].allow_unauthenticated"
         ))
     }
 }
@@ -288,11 +336,11 @@ fn reject_unsupported_security_keys(value: &toml::Value) -> Result<()> {
     if let Some(security) = root.get("security") {
         let Some(table) = security.as_table() else {
             return Err(MetaDbError::CodecError(
-                "refusing to start: [security] must be a table. The only accepted security key is [security].shared_secret".to_string(),
+                "refusing to start: [security] must be a table. The only accepted security keys are shared_secret and allow_unauthenticated".to_string(),
             ));
         };
         for (key, child) in table {
-            if key != "shared_secret" {
+            if key != "shared_secret" && key != "allow_unauthenticated" {
                 return Err(security_key_error(key));
             }
             // The secret value itself must not smuggle a nested TLS or secret table.
@@ -379,26 +427,76 @@ mod tests {
 
     #[test]
     fn loopback_binds_are_explicit_and_wildcards_are_not() {
-        for addr in [
-            "127.0.0.1:7800",
-            "127.0.0.1:0",
-            "localhost:7800",
-            "[::1]:7800",
-        ] {
+        let mut opted_in = ServerTomlConfig::default();
+        opted_in.security.allow_unauthenticated = true;
+        let implicit = ServerTomlConfig::default();
+        let mut whitespace = ServerTomlConfig::default();
+        whitespace.security.shared_secret = "   ".into();
+        let mut configured = ServerTomlConfig::default();
+        configured.security.shared_secret = "secret".into();
+        for addr in ["127.0.0.1:7800", "127.0.0.1:0", "[::1]:7800"] {
             assert!(is_loopback_bind(addr), "{addr}");
-            assert!(reject_unauthenticated_bind(addr, "").is_ok(), "{addr}");
+            assert!(opted_in.reject_unauthenticated_bind(addr).is_ok(), "{addr}");
+            let implicit_err = implicit.reject_unauthenticated_bind(addr).unwrap_err();
+            assert!(
+                implicit_err
+                    .to_string()
+                    .contains("not an implicit exception"),
+                "{addr}: {implicit_err}"
+            );
+            let whitespace_err = whitespace.reject_unauthenticated_bind(addr).unwrap_err();
+            assert!(
+                whitespace_err.to_string().contains("whitespace-only"),
+                "{addr}: {whitespace_err}"
+            );
         }
         for addr in [
             "0.0.0.0:7800",
             "[::]:7800",
             "10.1.2.3:7800",
             "db.internal:7800",
+            "localhost:7800",
         ] {
             assert!(!is_loopback_bind(addr), "{addr}");
-            let err = reject_unauthenticated_bind(addr, "  ").unwrap_err();
+            let err = opted_in.reject_unauthenticated_bind(addr).unwrap_err();
             assert!(err.to_string().contains("refusing to serve"), "{err}");
         }
-        assert!(reject_unauthenticated_bind("0.0.0.0:7800", "secret").is_ok());
+        assert!(configured
+            .reject_unauthenticated_bind("0.0.0.0:7800")
+            .is_ok());
+        configured.security.allow_unauthenticated = true;
+        let both = configured
+            .reject_unauthenticated_bind("127.0.0.1:7800")
+            .unwrap_err();
+        assert!(both.to_string().contains("both set"), "{both}");
+    }
+
+    #[test]
+    fn security_sensitive_aliases_fail_closed_and_storage_keys_do_not() {
+        for key in [
+            "api_key",
+            "bearer",
+            "jwt",
+            "private_key",
+            "ca_file",
+            "encryption",
+            "anon",
+        ] {
+            let parsed = ServerTomlConfig::from_toml_str(&format!("[node]\n{key} = \"x\"\n"));
+            let err = parsed.unwrap_err().to_string();
+            assert!(
+                err.contains("refusing to start") && err.contains(key),
+                "{key}: {err}"
+            );
+        }
+        let cfg = ServerTomlConfig::from_toml_str(
+            r#"
+            [storage]
+            bloom_bits_per_key = 12
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.storage.bloom_bits_per_key, 12);
     }
 
     #[test]
@@ -477,6 +575,36 @@ mod tests {
             listeners_err.contains("does not terminate TLS"),
             "{listeners_err}"
         );
+
+        let anonymous = ServerTomlConfig::from_toml_str(
+            r#"
+            [security]
+            anonymous = true
+            "#,
+        );
+        assert!(
+            anonymous.unwrap_err().to_string().contains("anonymous"),
+            "an unknown auth field inside [security] must not be ignored"
+        );
+        let insecure = ServerTomlConfig::from_toml_str(
+            r#"
+            [node]
+            insecure = true
+            "#,
+        );
+        assert!(
+            insecure.unwrap_err().to_string().contains("insecure"),
+            "an insecure flag outside [security] must not be ignored"
+        );
+        let opted_in = ServerTomlConfig::from_toml_str(
+            r#"
+            [security]
+            allow_unauthenticated = true
+            "#,
+        )
+        .unwrap();
+        assert!(opted_in.security.allow_unauthenticated);
+        assert!(opted_in.security.shared_secret.is_empty());
 
         let cfg = ServerTomlConfig::from_toml_str(
             r#"

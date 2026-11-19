@@ -73,7 +73,7 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 
 ## Metrics
 
-Set `node.metrics_listen_addr` (for example `127.0.0.1:9100`). `open_and_serve` accepts TCP connections on that address. `GET /metrics` returns Prometheus text. Any other path returns 404, and any other method returns 405. When `[security].shared_secret` is non-empty, every request on this listener must send `Authorization: Bearer <shared_secret>`. A missing, empty, or wrong bearer returns HTTP 401 and a body that is not the metric text, including a request for `/status`. A non-loopback metrics address with an empty secret refuses to start. This listener does not terminate TLS.
+Set `node.metrics_listen_addr` (for example `127.0.0.1:9100`). `open_and_serve` accepts TCP connections on that address. `GET /metrics` returns Prometheus text. Any other path returns 404, and any other method returns 405. When `[security].shared_secret` contains a non-whitespace character, every request on this listener must send `Authorization: Bearer <shared_secret>`. A missing, empty, or wrong bearer returns HTTP 401 and a body that is not the metric text, including a request for `/status`. An empty secret refuses to start on every address, including loopback, unless `allow_unauthenticated` is set. That flag still refuses a non-loopback metrics address. A whitespace-only secret refuses to start even when the flag is set. This listener does not terminate TLS.
 
 Gauges and counters from `render_prometheus_metrics`:
 
@@ -141,7 +141,7 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 - Quota cursor rows are written after the outbox lock is released, so a flush that already holds the memtable lock can still take the outbox lock.
 - Jumbo isolation is a route flag plus a node id chosen from the local node map. It does not evict other shards from a disk.
 - Heartbeats are an RPC with no sender in `metadbd`. `StoreHeartbeat` does not persist.
-- A non-empty shared secret authenticates Raft, the other three gRPC services, and the metrics listener with the same bearer. An empty secret is accepted only for loopback binds and leaves those listeners unauthenticated. A wildcard bind with an empty secret refuses to start. The process does not terminate TLS.
+- A non-empty shared secret authenticates Raft, the other three gRPC services, and the metrics listener with the same bearer. An empty secret does not start the process. `allow_unauthenticated = true` is the explicit exception for literal loopback IPs (`127.0.0.0/8` or `::1`) and still refuses a wildcard bind. The hostname `localhost` is not accepted for that exception. A whitespace-only secret is rejected. The process does not terminate TLS.
 - `memtable_size_bytes` seals and flushes the active memtable. `max_imm_memtables` caps queued immutable tables. Raft timer fields do not change runtime behavior through TOML.
 - `metadb-ctl bench` for `hotspot-create` and `bulk-ttl-delete` prints JSON lines: a header with `bench_pid`, then phase reports with attempted, succeeded, failed, and latency percentiles. The process exits non-zero unless every requested operation succeeds. `--workload mixed` or `--embedded` runs the in-process stress harness. `sql` prints the response as JSON and exits non-zero on an application error.
 

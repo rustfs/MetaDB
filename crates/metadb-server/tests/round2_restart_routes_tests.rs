@@ -7,6 +7,7 @@ async fn advertised_local_peer_address_must_follow_listener_after_restart() {
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.path().to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     let (first, old_address) = PersistentMetaDbCluster::open_and_serve(cfg.clone())
         .await
         .unwrap();
@@ -49,6 +50,7 @@ async fn reopening_another_nodes_directory_is_rejected() {
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.path().to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     let (first, _) = PersistentMetaDbCluster::open_and_serve(cfg.clone())
         .await
         .unwrap();
