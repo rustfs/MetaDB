@@ -107,7 +107,7 @@ Was als Betriebsverfahren nicht funktioniert:
 3. `metadb-ctl cell register` erzeugt keine zweite Zelle. `open_and_serve` registriert nur die lokale Zelle beim Global Manager.
 4. Der Speicherpfad `MetaDbEngine::new_single_node`, den die Tests `T1`–`T6` nutzen, kann eine Wählerzahl im Speicher auf 3 setzen. Dieses Objekt hat weder Platte noch Raft. Es ist keine Skalierung von `metadbd`.
 
-`topology_distributed` verwendet weiterhin `DurableCellManager::scale_out_replicas` mit localhost-Wählern in einem Betriebssystemprozess. `join_existing_group` startet echte `metadbd`-Prozesse und lässt sie beitreten. Disaggregierte Rollen und eine zweite Zelle sind weiterhin keine lebenden Einsätze. Die Jumbo-Isolation auf einem gewidmeten Knoten bleibt ein Routenflag, keine Verschiebung von Shards auf eine andere Maschine.
+`topology_distributed` verwendet weiterhin `DurableCellManager::scale_out_replicas` mit localhost-Wählern in einem Betriebssystemprozess. `join_existing_group` startet echte `metadbd`-Prozesse und lässt sie beitreten. Der Fall mit gemeinsamem Geheimnis in dieser Datei öffnet zwei Cluster im Testprozess; er startet keine zwei `metadbd`-Betriebssystemprozesse. Disaggregierte Rollen und eine zweite Zelle sind weiterhin keine lebenden Einsätze. Die Jumbo-Isolation auf einem gewidmeten Knoten bleibt ein Routenflag, keine Verschiebung von Shards auf eine andere Maschine.
 
 ## Fehler, die auftreten können
 

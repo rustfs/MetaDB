@@ -107,7 +107,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 3. `metadb-ctl cell register` 不创建第二个单元。`open_and_serve` 只把本地单元注册到全局管理器。
 4. 测试 `T1`–`T6` 使用的内存路径 `MetaDbEngine::new_single_node` 可以把内存中的投票者计数加到 3。那个对象没有磁盘，也没有 Raft。它不是 `metadbd` 的扩容。
 
-`topology_distributed` 仍在一个操作系统进程里，用 localhost 投票者调用 `DurableCellManager::scale_out_replicas`。`join_existing_group` 会启动真正的 `metadbd` 进程并让它们加入。拆开的角色和第二个单元仍不是真实部署。巨型分片的专用节点隔离仍是路由标志，不是把分片搬到另一台机器。
+`topology_distributed` 仍在一个操作系统进程里，用 localhost 投票者调用 `DurableCellManager::scale_out_replicas`。`join_existing_group` 会启动真正的 `metadbd` 进程并让它们加入。该文件里的共享密钥用例是在测试进程内打开两个集群，不启动两个 `metadbd` 操作系统进程。拆开的角色和第二个单元仍不是真实部署。巨型分片的专用节点隔离仍是路由标志，不是把分片搬到另一台机器。
 
 ## 会遇到的错误
 

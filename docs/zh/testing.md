@@ -114,7 +114,7 @@ cargo run -p metadb-server --bin metadb-ctl -- \
 
 ## 进程内压力工具
 
-`crates/metadb-server/tests/stress_harness.rs` 和 `metadb-ctl bench --embedded` 都调用 `metadb_server::stress`（`crates/metadb-server/src/stress.rs`）。没有名为 `mixed` 的第三种配置。`--workload mixed` 选择的就是这套工具。两种配置跑同一套混合负载：在一个临时数据目录上的持久 all-in-one 节点里做 create、lookup、dirstat、listdir、rename 和 unlink。计时循环之后，工具运行维护节拍，再按成功的操作核对目录列举、dirstat 和配额。维护节拍失败会使报告失败。这次运行是一个操作系统进程和一个数据目录。它不是三个 `metadbd` 进程，也不是 [官方前缀负载](../en/testing.md#prefix-load)。
+`crates/metadb-server/tests/stress_harness.rs` 和 `metadb-ctl bench --embedded` 都调用 `metadb_server::stress`（`crates/metadb-server/src/stress.rs`）。没有名为 `mixed` 的第三种配置。`--workload mixed` 选择的就是这套工具。两种配置跑同一套混合负载：在一个临时数据目录上的持久 all-in-one 节点里做 create、lookup、dirstat、listdir、rename 和 unlink。计时循环之后，工具运行维护节拍，再按成功的操作核对目录列举、dirstat 和配额。维护节拍失败会给 `errors` 加一，把 `correctness_errors` 设为 1，并跳过这次核对。这次运行是一个操作系统进程和一个数据目录。它不是三个 `metadbd` 进程，也不是 [官方前缀负载](../en/testing.md#prefix-load)。
 
 | 配置 | 测试 | 时长 | 并发 | 目录数 | 何时运行 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -142,7 +142,7 @@ cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile local
 metadb stress profile=<name> ops=<count> errors=<count> correctness_errors=<count> elapsed_ms=<ms> ops_per_s=<rate> latency_us p50=<us> p99=<us> max=<us>
 ```
 
-`errors` 统计混合循环里失败的操作。`correctness_errors` 统计之后发现的不一致。`latency_us` 的 `p50`、`p99` 和 `max` 是已记录操作延迟的分位数，单位是微秒。它们会被打印。本树不强制延迟门槛。
+`ops` 只统计混合循环里成功的操作。`ops_per_s` 用该计数除以经过的时间。`errors` 统计混合循环里没有成功的操作。维护节拍失败也会加进 `errors`，并把 `correctness_errors` 设为 1，而不再跑核对。核对真正跑起来时，`correctness_errors` 既统计目录列举、dirstat 和配额的不一致，也统计失败的核对调用（`dirstat`、`listdir` 和 `get_quota`）。`latency_us` 的 `p50`、`p99` 和 `max` 是每一次混合循环尝试的延迟分位数，包括失败的尝试，单位是微秒。它们不是 `ops` 的分位数。它们会被打印。本树不强制延迟门槛。
 
 任一命令打出的一行，都是打出它的那台机器上的结果。本仓库不把这一行记入仓库。它不是服务级结果，不是首次交付通过，也不是官方的 1,000,000 次创建前缀负载。
 
@@ -154,7 +154,7 @@ metadb stress profile=<name> ops=<count> errors=<count> correctness_errors=<coun
 - `cargo test -p metadb-server --test topology_scale_out` 在该进程里强制一次 PID 边界分裂。
 - `cargo test -p metadb-server --test topology_distributed` 使用一个进程，通过 `DurableCellManager::scale_out_replicas` 建立三个 localhost 投票者，包括创建负载下的领导者丢失。
 - `cargo test -p metadb-server --test stress_crash_restart` 在一次创建还在 `propose` 之内时不刷 memtable 就停止，然后重新打开同一个 `data_dir`。
-- `cargo test -p metadb-server --test join_existing_group` 启动第二个 `metadbd` 并加入第一个进程的 Raft 组，包括共享密钥的情形。
+- `cargo test -p metadb-server --test join_existing_group` 覆盖两种不同的加入。`metadbd_processes_join_existing_group_and_fail_over` 启动真正的 `metadbd` 进程，加入第一个进程的 Raft 组，并做故障转移。`join_sends_the_shared_secret` 在测试进程里打开两个 `PersistentMetaDbCluster`，并检查这次加入发送了共享密钥。这一例不启动两个 `metadbd` 操作系统进程。
 - `open_and_serve` 仍然拒绝除 `all-in-one` 以外的每个角色。第二个单元仍未实现。`RegisterCell` 返回错误。
 
 冒烟配置和被忽略的 local 配置见 [进程内压力工具](#进程内压力工具)。`topology_distributed` 仍是一个操作系统进程里的三个 localhost Raft 投票者，不是三个 `metadbd` 进程。拆开的角色和第二个单元仍不是真实部署。

@@ -114,7 +114,7 @@ Eine Zahl aus diesem Befehl nicht als Repository-Ergebnis behandeln. Ein entfern
 
 ## Prozessinterner Stress-Harness
 
-`crates/metadb-server/tests/stress_harness.rs` und `metadb-ctl bench --embedded` rufen beide `metadb_server::stress` auf (`crates/metadb-server/src/stress.rs`). Es gibt kein drittes Profil namens `mixed`. `--workload mixed` wählt diesen Harness. Beide Profile führen dieselbe gemischte Last aus: create, lookup, dirstat, listdir, rename und unlink gegen einen dauerhaften All-in-one-Knoten auf einem temporären Datenverzeichnis. Nach der zeitlich begrenzten Schleife führt der Harness Wartungsticks aus und prüft dann Verzeichnislisten, dirstat und Quota gegen die erfolgreichen Operationen. Ein fehlgeschlagener Wartungstick lässt den Bericht fehlschlagen. Der Lauf ist ein Betriebssystemprozess und ein Datenverzeichnis. Er ist nicht drei `metadbd`-Prozesse und nicht die [offizielle Präfix-Last](../en/testing.md#prefix-load).
+`crates/metadb-server/tests/stress_harness.rs` und `metadb-ctl bench --embedded` rufen beide `metadb_server::stress` auf (`crates/metadb-server/src/stress.rs`). Es gibt kein drittes Profil namens `mixed`. `--workload mixed` wählt diesen Harness. Beide Profile führen dieselbe gemischte Last aus: create, lookup, dirstat, listdir, rename und unlink gegen einen dauerhaften All-in-one-Knoten auf einem temporären Datenverzeichnis. Nach der zeitlich begrenzten Schleife führt der Harness Wartungsticks aus und prüft dann Verzeichnislisten, dirstat und Quota gegen die erfolgreichen Operationen. Ein fehlgeschlagener Wartungstick addiert eins zu `errors`, setzt `correctness_errors` auf 1 und überspringt diese Prüfung. Der Lauf ist ein Betriebssystemprozess und ein Datenverzeichnis. Er ist nicht drei `metadbd`-Prozesse und nicht die [offizielle Präfix-Last](../en/testing.md#prefix-load).
 
 | Profil | Test | Dauer | Nebenläufigkeit | Verzeichnisse | Wann er läuft |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -142,7 +142,7 @@ Der Test druckt eine Zeile und verlangt `errors = 0`, `correctness_errors = 0` u
 metadb stress profile=<name> ops=<count> errors=<count> correctness_errors=<count> elapsed_ms=<ms> ops_per_s=<rate> latency_us p50=<us> p99=<us> max=<us>
 ```
 
-`errors` zählt fehlgeschlagene Operationen in der gemischten Schleife. `correctness_errors` zählt danach gefundene Abweichungen. `latency_us` `p50`, `p99` und `max` sind Perzentile der aufgezeichneten Operationslatenz, in Mikrosekunden. Sie werden gedruckt. Dieser Baum erzwingt keine Latenzschwelle.
+`ops` zählt nur erfolgreiche Operationen der gemischten Schleife. `ops_per_s` teilt diese Zahl durch die verstrichene Zeit. `errors` zählt die nicht erfolgreichen. Ein fehlgeschlagener Wartungstick wird ebenfalls zu `errors` addiert und setzt `correctness_errors` auf 1, ohne die Prüfung auszuführen. Läuft die Prüfung, zählt `correctness_errors` sowohl abweichende Listen, dirstat und Quota als auch fehlgeschlagene Prüfrufe (`dirstat`, `listdir` und `get_quota`). `latency_us` `p50`, `p99` und `max` sind Perzentile jedes Versuchs der gemischten Schleife, einschließlich der fehlgeschlagenen, in Mikrosekunden. Sie sind keine Perzentile von `ops`. Sie werden gedruckt. Dieser Baum erzwingt keine Latenzschwelle.
 
 Eine Zeile aus einem der beiden Befehle ist ein Ergebnis für die Maschine, die sie gedruckt hat. Dieses Repository zeichnet keine auf. Sie ist kein Ergebnis auf Dienstebene, kein First-Ship-Bestehen und nicht die offizielle Präfix-Last von 1.000.000 Anlegen.
 
@@ -154,7 +154,7 @@ Diese Befehle sind in diesem Baum. Die CI führt sie mit `cargo test --workspace
 - `cargo test -p metadb-server --test topology_scale_out` erzwingt einen PID-Grenz-Split in diesem Prozess.
 - `cargo test -p metadb-server --test topology_distributed` nutzt einen Prozess und `DurableCellManager::scale_out_replicas` für drei localhost-Wähler, einschließlich Leader-Verlust unter Anlege-Last.
 - `cargo test -p metadb-server --test stress_crash_restart` stoppt ohne Memtable-Flush, während ein Anlegen in `propose` ist, und öffnet dasselbe `data_dir` wieder.
-- `cargo test -p metadb-server --test join_existing_group` startet ein zweites `metadbd` und lässt es der Raft-Gruppe des ersten Prozesses beitreten, einschließlich eines Falls mit gemeinsamem Geheimnis.
+- `cargo test -p metadb-server --test join_existing_group` deckt zwei verschiedene Beitritte ab. `metadbd_processes_join_existing_group_and_fail_over` startet echte `metadbd`-Prozesse, lässt sie der Raft-Gruppe des ersten Prozesses beitreten und führt ein Failover aus. `join_sends_the_shared_secret` öffnet zwei `PersistentMetaDbCluster`-Server im Testprozess und prüft, dass das gemeinsame Geheimnis bei diesem Beitritt gesendet wird. Dieser Fall startet keine zwei `metadbd`-Betriebssystemprozesse.
 - `open_and_serve` weist weiterhin jede Rolle außer `all-in-one` zurück. Eine zweite Zelle bleibt unimplementiert. `RegisterCell` liefert einen Fehler.
 
 Das Smoke-Profil und das ignorierte Local-Profil sind der [prozessinterne Stress-Harness](#prozessinterner-stress-harness). `topology_distributed` bleibt ein Betriebssystemprozess mit drei localhost-Raft-Wählern, nicht drei `metadbd`-Prozesse. Disaggregierte Rollen und eine zweite Zelle sind weiterhin keine lebenden Einsätze.

@@ -114,7 +114,7 @@ Ne pas traiter un nombre issu de cette commande comme un résultat du dépôt. U
 
 ## Harnais de stress dans le processus
 
-`crates/metadb-server/tests/stress_harness.rs` et `metadb-ctl bench --embedded` appellent tous deux `metadb_server::stress` (`crates/metadb-server/src/stress.rs`). Il n'y a pas de troisième profil nommé `mixed`. `--workload mixed` sélectionne ce harnais. Les deux profils exécutent la même charge mixte : create, lookup, dirstat, listdir, rename et unlink contre un nœud all-in-one persistant, sur un répertoire de données temporaire. Après la boucle minutée, le harnais exécute des ticks de maintenance, puis vérifie les listes de répertoire, dirstat et le quota par rapport aux opérations qui ont réussi. Un tick de maintenance en échec fait échouer le rapport. L'exécution est un processus du système d'exploitation et un répertoire de données. Ce n'est pas trois processus `metadbd`, et ce n'est pas la [charge officielle par préfixe](../en/testing.md#prefix-load).
+`crates/metadb-server/tests/stress_harness.rs` et `metadb-ctl bench --embedded` appellent tous deux `metadb_server::stress` (`crates/metadb-server/src/stress.rs`). Il n'y a pas de troisième profil nommé `mixed`. `--workload mixed` sélectionne ce harnais. Les deux profils exécutent la même charge mixte : create, lookup, dirstat, listdir, rename et unlink contre un nœud all-in-one persistant, sur un répertoire de données temporaire. Après la boucle minutée, le harnais exécute des ticks de maintenance, puis vérifie les listes de répertoire, dirstat et le quota par rapport aux opérations qui ont réussi. Un tick de maintenance en échec ajoute un à `errors`, met `correctness_errors` à 1 et saute cette vérification. L'exécution est un processus du système d'exploitation et un répertoire de données. Ce n'est pas trois processus `metadbd`, et ce n'est pas la [charge officielle par préfixe](../en/testing.md#prefix-load).
 
 | Profil | Test | Durée | Concurrence | Répertoires | Quand il s'exécute |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -142,7 +142,7 @@ Le test imprime une ligne et exige `errors = 0`, `correctness_errors = 0` et `op
 metadb stress profile=<name> ops=<count> errors=<count> correctness_errors=<count> elapsed_ms=<ms> ops_per_s=<rate> latency_us p50=<us> p99=<us> max=<us>
 ```
 
-`errors` compte les opérations en échec dans la boucle mixte. `correctness_errors` compte les désaccords trouvés ensuite. `latency_us` `p50`, `p99` et `max` sont des percentiles de la latence enregistrée, en microsecondes. Ils sont imprimés. Cet arbre n'impose pas de seuil de latence.
+`ops` compte seulement les opérations de la boucle mixte qui ont réussi. `ops_per_s` divise ce compte par le temps écoulé. `errors` compte celles qui n'ont pas réussi. Un tick de maintenance en échec est aussi ajouté à `errors`, et il met `correctness_errors` à 1 sans exécuter la vérification. Lorsque la vérification s'exécute, `correctness_errors` compte à la fois les écarts de liste, de dirstat et de quota, et les appels de vérification en échec (`dirstat`, `listdir` et `get_quota`). `latency_us` `p50`, `p99` et `max` sont des percentiles de chaque tentative de la boucle mixte, y compris les échecs, en microsecondes. Ce ne sont pas des percentiles de `ops`. Ils sont imprimés. Cet arbre n'impose pas de seuil de latence.
 
 Une ligne issue de l'une ou l'autre commande est un résultat pour la machine qui l'a imprimée. Ce dépôt n'en enregistre pas. Ce n'est pas un résultat de niveau service, pas une validation de première livraison, et pas la charge officielle de 1 000 000 créations.
 
@@ -154,7 +154,7 @@ Ces commandes sont dans cet arbre. La CI les exécute avec `cargo test --workspa
 - `cargo test -p metadb-server --test topology_scale_out` force un découpage à frontière de PID dans ce processus.
 - `cargo test -p metadb-server --test topology_distributed` utilise un processus et `DurableCellManager::scale_out_replicas` pour trois votants localhost, y compris la perte du leader sous une charge de créations.
 - `cargo test -p metadb-server --test stress_crash_restart` s'arrête sans vider le memtable pendant qu'une création est dans `propose`, puis rouvre le même `data_dir`.
-- `cargo test -p metadb-server --test join_existing_group` démarre un second `metadbd` et le joint au groupe Raft du premier processus, y compris un cas avec secret partagé.
+- `cargo test -p metadb-server --test join_existing_group` couvre deux jointures différentes. `metadbd_processes_join_existing_group_and_fail_over` démarre de vrais processus `metadbd`, joint le groupe Raft du premier processus et bascule le leader. `join_sends_the_shared_secret` ouvre deux serveurs `PersistentMetaDbCluster` dans le processus de test et vérifie que le secret partagé est envoyé sur cette jointure. Ce cas ne démarre pas deux processus `metadbd` du système d'exploitation.
 - `open_and_serve` rejette toujours tout rôle autre que `all-in-one`. Une seconde cellule reste non implémentée. `RegisterCell` renvoie une erreur.
 
 Le profil smoke et le profil local ignoré sont le [harnais de stress dans le processus](#harnais-de-stress-dans-le-processus). `topology_distributed` reste un processus du système d'exploitation avec trois votants Raft sur localhost, et non trois processus `metadbd`. Les rôles désagrégés et une seconde cellule ne sont toujours pas des déploiements vivants.

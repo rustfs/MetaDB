@@ -114,7 +114,7 @@ cargo run -p metadb-server --bin metadb-ctl -- \
 
 ## プロセス内ストレスハーネス
 
-`crates/metadb-server/tests/stress_harness.rs` と `metadb-ctl bench --embedded` は、どちらも `metadb_server::stress`（`crates/metadb-server/src/stress.rs`）を呼びます。`mixed` という第 3 のプロファイルはありません。`--workload mixed` はこのハーネスを選びます。両方のプロファイルは同じ混合ワークロードを実行します。一時データディレクトリ上の永続 all-in-one ノードに対する create、lookup、dirstat、listdir、rename、unlink です。時間制限のループのあと、ハーネスはメンテナンスティックを実行し、成功した操作に対してディレクトリ一覧、dirstat、クォータを照合します。メンテナンスティックの失敗は報告を失敗にします。この実行は OS プロセス 1 つとデータディレクトリ 1 つです。`metadbd` プロセス 3 つではなく、[公式のプレフィックス負荷](../en/testing.md#prefix-load) でもありません。
+`crates/metadb-server/tests/stress_harness.rs` と `metadb-ctl bench --embedded` は、どちらも `metadb_server::stress`（`crates/metadb-server/src/stress.rs`）を呼びます。`mixed` という第 3 のプロファイルはありません。`--workload mixed` はこのハーネスを選びます。両方のプロファイルは同じ混合ワークロードを実行します。一時データディレクトリ上の永続 all-in-one ノードに対する create、lookup、dirstat、listdir、rename、unlink です。時間制限のループのあと、ハーネスはメンテナンスティックを実行し、成功した操作に対してディレクトリ一覧、dirstat、クォータを照合します。メンテナンスティックが失敗すると `errors` に 1 を足し、`correctness_errors` を 1 にして、その照合を飛ばします。この実行は OS プロセス 1 つとデータディレクトリ 1 つです。`metadbd` プロセス 3 つではなく、[公式のプレフィックス負荷](../en/testing.md#prefix-load) でもありません。
 
 | プロファイル | テスト | 時間 | 並行数 | ディレクトリ数 | いつ実行されるか |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -142,7 +142,7 @@ cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile local
 metadb stress profile=<name> ops=<count> errors=<count> correctness_errors=<count> elapsed_ms=<ms> ops_per_s=<rate> latency_us p50=<us> p99=<us> max=<us>
 ```
 
-`errors` は混合ループ中に失敗した操作を数えます。`correctness_errors` はその後に見つかった不一致を数えます。`latency_us` の `p50`、`p99`、`max` は記録された操作レイテンシのパーセンタイルで、単位はマイクロ秒です。印字されます。このツリーはレイテンシの閾値を課しません。
+`ops` は混合ループで成功した操作だけを数えます。`ops_per_s` はその数を経過時間で割ります。`errors` は混合ループで成功しなかった操作を数えます。失敗したメンテナンスティックも `errors` に加算され、照合を実行せずに `correctness_errors` を 1 にします。照合が実行されたとき、`correctness_errors` は一覧、dirstat、クォータの不一致と、失敗した照合呼び出し（`dirstat`、`listdir`、`get_quota`）の両方を数えます。`latency_us` の `p50`、`p99`、`max` は、失敗した試行を含む混合ループの全試行のレイテンシパーセンタイルで、単位はマイクロ秒です。`ops` のパーセンタイルではありません。印字されます。このツリーはレイテンシの閾値を課しません。
 
 どちらのコマンドが印字した行も、印字したマシンの結果です。このリポジトリはそれを記録しません。サービス水準の結果ではなく、初回出荷の合格でもなく、公式の 1,000,000 作成プレフィックス負荷でもありません。
 
@@ -154,7 +154,7 @@ metadb stress profile=<name> ops=<count> errors=<count> correctness_errors=<coun
 - `cargo test -p metadb-server --test topology_scale_out` はそのプロセスで PID 境界の分割を強制します。
 - `cargo test -p metadb-server --test topology_distributed` は 1 プロセスで `DurableCellManager::scale_out_replicas` を使い、localhost の投票者 3 つを作ります。作成負荷の下でのリーダー喪失を含みます。
 - `cargo test -p metadb-server --test stress_crash_restart` は作成が `propose` の中にあるあいだ memtable をフラッシュせずに停止し、同じ `data_dir` を開き直します。
-- `cargo test -p metadb-server --test join_existing_group` は 2 つ目の `metadbd` を起動し、最初のプロセスの Raft グループに参加します。共有シークレットの場合を含みます。
+- `cargo test -p metadb-server --test join_existing_group` は 2 種類の参加を扱います。`metadbd_processes_join_existing_group_and_fail_over` は実際の `metadbd` プロセスを起動し、最初のプロセスの Raft グループに参加してフェイルオーバーします。`join_sends_the_shared_secret` はテストプロセスの中で `PersistentMetaDbCluster` を 2 つ開き、その参加で共有シークレットが送られることを確認します。このケースは `metadbd` の OS プロセスを 2 つ起動しません。
 - `open_and_serve` は今も `all-in-one` 以外のロールを拒否します。2 つ目のセルは未実装のままです。`RegisterCell` はエラーを返します。
 
 smoke プロファイルと無視される local プロファイルは [プロセス内ストレスハーネス](#プロセス内ストレスハーネス) です。`topology_distributed` は今も、localhost の Raft 投票者 3 つを持つ 1 つの OS プロセスであり、`metadbd` プロセス 3 つではありません。分離されたロールと 2 つ目のセルは、今も稼働中の配備ではありません。

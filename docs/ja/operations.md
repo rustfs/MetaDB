@@ -107,7 +107,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 3. `metadb-ctl cell register` は 2 つ目のセルを作りません。`open_and_serve` はグローバルマネージャへローカルセルだけを登録します。
 4. テスト `T1`–`T6` が使うメモリ内の `MetaDbEngine::new_single_node` は、メモリ上の投票者数を 3 に増やせます。そのオブジェクトにはディスクも Raft もありません。`metadbd` のスケールアウトではありません。
 
-`topology_distributed` は今も、1 つの OS プロセスの中で localhost の投票者に対し `DurableCellManager::scale_out_replicas` を呼びます。`join_existing_group` は実際の `metadbd` プロセスを起動して参加させます。分離されたロールと 2 つ目のセルは、今も稼働中の配備ではありません。ジャンボの専用ノード隔離はルートフラグのままで、シャードを別のマシンへ移すことではありません。
+`topology_distributed` は今も、1 つの OS プロセスの中で localhost の投票者に対し `DurableCellManager::scale_out_replicas` を呼びます。`join_existing_group` は実際の `metadbd` プロセスを起動して参加させます。そのファイルの共有シークレットのケースは、テストプロセス内でクラスタを 2 つ開くもので、`metadbd` の OS プロセスを 2 つ起動しません。分離されたロールと 2 つ目のセルは、今も稼働中の配備ではありません。ジャンボの専用ノード隔離はルートフラグのままで、シャードを別のマシンへ移すことではありません。
 
 ## 遭遇しうるエラー
 

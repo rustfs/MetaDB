@@ -107,7 +107,7 @@ Ce qui ne fonctionne pas comme procédure d'exploitation :
 3. `metadb-ctl cell register` ne crée pas une seconde cellule. `open_and_serve` n'enregistre que la cellule locale sur le gestionnaire global.
 4. Le chemin en mémoire `MetaDbEngine::new_single_node` utilisé par les tests `T1`–`T6` peut porter un compteur de votants en mémoire à 3. Cet objet n'a ni disque ni Raft. Ce n'est pas une montée en charge de `metadbd`.
 
-`topology_distributed` utilise encore `DurableCellManager::scale_out_replicas` avec des votants localhost dans un seul processus du système d'exploitation. `join_existing_group` démarre de vrais processus `metadbd` et les joint. Les rôles désagrégés et une seconde cellule ne sont toujours pas des déploiements vivants. L'isolation jumbo sur nœud dédié reste un indicateur de route, pas un déplacement de shards vers une autre machine.
+`topology_distributed` utilise encore `DurableCellManager::scale_out_replicas` avec des votants localhost dans un seul processus du système d'exploitation. `join_existing_group` démarre de vrais processus `metadbd` et les joint. Le cas avec secret partagé dans ce fichier ouvre deux clusters dans le processus de test ; il ne démarre pas deux processus `metadbd` du système d'exploitation. Les rôles désagrégés et une seconde cellule ne sont toujours pas des déploiements vivants. L'isolation jumbo sur nœud dédié reste un indicateur de route, pas un déplacement de shards vers une autre machine.
 
 ## Erreurs que l'on peut rencontrer
 
