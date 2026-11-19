@@ -1,6 +1,6 @@
 # EGM Subsystem Specification 2: OpenRaft Multi-Raft Consensus, Off-Critical-Path Queues & Crash-Recoverable 2PC (`metadb-raft` & `metadb-tx`)
 
-* **Status**: Phase 0 Approved Specification
+* **Status**: Phase 0 design note. Not a first-launch acceptance of the running tree.
 * **Target Crates**: `crates/metadb-raft` and `crates/metadb-tx`
 * **Primary Reference**: Zebin Ren ([@ZebinRen](https://github.com/ZebinRen)), Biao Cao, Kang Chen ([@kangchenPKU](https://github.com/kangchenPKU)), Zhihui Yin, Qiushi Chen, Jielong Jian, Jiwei Xiong, Xinxing Wang, Yan Xing, Liguo Duan, Ran Zheng, Xianjun Meng, and Zhenyu Hou, *"MetaDB: Putting File-System Structure Back into Distributed Databases"*, [arXiv:2610.32247v1](https://arxiv.org/html/2610.32247v1) (Vrije Universiteit Amsterdam, Baidu & Peking University, 2026), §3.2, §4.2, §5.1, §5.2
 * **Semantic Boundaries**:

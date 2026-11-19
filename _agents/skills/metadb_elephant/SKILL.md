@@ -29,13 +29,13 @@ This skill loads the architectural history, foundational literature, subsystem c
 * `metadb-storage`: `StorageBackend` trait, pure-Rust WAL-less SSTable LSM (4 KiB CRC32C blocks, Bloom filters including physical tombstones, 16-shard LRU `BlockCache`, atomic `MANIFEST`), `SnapshotGuard`-gated `MemMvccStore`, and bottommost-safe `LocalityCompactor`.
 * `metadb-raft`: `openraft` Multi-Raft (`1-Voter` single-node to `3-Voter` distributed), segmented CRC32C log store, 3-watermark purge gate, `ReadIndex` batcher, and online `ConfChange`.
 * `metadb-tx`: Deterministic `RaftStateMachine`, `1-RTT` `PushdownExecutor`, `AsyncAttrAggregator` (Coordinated Flush Barrier + Read-Path Reconciliation), FIFO `AuxOutbox` + `[0x07]` local spill, and Primary-Anchored crash-recoverable 2PC (`Rename`, cross-shard `Mkdir`/`Rmdir`).
-* `metadb-cluster`: Unified `[0x01, 0x04)` sharding, `ShardEpoch` fencing, `PID`-boundary & `DualModeFineGrained` (`[0x04] DirShardDelta`) splitting, Jumbo dedicated-node isolation, `GlobalManager`, `CellLocalManager`, `MetaCache`, and `IdRangeAllocator`.
+* `metadb-cluster`: Unified `[0x01, 0x04)` sharding, `ShardEpoch` fencing, `PID`-boundary splits, a `DualModeFineGrained` mode flag (a later split may use `[0x04] DirShardDelta`; the flag write does not copy keys), a `JumboIsolated` route flag (not dedicated-node placement), `GlobalManager`, `CellLocalManager`, `MetaCache`, and `IdRangeAllocator`.
 * `metadb-proxy`: Tokenizing compiler for all 20 parameterized metadata SQL templates + Epoch-aware stateless router.
-* `metadb-server`: Embedded `MetaDbEngine` SDK + `metadbd` multi-role daemon + `metadb-ctl` operator CLI.
+* `metadb-server`: Persistent `MetaDbEngine::open` / `PersistentMetaDbCluster`, in-memory `new_single_node` simulator, `metadbd` (`all-in-one` only), and `metadb-ctl`.
 
 ## Implementation Status Policy
 
-* **Current Baseline**: Phases 0–6 Completed & Verified across all 8 pure-Rust crates (`cargo fmt`, `cargo clippy -D warnings`, and `cargo test --workspace` passing).
+* **Current baseline**: The 8 crates are in this repository. Phase labels are not a completed verification and not a first-launch pass. Crate tests exist. This file does not assert that `cargo test --workspace` is currently green. Multi-cell topology, role-split processes, and dedicated-host jumbo moves are not deployed. Jumbo isolation is a route flag.
 * **Ongoing Maintenance**: Keep `Architecture.md`, `README.md`, `docs/designs/*.md`, and `docs/guides/{en,ja,fr,zh,de}/` synchronized with any future architectural extensions.
 
 ## Non-Negotiable Architectural Invariants

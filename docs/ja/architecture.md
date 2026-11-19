@@ -9,13 +9,13 @@
 `PersistentMetaDbCluster::open_and_serve`（`crates/metadb-server/src/lib.rs`）は次を行います。
 
 1. `all-in-one` 以外の `node.role` を拒否する。
-2. `shared_secret` が空のとき、ワイルドカードまたはループバック以外の `grpc_listen_addr` と `metrics_listen_addr` を拒否する。その後 `node.grpc_listen_addr` をバインドする（既定は `127.0.0.1:7800`。`127.0.0.1:0` は OS にポートを選ばせる）。
+2. An empty `shared_secret` does not start the process unless `allow_unauthenticated = true`, and that flag is loopback-only. A whitespace-only secret is rejected even with the flag. A usable secret plus the flag is rejected. A wildcard or other non-loopback address cannot use the opt-in. It then binds `node.grpc_listen_addr` (default `127.0.0.1:7800`; `127.0.0.1:0` asks the OS for a port).
 3. `<data_dir>/global_allocator` で `DurableIdAllocator` を開く。
 4. `<data_dir>/be` で `ShardGroupHost` を開く。
 5. `<data_dir>/cell_<cell_id>` で `DurableCellManager` を開くかブートストラップする。
 6. その 1 つのセルを、キー範囲 `[0x01, 0x04)` で `DurableGlobalManager` に登録する。
 7. ルートの inode `1`（`ROOT_INODE_ID`）に属性レコードがあることを保証する。
-8. 同じリスナーで 4 つの gRPC サービスを提供する。4 つとも同じベアラインターセプタを取る。`metrics_listen_addr` が設定されているとき、そのアドレスの `GET /metrics` は同じシークレットを要求する。シークレットが空でなければ、欠落または誤ったベアラは拒否される。空のシークレットはループバックのバインドだけを受け付ける。このプロセスは TLS を終端しない。
+8. Serves four gRPC services on one listener. All four use the same bearer interceptor. When `metrics_listen_addr` is set, `GET /metrics` on that address requires the same secret. A non-empty secret rejects a missing or wrong bearer. An empty secret does not listen unless `allow_unauthenticated = true`, and that flag is loopback-only. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. This process does not terminate TLS.
 9. 250 ms 間隔のメンテナンスタスクを起動する。
 
 `metadbd` は薄いラッパです。TOML を読み、CLI の上書きを適用し、`open_and_serve` を呼び、任意で `--cell-manager` へ `RegisterNode` を呼び、Ctrl-C で `shutdown` を呼びます。メトリクスは設定されているとき `open_and_serve` の中で提供されます。
@@ -86,7 +86,8 @@ MVCC の版は `storage.mvcc_retention_ms`（既定 5,000）のあいだメモ�
 
 ## Raft
 
-ローカルの各シャードは `openraft` 0.10 のグループです。ログは `.../shards/<id>/raft` 以下の分割された CRC32C ファイルです。既定値は TOML から **読み込まれません**（`raft_options` は `#[serde(skip)]`）:
+ローカルの各シャードは `openraft` 0.10 のグループです。ログは `.../shards/<id>/raft` 以下の分割された CRC32C ファイルです。Defaults are loaded from `[raft]` when that table or a field is omitted. `raft_options` is not `#[serde(skip)]`. Unknown keys in `[raft]` fail parsing. Values apply at group start and are not reloaded. `max_segment_bytes` does not rewrite segments already on disk. `/readyz` is 200 only after startup has finished, shutdown has not started, and every local Raft group has finished startup replay, applied a log entry, is a voter, and has a known leader. A bound socket is not enough. There is no gRPC health RPC. See [Operability](../en/operability.md).
+
 
 | 項目 | 既定 |
 | :--- | :--- |

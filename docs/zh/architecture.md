@@ -9,13 +9,13 @@
 `PersistentMetaDbCluster::open_and_serve`（`crates/metadb-server/src/lib.rs`）：
 
 1. 拒绝除 `all-in-one` 以外的任何 `node.role`。
-2. `shared_secret` 为空时，拒绝通配或其他非环回的 `grpc_listen_addr` 与 `metrics_listen_addr`。然后绑定 `node.grpc_listen_addr`（默认 `127.0.0.1:7800`；`127.0.0.1:0` 让操作系统分配端口）。
+2. An empty `shared_secret` does not start the process unless `allow_unauthenticated = true`, and that flag is loopback-only. A whitespace-only secret is rejected even with the flag. A usable secret plus the flag is rejected. A wildcard or other non-loopback address cannot use the opt-in. It then binds `node.grpc_listen_addr` (default `127.0.0.1:7800`; `127.0.0.1:0` asks the OS for a port).
 3. 在 `<data_dir>/global_allocator` 打开 `DurableIdAllocator`。
 4. 在 `<data_dir>/be` 打开 `ShardGroupHost`。
 5. 在 `<data_dir>/cell_<cell_id>` 打开或引导 `DurableCellManager`。
 6. 把这一个单元以键范围 `[0x01, 0x04)` 注册到 `DurableGlobalManager`。
 7. 保证根 inode `1`（`ROOT_INODE_ID`）有属性记录。
-8. 在同一监听器上提供四个 gRPC 服务。四个服务使用同一个持有者拦截器。设置了 `metrics_listen_addr` 时，该地址上的 `GET /metrics` 要求同一个密钥。密钥非空时，缺失或错误的令牌会被拒绝。空密钥只接受环回绑定。本进程不终结 TLS。
+8. Serves four gRPC services on one listener. All four use the same bearer interceptor. When `metrics_listen_addr` is set, `GET /metrics` on that address requires the same secret. A non-empty secret rejects a missing or wrong bearer. An empty secret does not listen unless `allow_unauthenticated = true`, and that flag is loopback-only. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. This process does not terminate TLS.
 9. 启动间隔 250 ms 的维护任务。
 
 `metadbd` 是薄封装：加载 TOML，应用命令行覆盖，调用 `open_and_serve`，可选地对 `--cell-manager` 调用 `RegisterNode`，并在 Ctrl-C 时调用 `shutdown`。配置了指标时，由 `open_and_serve` 提供。
@@ -86,7 +86,8 @@ MVCC 版本在内存中保留 `storage.mvcc_retention_ms`（默认 5,000）。�
 
 ## Raft
 
-每个本地分片是一个 `openraft` 0.10 组。日志是 `.../shards/<id>/raft` 下的分段 CRC32C 文件。下列默认值 **不** 从 TOML 加载（`raft_options` 为 `#[serde(skip)]`）：
+每个本地分片是一个 `openraft` 0.10 组。日志是 `.../shards/<id>/raft` 下的分段 CRC32C 文件。Defaults are loaded from `[raft]` when that table or a field is omitted. `raft_options` is not `#[serde(skip)]`. Unknown keys in `[raft]` fail parsing. Values apply at group start and are not reloaded. `max_segment_bytes` does not rewrite segments already on disk. `/readyz` is 200 only after startup has finished, shutdown has not started, and every local Raft group has finished startup replay, applied a log entry, is a voter, and has a known leader. A bound socket is not enough. There is no gRPC health RPC. See [Operability](../en/operability.md).
+
 
 | 字段 | 默认 |
 | :--- | :--- |

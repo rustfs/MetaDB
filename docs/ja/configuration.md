@@ -2,7 +2,9 @@
 
 [概要](./README.md) · [English](../en/configuration.md) · [Français](../fr/configuration.md) · [Deutsch](../de/configuration.md) · [简体中文](../zh/configuration.md)
 
-`metadbd --config` と `ServerTomlConfig::from_toml_file` / `from_toml_str` は TOML を読みます（`crates/metadb-server/src/config.rs`）。シークレットや TLS を示さない未知のキーは無視されます。綴りの違う `shared_secret`、トークンやパスワードのキー、TLS や証明書のキーは拒否され、プロセスは起動しません。既知のセクションは省略できます。省略した項目は次の既定値になります。
+`metadbd --config` と `ServerTomlConfig::from_toml_file` / `from_toml_str` は TOML を読みます（`crates/metadb-server/src/config.rs`）。既知のセクションは省略できます。省略した項目は次の既定値になります。
+
+A key fails parsing when its normalized form (lowercase, hyphens become underscores) contains one of these substrings, including inside nested tables and arrays: `secret`, `password`, `passwd`, `token`, `credential`, `auth`, `anonymous`, `anon`, `insecure`, `api_key`, `apikey`, `bearer`, `jwt`, `private_key`, `privatekey`, `encryption`, `encrypt`, `tls`, `ssl`, `cert`, `x509`, `mtls`, `cipher`, `keystore`, `https`, `ca_file`, `cafile`, or the normalized key starts with `secur`. The only exceptions are the direct keys `[security].shared_secret` and `[security].allow_unauthenticated`. Any other key directly under `[security]` also fails parsing. This is the classifier, not a sample list: a key is not ignored merely because its name is absent from a shorter summary. Keys that do not match this classifier are still ignored. An empty `shared_secret` does not start the process. Development without credentials requires `allow_unauthenticated = true` and a literal loopback bind (`127.0.0.1` or `::1`). The hostname `localhost` is not accepted for that flag. A wildcard or any other non-loopback address cannot use it. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected.
 
 ## 既定値
 
@@ -13,7 +15,7 @@
 | `node.role` | `all-in-one` | する。それ以外の値はエラー |
 | `node.data_dir` | `./metadb-data` | する |
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | する。バインドアドレス |
-| `node.metrics_listen_addr` | 未設定 | 設定されたときだけする。別の TCP リスナー。ループバック以外は空でないシークレットが必要 |
+| `node.metrics_listen_addr` | 未設定 | Applied only when set. Separate TCP listener. An empty secret does not listen unless `allow_unauthenticated = true`, and that flag is loopback-only |
 | `clock.max_clock_drift_ms` | `500` | する。`HybridLogicalClock::with_max_drift_ms` |
 | `storage.memtable_size_bytes` | `33554432`（32 MiB） | する。計上バイトがこの大きさに達したとき、アクティブな memtable を封印してフラッシュする。1 未満は 1 として扱う |
 | `storage.max_imm_memtables` | `4` | する。書き手はこの上限を超える不変 memtable をキューに積まず、待つ |
@@ -24,9 +26,11 @@
 | `storage.locality_tombstone_ratio` | `0.50` | する。1000 倍し、1..=1000 にクランプし、`tombstone_min_ratio_permille` として保存する |
 | `sharding.bootstrap_table_shards` | `true` | する。`true` はシャード 1、2、3 を作る。`false` は `[0x01, 0x04)` を覆うシャード 1 を作る |
 | `sharding.shard_split_threshold_bytes` | `4294967296`（4 GiB） | する。分割判定はシャードの概算サイズを使う |
-| `security.shared_secret` | `""` | する。空は全リスナーがループバックのときだけ受け付ける。空でない値は gRPC とメトリクスに同じベアラを要求する |
+| `security.shared_secret` | `""` | Empty does not start the process. Loopback without credentials requires `allow_unauthenticated = true`. A non-empty secret requires the same bearer on gRPC and metrics. A whitespace-only secret is rejected |
+| `security.allow_unauthenticated` | `false` | Explicit opt-in for an empty secret on a literal loopback IP (`127.0.0.1` or `::1`) only. The hostname `localhost` is not accepted. Rejected together with a usable secret. Rejected on a wildcard or any other non-loopback bind. A whitespace-only secret is rejected even with this flag |
 
-`[raft]` テーブルはありません。`ServerTomlConfig.raft_options` は serde がスキップし、`RaftNodeOptions::default()` のままです（ハートビート 150 ms、選挙 450–900 ms、スナップショットログ保持 0、セグメント 64 MiB）。
+`[raft]` is loaded. `ServerTomlConfig.raft_options` is not `#[serde(skip)]`. Omitted fields use heartbeat 150 ms, election timeout 450–900 ms, `max_in_snapshot_log_to_keep` 0, and segment size 64 MiB (`67108864`). Unknown keys inside `[raft]` fail parsing. `election_timeout_min_ms` must be greater than `heartbeat_interval_ms` and less than `election_timeout_max_ms`. `max_segment_bytes = 0` is rejected. The values apply when each local Raft group starts and are not reloaded. `max_segment_bytes` does not rewrite segments already on disk. `join_timeout` is not a TOML field. There is no gRPC health RPC. `/livez`, `/readyz`, and `/healthz` exist only when `metrics_listen_addr` is set. `/readyz` does not wait for the 250 ms 2PC recovery pass. See [Operability](../en/operability.md).
+
 
 `to_lsm_config` は常に `auto_locality_compaction: true` を設定します。
 
@@ -73,12 +77,12 @@ CLI フラグはファイルを解析したあとで上書きします。`--node
 
 `shared_secret` が空でないとき、`MetadataService`、`TransactionService`、`ControlPlaneService`、`RaftTransportService` は `authorization` が `Bearer <shared_secret>` と完全に一致することを要求します。`metrics_listen_addr` の `GET /metrics` も同じ `Authorization` ヘッダを要求します。ヘッダの欠落、空のベアラ、接頭辞、より長いトークンは拒否されます。失敗したメトリクス応答の本体は Prometheus テキストではありません。Raft ピアは同じベアラを送ります。`metadb-ctl --auth-token`（環境変数 `METADB_AUTH_TOKEN`）と `metadbd --join` / `--cell-manager` も送ります。`metadb-ctl cluster status` は `GetRoutes` を呼び、同じインターセプタの対象です。
 
-空、または空白だけのシークレットは、`grpc_listen_addr` と設定済みの `metrics_listen_addr` がどちらもループバック（`127.0.0.0/8`、`::1`、または名前 `localhost`）のときだけ受け付けます。ワイルドカード（`0.0.0.0`、`::`）やそれ以外のアドレスは待受を拒否します。空のループバックシークレットは起動時に警告されます。リスナーは引き続き平文です。信頼できるネットワークに留めるか、すべてのサービスをクライアントを認証するプロキシの後ろに置き、このプロセスへの直接アクセスを塞いでください。
+An empty secret does not start the process. Loopback is not an implicit exception. Development without credentials requires `allow_unauthenticated = true` and every listener on a literal loopback IP (`127.0.0.1` or `::1`). The hostname `localhost` is not accepted for that flag. A wildcard (`0.0.0.0`, `::`) or any other non-loopback address cannot use it. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. Listeners stay plaintext. Keep an opted-in listener on a trusted network, or put every service behind a proxy that authenticates the client and block direct access to this process.
 
 ## 設定できないもの
 
 - ロールごとのサブシステム切り出し。ロール項目は許可と拒否のスイッチであり、機能セットではありません。
 - ピア一覧、投票者集合、参加トークン。メンバーシップはこのプロセス 1 つから始まります。追加のピアは `RegisterNode` と `ScaleShardReplicas` のあとでのみ現れ、そのピアは同じシャードログに対してすでに `RaftTransportService` を話す Raft メンバーでなければなりません。2 つ目の all-in-one プロセスはそれをしません。 [運用](./operations.md) を参照してください。
 - 2 つ目のセルのキー範囲。`RegisterCell` はエラーを返し、何も保存しません。空ディレクトリの 2 つ目の all-in-one は `[cluster] join` で現在のリーダーに参加します。これは同じセルです。
-- Raft のタイマ、または局所性コンパクションのオンとオフ。
+- Locality-compaction on/off. `to_lsm_config` always enables it. Raft timers are the `[raft]` table; see [Operability](../en/operability.md).
 - このプロセス内の TLS 証明書。設定中の TLS キーは拒否される。終端は外部プロキシで行う。
