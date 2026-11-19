@@ -10,6 +10,8 @@ Snapshot installation requires a complete existing database image. It verifies r
 
 A state-machine operation lock serializes complete apply operations, checkpoint creation, snapshot replacement, and read-cut acquisition. This favors correctness and can pause writers while a snapshot is built. A later optimization should pin immutable state under a shorter lock and stream it without weakening the atomic checkpoint boundary.
 
+An operator backup hold is a `BACKUP_HOLD` file in the data directory. While it is pending, log purge and snapshot-directory deletion stop. Once floors are latched, purge cannot advance past the purged index recorded for that shard, and snapshot directories at or below the recorded snapshot index stay on disk. Release deletes the file. Expiry is a wall-clock deadline (maximum 24 hours); the next purge check drops an expired hold so a crash cannot pin compaction forever. The backup artifact is that held image: a flushed LSM checkpoint or the protected complete snapshot, plus the unpurged segmented log and the node metadata needed to open the directory. Restore rejects a manifest, checksum, log gap, or LSM image that does not cover the purged prefix.
+
 MANIFEST recovery rejects incomplete baselines, complete CRC failures, and missing CURRENT pointers in existing databases. Valid incomplete append tails remain recoverable. The existing v1 framing does not protect its length header independently, so simultaneous structural payload and length corruption still needs a future format upgrade for complete discrimination. Full SST metadata equality detects mismatched recorded histories; identical metadata with different payload identity requires a future content digest or file UUID.
 
 ## Transactions and accounting

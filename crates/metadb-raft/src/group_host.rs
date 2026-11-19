@@ -500,6 +500,9 @@ impl ShardRaftGroup {
         }
         let safe_idx = self.watermarks.safe_purge_index();
         let _ = self.raft.trigger().purge_log(safe_idx).await;
+        // A hold can make that purge a no-op. OpenRaft may not ask again for the same
+        // index after the hold is released, so apply the storage clamp directly.
+        let _ = self.log_store.try_purge_to_safe_watermark();
         for _ in 0..40 {
             if self.log_store.retained_entry_count() == 0 {
                 break;

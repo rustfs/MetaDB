@@ -22,7 +22,62 @@ use crate::types::{MetaDbTypeConfig, ShardWatermarkTracker};
 
 fn purge_limit(raft_dir: &Path, watermark_safe: u64, requested: u64) -> u64 {
     let covered = highest_durable_snapshot_index(raft_dir);
-    watermark_safe.min(requested).min(covered)
+    let mut limit = watermark_safe.min(requested).min(covered);
+    // A backup hold clamps the purge even after a newer snapshot is published.
+    // `Some(0)` freezes a log that has not been purged yet.
+    if let Some(held) = crate::backup::hold_purge_cap(raft_dir) {
+        limit = limit.min(held);
+    }
+    limit
+}
+
+fn copy_raft_file(src: &Path, dest: &Path) -> io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = fs::read(src)?;
+    let mut file = OpenOptions::new().create_new(true).write(true).open(dest)?;
+    file.write_all(&bytes)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+/// Read-only check used by backup restore. Does not truncate a torn tail.
+pub fn inspect_raft_dir(raft_dir: &Path) -> io::Result<RaftLogInspection> {
+    LogStoreInner::inspect_dir(raft_dir)
+}
+
+/// Last purged index stored in `HARD_STATE`, or 0 when the log has not been purged.
+pub fn read_persisted_purged_index(raft_dir: &Path) -> io::Result<u64> {
+    let state = LogStoreInner::load_hard_state_readonly(raft_dir)?;
+    Ok(state.last_purged_log_id.map(|id| id.index).unwrap_or(0))
+}
+
+/// Read-only summary of a raft directory. A torn tail is an error: backup restore
+/// must not silently drop frames the way crash recovery can.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftLogInspection {
+    pub last_purged_index: u64,
+    pub committed_index: Option<u64>,
+    pub first_retained: Option<u64>,
+    pub last_retained: Option<u64>,
+    pub retained_count: u64,
+}
+
+impl RaftLogInspection {
+    /// True when every index in `from..=to` is present as a contiguous retained span.
+    pub fn covers_inclusive(&self, from: u64, to: u64) -> bool {
+        if from > to {
+            return true;
+        }
+        let (Some(first), Some(last)) = (self.first_retained, self.last_retained) else {
+            return false;
+        };
+        if self.retained_count != last.saturating_sub(first).saturating_add(1) {
+            return false;
+        }
+        from >= first && to <= last
+    }
 }
 
 pub const RAFT_SEGMENT_MAGIC: &[u8; 8] = b"MRAFTLO1";
@@ -562,6 +617,134 @@ impl LogStoreInner {
 
         Ok(())
     }
+
+    fn inspect_dir(raft_dir: &Path) -> io::Result<RaftLogInspection> {
+        if !raft_dir.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("raft directory {} is missing", raft_dir.display()),
+            ));
+        }
+        let hard_state = Self::load_hard_state_readonly(raft_dir)?;
+        let purged_idx = hard_state.last_purged_log_id.map(|id| id.index);
+        let mut seg_paths: Vec<(u64, PathBuf)> = Vec::new();
+        for entry in fs::read_dir(raft_dir)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if let Some(mid) = name
+                .strip_prefix("segment_")
+                .and_then(|s| s.strip_suffix(".raftlog"))
+            {
+                let first_idx = mid.parse::<u64>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid raft segment name {name}"),
+                    )
+                })?;
+                seg_paths.push((first_idx, entry.path()));
+            }
+        }
+        seg_paths.sort_by_key(|(idx, _)| *idx);
+
+        let mut entries: BTreeMap<u64, EntryOf<MetaDbTypeConfig>> = BTreeMap::new();
+        let mut previous_index = None;
+        for (first_index, path) in seg_paths {
+            let mut raw = Vec::new();
+            File::open(&path)?.read_to_end(&mut raw)?;
+            if raw.len() < 8 || &raw[0..8] != RAFT_SEGMENT_MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "raft segment {} is incomplete or has a bad magic",
+                        path.display()
+                    ),
+                ));
+            }
+            let mut offset = 8usize;
+            let mut entry_end_offsets: BTreeMap<u64, u64> = BTreeMap::new();
+            while offset < raw.len() {
+                if offset + 8 > raw.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "torn raft frame in {} (backup images must not need tail repair)",
+                            path.display()
+                        ),
+                    ));
+                }
+                let frame_len =
+                    u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap()) as usize;
+                let expected_crc =
+                    u32::from_le_bytes(raw[offset + 4..offset + 8].try_into().unwrap());
+                let frame_end = offset.saturating_add(8).saturating_add(frame_len);
+                if frame_len < 8 || frame_end > raw.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("torn or short raft frame in {}", path.display()),
+                    ));
+                }
+                let frame_body = &raw[offset + 8..frame_end];
+                let actual_crc = checksum_crc32c(frame_body);
+                if actual_crc != expected_crc {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("CRC32C mismatch in raft segment {}", path.display()),
+                    ));
+                }
+                let log_index = u64::from_le_bytes(frame_body[0..8].try_into().unwrap());
+                let entry: EntryOf<MetaDbTypeConfig> =
+                    codec::deserialize_serde(&frame_body[8..])
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                if entry.log_id().index != log_index
+                    || previous_index.is_some_and(|prev| log_index <= prev)
+                    || (entry_end_offsets.is_empty() && log_index != first_index)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "inconsistent raft frame index {log_index} in {}",
+                            path.display()
+                        ),
+                    ));
+                }
+                previous_index = Some(log_index);
+                entry_end_offsets.insert(log_index, frame_end as u64);
+                let keep = purged_idx.is_none_or(|purged| log_index > purged);
+                if keep {
+                    entries.insert(log_index, entry);
+                }
+                offset = frame_end;
+            }
+        }
+        Self::ensure_committed_recovered(&hard_state, &entries)?;
+        let first_retained = entries.keys().next().copied();
+        let last_retained = entries.keys().next_back().copied();
+        Ok(RaftLogInspection {
+            last_purged_index: purged_idx.unwrap_or(0),
+            committed_index: hard_state.committed.map(|id| id.index),
+            first_retained,
+            last_retained,
+            retained_count: entries.len() as u64,
+        })
+    }
+
+    fn load_hard_state_readonly(raft_dir: &Path) -> io::Result<PersistedHardState> {
+        let path = raft_dir.join("HARD_STATE");
+        if !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("HARD_STATE is missing from {}", raft_dir.display()),
+            ));
+        }
+        let mut raw = Vec::new();
+        File::open(&path)?.read_to_end(&mut raw)?;
+        let body = verify_crc32c_le(&raw, "Raft HARD_STATE")
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        codec::deserialize(body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
 }
 
 /// Cloneable segmented CRC32C Raft log store implementing both `RaftLogStorage` and `RaftLogReader`.
@@ -613,6 +796,43 @@ impl SegmentedRaftLogStore {
 
     pub fn segment_file_count(&self) -> usize {
         self.inner.lock().unwrap().segments.len()
+    }
+
+    /// Index already removed from the log. A backup hold must not purge past this.
+    pub fn last_purged_index(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .hard_state
+            .last_purged_log_id
+            .map(|id| id.index)
+            .unwrap_or(0)
+    }
+
+    /// Copies `HARD_STATE`, `INITIALIZED`, and segment files while appends are blocked.
+    ///
+    /// The active segment is synced before the bytes are read, so the copy does not
+    /// include a torn tail and does not modify the live directory.
+    pub fn copy_durable_log(&self, dest: &Path) -> io::Result<RaftLogInspection> {
+        let guard = self.inner.lock().unwrap();
+        if let Some(active) = guard.active_file.as_ref() {
+            active.sync_data()?;
+        }
+        fs::create_dir_all(dest)?;
+        copy_raft_file(&guard.raft_dir.join("HARD_STATE"), &dest.join("HARD_STATE"))?;
+        let initialized = guard.raft_dir.join("INITIALIZED");
+        if initialized.is_file() {
+            copy_raft_file(&initialized, &dest.join("INITIALIZED"))?;
+        }
+        for segment in &guard.segments {
+            let name = segment
+                .path
+                .file_name()
+                .ok_or_else(|| io::Error::other("raft segment path has no file name"))?;
+            copy_raft_file(&segment.path, &dest.join(name))?;
+        }
+        drop(guard);
+        LogStoreInner::inspect_dir(dest)
     }
 
     /// Triggers opportunistic physical segment cleanup up to `watermarks.safe_purge_index()`
@@ -792,6 +1012,8 @@ impl RaftLogStorage<MetaDbTypeConfig> for SegmentedRaftLogStore {
         // Clamp OpenRaft's requested `log_id` against the 3-watermark durability gate
         // and against a snapshot directory that is still readable. Purging the log
         // past a missing snapshot leaves restart with nothing to read.
+        // Re-read the backup hold after the lock is taken so a hold that became
+        // visible after the first check still blocks this deletion.
         let safe_idx = {
             let guard = self.inner.lock().unwrap();
             purge_limit(
@@ -804,6 +1026,14 @@ impl RaftLogStorage<MetaDbTypeConfig> for SegmentedRaftLogStore {
             return Ok(());
         }
         let mut guard = self.inner.lock().unwrap();
+        let safe_idx = purge_limit(
+            &guard.raft_dir,
+            self.watermarks.safe_purge_index(),
+            safe_idx,
+        );
+        if safe_idx == 0 {
+            return Ok(());
+        }
         let clamped = if safe_idx == log_id.index {
             Some(log_id)
         } else {

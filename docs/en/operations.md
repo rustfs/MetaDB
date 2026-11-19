@@ -142,6 +142,49 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 - `memtable_size_bytes` seals and flushes the active memtable. `max_imm_memtables` caps queued immutable tables. Raft timer fields do not change runtime behavior through TOML.
 - `metadb-ctl bench` for `hotspot-create` and `bulk-ttl-delete` prints JSON lines: a header with `bench_pid`, then phase reports with attempted, succeeded, failed, and latency percentiles. The process exits non-zero unless every requested operation succeeds. `--workload mixed` or `--embedded` runs the in-process stress harness. `sql` prints the response as JSON and exits non-zero on an application error.
 
+## Backup and restore
+
+This is a single-node operator path for one data directory. It is not a multi-Cell or Jumbo backup, and it is not a production backup system. There is no independent Raft WAL. If the segmented log, the complete snapshot, and the flushed LSM image are all missing, committed keys are not reconstructed. A passing test run does not make this path a first-ship pass.
+
+The restorable image is the newest flushed LSM checkpoint, or the complete snapshot the hold protects when that checkpoint does not cover the purged log prefix, plus the segmented Raft log that is still on disk. Keys that are only in an unflushed memtable are restored by replaying that log. The copy does not rename or truncate files in the live data directory.
+
+### Hold lifetime
+
+`BACKUP_HOLD` in the data directory is the hold. `metadb-ctl backup hold` writes it as pending, which freezes purge and snapshot deletion, then latches a floor per shard:
+
+- `max_purge_index` is the log prefix already purged. Purge cannot move past it.
+- `retain_snapshots_through` is the newest complete snapshot index. Snapshot directories at or below that index are not replaced or deleted. A pending hold protects every snapshot index until the floor is latched.
+
+Calling hold again while one is active does not move those floors or extend the deadline. `--ttl-secs` is a wall-clock lifetime from 1 second through 86400 seconds (the default is 900). The next purge or snapshot publication treats `now >= expires_unix_ms` as no hold and deletes the file. `metadb-ctl backup release` deletes the file immediately. A crash leaves the file in place until that deadline; it does not pin purge for the life of the process. Expiry follows the system clock. A clock step can shorten or lengthen the remaining time, but the 24 hour cap is the longest hold the command will install.
+
+A purge that has already chosen its cutoff before the hold file is visible can finish. `metadb-ctl` waits until the running process has latched floors before it returns, and an in-process hold is pending before it reads those floors. After the command prints `phase=active`, later purge checks honor the floor.
+
+### Commands
+
+Stop is not required. If a shard `lsm/LOCK` is held, the command asks the running `metadbd` (its 250 ms maintenance loop) to latch the hold and to copy the log under the log lock. If the process is stopped, the same commands read the directory directly. Do not start `metadbd` while a stopped-directory command is running.
+
+```bash
+metadb-ctl backup hold --data-dir /var/lib/metadb --ttl-secs 900
+metadb-ctl backup create --data-dir /var/lib/metadb --output /var/backups/metadb-2026-11-19
+metadb-ctl backup release --data-dir /var/lib/metadb
+
+# The destination path must not exist. An incomplete artifact is rejected and is not opened.
+metadb-ctl backup restore --backup /var/backups/metadb-2026-11-19 --data-dir /var/lib/metadb-restored
+metadbd --config restored.toml
+```
+
+`backup create` fails when no active hold is installed, when a shard is not listed on that hold, when the log is purged past the hold floor, or when neither the flushed LSM nor a protected complete snapshot covers the purged prefix. The artifact contains `BACKUP_MANIFEST` and `tree/`. Restore checks the manifest version, every file length and CRC32C, the Raft log (a torn tail is rejected rather than repaired), and that each shard LSM checkpoint matches the manifest and covers the purged index. It does not invent keys.
+
+After restore, open the new directory with the same node id and cell id. Look up and list the keys that had been committed. Keys that were never flushed and were not in the copied log are not recovered.
+
+### What this path does not do
+
+- It does not add a Raft WAL beside the segmented log.
+- It does not rebuild a missing LSM from nothing when the log and snapshot are gone.
+- It does not take a consistent cut across Cells, Jumbo moves, or a multi-process replica set. A peer `install_snapshot` during the copy is outside this procedure.
+- It does not stream large SSTables; each file is read into memory while it is copied.
+- It does not keep purge frozen after the deadline if the operator never returns. Release or wait for expiry before expecting log cleanup to resume.
+
 ## Documentation gaps
 
 These items are missing from the product, so this guide cannot describe a procedure for them:
