@@ -12,7 +12,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-`cargo test --workspace` 会构建库、集成测试和两个二进制。没有 `[[bench]]` 目标，也没有 `benches/` 目录。本树自带的负载发生器是下面的 `metadb-ctl bench`。
+`cargo test --workspace` 会构建库、集成测试和两个二进制。没有 `[[bench]]` 目标，也没有 `benches/` 目录。本树自带的负载发生器是下面的 `metadb-ctl bench` 和 `cargo test -p metadb-server --test stress_harness`。
 
 较窄的常用命令：
 
@@ -31,6 +31,7 @@ cargo test -p metadb-proxy --test sql_templates_tests
 cargo test -p metadb-storage --test lsm_recovery_tests
 cargo test -p metadb-storage --test mvcc_snapshot_tests
 cargo test -p metadb-storage --test locality_compaction_tests
+cargo test -p metadb-server --test stress_harness
 ```
 
 ## 每个套件实际覆盖什么
@@ -99,31 +100,61 @@ cargo run -p metadb-server --bin metadb-ctl -- \
   bench --workload bulk-ttl-delete --concurrency 16 --ops 1000
 ```
 
-标志：`--workload` 为 `hotspot-create`（默认）、`bulk-ttl-delete` 或 `mixed`。省略 `--concurrency` 时为 16。`--ops` 默认 1000。`--embedded` 或 `--workload mixed` 会启动一个临时的 all-in-one 节点和进程内压力工具，而不是拨号 `--endpoint`。
+标志：`--workload` 为 `hotspot-create`（默认）、`bulk-ttl-delete` 或 `mixed`。对远程负载，省略 `--concurrency` 时为 16，`--ops` 默认为 1000。只有走嵌入路径时才读取 `--profile`。`--embedded` 或 `--workload mixed` 不拨号 `--endpoint`，也不使用 `--ops`。它会启动一个临时的 all-in-one 节点并运行进程内压力工具。见 [进程内压力工具](#进程内压力工具)。
 
 来自 `crates/metadb-server/src/bin/metadb-ctl.rs` 的远程负载行为：
 
-- 客户端分配一个目录 id，再分配长度为 `--ops` 的文件 inode 和文件 id 块。数量或结尾溢出的授予会被拒绝。
+- 客户端分配一个目录 id，再分配长度为 `--ops` 的文件 inode 和文件 id 块，并拒绝数量或结尾溢出的授予。
 - 它打印一个包含 `bench_pid`、`workload` 和 `requested_ops` 的 JSON 对象，然后在新目录下创建同样数量的 4096 字节文件。
-- 每个阶段打印包含 `attempted`、`succeeded`、`failed`、`transport_failed`、`application_failed`、`errors_by_kind` 和延迟分位数的 JSON。若 `succeeded` 不等于 `--ops`，进程以非零状态退出。
-- `bulk-ttl-delete` 删除已创建的名字，再用 `limit = 1` 列举该目录。
-- 再跑一次会分配新的 `bench_pid`。被拒绝的创建不算成功。
+- 每个阶段打印包含 `attempted`、`succeeded`、`failed`、`transport_failed`、`application_failed`、`errors_by_kind` 以及延迟分位数（`p50_ms`、`p99_ms`、`p999_ms`）的 JSON。若 `succeeded` 不等于 `--ops`，进程以非零状态退出。
+- `bulk-ttl-delete` 删除已创建的名字，再用 `limit = 1` 列举该目录，并打印这一页是否为空。
+- 再跑一次会分配新的 `bench_pid`。它不复用固定的 inode，也不把被拒绝的创建记为成功。
 
-不要把这条命令打出的数字当作仓库结果。它取决于机器、构建配置和你指向的服务器。本树没有记录样本。
+不要把这条命令打出的数字当作仓库结果。远程运行取决于机器、构建配置和你指向的服务器。嵌入运行取决于机器和构建配置。本树没有记录其中任何一份样本。
 
-## 未合并的拉取请求 2
+## 进程内压力工具
 
-[拉取请求 2](https://github.com/rustfs/MetaDB/pull/2) 处于打开状态，不属于本分支。它增加持久拓扑测试和一套嵌入式压力工具。它自己的说明写道：
+`crates/metadb-server/tests/stress_harness.rs` 和 `metadb-ctl bench --embedded` 都调用 `metadb_server::stress`（`crates/metadb-server/src/stress.rs`）。没有名为 `mixed` 的第三种配置。`--workload mixed` 选择的就是这套工具。两种配置跑同一套混合负载：在一个临时数据目录上的持久 all-in-one 节点里做 create、lookup、dirstat、listdir、rename 和 unlink。计时循环之后，工具运行维护节拍，再按成功的操作核对目录列举、dirstat 和配额。维护节拍失败会使报告失败。这次运行是一个操作系统进程和一个数据目录。它不是三个 `metadbd` 进程，也不是 [官方前缀负载](../en/testing.md#prefix-load)。
 
-- 单节点测试在临时目录上调用 `PersistentMetaDbCluster::open_and_serve`。
-- 扩容测试在同一进程里强制一次 PID 边界分裂。
-- 分布式测试是一个进程、三个 localhost Raft 投票者。它调用 `DurableCellManager::scale_out_replicas`。它不启动三个 `metadbd` 操作系统进程。
-- `open_and_serve` 仍然拒绝除 `all-in-one` 以外的每个角色。拆开的角色和第二个单元仍未实现。
+| 配置 | 测试 | 时长 | 并发 | 目录数 | 何时运行 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `smoke` | `stress_smoke_mixed_workload` | 5 秒 | 4 | 4 | `cargo test -p metadb-server --test stress_harness`，包括 `cargo test --workspace`。忽略 `METADB_STRESS_*`。 |
+| `local` | `stress_local_mixed_workload` | 除非覆盖，否则 30 秒 | 除非覆盖，否则 8 | 除非覆盖，否则 16 | `#[ignore]`。不属于 `cargo test --workspace`。读取 `METADB_STRESS_DURATION_SECS`、`METADB_STRESS_CONCURRENCY`、`METADB_STRESS_KEYSPACE` 和 `METADB_STRESS_SEED`。 |
 
-该拉取请求的报告，在作者的虚拟机上、Rust 1.100.0（未写明硬件），包含本分支没有的那套工具的一行冒烟输出：
+```bash
+cargo test -p metadb-server --test stress_harness stress_smoke -- --nocapture
 
-```text
-metadb stress profile=smoke ops=12219 errors=0 correctness_errors=0 elapsed_ms=5221 ops_per_s=2340.3 latency_us p50=1318 p99=5207 max=12449
+METADB_STRESS_DURATION_SECS=120 \
+METADB_STRESS_CONCURRENCY=16 \
+METADB_STRESS_KEYSPACE=32 \
+METADB_STRESS_SEED=7 \
+  cargo test -p metadb-server --test stress_harness stress_local -- --ignored --nocapture
+
+cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile smoke
+cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile local
 ```
 
-这一行是一次未合并测试的单次运行。它不是服务目标，本分支上的 `metadb-ctl bench` 也不会复现它。`cargo test -p metadb-server --test topology_distributed` 和 `metadb-ctl bench --embedded` 这类命令只存在于该拉取请求的分支上。
+`METADB_STRESS_*` 适用于 local 配置，包括 `metadb-ctl bench --embedded --profile local`。在 `metadb-ctl bench --embedded` 上，`--duration-secs`、`--concurrency`、`--keyspace` 和 `--seed` 会在读完环境变量之后覆盖所选的任一配置。`cargo test` 的 local 配置没有这些标志覆盖，只读上述变量。时长、并发或目录数小于 1 时会被抬到 1。`--profile` 默认为 `smoke`。`--profile ci` 与 smoke 配置相同。其他 `--profile` 值会以错误退出。smoke 配置不读 `METADB_STRESS_*`。远程的 `hotspot-create` 和 `bulk-ttl-delete` 忽略 `--profile`。
+
+测试打印一行，并要求 `errors = 0`、`correctness_errors = 0` 且 `ops > 0`。`metadb-ctl bench --embedded` 会打印 `embedded metadbd listening on <addr>` 和同一行，并在 `errors` 或 `correctness_errors` 大于 0 时以非零状态退出。这一行的字段是：
+
+```text
+metadb stress profile=<name> ops=<count> errors=<count> correctness_errors=<count> elapsed_ms=<ms> ops_per_s=<rate> latency_us p50=<us> p99=<us> max=<us>
+```
+
+`errors` 统计混合循环里失败的操作。`correctness_errors` 统计之后发现的不一致。`latency_us` 的 `p50`、`p99` 和 `max` 是已记录操作延迟的分位数，单位是微秒。它们会被打印。本树不强制延迟门槛。
+
+任一命令打出的一行，都是打出它的那台机器上的结果。本仓库不把这一行记入仓库。它不是服务级结果，不是首次交付通过，也不是官方的 1,000,000 次创建前缀负载。
+
+## 持久拓扑与加入
+
+这些命令在本树中。CI 用 `cargo test --workspace --locked` 运行它们。
+
+- `cargo test -p metadb-server --test topology_single_node` 在临时目录上打开 `PersistentMetaDbCluster`。
+- `cargo test -p metadb-server --test topology_scale_out` 在该进程里强制一次 PID 边界分裂。
+- `cargo test -p metadb-server --test topology_distributed` 使用一个进程，通过 `DurableCellManager::scale_out_replicas` 建立三个 localhost 投票者，包括创建负载下的领导者丢失。
+- `cargo test -p metadb-server --test stress_crash_restart` 在一次创建还在 `propose` 之内时不刷 memtable 就停止，然后重新打开同一个 `data_dir`。
+- `cargo test -p metadb-server --test join_existing_group` 启动第二个 `metadbd` 并加入第一个进程的 Raft 组，包括共享密钥的情形。
+- `open_and_serve` 仍然拒绝除 `all-in-one` 以外的每个角色。第二个单元仍未实现。`RegisterCell` 返回错误。
+
+冒烟配置和被忽略的 local 配置见 [进程内压力工具](#进程内压力工具)。`topology_distributed` 仍是一个操作系统进程里的三个 localhost Raft 投票者，不是三个 `metadbd` 进程。拆开的角色和第二个单元仍不是真实部署。

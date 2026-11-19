@@ -67,7 +67,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ### `bench`
 
-See [Tests and benches](./testing.md#metadb-ctl-bench). This is a client against a running server. It is not a Cargo benchmark target. The repository does not check in a throughput number for it.
+See [Tests and benches](./testing.md#metadb-ctl-bench). Remote `hotspot-create` and `bulk-ttl-delete` are a client against a running server. They print JSON with `attempted`, `succeeded`, and `failed`, and the process exits non-zero unless `succeeded` equals `--ops`. `--embedded` and `--workload mixed` run the [in-process stress harness](./testing.md#in-process-stress-harness) instead of dialing the endpoint. That path passes when `errors` and `correctness_errors` are both zero, and it prints latency percentiles in microseconds. Neither path is a Cargo benchmark target. The repository does not check in a throughput number for either path. A printed line is not a service-level result and is not the official 1,000,000-create profile.
 
 The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `SetAttr` overwrites, then 100,000 deletes, concurrency 64) is documented in [Tests and benches](./testing.md#prefix-load). GitHub Actions runs only the small profile. It does not run the 1,000,000-create profile.
 

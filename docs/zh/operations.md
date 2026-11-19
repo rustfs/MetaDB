@@ -67,7 +67,9 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ### `bench`
 
-见 [测试与压测](./testing.md#metadb-ctl-bench)。这是针对正在运行的服务器的客户端。它不是 Cargo 基准目标。本仓库没有为它登记吞吐量数字。
+见 [测试与压测](./testing.md#metadb-ctl-bench)。远程的 `hotspot-create` 和 `bulk-ttl-delete` 是针对正在运行的服务器的客户端。它们打印带 `attempted`、`succeeded` 和 `failed` 的 JSON，只要 `succeeded` 不等于 `--ops`，进程就以非零状态退出。`--embedded` 和 `--workload mixed` 不拨号端点，而是运行 [进程内压力工具](./testing.md#进程内压力工具)。该路径在 `errors` 和 `correctness_errors` 都为 0 时通过，并打印以微秒计的延迟分位数。两条路径都不是 Cargo 基准目标。本仓库没有为其中任何一条登记吞吐量数字。打印出来的一行不是服务级结果，也不是官方的 1,000,000 次创建负载。
+
+单独的前缀负载工具（100 个前缀 × 10,000 次创建，然后 100,000 次 `SetAttr` 覆盖，然后 100,000 次删除，并发 64）写在 [英文测试与压测](../en/testing.md#prefix-load)。GitHub Actions 只跑小配置。它不跑 1,000,000 次创建的配置。
 
 ## 指标
 
@@ -105,7 +107,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 3. `metadb-ctl cell register` 不创建第二个单元。`open_and_serve` 只把本地单元注册到全局管理器。
 4. 测试 `T1`–`T6` 使用的内存路径 `MetaDbEngine::new_single_node` 可以把内存中的投票者计数加到 3。那个对象没有磁盘，也没有 Raft。它不是 `metadbd` 的扩容。
 
-[未合并的拉取请求 2](https://github.com/rustfs/MetaDB/pull/2) 陈述了同一边界：它的分布式测试在一个操作系统进程里，用三个 localhost Raft 投票者调用 `DurableCellManager::scale_out_replicas`。它不启动三个 `metadbd` 进程。拆开的角色和第二个单元在那里也没有作为真实部署被测试。该拉取请求中的巨型分片专用节点隔离仍是内存模拟器的行为。
+`topology_distributed` 仍在一个操作系统进程里，用 localhost 投票者调用 `DurableCellManager::scale_out_replicas`。`join_existing_group` 会启动真正的 `metadbd` 进程并让它们加入。拆开的角色和第二个单元仍不是真实部署。巨型分片的专用节点隔离仍是路由标志，不是把分片搬到另一台机器。
 
 ## 会遇到的错误
 
@@ -131,7 +133,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ## 已知限制
 
-- 一个操作系统进程，角色只能是 `all-in-one`。
+- 角色只能是 `all-in-one`。`be`、`proxy`、`cell-manager` 和 `global-manager` 在开始监听之前被拒绝。
 - 第二个 all-in-one 进程可以用 `[cluster] join` 加入同一个单元。这不会创建第二个单元。`RegisterCell` 返回错误。
 - 未知且非零的 `cell_id` 上，`GetRoutes` 失败关闭。`StoreHeartbeat` 不会替换缓存路由。
 - 巨型隔离是路由标志加上从本地节点表选出的节点标识。它不会把其他分片从磁盘上赶走。
@@ -145,9 +147,8 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 下列能力产品里没有，因此本指南无法为它们写出步骤：
 
 1. `be`、`proxy`、`cell-manager` 和 `global-manager` 的多进程布局。
-2. 把第二个和第三个 `metadbd` 操作系统进程加入已有 Raft 组。
-3. 创建第二个单元并路由到它。
-4. 把巨型分片放到独立机器上，并把其他分片从那台机器移走。
-5. 本进程内的 TLS。进程不终结 TLS。要求 TLS 或证书的配置键会被拒绝，而不是以明文提供服务。请在外部代理终结 TLS。密钥非空时，Raft 和指标与其他服务使用同一个持有者令牌；这不是双向 TLS。由心跳驱动的控制循环没有实现。
-6. 运维人员可以设置并观察到的 Raft 计时器。
-7. 记入仓库的 `metadb-ctl bench` 服务级结果。该命令打印你运行它的那台机器上的数字。本仓库没有记录一份。未合并的拉取请求 2 报告了另一套嵌入式工具；那些命令不在本树中。见 [测试与压测](./testing.md)。
+2. 第二个单元。`RegisterCell` 仍是错误。join 只到达当前 leader；follower 不转发。
+3. 把巨型分片放到独立机器上，并把其他分片从那台机器移走。
+4. 本进程内的 TLS。进程不终结 TLS。要求 TLS 或证书的配置键会被拒绝，而不是以明文提供服务。请在外部代理终结 TLS。密钥非空时，Raft 和指标与其他服务使用同一个持有者令牌；这不是双向 TLS。由心跳驱动的控制循环没有实现。
+5. 运维人员可以设置并观察到的 Raft 计时器。
+6. 记入仓库的 `metadb-ctl bench` 服务级结果。该命令打印你运行它的那台机器上的数字。本仓库没有记录一份。见 [测试与压测](./testing.md)。

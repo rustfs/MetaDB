@@ -67,7 +67,9 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ### `bench`
 
-Voir [Tests et bancs](./testing.md#metadb-ctl-bench). C'est un client contre un serveur en cours d'exécution. Ce n'est pas une cible de banc Cargo. Le dépôt n'enregistre pas de nombre de débit pour cette commande.
+Voir [Tests et bancs](./testing.md#metadb-ctl-bench). Les charges distantes `hotspot-create` et `bulk-ttl-delete` sont un client contre un serveur en cours d'exécution. Elles impriment du JSON avec `attempted`, `succeeded` et `failed`, et le processus se termine en erreur si `succeeded` n'est pas égal à `--ops`. `--embedded` et `--workload mixed` exécutent le [harnais de stress dans le processus](./testing.md#harnais-de-stress-dans-le-processus) au lieu d'appeler le point de terminaison. Ce chemin réussit lorsque `errors` et `correctness_errors` sont tous deux à zéro, et il imprime des percentiles de latence en microsecondes. Aucun des deux chemins n'est une cible de banc Cargo. Le dépôt n'enregistre pas de nombre de débit pour l'un ou l'autre. Une ligne imprimée n'est pas un résultat de niveau service et n'est pas la charge officielle de 1 000 000 créations.
+
+Le harnais distinct de charge par préfixe (100 préfixes × 10 000 créations, puis 100 000 réécritures `SetAttr`, puis 100 000 suppressions, concurrence 64) est documenté dans les [tests et bancs en anglais](../en/testing.md#prefix-load). GitHub Actions n'exécute que le petit profil. Il n'exécute pas le profil de 1 000 000 créations.
 
 ## Métriques
 
@@ -105,7 +107,7 @@ Ce qui ne fonctionne pas comme procédure d'exploitation :
 3. `metadb-ctl cell register` ne crée pas une seconde cellule. `open_and_serve` n'enregistre que la cellule locale sur le gestionnaire global.
 4. Le chemin en mémoire `MetaDbEngine::new_single_node` utilisé par les tests `T1`–`T6` peut porter un compteur de votants en mémoire à 3. Cet objet n'a ni disque ni Raft. Ce n'est pas une montée en charge de `metadbd`.
 
-La [pull request ouverte n° 2](https://github.com/rustfs/MetaDB/pull/2) (non fusionnée) énonce la même frontière : son test distribué appelle `DurableCellManager::scale_out_replicas` avec trois votants Raft sur localhost dans un seul processus du système d'exploitation. Il ne lance pas trois processus `metadbd`. Les rôles désagrégés et une seconde cellule n'y sont pas non plus testés comme déploiements vivants. L'isolation jumbo sur nœud dédié dans cette pull request reste le comportement du simulateur en mémoire.
+`topology_distributed` utilise encore `DurableCellManager::scale_out_replicas` avec des votants localhost dans un seul processus du système d'exploitation. `join_existing_group` démarre de vrais processus `metadbd` et les joint. Les rôles désagrégés et une seconde cellule ne sont toujours pas des déploiements vivants. L'isolation jumbo sur nœud dédié reste un indicateur de route, pas un déplacement de shards vers une autre machine.
 
 ## Erreurs que l'on peut rencontrer
 
@@ -131,7 +133,7 @@ Les variantes sont définies dans `crates/metadb-core/src/error.rs`. Les méthod
 
 ## Limites connues
 
-- Un seul processus du système d'exploitation, rôle `all-in-one` seulement.
+- Rôle `all-in-one` seulement. `be`, `proxy`, `cell-manager` et `global-manager` sont rejetés avant l'écoute.
 - Un second processus all-in-one peut rejoindre la même cellule avec `[cluster] join`. Cela ne crée pas une seconde cellule. `RegisterCell` renvoie une erreur.
 - `GetRoutes` échoue fermé pour un `cell_id` non nul inconnu. `StoreHeartbeat` ne remplace pas les routes en cache.
 - L'isolation jumbo est un indicateur de route plus un identifiant de nœud choisi dans la table locale. Elle n'évince pas d'autres shards d'un disque.
@@ -145,9 +147,8 @@ Les variantes sont définies dans `crates/metadb-core/src/error.rs`. Les méthod
 Ces éléments manquent au produit, donc ce guide ne peut pas décrire de procédure pour eux :
 
 1. Une disposition multi-processus pour `be`, `proxy`, `cell-manager` et `global-manager`.
-2. L'ajout d'un second et d'un troisième processus `metadbd` du système d'exploitation à un groupe Raft existant.
-3. La création et le routage vers une seconde cellule.
-4. Le placement d'un shard jumbo sur sa propre machine et le déplacement des autres shards hors de cette machine.
-5. Le TLS natif. Ce processus ne termine pas TLS. Les clés de configuration qui demandent TLS ou un certificat sont rejetées au lieu de servir en clair. Placer la terminaison dans un proxy externe. Raft et les métriques utilisent le même bearer que les autres services lorsqu'un secret est défini ; ce n'est pas du TLS mutuel. Une boucle de contrôle pilotée par les battements de cœur n'est pas implémentée.
-6. Une temporisation Raft que l'exploitant peut régler et observer.
-7. Un résultat de niveau service enregistré pour `metadb-ctl bench`. La commande imprime des nombres pour la machine sur laquelle on l'exécute. Ce dépôt n'en enregistre pas. La pull request non fusionnée n° 2 rapporte un harnais embarqué distinct ; ces commandes ne sont pas dans cet arbre. Voir [Tests et bancs](./testing.md).
+2. Une seconde cellule. `RegisterCell` reste une erreur. Le join n'atteint que le leader courant ; un follower ne le transmet pas.
+3. Le placement d'un shard jumbo sur sa propre machine et le déplacement des autres shards hors de cette machine.
+4. Le TLS natif. Ce processus ne termine pas TLS. Les clés de configuration qui demandent TLS ou un certificat sont rejetées au lieu de servir en clair. Placer la terminaison dans un proxy externe. Raft et les métriques utilisent le même bearer que les autres services lorsqu'un secret est défini ; ce n'est pas du TLS mutuel. Une boucle de contrôle pilotée par les battements de cœur n'est pas implémentée.
+5. Une temporisation Raft que l'exploitant peut régler et observer.
+6. Un résultat de niveau service enregistré pour `metadb-ctl bench`. La commande imprime des nombres pour la machine sur laquelle on l'exécute. Ce dépôt n'en enregistre pas. Voir [Tests et bancs](./testing.md).

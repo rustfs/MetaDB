@@ -67,7 +67,9 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ### `bench`
 
-Siehe [Tests und Benches](./testing.md#metadb-ctl-bench). Das ist ein Client gegen einen laufenden Server. Es ist kein Cargo-Bench-Ziel. Das Repository zeichnet dafür keine Durchsatzzahl auf.
+Siehe [Tests und Benches](./testing.md#metadb-ctl-bench). Entfernte `hotspot-create` und `bulk-ttl-delete` sind ein Client gegen einen laufenden Server. Sie drucken JSON mit `attempted`, `succeeded` und `failed`, und der Prozess endet mit einem Fehler, wenn `succeeded` nicht `--ops` entspricht. `--embedded` und `--workload mixed` führen den [prozessinternen Stress-Harness](./testing.md#prozessinterner-stress-harness) aus, statt den Endpunkt anzuwählen. Dieser Pfad besteht, wenn `errors` und `correctness_errors` beide null sind, und er druckt Latenzperzentile in Mikrosekunden. Keiner der beiden Pfade ist ein Cargo-Bench-Ziel. Das Repository zeichnet für keinen der beiden eine Durchsatzzahl auf. Eine gedruckte Zeile ist kein Ergebnis auf Dienstebene und nicht die offizielle Last von 1.000.000 Anlegen.
+
+Der gesonderte Präfix-Last-Harness (100 Präfixe × 10.000 Anlegen, dann 100.000 `SetAttr`-Überschreibungen, dann 100.000 Löschungen, Nebenläufigkeit 64) steht in den [englischen Tests und Benches](../en/testing.md#prefix-load). GitHub Actions führt nur das kleine Profil aus. Es führt das Profil mit 1.000.000 Anlegen nicht aus.
 
 ## Metriken
 
@@ -105,7 +107,7 @@ Was als Betriebsverfahren nicht funktioniert:
 3. `metadb-ctl cell register` erzeugt keine zweite Zelle. `open_and_serve` registriert nur die lokale Zelle beim Global Manager.
 4. Der Speicherpfad `MetaDbEngine::new_single_node`, den die Tests `T1`–`T6` nutzen, kann eine Wählerzahl im Speicher auf 3 setzen. Dieses Objekt hat weder Platte noch Raft. Es ist keine Skalierung von `metadbd`.
 
-[Offener Pull Request 2](https://github.com/rustfs/MetaDB/pull/2) (nicht zusammengeführt) zieht dieselbe Grenze: Sein verteilter Test ruft `DurableCellManager::scale_out_replicas` mit drei localhost-Raft-Wählern in einem Betriebssystemprozess auf. Er startet keine drei `metadbd`-Prozesse. Disaggregierte Rollen und eine zweite Zelle werden dort ebenfalls nicht als lebende Einsätze getestet. Die Jumbo-Isolation auf einem gewidmeten Knoten bleibt in diesem Pull Request das Verhalten des Speichersimulators.
+`topology_distributed` verwendet weiterhin `DurableCellManager::scale_out_replicas` mit localhost-Wählern in einem Betriebssystemprozess. `join_existing_group` startet echte `metadbd`-Prozesse und lässt sie beitreten. Disaggregierte Rollen und eine zweite Zelle sind weiterhin keine lebenden Einsätze. Die Jumbo-Isolation auf einem gewidmeten Knoten bleibt ein Routenflag, keine Verschiebung von Shards auf eine andere Maschine.
 
 ## Fehler, die auftreten können
 
@@ -131,7 +133,7 @@ Die Varianten sind in `crates/metadb-core/src/error.rs` definiert. gRPC-Methoden
 
 ## Bekannte Grenzen
 
-- Ein Betriebssystemprozess, nur Rolle `all-in-one`.
+- Nur Rolle `all-in-one`. `be`, `proxy`, `cell-manager` und `global-manager` werden vor dem Lauschen abgelehnt.
 - Ein zweiter all-in-one-Prozess kann mit `[cluster] join` derselben Zelle beitreten. Das erzeugt keine zweite Zelle. `RegisterCell` liefert einen Fehler.
 - `GetRoutes` scheitert geschlossen bei einer unbekannten `cell_id` ungleich null. `StoreHeartbeat` ersetzt zwischengespeicherte Routen nicht.
 - Jumbo-Isolation ist ein Routenflag plus eine Knotenkennung aus der lokalen Knotentabelle. Sie verdrängt andere Shards nicht von einer Platte.
@@ -145,9 +147,8 @@ Die Varianten sind in `crates/metadb-core/src/error.rs` definiert. gRPC-Methoden
 Diese Punkte fehlen im Produkt, daher kann dieser Leitfaden kein Verfahren dafür beschreiben:
 
 1. Eine Mehrprozess-Anordnung für `be`, `proxy`, `cell-manager` und `global-manager`.
-2. Einen zweiten und dritten `metadbd`-Betriebssystemprozess einer bestehenden Raft-Gruppe hinzufügen.
-3. Eine zweite Zelle anlegen und dorthin routen.
-4. Einen Jumbo-Shard auf eine eigene Maschine legen und andere Shards von dieser Maschine wegziehen.
-5. Natives TLS. Dieser Prozess beendet TLS nicht. Konfigurationsschlüssel, die TLS oder ein Zertifikat verlangen, werden abgelehnt, statt Klartext zu dienen. Die Terminierung gehört in einen externen Proxy. Raft und Metriken nutzen denselben Bearer wie die anderen Dienste, wenn ein Geheimnis gesetzt ist; das ist kein gegenseitiges TLS. Eine heartbeat-getriebene Steuerschleife ist nicht implementiert.
-6. Einen Raft-Zeitgeber, den der Betrieb setzen und beobachten kann.
-7. Ein eingechecktes Ergebnis auf Dienstebene für `metadb-ctl bench`. Der Befehl druckt Zahlen für die Maschine, auf der man ihn ausführt. Dieses Repository zeichnet keine auf. Der nicht zusammengeführte Pull Request 2 berichtet einen eigenen eingebetteten Harness; diese Befehle sind nicht in diesem Baum. Siehe [Tests und Benches](./testing.md).
+2. Eine zweite Zelle. `RegisterCell` bleibt ein Fehler. Join erreicht nur den aktuellen Leader; ein Follower leitet ihn nicht weiter.
+3. Einen Jumbo-Shard auf eine eigene Maschine legen und andere Shards von dieser Maschine wegziehen.
+4. Natives TLS. Dieser Prozess beendet TLS nicht. Konfigurationsschlüssel, die TLS oder ein Zertifikat verlangen, werden abgelehnt, statt Klartext zu dienen. Die Terminierung gehört in einen externen Proxy. Raft und Metriken nutzen denselben Bearer wie die anderen Dienste, wenn ein Geheimnis gesetzt ist; das ist kein gegenseitiges TLS. Eine heartbeat-getriebene Steuerschleife ist nicht implementiert.
+5. Einen Raft-Zeitgeber, den der Betrieb setzen und beobachten kann.
+6. Ein eingechecktes Ergebnis auf Dienstebene für `metadb-ctl bench`. Der Befehl druckt Zahlen für die Maschine, auf der man ihn ausführt. Dieses Repository zeichnet keine auf. Siehe [Tests und Benches](./testing.md).
