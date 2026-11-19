@@ -980,6 +980,25 @@ impl DurableCellManager {
         Ok(())
     }
 
+    /// Routes for cluster status. A local shard that cannot rebuild its snapshot
+    /// is not returned as a live voter; the caller gets an error instead.
+    pub fn routes_for_live_status(&self) -> Result<Vec<CompositeShardRoute>> {
+        let routes = self.list_routes();
+        for route in &routes {
+            if let Some(group) = self.host.get_group(route.shard_id) {
+                // Probe the snapshot directory. The in-memory latch is still
+                // empty until something attempts repair.
+                group.ensure_published_snapshot_sync().map_err(|error| {
+                    MetaDbError::StorageIoError(format!(
+                        "shard {} storage is unrecoverable, so it is not a live voter: {error}",
+                        route.shard_id
+                    ))
+                })?;
+            }
+        }
+        Ok(routes)
+    }
+
     pub fn list_routes(&self) -> Vec<CompositeShardRoute> {
         let mut routes: Vec<CompositeShardRoute> = {
             let guard = self.state.lock().unwrap();
