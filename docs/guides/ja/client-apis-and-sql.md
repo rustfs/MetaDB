@@ -11,7 +11,7 @@
    * `MetadataService`：`CreateFile`, `Mkdir`, `Unlink`, `Rmdir`, `SetAttr`, `Lookup`, `DirStat`, `ListDir`, `ExecuteSql`, `GetQuota`, `SetQuotaLimit`, `ListQuotas`, `GetSecondaryIndex`, `ScanSecondaryIndex`。
    * `TransactionService`：`Rename`（単一シャード `1-RTT` / クロスシャード `2PC` 自動切替）および内部 2PC / `ApplyAuxBatch` RPC。
    * `ControlPlaneService`：`GetRoutes`, `AllocateIdBlock`, `StoreHeartbeat`, `TriggerShardSplit`, `EnableDualModeSplit`, `ScaleShardReplicas`, `RegisterCell`。
-3. **20 種類の軽量 SQL テンプレート (`metadb-proxy`)**：汎用 SQL オプティマイザを経由せず `<5µs` でストレージ実行プランへ直接変換します（全 20 パターンおよび `?` プレースホルダ・エスケープ実装済）。
+3. **20 種類の軽量 SQL テンプレート (`metadb-proxy`)**：`sql_templates_tests` covers all 20 templates. A compile time under `5µs` is not a measurement of this repository.
 
 > **予約名ルール**：ユーザーファイル／ディレクトリ名として `'_attr_'` または NULL 文字 `'\0'` を含む名前は使用できません（`MetaDbError::ReservedEntryName`）。`name = '_attr_'` はテンプレート #7 の `DirStat` 専用です。
 

@@ -2,7 +2,7 @@
 
 * **Project**: `rustfs/MetaDB`
 * **Language & Stack**: 100% Pure Rust (`tokio` + `tonic`/`prost` gRPC + `openraft` Multi-Raft + Custom WAL-less LSM Storage; zero C/C++ FFI)
-* **Specification Status**: Phase 0 Approved Architecture & Subsystem Suite (see [Section 12](#12-implementation-status-matrix-paper-vs-repository) for current prototype vs. Phase 1–6 implementation status)
+* **Specification Status**: Phase 0 is the design status of this architecture note. It is not a first-launch acceptance of the running tree. [Section 12](#12-implementation-status-matrix-paper-vs-repository) separates design claims, crate tests, and multi-process gaps.
 * **Design Methodology**: [Google Elephant-Goldfish Model (EGM)](https://github.com/google/elephant-goldfish-model) for Spec-Driven Development (SDD)
 * **Primary Theoretical Reference**: This architecture is directly inspired by and adapted from Baidu's trillion-scale production metadata database paper:
   > **Zebin Ren ([@ZebinRen](https://github.com/ZebinRen)), Biao Cao, Kang Chen ([@kangchenPKU](https://github.com/kangchenPKU)), Zhihui Yin, Qiushi Chen, Jielong Jian, Jiwei Xiong, Xinxing Wang, Yan Xing, Liguo Duan, Ran Zheng, Xianjun Meng, and Zhenyu Hou.**

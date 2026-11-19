@@ -8,6 +8,8 @@ The current binary runs a persistent deployment only as `all-in-one`. A second `
 
 ## Stage 1：スタンドアロン・シングルノード構成 (`metadbd --role all-in-one`) `[実装済]`
 
+`[実装済]` means one `metadbd --role all-in-one` process in current source. It is not a multi-cell deployment. `MetaDbEngine::new_single_node` is an in-memory simulator with no disk and no Raft, not this process.
+
 単一プロセス内で `GlobalManager`、`CellLocalManager`、`MetaCache`、`Proxy`、および **`1-Voter` OpenRaft** バックエンドを実行します。ローカル KV の WAL は無効化され、CRC32C チェックサム付き `.raftlog` セグメントへの順次追記のみで耐久性を保証します。
 
 ```toml
@@ -43,6 +45,8 @@ metadbd --config /etc/metadb/standalone.toml
 ---
 
 ## Stage 2：単一ホスト上の自動 `PID` 境界シャード分割 `[実装済]`
+
+`[実装済]` means in-process PID-boundary splits inside that same all-in-one process. It is not a multi-host topology. Jumbo isolation is a route flag and does not move peer shards.
 
 シャードサイズが `shard_split_threshold_bytes` を超えると、`PolicyShardSplitter` が `group_key = PID`（`[0x01][pid: 8B BE]`）境界でシャードを分割し、親ディレクトリ属性 `(PID, "_attr_")` と全子エントリを同一シャードに維持します。
 

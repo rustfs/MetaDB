@@ -18,11 +18,11 @@
 
 ## Why MetaDB?
 
-General-purpose distributed databases (such as TiDB, CockroachDB, and FoundationDB) treat file-system and object-storage metadata as generic flat key-value or relational rows. At exabyte scale, this "black-box" approach creates three severe bottlenecks:
+General-purpose distributed databases (such as TiDB, CockroachDB, and FoundationDB) treat file-system and object-storage metadata as generic flat key-value or relational rows. The three bottlenecks below are Baidu production observations reported in `arXiv:2610.32247v1`. None of the ratios or latencies is a measurement of this repository.
 
-1. **Data Model Mismatch**: Flat hash or byte-midpoint sharding fractures entries of the same directory across multiple shards, turning `>96%` of localized single-directory operations (`create`, `mkdir`, `unlink`, `listdir`) into multi-shard Two-Phase Commit (2PC) transactions and incurring extra network round-trips.
-2. **Transaction Model Mismatch**: Synchronously locking the shared parent-directory attribute record (`num_children`, `size_bytes`, `modify_time`) collapses concurrent single-directory write throughput by `10x–36x`, while synchronous updates to `QuotaTable` and `SecondaryIndexTable` force unnecessary cross-shard 2PC on every write.
-3. **Storage Implementation Mismatch**: Persisting multi-version concurrency control (MVCC) tombstones to disk for transient (`<10ms`) metadata transactions creates a **double-tombstone penalty** (MVCC tombstones + LSM-tree tombstones). Under consecutive bulk TTL deletions, accumulated tombstones degrade `listdir` range-scan latency from `<100ms` to `~6 seconds`.
+1. **Data Model Mismatch**: The paper reports that flat hash or byte-midpoint sharding turns `>96%` of localized single-directory operations (`create`, `mkdir`, `unlink`, `listdir`) into multi-shard Two-Phase Commit (2PC). That percentage is Baidu's workload figure, not a ratio counted in this tree.
+2. **Transaction Model Mismatch**: The paper reports that synchronously locking the shared parent-directory attribute record collapses concurrent single-directory write throughput by `10x–36x` (including a `36.2x` gap versus TiDB in that study). Synchronous `QuotaTable` and `SecondaryIndexTable` updates are the paper's description of extra cross-shard 2PC, not a benchmark of this repository.
+3. **Storage Implementation Mismatch**: The paper reports a double-tombstone penalty for short-lived (`<10ms`) metadata transactions, and `listdir` latency moving from `<100ms` to `~6 seconds` under bulk TTL deletion (`arXiv:2610.32247v1`, §2.3.3 and §7.4). Those latencies are not measurements of this repository.
 
 ---
 

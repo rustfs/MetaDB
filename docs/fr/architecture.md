@@ -88,6 +88,8 @@ Les versions MVCC vivent en mémoire pendant `storage.mvcc_retention_ms` (défau
 
 Chaque shard local est un groupe `openraft` 0.10. Le journal est un fichier segmenté CRC32C sous `.../shards/<id>/raft`. Options par défaut, qui ne sont **pas** chargées depuis le TOML (`raft_options` est `#[serde(skip)]`) :
 
+That skip is current `main`. Unmerged pull request #38 proposes loading `[raft]`. If it merges, this paragraph has to be rewritten. Loading `[raft]` is not current behavior.
+
 | Champ | Défaut |
 | :--- | :--- |
 | battement | 150 ms |

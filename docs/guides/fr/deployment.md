@@ -8,6 +8,8 @@ The current binary runs a persistent deployment only as `all-in-one`. A second `
 
 ## Étape 1 : Déploiement Mononœud Autonome (`metadbd --role all-in-one`) `[Implémenté]`
 
+`[Implémenté]` means one `metadbd --role all-in-one` process in current source. It is not a multi-cell deployment. `MetaDbEngine::new_single_node` is an in-memory simulator with no disk and no Raft, not this process.
+
 Tous les rôles (`GlobalManager`, `CellLocalManager`, `MetaCache`, `Proxy` et stockage `BE` en **OpenRaft `1-Voter`**) tournent dans un seul binaire. Le WAL local du moteur KV est désactivé : seul le journal segmenté `.raftlog` (protégé par CRC32C) assure la durabilité séquentielle.
 
 ```toml
@@ -43,6 +45,8 @@ metadbd --config /etc/metadb/standalone.toml
 ---
 
 ## Étape 2 : Découpage Dynamique sur Frontière `PID` `[Implémenté]`
+
+`[Implémenté]` means in-process PID-boundary splits inside that same all-in-one process. It is not a multi-host topology. Jumbo isolation is a route flag and does not move peer shards.
 
 Lorsqu'un shard dépasse `shard_split_threshold_bytes`, `PolicyShardSplitter` choisit une frontière stricte `group_key = PID` (`[0x01][pid: 8B BE]`) afin que `(PID, "_attr_")` et tous ses enfants restent sur le même shard.
 

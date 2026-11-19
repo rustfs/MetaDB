@@ -6,6 +6,8 @@
 
 ## 1. `metadb-ctl` 管理 CLI `[実装済]`
 
+`[実装済]` means the `metadb-ctl` binary exists and talks to an all-in-one process. `cell register` does not create a cell. `metadbd --role be` is not a supported deployment. Output from a bench command is for the machine that ran it, not a checked-in result.
+
 ```bash
 # クラスター全体の Cell・BE ノード状態・3 ウォーターマーク遅延を確認
 metadb-ctl --endpoint 127.0.0.1:7800 cluster status

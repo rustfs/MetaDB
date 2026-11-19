@@ -2,7 +2,9 @@
 
 [概览](./README.md) · [English](../en/configuration.md) · [Français](../fr/configuration.md) · [Deutsch](../de/configuration.md) · [日本語](../ja/configuration.md)
 
-`metadbd --config` 以及 `ServerTomlConfig::from_toml_file` / `from_toml_str` 读取 TOML（`crates/metadb-server/src/config.rs`）。不表示密钥或 TLS 的未知键仍会被忽略。拼错的 `shared_secret`、令牌或密码键，以及任何 TLS 或证书键都会被拒绝，进程不会启动。每个已知节都可以省略。省略的字段取下面的默认值。
+`metadbd --config` 以及 `ServerTomlConfig::from_toml_file` / `from_toml_str` 读取 TOML（`crates/metadb-server/src/config.rs`）。每个已知节都可以省略。省略的字段取下面的默认值。
+
+On current `main`, a key inside `[security]` other than `shared_secret` fails parsing. TLS-like keys (`tls`, `ssl`, `cert`) and secret-like keys (`secret`, `password`, `token`, `credential`, `auth`) fail anywhere, including nested tables. Unknown keys that do not match those names are still ignored. Unmerged pull request #35 also rejects `anonymous` and `insecure` anywhere and accepts `[security].allow_unauthenticated` beside `shared_secret`. The empty-secret rules later in this file describe #35, not current `main`. Until #35 merges, `main` still accepts an empty secret on loopback and does not implement `allow_unauthenticated`.
 
 ## 默认值
 
@@ -28,6 +30,8 @@
 | `security.allow_unauthenticated` | `false` | Explicit opt-in for an empty secret on loopback only. Rejected together with a usable secret. Rejected on a wildcard or any other non-loopback bind. A whitespace-only secret is rejected even with this flag |
 
 没有 `[raft]` 表。`ServerTomlConfig.raft_options` 被 serde 跳过，保持 `RaftNodeOptions::default()`（心跳 150 ms，选举 450–900 ms，快照日志保留 0，段大小 64 MiB）。
+
+That skip is current `main`. Unmerged pull request #38 proposes loading a `[raft]` table. If #38 merges, this sentence has to be rewritten. Loading `[raft]` is not current behavior.
 
 `to_lsm_config` 总是把 `auto_locality_compaction` 设为 `true`。
 

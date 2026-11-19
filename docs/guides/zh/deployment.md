@@ -10,6 +10,8 @@ The current binary runs a persistent deployment only as `all-in-one`. A second `
 
 ## 阶段一：独立单节点部署 (`metadbd --role all-in-one`) `[已实现]`
 
+`[已实现]` means one `metadbd --role all-in-one` process in current source. It is not a multi-cell deployment. `MetaDbEngine::new_single_node` is an in-memory simulator with no disk and no Raft, not this process.
+
 在单机一体化模式下，`GlobalManager`、`CellLocalManager`、`MetaCache`、`Proxy` 与 `BE` 存储引擎运行于同一进程，底层采用 **`1-Voter` OpenRaft**。由于分段 CRC32C `.raftlog` 已经提供顺序写崩溃持久化保障，底层 LSM 引擎彻底关闭本地 KV WAL，避免双重写日志开销。
 
 ### `standalone.toml` 配置示例
@@ -51,6 +53,8 @@ metadbd --config /etc/metadb/standalone.toml
 ---
 
 ## 阶段二：单节点动态 `PID` 边界分片分裂 `[已实现]`
+
+`[已实现]` means in-process PID-boundary splits inside that same all-in-one process. It is not a multi-host topology. Jumbo isolation is a route flag and does not move peer shards.
 
 当分片容量超过 `shard_split_threshold_bytes` 时，`PolicyShardSplitter` 会扫描 SSTable 块索引中点并严格沿着 `group_key = PID`（`[0x01][pid: 8B BE]`）边界执行原子分裂：
 * 同一目录的属性记录 `(PID, "_attr_")` 与所有直接子项 `(PID, child_name)` 始终保持在同一分片内。

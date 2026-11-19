@@ -8,6 +8,8 @@ The current binary runs a persistent deployment only as `all-in-one`. A second `
 
 ## Stufe 1: Eigenständiger Einzelknoten (`metadbd --role all-in-one`) `[Implementiert]`
 
+`[Implementiert]` means one `metadbd --role all-in-one` process in current source. It is not a multi-cell deployment. `MetaDbEngine::new_single_node` is an in-memory simulator with no disk and no Raft, not this process.
+
 Im Einzelknotenmodus laufen `GlobalManager`, `CellLocalManager`, `MetaCache`, `Proxy` und das **`1-Voter`-OpenRaft**-Speicher-Backend in einem einzigen Prozess. Auf ein separates KV-WAL wird verzichtet, da das CRC32C-gesicherte `.raftlog` bereits sequenzielle Absturzsicherheit garantiert.
 
 ```toml
@@ -43,6 +45,8 @@ metadbd --config /etc/metadb/standalone.toml
 ---
 
 ## Stufe 2: Dynamisches Shard-Splitting an `PID`-Grenzen `[Implementiert]`
+
+`[Implementiert]` means in-process PID-boundary splits inside that same all-in-one process. It is not a multi-host topology. Jumbo isolation is a route flag and does not move peer shards.
 
 Überschreitet ein Shard `shard_split_threshold_bytes`, teilt `PolicyShardSplitter` ihn strikt entlang einer `group_key = PID`-Grenze (`[0x01][pid: 8B BE]`), sodass `(PID, "_attr_")` und sämtliche Kind-Einträge gemeinsam auf demselben Shard verbleiben.
 

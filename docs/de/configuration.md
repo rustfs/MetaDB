@@ -2,7 +2,9 @@
 
 [Überblick](./README.md) · [English](../en/configuration.md) · [Français](../fr/configuration.md) · [日本語](../ja/configuration.md) · [简体中文](../zh/configuration.md)
 
-`metadbd --config` und `ServerTomlConfig::from_toml_file` / `from_toml_str` lesen TOML (`crates/metadb-server/src/config.rs`). Unbekannte Schlüssel, die kein Geheimnis und kein TLS benennen, werden ignoriert. Ein falsch geschriebenes `shared_secret`, ein Token- oder Passwortschlüssel oder ein TLS- oder Zertifikatsschlüssel wird abgelehnt, und der Prozess startet nicht. Jeder bekannte Abschnitt ist optional. Ausgelassene Felder nehmen die Vorgaben unten an.
+`metadbd --config` und `ServerTomlConfig::from_toml_file` / `from_toml_str` lesen TOML (`crates/metadb-server/src/config.rs`). Jeder bekannte Abschnitt ist optional. Ausgelassene Felder nehmen die Vorgaben unten an.
+
+On current `main`, a key inside `[security]` other than `shared_secret` fails parsing. TLS-like keys (`tls`, `ssl`, `cert`) and secret-like keys (`secret`, `password`, `token`, `credential`, `auth`) fail anywhere, including nested tables. Unknown keys that do not match those names are still ignored. Unmerged pull request #35 also rejects `anonymous` and `insecure` anywhere and accepts `[security].allow_unauthenticated` beside `shared_secret`. The empty-secret rules later in this file describe #35, not current `main`. Until #35 merges, `main` still accepts an empty secret on loopback and does not implement `allow_unauthenticated`.
 
 ## Vorgaben
 
@@ -28,6 +30,8 @@
 | `security.allow_unauthenticated` | `false` | Explicit opt-in for an empty secret on loopback only. Rejected together with a usable secret. Rejected on a wildcard or any other non-loopback bind. A whitespace-only secret is rejected even with this flag |
 
 Es gibt keine Tabelle `[raft]`. `ServerTomlConfig.raft_options` wird von serde übersprungen und bleibt bei `RaftNodeOptions::default()` (Heartbeat 150 ms, Wahl 450–900 ms, Snapshot-Log-Behalten 0, Segment 64 MiB).
+
+That skip is current `main`. Unmerged pull request #38 proposes loading a `[raft]` table. If #38 merges, this sentence has to be rewritten. Loading `[raft]` is not current behavior.
 
 `to_lsm_config` setzt immer `auto_locality_compaction: true`.
 
