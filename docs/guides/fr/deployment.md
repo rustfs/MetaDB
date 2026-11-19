@@ -2,7 +2,9 @@
 
 * **Retour à l'index**: [Présentation Français](./README.md) | [Portail](../../README.md)
 
-MetaDB exécute **exactement le même moteur LSM sans WAL et la même machine à états OpenRaft** du nœud unique jusqu'au cluster multi-cellules de plus de 1 000 serveurs, sans migration hors ligne.
+Le binaire actuel ne lance un déploiement persistant qu'en `all-in-one`. Les tests d'intégration couvrent Raft multi-processus dans la même cellule. Les processus découpés par rôle et la topologie multi-cellules sont un objectif de conception, pas un déploiement que ce dépôt exécute. La fourchette 100 milliards – 10 000 milliards et plus est un modèle de conception, pas un résultat mesuré ici. Les chiffres de l'ordre de 10^12 enregistrements publiés dans `arXiv:2610.32247v1` sont des données de production Baidu.
+
+> **État d'implémentation** : le LSM persistant, la réplication Raft, le découpage local des shards et les opérations gRPC/CLI all-in-one ont une couverture de régression. Seul `all-in-one` démarre un démon. `be`, `proxy`, `cell-manager`, `global-manager` et `RegisterCell` à distance sont rejetés. Voir les [notes de correction](../../designs/correctness_hardening.md).
 
 ---
 
@@ -48,22 +50,29 @@ Lorsqu'un shard dépasse `shard_split_threshold_bytes`, `PolicyShardSplitter` ch
 
 ---
 
-## Étape 3 : Extension sans Interruption vers Multi-Raft `3-Voter` & Multi-Cell `[Implémenté]`
+## Étape 3 : Topologie Multi-Cell Envisagée
 
-### 3.1 Promotion Haute Disponibilité `1-Voter -> Learner -> 3-Voter`
+L'étape 3 est un objectif de conception. Le binaire actuel ne la déploie pas.
 
-```bash
-metadbd --role be --node-id 2 --listen 10.0.1.12:7800 --cell-manager 10.0.1.11:7800 --data-dir /var/lib/metadb
-metadbd --role be --node-id 3 --listen 10.0.1.13:7800 --cell-manager 10.0.1.11:7800 --data-dir /var/lib/metadb
+`metadbd` n'exécute que `--role all-in-one`. `PersistentMetaDbCluster::open_and_serve` dans `crates/metadb-server/src/lib.rs` refuse `be`, `proxy`, `cell-manager` et `global-manager` avant d'écouter. `RegisterCell` dans `crates/metadb-server/src/grpc_services.rs` renvoie une erreur applicative et n'enregistre pas une seconde cellule. Cet arbre n'a pas de déploiement multi-processus et multi-cellules en service.
 
-metadb-ctl raft scale-replicas --cell-id 1 --target-voters 3
-```
+Un second `metadbd --role all-in-one` peut rejoindre la **même** cellule lorsque `--join` ou `--cell-manager` désigne le leader courant et que le répertoire de données est vierge. Ce chemin est couvert par `crates/metadb-server/tests/join_existing_group.rs`. Le processus qui rejoint reste all-in-one. Ce n'est pas un backend découpé par rôle, et la jonction ne crée pas une autre cellule. Voir [Exploitation](../../fr/operations.md).
 
-Les nouveaux nœuds rejoignent le groupe en tant que `Learner`, reçoivent un instantané SSTable par liens physiques (`InstallSnapshot`) suivi des segments `.raftlog`, puis passent `Voter` par consensus conjoint sans arrêt des écritures.
+### 3.1 Votants dans une seule cellule
 
-### 3.2 Architecture Multi-Cell à Deux Niveaux (`100 Md – 10 000 Md+` d'entrées)
+Ne lancez pas `metadbd --role be`. Ce rôle se termine dans `open_and_serve` ; ces commandes ne sont pas un mode opératoire. `metadb-ctl raft scale-replicas` appelle `ScaleShardReplicas` et exige que le nombre de votants demandé soit déjà enregistré dans la cellule. Une cellule all-in-one neuve n'a qu'un nœud, donc `--target-voters 3` échoue tant que ces nœuds n'existent pas. Les contraintes sont dans [Exploitation](../../fr/operations.md).
 
-* **`global-manager`** : Table grossière `[start_key, end_key) -> CellId` (`<1 000` entrées) et allocation de blocs de `65 536` identifiants.
-* **`cell-manager`** : Battements de cœur par shard (`20K–50K` shards/Cell), découpage `PID` et isolation dédiée des Jumbo Shards.
-* **`be`** : Groupes Multi-Raft, `MemMvccStore`, `LsmStorageBackend` et exécution `1-RTT`.
-* **`proxy`** : Routage `MetaCache` en un saut, compilation des 20 modèles SQL et coordination 2PC.
+### 3.2 Modèle de conception d'une topologie désagrégée (`100B – 10T+` enregistrements)
+
+`100B – 10T+` (100 Md – 10 000 Md et plus) est une **plage de modèle de conception** : une arithmétique pour dimensionner une future topologie multi-cellules. Ce n'est pas un nombre d'enregistrements stockés par ce dépôt, ni un chiffre de production Baidu présenté comme un résultat de `rustfs/MetaDB`. Les tailles publiées dans `arXiv:2610.32247v1`, dont les 1 848 milliards d'enregistrements (`1,848 × 10^12`) du cluster BOS2, sont des données de production Baidu.
+
+Le tableau est le découpage de rôles envisagé. Ce binaire n'exécute pas ces rôles.
+
+| Rôle | `--role` de conception | Responsabilité envisagée |
+| :--- | :--- | :--- |
+| **Gestionnaire global** | `global-manager` | Associerait des intervalles grossiers `[start_key, end_key)` à un `CellId`, allouerait des blocs de `65 536` identifiants et coordonnerait les baux de renommage de répertoire entre cellules. |
+| **Gestionnaire de cellule** | `cell-manager` | Traiterait les battements de cœur BE (`20K–50K` shards par cellule) et orchestrerait les découpages `PID`, l'isolation jumbo et les changements d'appartenance. |
+| **Stockage backend (`BE`)** | `be` | Hébergerait les groupes Multi-Raft et le moteur LSM sur des hôtes NVMe. |
+| **Proxy sans état** | `proxy` | Embarquerait `MetaCache`, compilerait les 20 modèles SQL et coordonnerait le 2PC inter-shards. |
+
+`metadb-ctl cell register` appelle `RegisterCell` et se termine avec un statut non nul. Il n'enregistre pas de cellule. Ne l'utilisez pas comme étape de fédération.

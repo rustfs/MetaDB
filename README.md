@@ -127,7 +127,7 @@ cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile local
 
 `stress_crash_restart` stops a single-node process with `PersistentMetaDbCluster::shutdown_without_flush` while creates are still inside Raft propose, reopens the same `data_dir`, and checks listings, `dirstat`, quota, and a secondary index. A second stop covers a joined rename, unlink, and create tail. `three_voter_leader_loss_under_load` runs creates on a 3-voter cell, stops the leader without flushing, checks the new leader, and restarts the stopped voter while creates continue.
 
-`metadb-ctl bench --workload hotspot-create` and `--workload bulk-ttl-delete` still drive a remote gRPC endpoint and report throughput only. `--workload mixed` is the embedded harness.
+`metadb-ctl bench --workload hotspot-create` and `--workload bulk-ttl-delete` dial a remote gRPC endpoint and print JSON: a header, then phase reports with `attempted`, `succeeded`, `failed`, and latency percentiles. The process exits non-zero unless every requested operation succeeds. `--workload mixed` and `--embedded` run the in-process stress harness. Numbers from that command are for the machine that ran it; this repository does not record them as a result.
 
 `metadbd` only runs `--role all-in-one`. `topology_distributed` still builds a 3-voter cell in-process. A second OS process can join that cell's Raft groups: `cargo test -p metadb-server --test join_existing_group`. `RegisterCell` does not create a second Cell. CI runs `cargo fmt`, `cargo clippy --locked`, and `cargo test --locked`, times the job out at 45 minutes, cancels a superseded run, and rejects a bare `#[ignore]` attribute.
 
