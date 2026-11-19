@@ -2,7 +2,9 @@
 
 * **ガイド目次へ戻る**: [日本語概要](./README.md) | [ハブ](../../README.md)
 
-MetaDB はシングルノード構成から 1,000 台超の分散クラスターまで **完全に同一の WAL レス LSM エンジンと OpenRaft ステートマシン** を実行し、データ移行なしで段階的にスケールアウトできます。
+現在のバイナリが永続化して起動するのは `all-in-one` だけです。同一セル内の複数プロセス Raft は統合テストが扱います。ロールごとに分けたプロセスと Multi-Cell 構成は設計目標であり、このリポジトリが稼働させている配置ではありません。1,000 億〜10 兆以上のレコード数は設計モデルであり、このリポジトリの測定結果ではありません。`arXiv:2610.32247v1` の兆規模の数値は Baidu の本番データです。
+
+> **実装状態**: 永続 LSM、Raft 複製、単一ホスト上のシャード分割、および all-in-one の gRPC/CLI には回帰テストがあります。デーモンを起動できるロールは `all-in-one` だけです。`be`、`proxy`、`cell-manager`、`global-manager` と遠隔の `RegisterCell` は拒否されます。[正確性メモ](../../designs/correctness_hardening.md) を参照してください。
 
 ---
 
@@ -48,22 +50,29 @@ metadbd --config /etc/metadb/standalone.toml
 
 ---
 
-## Stage 3：`3-Voter` Multi-Raft および Multi-Cell 分散クラスターへの無停止拡張 `[実装済]`
+## Stage 3：想定している Multi-Cell 構成
 
-### 3.1 `1-Voter` から `3-Voter` への無停止レプリカ昇格
+Stage 3 は設計目標です。現在のバイナリはこの構成をデプロイしません。
 
-```bash
-# 新規 BE ノード 2 台を起動
-metadbd --role be --node-id 2 --listen 10.0.1.12:7800 --cell-manager 10.0.1.11:7800 --data-dir /var/lib/metadb
-metadbd --role be --node-id 3 --listen 10.0.1.13:7800 --cell-manager 10.0.1.11:7800 --data-dir /var/lib/metadb
+`metadbd` が実行するのは `--role all-in-one` だけです。`crates/metadb-server/src/lib.rs` の `PersistentMetaDbCluster::open_and_serve` は、待受の前に `be`、`proxy`、`cell-manager`、`global-manager` を拒否します。`crates/metadb-server/src/grpc_services.rs` の `RegisterCell` はアプリケーションエラーを返し、2 つ目のセルを保存しません。このツリーに、複数プロセスの Multi-Cell を実際に動かす配置はありません。
 
-# Learner 追加 -> SSTable スナップショット転送 -> Joint Consensus による Voter 昇格
-metadb-ctl raft scale-replicas --cell-id 1 --target-voters 3
-```
+2 つ目の `metadbd --role all-in-one` は、`--join` または `--cell-manager` が現在のリーダーを指し、データディレクトリが空であるときに**同じ**セルへ参加できます。この経路は `crates/metadb-server/tests/join_existing_group.rs` が扱います。参加者は依然として all-in-one であり、ロールを削ったバックエンドではなく、別のセルも作りません。[運用](../../ja/operations.md) を参照してください。
 
-### 3.2 Multi-Cell 2 階層コントロールプレーン構成（1,000 億〜10 兆+ レコード）
+### 3.1 同一セル内の投票者
 
-* **`global-manager`**：キー範囲と `CellId` の対応表（`<1,000` エントリ）および `65,536` 単位のグローバル ID ブロック割当てを管理。
-* **`cell-manager`**：各 Cell 内のシャードハートビート（Cell あたり `20K–50K` シャード）、`PID` 分割、Jumbo 専用ノード分離を制御。
-* **`be`**：Multi-Raft グループ、`MemMvccStore`、`LsmStorageBackend`、`PushdownExecutor` を実行。
-* **`proxy`**：`MetaCache` による 1 ホップルーティング、20 種類の SQL テンプレートコンパイル、クロスシャード 2PC を担当。
+`metadbd --role be` は起動しないでください。そのロールは `open_and_serve` で終了するため、手順にはなりません。`metadb-ctl raft scale-replicas` は `ScaleShardReplicas` を呼び、要求した投票者数がすでにそのセルへ登録されている必要があります。新しい all-in-one セルのノードは 1 つなので、それらのノードが存在するまで `--target-voters 3` は失敗します。制約は [運用](../../ja/operations.md) にあります。
+
+### 3.2 分離構成の設計モデル（`100B – 10T+` レコード）
+
+`100B – 10T+`（1,000 億〜10 兆以上）は**設計モデル**の範囲です。将来の Multi-Cell 構成がどの程度の容量になるかの算術であり、このリポジトリが保存したレコード数ではありません。Baidu の本番数値を `rustfs/MetaDB` の結果として書いたものでもありません。`arXiv:2610.32247v1` が公表するクラスター規模（BOS2 の 1.848 兆レコードを含む）は Baidu の本番データです。
+
+表は想定しているロール分割です。このバイナリはこれらのロールを実行しません。
+
+| ロール | 設計上の `--role` | 想定する責務 |
+| :--- | :--- | :--- |
+| **Global Manager** | `global-manager` | 粗い `[start_key, end_key)` を `CellId` へ対応させ、`65,536` 個単位の ID を割り当て、セルをまたぐディレクトリ改名リースを調整する、という設計です。 |
+| **Cell Local Manager** | `cell-manager` | セル内の BE ハートビート（セルあたり `20K–50K` シャード）を処理し、`PID` 分割、Jumbo 隔離、メンバー変更を編成する、という設計です。 |
+| **Backend Storage (`BE`)** | `be` | NVMe ホスト上で Multi-Raft シャードグループと LSM エンジンを持つ、という設計です。 |
+| **Stateless Proxy** | `proxy` | `MetaCache` を内蔵し、20 種の SQL テンプレートをコンパイルし、シャードをまたぐ 2PC を調整する、という設計です。 |
+
+`metadb-ctl cell register` は `RegisterCell` を呼び、非ゼロで終了します。セルは登録しません。連合の手順として使わないでください。

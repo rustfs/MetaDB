@@ -2,9 +2,9 @@
 
 * **返回指南首页**: [简体中文概览](./README.md) | [文档中心](../../README.md)
 
-MetaDB 在单机模式与千节点分布式集群中使用**完全相同的无 WAL LSM 存储引擎与 OpenRaft 状态机**，支持从单机平滑在线演进至百亿—十万亿级元数据集群，无需停机迁移数据格式。
+当前二进制只以 `all-in-one` 运行持久化部署。同一单元内的多节点 Raft 由集成测试覆盖。按角色拆开的进程和多单元拓扑是设计目标，不是本仓库已经跑起来的部署。千亿到十万亿以上的记录数是设计模型，不是本仓库的实测结果；`arXiv:2610.32247v1` 里的万亿规模是百度生产数据。
 
-> **实现状态说明**：无 WAL SSTable 持久化 LSM 引擎、`openraft` Multi-Raft（`1-Voter -> 3-Voter` 在线扩容）、带 `ShardEpoch` 围栏的 `PID` 边界与 `DualModeFineGrained` 分片分裂、Jumbo 分片隔离、守护进程 `metadbd` 以及运维工具 `metadb-ctl` 均已在当前 8-Crate 工作区中完整实现并通过测试验证。
+> **实现状态**：持久化 LSM、Raft 复制、本机分片分裂，以及 all-in-one 的 gRPC/CLI 有回归覆盖。只有 `all-in-one` 会启动守护进程。`be`、`proxy`、`cell-manager`、`global-manager` 和远程 `RegisterCell` 会被拒绝。见 [正确性说明](../../designs/correctness_hardening.md)。
 
 ---
 
@@ -58,31 +58,29 @@ metadbd --config /etc/metadb/standalone.toml
 
 ---
 
-## 阶段三：在线扩展至 `3-Voter` Multi-Raft 与多单元集群 `[已实现]`
+## 阶段三：预期中的多单元拓扑
 
-### 3.1 零停机高可用升级（`1-Voter -> Learner -> 3-Voter`）
+阶段三是设计目标。当前二进制不会按角色拆开进程来部署它。
 
-1. 启动两台新的存储后端节点（`--role be`）接入当前控制面：
-   ```bash
-   metadbd --role be --node-id 2 --listen 10.0.1.12:7800 --cell-manager 10.0.1.11:7800 --data-dir /var/lib/metadb
-   metadbd --role be --node-id 3 --listen 10.0.1.13:7800 --cell-manager 10.0.1.11:7800 --data-dir /var/lib/metadb
-   ```
-2. 通过 `metadb-ctl` 在线提升副本数：
-   ```bash
-   metadb-ctl raft scale-replicas --cell-id 1 --target-voters 3
-   ```
-   **内部演进流程**：
-   * `ConfChangeOrchestrator` 先将节点 `2`、`3` 添加为无投票权的 `Learner`。
-   * Leader 触发协同刷盘屏障，创建硬链接 SSTable 快照并通过 `InstallSnapshot` 与增量日志追平进度。
-   * 当复制延迟低于 `64` 条日志后，通过 OpenRaft 联合共识（Joint Consensus）将其平滑提升为 `Voter`，全程**零写入中断**。
+`metadbd` 只运行 `--role all-in-one`。`crates/metadb-server/src/lib.rs` 中的 `PersistentMetaDbCluster::open_and_serve` 在监听之前拒绝 `be`、`proxy`、`cell-manager` 和 `global-manager`。`crates/metadb-server/src/grpc_services.rs` 中的 `RegisterCell` 返回应用错误，并且不保存第二个单元。本仓库没有在线的多进程、多单元部署。
 
-### 3.2 多单元（Multi-Cell）存算与控制面分离拓扑（百亿—十万亿级规模）
+第二个 `metadbd --role all-in-one` 可以在 `--join` 或 `--cell-manager` 指向当前 leader、且数据目录是新的时候加入**同一个**单元。该路径由 `crates/metadb-server/tests/join_existing_group.rs` 覆盖。加入者仍是 all-in-one 进程，不是裁剪后的存储后端，也不会创建另一个单元。见 [运维](../../zh/operations.md)。
 
-当单集群规模超过 `~50,000` 个分片时，可将各角色独立部署并划分为多个自治 **Cell**：
+### 3.1 同一单元内的投票者
 
-| 组件角色 | `--role` 参数 | 推荐部署方式 | 核心职责 |
-| :--- | :--- | :--- | :--- |
-| **全局管理器 (`GlobalManager`)** | `global-manager` | 3 副本 Raft 组 | 维护粗粒度 `[start_key, end_key) -> CellId` 映射、分配 `65,536` 步长全局 ID 号段、管理跨目录移动租约。 |
-| **单元管理器 (`CellLocalManager`)** | `cell-manager` | 每 Cell 独立 3 副本组 | 承载本 Cell 内 BE 节点心跳（每 Cell `20K–50K` 分片）、`PID` 分裂调度、Jumbo 独占隔离与副本变更。 |
-| **存储后端 (`BE`)** | `be` | 每 Cell `12 – 60+` 台 NVMe 节点 | 承载 Multi-Raft 分片、`MemMvccStore`、`LsmStorageBackend`、`1-RTT` 下推执行与异步发件箱。 |
-| **无状态代理 (`Proxy`)** | `proxy` | 弹性扩缩容 / 与 RustFS 同机部署 | 内嵌 `MetaCache`（`>99.9%` 单跳命中率）、编译 20 条 SQL 模板并协调跨分片 2PC 事务。 |
+不要启动 `metadbd --role be`。该角色在 `open_and_serve` 中退出，因此那些命令不是操作步骤。`metadb-ctl raft scale-replicas` 调用 `ScaleShardReplicas`，并要求目标投票者数量已经登记在该单元中。新建的 all-in-one 单元只有一个节点，所以在这些节点存在之前，`--target-voters 3` 会失败。约束见 [运维](../../zh/operations.md)。
+
+### 3.2 存算分离拓扑的设计模型（`100B – 10T+` 条记录）
+
+`100B – 10T+`（约千亿到十万亿以上）是**设计模型**中的规模区间，用来估算未来多单元拓扑可能需要的容量。它不是本仓库存储过的记录数，也不是把百度生产数据写成 `rustfs/MetaDB` 的结果。`arXiv:2610.32247v1` 发表的集群规模，包括 BOS2 的 1.848 万亿条记录，属于百度的生产数据。
+
+下表是预期的角色划分。当前二进制不运行这些角色。
+
+| 角色 | 设计中的 `--role` | 预期职责 |
+| :--- | :--- | :--- |
+| **全局管理器** | `global-manager` | 设计中把粗粒度 `[start_key, end_key)` 映射到 `CellId`，按 `65,536` 一段分配 ID，并协调跨单元目录改名租约。 |
+| **单元管理器** | `cell-manager` | 设计中处理本单元 BE 心跳（每单元 `20K–50K` 分片），并编排 `PID` 分裂、Jumbo 隔离和成员变更。 |
+| **存储后端 (`BE`)** | `be` | 设计中在 NVMe 主机上承载 Multi-Raft 分片组和 LSM 引擎。 |
+| **无状态代理** | `proxy` | 设计中内嵌 `MetaCache`，编译 20 条 SQL 模板，并协调跨分片 2PC。 |
+
+`metadb-ctl cell register` 调用 `RegisterCell` 并以非零状态退出。它不会注册新单元。不要把它当作联邦步骤。
