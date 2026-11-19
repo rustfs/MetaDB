@@ -82,7 +82,7 @@ async fn hold_blocks_purge_until_release() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     cluster.release_backup_hold().unwrap();
-    cluster.run_maintenance_tick().await.unwrap();
+    cluster.run_background_maintenance_tick().await.unwrap();
     let purged = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let (_, purged) = purged_index(&cluster).await;
@@ -231,7 +231,8 @@ async fn backup_restore_reads_committed_keys_and_rejects_a_truncated_artifact() 
     assert!(removed, "backup artifact had no raft segment to delete");
     let rejected = tempdir().unwrap();
     let rejected_data = rejected.path().join("data");
-    let error = backup::restore_backup(&broken, &rejected_data).unwrap_err();
+    let error = backup::restore_backup(&broken, &rejected_data, &metadb_server::check_backup_tree)
+        .unwrap_err();
     assert!(
         error.to_string().contains("backup restore rejected"),
         "incomplete restore error was: {error}"
@@ -240,7 +241,7 @@ async fn backup_restore_reads_committed_keys_and_rejects_a_truncated_artifact() 
 
     let restored = tempdir().unwrap();
     let data = restored.path().join("data");
-    backup::restore_backup(&artifact, &data).unwrap();
+    backup::restore_backup(&artifact, &data, &metadb_server::check_backup_tree).unwrap();
     let cfg = persistent_cfg(&data);
     let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
     for name in ["a.dat", "b.dat", "c.dat", "d.dat", "e.dat", "tail.dat"] {

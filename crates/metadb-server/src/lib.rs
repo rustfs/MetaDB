@@ -807,6 +807,12 @@ impl PersistentMetaDbCluster {
         self.run_maintenance_tick_inner(true).await
     }
 
+    /// One background-loop pass. It skips a new snapshot when the log tail is small, but still
+    /// applies the storage purge clamp so a released backup hold can discard that tail.
+    pub async fn run_background_maintenance_tick(&self) -> Result<()> {
+        self.run_maintenance_tick_inner(false).await
+    }
+
     async fn run_maintenance_tick_inner(&self, force_snapshot: bool) -> Result<()> {
         // Operator backup jobs and pending holds are latched on this loop so a
         // `metadb-ctl` process can ask the running server to copy under its log lock.
@@ -844,6 +850,9 @@ impl PersistentMetaDbCluster {
                 // First snapshot (watermark still 0) or a large unpurged tail. Skip the
                 // full-dataset snapshot on every 250ms tick while the log is still small.
                 if !force_snapshot && last_snap > 0 && last_snap >= state_flushed && retained < 64 {
+                    // A hold can block purge while a snapshot is already current. Releasing
+                    // or expiring it must not wait for the next full snapshot.
+                    let _ = grp.log_store().try_purge_to_safe_watermark();
                     continue;
                 }
                 grp.flush_snapshot_and_purge().await?;
@@ -936,7 +945,12 @@ impl PersistentMetaDbCluster {
                 engine: engines[index].as_ref(),
             })
             .collect();
-        backup::create_online_backup(&self.config.node.data_dir, destination, &shards)
+        backup::create_online_backup(
+            &self.config.node.data_dir,
+            destination,
+            &shards,
+            &check_backup_tree,
+        )
     }
 
     /// Services an operator hold latch or `BACKUP_JOB` left by `metadb-ctl`.
@@ -1004,6 +1018,38 @@ impl PersistentMetaDbCluster {
             let _ = h.await;
         }
     }
+}
+
+/// Rejects a backup tree whose cell state names a shard the tree does not contain.
+pub fn check_backup_tree(root: &Path) -> Result<()> {
+    let copied = backup::list_shard_ids(root)?;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with("cell_") {
+            continue;
+        }
+        let state = entry.path().join("CELL_MANAGER_STATE");
+        if !state.is_file() {
+            continue;
+        }
+        let referenced = metadb_cluster::DurableCellManager::shard_ids_in_cell_state_file(&state)?;
+        for shard_id in referenced {
+            if !copied.contains(&shard_id) {
+                return Err(MetaDbError::StorageIoError(format!(
+                    "backup rejected: {name}/CELL_MANAGER_STATE references shard {shard_id} which was not copied"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn spawn_grpc_server(
