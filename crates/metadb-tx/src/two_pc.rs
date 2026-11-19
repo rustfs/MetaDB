@@ -438,9 +438,9 @@ async fn renew_open_lease(
     true
 }
 
-/// Fatal renew results are the typed [`MetaDbError::LeaseRenewRejected`] variant.
-/// A missing record (`TransactionAborted`) and transport or routing errors are
-/// retried and must not move the in-memory deadline.
+/// Fatal renew results are the typed [`MetaDbError::LeaseRenewRejected`] variant,
+/// including a prepared participant that no longer has a live intent.
+/// Transport and routing errors are retried and must not move the in-memory deadline.
 fn lease_renew_is_fatal(error: &MetaDbError) -> bool {
     matches!(error, MetaDbError::LeaseRenewRejected(_))
 }

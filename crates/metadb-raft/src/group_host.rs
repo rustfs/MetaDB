@@ -656,7 +656,7 @@ impl ShardRaftGroup {
             });
         }
         match self
-            .propose_local(expected_epoch, caller_hlc, payload.clone())
+            .propose_local(expected_epoch, caller_hlc, payload.clone(), deadline)
             .await
         {
             Err(MetaDbError::NotLeader { leader_hint, .. }) => {
@@ -704,6 +704,7 @@ impl ShardRaftGroup {
         expected_epoch: ShardEpoch,
         caller_hlc: HlcTimestamp,
         payload: Vec<u8>,
+        deadline: tokio::time::Instant,
     ) -> Result<MetaDbRaftResponse> {
         // Forwarded ClientWrite RPCs enter here and skip `propose_until`.
         self.repair_published_snapshot().await?;
@@ -716,10 +717,24 @@ impl ShardRaftGroup {
             });
         }
 
+        let gate = self.proposal_gate.read().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.enter().await;
+        }
+        // Stamp after the proposal gate. A renewal that waited past its
+        // expire_hlc must observe that later timestamp when it is validated.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(MetaDbError::RetryableConsensus {
+                shard_id: self.shard_id,
+                leader_hint: Some(self.node_id),
+                kind: metadb_core::RetryableConsensusKind::QuorumUnavailable,
+            });
+        }
         let proposal_hlc = if caller_hlc == HlcTimestamp::ZERO {
             self.clock.now()
         } else {
-            self.clock.update_checked(caller_hlc)?
+            self.clock
+                .update_checked(caller_hlc.max(self.clock.now()))?
         };
 
         let req = MetaDbRaftRequest {
@@ -728,18 +743,31 @@ impl ShardRaftGroup {
             payload,
         };
 
-        let gate = self.proposal_gate.read().unwrap().clone();
-        if let Some(gate) = gate {
-            gate.enter().await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(MetaDbError::RetryableConsensus {
+                shard_id: self.shard_id,
+                leader_hint: Some(self.node_id),
+                kind: metadb_core::RetryableConsensusKind::QuorumUnavailable,
+            });
         }
-
-        let write_resp = match self.raft.client_write(req).await {
-            Ok(response) => response,
-            Err(error) => {
+        // Dropping this wait does not prove the append failed. Callers that
+        // retry must reuse the same proposal id so a late commit is replayed
+        // from the receipt instead of applied twice.
+        let write_resp = match tokio::time::timeout(remaining, self.raft.client_write(req)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
                 return Err(crate::error_map::map_client_write_error(
                     self.shard_id,
                     error,
                 ))
+            }
+            Err(_) => {
+                return Err(MetaDbError::RetryableConsensus {
+                    shard_id: self.shard_id,
+                    leader_hint: Some(self.node_id),
+                    kind: metadb_core::RetryableConsensusKind::QuorumUnavailable,
+                })
             }
         };
         let app_resp = write_resp.data;
@@ -896,8 +924,13 @@ impl LocalProposer for ShardRaftGroup {
         caller_hlc: HlcTimestamp,
         payload: Vec<u8>,
     ) -> Result<MetaDbRaftResponse> {
-        self.propose_local(expected_epoch, caller_hlc, payload)
-            .await
+        self.propose_local(
+            expected_epoch,
+            caller_hlc,
+            payload,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await
     }
 }
 

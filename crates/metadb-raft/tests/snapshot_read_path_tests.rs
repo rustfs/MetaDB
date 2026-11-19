@@ -287,7 +287,12 @@ async fn forwarded_propose_local_rewrites_a_missing_snapshot() {
         value: b"delta".to_vec(),
     };
     group
-        .propose_local(epoch, HlcTimestamp::ZERO, codec::serialize(&cmd).unwrap())
+        .propose_local(
+            epoch,
+            HlcTimestamp::ZERO,
+            codec::serialize(&cmd).unwrap(),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
         .await
         .unwrap();
     let rewritten = shard_dir
@@ -423,6 +428,7 @@ async fn restart_after_purged_log_missing_lsm_and_snapshot_is_unrecoverable_befo
                         value: b"nope".to_vec(),
                     })
                     .unwrap(),
+                    tokio::time::Instant::now() + Duration::from_secs(5),
                 )
                 .await
                 .is_err();
@@ -626,6 +632,7 @@ async fn learner_install_fails_closed_when_leader_is_unrecoverable() {
                 value: b"no".to_vec(),
             })
             .unwrap(),
+            tokio::time::Instant::now() + Duration::from_secs(5),
         )
         .await;
     assert!(

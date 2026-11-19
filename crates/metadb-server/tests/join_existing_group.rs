@@ -237,6 +237,7 @@ async fn second_process_joins_existing_raft_group_fails_over_and_reopens() {
                 leader_group.current_epoch(),
                 HlcTimestamp::new(10_000_000_000_000, 0),
                 vec![0],
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
             )
             .await
             .unwrap_err()

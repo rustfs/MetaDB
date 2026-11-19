@@ -2033,19 +2033,22 @@ impl TxStateMachineHandler {
                     TxnState::Pending => {}
                 }
 
-                // Resolution B13: Verify lease / expiry fence at Commit!
+                // The apply timestamp is the authoritative clock for this decision.
+                // A commit proposal that was stamped earlier and delayed past the
+                // durable lease must not become Committed.
+                let decision_hlc = tx_commit_hlc.max(commit_hlc);
                 if rename_fence_token != txn_rec.rename_fence_token
-                    || (rename_fence_token.is_some() && tx_commit_hlc > txn_rec.expire_hlc)
+                    || decision_hlc > txn_rec.expire_hlc
                 {
                     txn_rec.state = TxnState::Aborted;
                     engine.apply_committed_put(tk, txn_rec.encode(), commit_hlc, raft_index);
                     self.release_lease_hold(engine, txn_id);
                     return Err(MetaDbError::TransactionAborted(
-                        "DirRenameLease expired or fence token mismatch at commit".to_string(),
+                        "2PC lease expired or fence token mismatch at commit".to_string(),
                     ));
                 }
 
-                let final_commit_hlc = tx_commit_hlc.max(commit_hlc);
+                let final_commit_hlc = decision_hlc;
                 let local_range = self.key_range();
                 let local_keys: Vec<Vec<u8>> = txn_rec
                     .participant_keys
@@ -2107,6 +2110,9 @@ impl TxStateMachineHandler {
                 }
                 self.outbox
                     .record_entry_specs(raft_index, tx_commit_hlc, aux_specs);
+                if !self.shard_still_has_txn_intent(engine, txn_id)? {
+                    self.release_lease_hold(engine, txn_id);
+                }
                 Ok(TxRaftOutput::Committed {
                     commit_hlc: tx_commit_hlc,
                     already_applied: !any_applied,
@@ -2417,12 +2423,55 @@ impl TxStateMachineHandler {
             .physical_ms()
             .saturating_sub(commit_hlc.physical_ms())
             .max(1);
+        let mut pins = Vec::with_capacity(keys.len());
+        for key in keys {
+            // Read at the physical ceiling so a version newer than the
+            // in-memory watermark is still captured. A read error is not
+            // absence: leave a pin already loaded from prefix 0x0E in place.
+            match engine.get(
+                key,
+                HlcTimestamp::new(HlcTimestamp::MAX_PHYSICAL_MS, u16::MAX),
+            ) {
+                Ok(Some(bytes)) => pins.push((
+                    key.clone(),
+                    start_hlc,
+                    metadb_storage::MvccValue::Value(bytes),
+                )),
+                Ok(None) => {
+                    pins.push((key.clone(), start_hlc, metadb_storage::MvccValue::Tombstone))
+                }
+                Err(_) => {}
+            }
+        }
         engine.mvcc().snapshot_registry().renew_lease_hold(
             txn_id,
             start_hlc,
             std::time::Instant::now() + std::time::Duration::from_millis(remain_ms),
             keys,
+            &pins,
         );
+    }
+
+    fn shard_still_has_txn_intent(
+        &self,
+        engine: &LifecycleStorageEngine,
+        txn_id: TxnId,
+    ) -> Result<bool> {
+        let rows = Self::scan_latest_in_apply(engine, &[0x05], &[0x06])?;
+        for (_, raw) in rows {
+            let Ok(intent) = WriteIntentRecord::decode(&raw) else {
+                continue;
+            };
+            if intent.txn_id == txn_id {
+                return Ok(true);
+            }
+            if let IntentOp::DirExistsFenceSet { holders } = intent.op {
+                if holders.contains_key(&txn_id) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn release_lease_hold(&self, engine: &LifecycleStorageEngine, txn_id: TxnId) {
@@ -2558,8 +2607,8 @@ impl TxStateMachineHandler {
         }
 
         if !saw_participant {
-            return Err(MetaDbError::TransactionAborted(
-                "2PC lease renewal found no live transaction".into(),
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::NoLiveParticipant,
             ));
         }
 
@@ -2729,6 +2778,14 @@ impl TxStateMachineHandler {
         Ok(())
     }
 
+    fn wall_clock_hlc() -> HlcTimestamp {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        HlcTimestamp::new(millis, 0)
+    }
+
     fn record_attr_specs(&self, specs: &[AttrDeltaSpec], raft_index: u64, hlc: HlcTimestamp) {
         for s in specs {
             self.attr_agg
@@ -2740,19 +2797,37 @@ impl TxStateMachineHandler {
     /// still live in the snapshot, so rebuild MVCC holds from that state.
     /// Participant shards have `WriteIntent`s and no `TxnRecord`.
     fn rehydrate_lease_holds(&self, engine: &LifecycleStorageEngine) {
-        let latest = engine.mvcc().latest_watermarks().1;
+        if let Ok(rows) = Self::scan_latest_in_apply(
+            engine,
+            &[metadb_storage::mvcc::LEASE_PREIMAGE_PREFIX],
+            &[metadb_storage::mvcc::LEASE_PREIMAGE_PREFIX + 1],
+        ) {
+            for (key, raw) in rows {
+                if let Some((txn_id, user_key, hlc, value)) =
+                    metadb_storage::mvcc::decode_preimage(&key, &raw)
+                {
+                    engine
+                        .mvcc()
+                        .snapshot_registry()
+                        .ingest_persisted_preimage(txn_id, user_key, hlc, value);
+                }
+            }
+        }
+        // Wall clock, not the checkpoint HLC. A restart long after expiry must
+        // not start a fresh hold from a stale applied timestamp.
+        let now = Self::wall_clock_hlc();
         if let Ok(rows) = Self::scan_latest_in_apply(engine, &[0x06], &[0x07]) {
             for (_, raw) in rows {
                 let Ok(rec) = TxnStatusRecord::decode(&raw) else {
                     continue;
                 };
-                if matches!(rec.state, TxnState::Pending) && latest <= rec.expire_hlc {
+                if matches!(rec.state, TxnState::Pending) && now <= rec.expire_hlc {
                     self.install_lease_hold(
                         engine,
                         rec.txn_id,
                         rec.start_hlc,
                         rec.expire_hlc,
-                        latest,
+                        now,
                         &rec.participant_keys,
                     );
                 }
@@ -2772,7 +2847,7 @@ impl TxStateMachineHandler {
             match intent.op {
                 IntentOp::DirExistsFenceSet { holders } => {
                     for (txn_id, (_, expire_hlc)) in holders {
-                        if latest > expire_hlc {
+                        if now > expire_hlc {
                             continue;
                         }
                         let start_hlc = if txn_id == intent.txn_id {
@@ -2790,17 +2865,17 @@ impl TxStateMachineHandler {
                             txn_id,
                             start_hlc,
                             expire_hlc,
-                            latest,
+                            now,
                             std::slice::from_ref(&user_key),
                         );
                     }
                 }
-                _ if latest <= intent.expire_hlc => self.install_lease_hold(
+                _ if now <= intent.expire_hlc => self.install_lease_hold(
                     engine,
                     intent.txn_id,
                     intent.start_hlc,
                     intent.expire_hlc,
-                    latest,
+                    now,
                     std::slice::from_ref(&user_key),
                 ),
                 _ => {}

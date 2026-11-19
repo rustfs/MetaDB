@@ -568,8 +568,10 @@ async fn abandoned_prepare_expires_and_renew_after_expiry_is_rejected() {
         matches!(
             revived,
             MetaDbError::LeaseRenewRejected(
-                LeaseRenewReject::AlreadyAborted | LeaseRenewReject::AfterExpiry
-            ) | MetaDbError::TransactionAborted(_)
+                LeaseRenewReject::AlreadyAborted
+                    | LeaseRenewReject::AfterExpiry
+                    | LeaseRenewReject::NoLiveParticipant
+            )
         ),
         "{revived}"
     );
@@ -712,18 +714,17 @@ async fn lookup_and_rollback_remain_correct_past_default_mvcc_retention() {
         .shard1
         .engine()
         .get(&source_key, start_hlc)
-        .expect("lease must extend MVCC retention for the prepared key");
+        .expect("captured pre-image must survive flush");
     assert!(historical.is_some(), "pre-image must survive the 5s window");
-    let listed = cluster
-        .shard1
-        .engine()
-        .scan_range(
-            &MetaKey::encode_pid_prefix_start(100),
-            &MetaKey::encode_pid_prefix_end(100),
-            start_hlc,
-        )
-        .unwrap();
-    assert!(listed.iter().any(|(key, _)| key == &source_key));
+    let listed = cluster.shard1.engine().scan_range(
+        &MetaKey::encode_pid_prefix_start(100),
+        &MetaKey::encode_pid_prefix_end(100),
+        start_hlc,
+    );
+    assert!(
+        matches!(listed, Err(MetaDbError::TransactionTimeout { .. })),
+        "a leased key must not open a historical scan of the shard: {listed:?}"
+    );
 
     gate.release();
     let error = rename.await.unwrap().unwrap_err();

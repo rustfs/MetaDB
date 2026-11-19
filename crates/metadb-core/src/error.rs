@@ -150,6 +150,8 @@ pub enum LeaseRenewReject {
     RenameLeaseExpired,
     /// The directory-rename lease is already at its lifetime cap.
     RenameLeaseCap,
+    /// This participant no longer has a live intent or pending record to renew.
+    NoLiveParticipant,
 }
 
 /// Why a consensus operation can be proposed again without hiding a durable loss.

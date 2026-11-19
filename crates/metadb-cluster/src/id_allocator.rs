@@ -439,13 +439,20 @@ impl DurableIdAllocator {
                 ));
             }
         }
+        // A caller-supplied TTL must not raise the hard cap. Reject it instead
+        // of granting a longer fence. The renewal deadline is the same cap.
+        let cap = max_lifetime_ms.max(100);
         let ttl = ttl_ms.max(100);
-        let lifetime = max_lifetime_ms.max(ttl);
+        if ttl > cap {
+            return Err(MetaDbError::StorageIoError(
+                "rename lease TTL exceeds the lifetime cap".to_string(),
+            ));
+        }
         let expire_ms = now_hlc
             .physical_ms()
             .checked_add(ttl)
             .ok_or_else(|| MetaDbError::StorageIoError("rename lease TTL overflow".to_string()))?;
-        let deadline_ms = now_hlc.physical_ms().checked_add(lifetime).ok_or_else(|| {
+        let deadline_ms = now_hlc.physical_ms().checked_add(cap).ok_or_else(|| {
             MetaDbError::StorageIoError("rename lease lifetime overflow".to_string())
         })?;
         let mut next = guard.clone();

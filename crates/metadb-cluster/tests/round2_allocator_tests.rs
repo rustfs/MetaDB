@@ -186,6 +186,19 @@ fn version_two_allocator_cannot_be_misread_as_legacy_counters() {
 }
 
 #[test]
+fn rename_lease_ttl_cannot_raise_the_lifetime_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let allocator = DurableIdAllocator::open(dir.path()).unwrap();
+    assert!(allocator
+        .acquire_dir_rename_lease(HlcTimestamp::new(1_000, 0), 90_000, 60_000)
+        .is_err());
+    let (_, expire) = allocator
+        .acquire_dir_rename_lease(HlcTimestamp::new(1_000, 0), 3_000, 60_000)
+        .unwrap();
+    assert_eq!(expire, HlcTimestamp::new(4_000, 0));
+}
+
+#[test]
 fn rename_lease_renewal_is_capped_and_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let allocator = DurableIdAllocator::open(dir.path()).unwrap();
