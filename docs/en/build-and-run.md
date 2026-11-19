@@ -44,19 +44,22 @@ Debug builds use `cargo build -p metadb-server --bins` and write the same names 
 
 Any role other than `all-in-one` fails before the listener is bound, with `server role ... is not implemented; only all-in-one runs a process`.
 
-Example, loopback only:
+Example, loopback only. `metadbd` with no config file uses an empty `shared_secret` and `allow_unauthenticated = false`, so that process does not start. The file below is the explicit loopback opt-in. It is not a credential. Do not use it on a non-loopback address.
 
 ```bash
 mkdir -p /tmp/metadb-data
-cargo run -p metadb-server --bin metadbd -- \
-  --data-dir /tmp/metadb-data \
-  --listen 127.0.0.1:7800 \
-  --node-id 1 \
-  --cell-id 1 \
-  --role all-in-one
+cat > /tmp/metadb-loopback.toml <<'EOF'
+[node]
+data_dir = "/tmp/metadb-data"
+grpc_listen_addr = "127.0.0.1:7800"
+
+[security]
+allow_unauthenticated = true
+EOF
+cargo run -p metadb-server --bin metadbd -- --config /tmp/metadb-loopback.toml
 ```
 
-With a file, see [Configuration](./configuration.md):
+A usable secret is a different configuration. Put a secret you choose in `shared_secret` and do not set `allow_unauthenticated` in that same file. Both together are rejected. See [Configuration](./configuration.md).
 
 ```bash
 cargo run -p metadb-server --bin metadbd -- --config ./standalone.toml
@@ -64,7 +67,7 @@ cargo run -p metadb-server --bin metadbd -- --config ./standalone.toml
 
 Logs use `tracing-subscriber`'s `EnvFilter`. The default filter is `info`. Override it with the standard `RUST_LOG` variable, for example `RUST_LOG=debug`.
 
-On startup with an empty `security.shared_secret`, the process logs a warning that loopback gRPC has no authentication. The default bind is `127.0.0.1`. A wildcard or other non-loopback address with an empty, missing, or misspelled secret refuses to listen. A non-empty `[security].shared_secret` requires the same bearer on metadata, transaction, control-plane, Raft transport, and `GET /metrics`. The process does not terminate TLS. A TLS or certificate key in the config fails startup instead of serving plaintext. Keep the listener on a trusted network, or put every service behind a proxy that authenticates clients and block direct access to this process.
+An empty `security.shared_secret` does not start the process. The default bind is `127.0.0.1`, and loopback is not an implicit exception. Local development without credentials sets `allow_unauthenticated = true` and keeps every listener on a literal loopback IP (`127.0.0.1` or `::1`). The hostname `localhost` is not accepted for that opt-in. After each socket binds, the bound IP is checked again. A wildcard or other non-loopback address still refuses to listen. A whitespace-only secret is rejected, including on `/livez`, `/readyz`, `/healthz`, and `/metrics`. A secret that contains a non-whitespace character requires the same bearer on metadata, transaction, control-plane, Raft transport, and every request on the metrics listener. `/readyz` is not 200 just because that listener is bound. See [Operability](./operability.md). The process does not terminate TLS. A TLS, certificate, anonymous, or insecure key in the config fails startup instead of serving plaintext. Keep an opted-in listener on a trusted network, or put every service behind a proxy that authenticates clients and block direct access to this process.
 
 Ctrl-C flushes shard state and stops the OpenRaft groups (`cluster.shutdown()`).
 

@@ -102,7 +102,7 @@ pub struct ChannelPool {
 impl ChannelPool {
     /// Configures authentication for all Raft clients sharing this pool.
     pub fn set_shared_secret(&self, secret: Option<String>) {
-        *self.shared_secret.write().unwrap() = secret.filter(|s| !s.is_empty());
+        *self.shared_secret.write().unwrap() = secret.filter(|s| !s.trim().is_empty());
     }
 
     fn authenticate<T>(&self, mut request: Request<T>) -> Result<Request<T>, io::Error> {
