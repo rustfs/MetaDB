@@ -17,7 +17,7 @@ use metadb_core::{
     DirShardDeltaKey, DirShardDeltaRecord, EntryType, FileId, HlcTimestamp, InodeAttr, InodeId,
     IntentOp, MetaDbError, MetaEntry, MetaKey, QuotaKey, QuotaRecord, Result, SecondaryIndexKey,
     SecondaryIndexRecord, ShardEpoch, ShardId, TxnId, TxnRecordKey, TxnState, TxnStatusRecord,
-    UserId, WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME,
+    UserId, WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME, PROPOSAL_ENVELOPE_MAGIC,
 };
 use metadb_raft::{MetaDbRaftRequest, ShardApplyHandler, ShardWatermarkTracker};
 use metadb_storage::{
@@ -221,7 +221,9 @@ pub struct NodeInstanceRecord {
 
 /// Prefix for a committed proposal receipt. Not a user-table key.
 const PROPOSAL_RECEIPT_PREFIX: u8 = 0x0A;
-const PROPOSAL_ENVELOPE_MAGIC: &[u8] = b"MDBP0001";
+const RECEIPT_VALUE_MAGIC: &[u8] = b"MDBR0001";
+/// Longer than the 30s write-retry budget and the 45s join budget.
+pub const PROPOSAL_RECEIPT_RETENTION_MS: u64 = 10 * 60 * 1000;
 
 /// Allocates an id for one logical client write. Zero is reserved for legacy payloads.
 pub fn fresh_proposal_id() -> u128 {
@@ -303,14 +305,66 @@ fn decode_proposed_command(payload: &[u8]) -> Result<(u128, TxRaftCmd)> {
     Ok((proposal_id, cmd))
 }
 
+fn encode_receipt(commit_hlc: HlcTimestamp, result: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8 + 8 + result.len());
+    bytes.extend_from_slice(RECEIPT_VALUE_MAGIC);
+    bytes.extend_from_slice(&commit_hlc.as_u64().to_le_bytes());
+    bytes.extend_from_slice(result);
+    bytes
+}
+
+fn decode_receipt(value: &[u8]) -> (Option<HlcTimestamp>, Vec<u8>) {
+    if value.starts_with(RECEIPT_VALUE_MAGIC) && value.len() >= 16 {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&value[8..16]);
+        return (
+            Some(HlcTimestamp(u64::from_le_bytes(raw))),
+            value[16..].to_vec(),
+        );
+    }
+    (None, value.to_vec())
+}
+
+fn receipt_expired(stored: HlcTimestamp, commit_hlc: HlcTimestamp) -> bool {
+    commit_hlc
+        .physical_ms()
+        .saturating_sub(stored.physical_ms())
+        > PROPOSAL_RECEIPT_RETENTION_MS
+}
+
+fn expire_proposal_receipts(
+    engine: &LifecycleStorageEngine,
+    commit_hlc: HlcTimestamp,
+    raft_index: u64,
+) -> Result<()> {
+    let rows = TxStateMachineHandler::scan_latest_in_apply(engine, &[0x0A], &[0x0B])?;
+    for (key, value) in rows {
+        let (stored, _) = decode_receipt(&value);
+        if stored.is_some_and(|stored| receipt_expired(stored, commit_hlc)) {
+            engine.apply_committed_delete(key, commit_hlc, raft_index);
+        }
+    }
+    Ok(())
+}
+
 fn committed_proposal_result(
     engine: &LifecycleStorageEngine,
     proposal_id: u128,
+    commit_hlc: HlcTimestamp,
 ) -> Result<Option<Vec<u8>>> {
     if proposal_id == 0 {
         return Ok(None);
     }
-    TxStateMachineHandler::read_latest_in_apply(engine, &proposal_receipt_key(proposal_id))
+    let Some(raw) =
+        TxStateMachineHandler::read_latest_in_apply(engine, &proposal_receipt_key(proposal_id))?
+    else {
+        return Ok(None);
+    };
+    let (stored, result) = decode_receipt(&raw);
+    if stored.is_some_and(|stored| receipt_expired(stored, commit_hlc)) {
+        return Ok(None);
+    }
+    Ok(Some(result))
 }
 
 pub fn node_instance_key(node_id: u64) -> Vec<u8> {
@@ -2389,9 +2443,10 @@ impl ShardApplyHandler for TxStateMachineHandler {
         &self,
         request: &MetaDbRaftRequest,
         engine: &LifecycleStorageEngine,
+        commit_hlc: HlcTimestamp,
     ) -> Result<Option<Vec<u8>>> {
         let (proposal_id, _) = decode_proposed_command(&request.payload)?;
-        committed_proposal_result(engine, proposal_id)
+        committed_proposal_result(engine, proposal_id, commit_hlc)
     }
 
     fn apply_command(
@@ -2401,8 +2456,9 @@ impl ShardApplyHandler for TxStateMachineHandler {
         request: &MetaDbRaftRequest,
         engine: &LifecycleStorageEngine,
     ) -> Result<Vec<u8>> {
+        expire_proposal_receipts(engine, commit_hlc, raft_index)?;
         let (proposal_id, cmd) = decode_proposed_command(&request.payload)?;
-        if let Some(prior) = committed_proposal_result(engine, proposal_id)? {
+        if let Some(prior) = committed_proposal_result(engine, proposal_id, commit_hlc)? {
             return Ok(prior);
         }
         let out = self.apply_tx_cmd(raft_index, commit_hlc, cmd, engine)?;
@@ -2412,7 +2468,7 @@ impl ShardApplyHandler for TxStateMachineHandler {
         if proposal_id != 0 {
             engine.apply_committed_put(
                 proposal_receipt_key(proposal_id),
-                bytes.clone(),
+                encode_receipt(commit_hlc, &bytes),
                 commit_hlc,
                 raft_index,
             );

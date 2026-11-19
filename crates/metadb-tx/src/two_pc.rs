@@ -72,7 +72,13 @@ where
                     ..
                 },
             ) => return Err(error),
-            Err(error @ MetaDbError::NotLeader { .. }) => {
+            Err(
+                error @ (MetaDbError::NotLeader { .. }
+                | MetaDbError::RetryableConsensus {
+                    kind: metadb_core::RetryableConsensusKind::QuorumUnavailable,
+                    ..
+                }),
+            ) => {
                 let now = tokio::time::Instant::now();
                 let limit = deadline.min(election_deadline);
                 if now >= limit {
@@ -1761,6 +1767,16 @@ impl DistributedTxRouter {
     /// Directory partition on `shard_id`. A follower that knows the leader forwards
     /// this read and does not return `NotLeader` to the caller.
     pub async fn dir_partition_stat(
+        &self,
+        shard_id: u64,
+        epoch: ShardEpoch,
+        pid: InodeId,
+        barrier: Option<HlcTimestamp>,
+    ) -> Result<DirPartitionStat> {
+        retry_routing(|| self.dir_partition_stat_once(shard_id, epoch, pid, barrier)).await
+    }
+
+    async fn dir_partition_stat_once(
         &self,
         shard_id: u64,
         epoch: ShardEpoch,

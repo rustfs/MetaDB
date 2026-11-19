@@ -62,6 +62,7 @@ pub trait ShardApplyHandler: Send + Sync + 'static {
         &self,
         _request: &MetaDbRaftRequest,
         _engine: &LifecycleStorageEngine,
+        _commit_hlc: HlcTimestamp,
     ) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
@@ -892,7 +893,7 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
                     let apply_res = match self
                         .shared
                         .handler
-                        .previously_committed_proposal(&req, &engine)
+                        .previously_committed_proposal(&req, &engine, commit_hlc)
                     {
                         Ok(Some(prior)) => {
                             self.shared
