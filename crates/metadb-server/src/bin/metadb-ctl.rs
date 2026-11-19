@@ -373,16 +373,7 @@ async fn run_backup(command: BackupCmd) -> Result<(), Box<dyn std::error::Error 
 fn absolute_new_path(
     path: &std::path::Path,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    if path.as_os_str().is_empty() {
-        return Err("backup path is empty".into());
-    }
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => std::path::Path::new("."),
-    };
-    let parent = std::fs::canonicalize(parent)?;
-    let name = path.file_name().ok_or("backup path has no file name")?;
-    Ok(parent.join(name))
+    Ok(metadb_raft::backup::absolute_output_path(path)?)
 }
 
 fn print_hold(label: &str, record: &metadb_raft::backup::BackupHoldRecord) {

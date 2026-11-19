@@ -765,15 +765,10 @@ pub fn restore_backup(
         fs::remove_dir_all(&staging.path)?;
     } else {
         let parent = destination_parent(destination);
-        fs::create_dir_all(&parent)?;
+        sync_directory_and_ancestors(&parent)?;
         fs::rename(&staging.path, destination)?;
         staging.disarm();
         sync_dir(&parent)?;
-        if let Some(grandparent) = parent.parent() {
-            if !grandparent.as_os_str().is_empty() {
-                let _ = sync_dir(grandparent);
-            }
-        }
     }
     Ok(BackupSummary {
         hold_id: manifest.hold_id,
@@ -1164,15 +1159,10 @@ fn finish_manifest(
         )));
     }
     let parent = destination_parent(destination);
-    fs::create_dir_all(&parent)?;
+    sync_directory_and_ancestors(&parent)?;
     fs::rename(staging, destination)?;
     staging_guard.disarm();
     sync_dir(&parent)?;
-    if let Some(grandparent) = parent.parent() {
-        if !grandparent.as_os_str().is_empty() {
-            let _ = sync_dir(grandparent);
-        }
-    }
     Ok(BackupSummary {
         hold_id: manifest.hold_id,
         shard_count: manifest.shards.len(),
@@ -1199,6 +1189,48 @@ fn destination_parent(destination: &Path) -> PathBuf {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     }
+}
+
+/// Creates any missing ancestors of `dir`, then syncs from `dir` up through the
+/// first ancestor that already existed so a later rename cannot depend on a
+/// directory entry that was never persisted.
+fn sync_directory_and_ancestors(dir: &Path) -> Result<()> {
+    let mut created = Vec::new();
+    let mut cursor = dir.to_path_buf();
+    while !cursor.exists() {
+        created.push(cursor.clone());
+        if !cursor.pop() {
+            break;
+        }
+    }
+    let preexisting = cursor;
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+    }
+    for path in &created {
+        sync_dir(path)?;
+    }
+    if preexisting.as_os_str().is_empty() {
+        sync_dir(Path::new("."))?;
+    } else {
+        sync_dir(&preexisting)?;
+    }
+    Ok(())
+}
+
+/// Resolves `path` against the current directory without requiring the final component to exist.
+pub fn absolute_output_path(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(backup_error("backup path is empty"));
+    }
+    let Some(name) = path.file_name() else {
+        return Err(backup_error("backup path has no file name"));
+    };
+    if name == "." || name == ".." {
+        return Err(backup_error("backup path has no file name"));
+    }
+    let parent = fs::canonicalize(destination_parent(path))?;
+    Ok(parent.join(name))
 }
 
 fn sync_tree(dir: &Path) -> Result<()> {
@@ -1740,6 +1772,40 @@ mod tests {
             destination_parent(Path::new("/var/lib/archive")),
             PathBuf::from("/var/lib")
         );
+        let anchored = absolute_output_path(Path::new("metadb-backup-out")).unwrap();
+        assert_eq!(
+            anchored,
+            std::env::current_dir().unwrap().join("metadb-backup-out")
+        );
+        assert!(anchored.is_absolute());
+    }
+
+    #[test]
+    fn new_ancestors_are_created_and_the_leaf_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("level-one").join("level-two");
+        sync_directory_and_ancestors(&parent).unwrap();
+        assert!(parent.is_dir());
+        assert!(dir.path().join("level-one").is_dir());
+    }
+
+    #[test]
+    fn registry_that_names_an_uncopied_shard_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("be")).unwrap();
+        let mut registry = BTreeMap::new();
+        registry.insert(
+            99u64,
+            crate::group_host::RegistryShardState::Active {
+                peers: BTreeMap::new(),
+            },
+        );
+        let mut bytes = metadb_core::codec::serialize(&registry).unwrap();
+        metadb_core::append_crc32c_le(&mut bytes);
+        fs::write(dir.path().join("be").join("NODE_SHARD_REGISTRY"), bytes).unwrap();
+        let copied = BTreeSet::from([1u64]);
+        let error = ensure_registry_matches(dir.path(), &copied).unwrap_err();
+        assert!(error.to_string().contains("shard 99"), "{error}");
     }
 
     #[test]
