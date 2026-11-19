@@ -24,9 +24,9 @@ pub use recovery_worker::{AuxDispatcher, TxnRecoveryWorker};
 pub use state_machine_impl::{
     command_payload, encode_proposed_command, fresh_proposal_id, node_instance_key,
     proposal_receipt_key, NodeInstanceRecord, SetAttrPatch, TxRaftCmd, TxRaftOutput,
-    TxStateMachineHandler, PROPOSAL_RECEIPT_RETENTION_MS,
+    TxStateMachineHandler, MAX_2PC_LEASE_LIFETIME_MS, PROPOSAL_RECEIPT_RETENTION_MS,
 };
 pub use two_pc::{
     DirPartitionStat, DirRenameLease, DistributedTxRouter, RoutedShardHandle, ShardDirectory,
-    TwoPcCrashStage,
+    TwoPcCrashStage, TwoPcPrepareGate, DEFAULT_2PC_TTL_MS,
 };

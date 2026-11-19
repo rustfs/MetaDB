@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use metadb_core::{CellId, CompositeKeyRange, HybridLogicalClock, InodeId, MetaDbError, Result};
-use metadb_tx::{DirRenameLease, RoutedShardHandle, ShardDirectory};
+use metadb_tx::{DirRenameLease, RoutedShardHandle, ShardDirectory, MAX_2PC_LEASE_LIFETIME_MS};
 
 use crate::cell_manager::DurableCellManager;
 use crate::id_allocator::DurableIdAllocator;
@@ -183,13 +183,26 @@ impl ShardDirectory for DurableGlobalManager {
         _moved_dir_id: InodeId,
         ttl_ms: u64,
     ) -> Result<DirRenameLease> {
-        let (token, expire_hlc) = self
-            .id_allocator
-            .acquire_dir_rename_lease(self.clock.now(), ttl_ms)?;
+        let (token, expire_hlc) = self.id_allocator.acquire_dir_rename_lease(
+            self.clock.now(),
+            ttl_ms,
+            MAX_2PC_LEASE_LIFETIME_MS,
+        )?;
         Ok(DirRenameLease {
             rename_fence_token: token,
             expire_hlc,
         })
+    }
+
+    async fn extend_dir_rename_lease(
+        &self,
+        token: u64,
+        ttl_ms: u64,
+    ) -> Result<Option<metadb_core::HlcTimestamp>> {
+        let expire = self
+            .id_allocator
+            .extend_dir_rename_lease(token, self.clock.now(), ttl_ms)?;
+        Ok(Some(expire))
     }
 
     async fn release_dir_rename_lease(&self, token: u64) {

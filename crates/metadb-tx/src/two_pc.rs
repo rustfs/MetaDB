@@ -4,7 +4,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use metadb_core::codec;
@@ -14,8 +15,8 @@ use metadb_core::{
     AttrDeltaSpec, AuxIntentSpec, DirShardDeltaKey, DirShardDeltaRecord, EntryType, FileId,
     HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId, IntentOp, MetaDbError, MetaEntry,
     MetaKey, QuotaKey, QuotaRecord, Result, SecondaryIndexKey, SecondaryIndexRecord, ShardEpoch,
-    ShardId, TxnId, UserId, WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME, TABLE_PREFIX_QUOTA,
-    TABLE_PREFIX_SECONDARY_INDEX,
+    ShardId, TxnId, TxnRecordKey, TxnState, TxnStatusRecord, UserId, WriteIntentKey,
+    WriteIntentRecord, ATTR_ENTRY_NAME, TABLE_PREFIX_QUOTA, TABLE_PREFIX_SECONDARY_INDEX,
 };
 use metadb_raft::ShardRaftGroup;
 use metadb_storage::{ScanControl, SnapshotGuard};
@@ -25,10 +26,41 @@ use crate::recovery_worker::TxnRecoveryWorker;
 use crate::rename_cycle::RenameCycleWalker;
 use crate::state_machine_impl::{
     encode_proposed_command, fresh_proposal_id, SetAttrPatch, TxRaftCmd, TxRaftOutput,
-    TxStateMachineHandler,
+    TxStateMachineHandler, MAX_2PC_LEASE_LIFETIME_MS,
 };
 
 pub const DEFAULT_2PC_TTL_MS: u64 = 3_000;
+
+/// Test seam. The coordinator notifies `prepared` after every participant has
+/// prepared and before primary commit, then waits until `release` is notified.
+/// Lease renewal keeps running during the wait.
+pub struct TwoPcPrepareGate {
+    prepared: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl TwoPcPrepareGate {
+    pub fn new() -> Self {
+        Self {
+            prepared: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub async fn wait_prepared(&self) {
+        self.prepared.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+impl Default for TwoPcPrepareGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 fn publish_quota(mut record: QuotaRecord) -> QuotaRecord {
     record.used_bytes = record.used_bytes.max(0);
@@ -159,6 +191,22 @@ pub trait ShardDirectory: Send + Sync + 'static {
     /// Releases a `DirRenameLease` on completion.
     async fn release_dir_rename_lease(&self, token: u64);
 
+    /// Extends the active directory-rename lease for `token`.
+    ///
+    /// `Ok(None)` means this directory does not renew rename leases. The
+    /// coordinator then treats the granted `expire_hlc` as a hard cap and
+    /// aborts when that cap passes. `Ok(Some(expire))` is the new deadline.
+    /// `Err` means the token is not current, the lease has already expired,
+    /// or the lifetime cap has been reached; the coordinator must abort.
+    async fn extend_dir_rename_lease(
+        &self,
+        token: u64,
+        ttl_ms: u64,
+    ) -> Result<Option<HlcTimestamp>> {
+        let _ = (token, ttl_ms);
+        Ok(None)
+    }
+
     /// Dial address of `node_id` in `shard_id`'s applied membership, when this process hosts it.
     fn raft_peer_addr(&self, _shard_id: u64, _node_id: u64) -> Option<String> {
         None
@@ -172,13 +220,245 @@ pub trait ShardDirectory: Send + Sync + 'static {
     }
 }
 
+struct LeaseKeeper {
+    cancel: AtomicBool,
+    failed: AtomicBool,
+    prepared: Mutex<Vec<PreparedShardBatch>>,
+    /// One durable `expire_hlc` per prepared participant batch. Empty before the
+    /// first successful Prepare. The commit check uses the minimum.
+    durable_expire_ms: Mutex<Vec<u64>>,
+    /// Deadline assumed before any participant is prepared. Not raised by a renew
+    /// that has not been applied.
+    initial_expire_ms: AtomicU64,
+    deadline_ms: u64,
+    rename_cap_ms: AtomicU64,
+    /// Mirrors the minimum durable deadline after each successful Prepare or a
+    /// renew that every prepared participant applied. Tests read this.
+    publish_probe: Option<Arc<AtomicU64>>,
+    /// Test hook. Each remaining count skips one participant proposal as a
+    /// transient failure and does not advance the in-memory deadline.
+    transient_faults: Option<Arc<AtomicU32>>,
+}
+
+impl LeaseKeeper {
+    fn new(
+        initial_expire_ms: u64,
+        deadline_ms: u64,
+        rename_cap_ms: u64,
+        publish_probe: Option<Arc<AtomicU64>>,
+        transient_faults: Option<Arc<AtomicU32>>,
+    ) -> Self {
+        Self {
+            cancel: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            prepared: Mutex::new(Vec::new()),
+            durable_expire_ms: Mutex::new(Vec::new()),
+            initial_expire_ms: AtomicU64::new(initial_expire_ms),
+            deadline_ms,
+            rename_cap_ms: AtomicU64::new(rename_cap_ms),
+            publish_probe,
+            transient_faults,
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    fn observe(&self, batch: PreparedShardBatch) {
+        self.prepared.lock().unwrap().push(batch);
+    }
+
+    fn clear(&self) {
+        self.prepared.lock().unwrap().clear();
+        self.durable_expire_ms.lock().unwrap().clear();
+    }
+
+    fn note_prepared_expire(&self, expire_ms: u64) {
+        let mut floors = self.durable_expire_ms.lock().unwrap();
+        floors.push(expire_ms);
+        let min = floors.iter().copied().min().unwrap_or(expire_ms);
+        drop(floors);
+        self.record_published(min);
+    }
+
+    /// Raises every prepared participant's remembered deadline only after each
+    /// of those participants has applied the same `expire_ms`.
+    fn publish_durable(&self, expire_ms: u64) {
+        let mut floors = self.durable_expire_ms.lock().unwrap();
+        if floors.is_empty() {
+            return;
+        }
+        for floor in floors.iter_mut() {
+            *floor = expire_ms.max(*floor);
+        }
+        let min = floors.iter().copied().min().unwrap_or(expire_ms);
+        drop(floors);
+        self.record_published(min);
+    }
+
+    fn record_published(&self, expire_ms: u64) {
+        if let Some(probe) = &self.publish_probe {
+            probe.store(expire_ms, Ordering::Release);
+        }
+    }
+
+    fn durable_floor_ms(&self) -> Option<u64> {
+        self.durable_expire_ms.lock().unwrap().iter().copied().min()
+    }
+
+    fn expire_for(&self, now: HlcTimestamp, ttl_ms: u64) -> HlcTimestamp {
+        let base = self
+            .durable_floor_ms()
+            .unwrap_or_else(|| self.initial_expire_ms.load(Ordering::Acquire));
+        let proposed = now
+            .physical_ms()
+            .saturating_add(ttl_ms)
+            .min(self.deadline_ms)
+            .min(self.rename_cap_ms.load(Ordering::Acquire));
+        HlcTimestamp::new(proposed.max(base), 0)
+    }
+
+    fn published(&self) -> HlcTimestamp {
+        let ms = self
+            .durable_floor_ms()
+            .unwrap_or_else(|| self.initial_expire_ms.load(Ordering::Acquire));
+        HlcTimestamp::new(ms, 0)
+    }
+}
+
+struct LeaseTask {
+    keeper: Arc<LeaseKeeper>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for LeaseTask {
+    fn drop(&mut self) {
+        self.keeper.cancel.store(true, Ordering::Release);
+        self.handle.abort();
+    }
+}
+
+async fn renew_open_lease(
+    directory: &dyn ShardDirectory,
+    clock: &HybridLogicalClock,
+    keeper: &LeaseKeeper,
+    txn_id: TxnId,
+    coord_node_id: u64,
+    primary_key: &[u8],
+    start_hlc: HlcTimestamp,
+    rename_token: Option<u64>,
+    ttl_ms: u64,
+) -> bool {
+    if keeper.cancel.load(Ordering::Acquire) {
+        return true;
+    }
+    let now = clock.now();
+    if now.physical_ms() >= keeper.deadline_ms {
+        return false;
+    }
+    let mut cap_ms = keeper.deadline_ms;
+    if let Some(token) = rename_token {
+        match directory.extend_dir_rename_lease(token, ttl_ms).await {
+            Ok(Some(expire)) => {
+                cap_ms = cap_ms.min(expire.physical_ms());
+                keeper
+                    .rename_cap_ms
+                    .store(expire.physical_ms(), Ordering::Release);
+            }
+            Ok(None) => {
+                cap_ms = cap_ms.min(keeper.rename_cap_ms.load(Ordering::Acquire));
+            }
+            Err(error) if lease_renew_is_fatal(&error) => return false,
+            Err(_) => return true,
+        }
+    }
+    let proposed_ms = now.physical_ms().saturating_add(ttl_ms).min(cap_ms);
+    let Some(published) = keeper.durable_floor_ms() else {
+        // Nothing is prepared yet, so there is no durable deadline to move.
+        return true;
+    };
+    if now.physical_ms() >= published {
+        // The durable expire has passed. A late Extend2pcLease cannot revive it.
+        return false;
+    }
+    if proposed_ms <= published {
+        return true;
+    }
+    let shards = keeper.prepared.lock().unwrap().clone();
+    if shards.is_empty() {
+        return true;
+    }
+    let expire_hlc = HlcTimestamp::new(proposed_ms, 0);
+    let mut all_applied = true;
+    for (_epoch, _group, keys) in shards {
+        if keeper.transient_faults.as_ref().is_some_and(|faults| {
+            faults
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        }) {
+            all_applied = false;
+            continue;
+        }
+        let route_key = keys
+            .first()
+            .cloned()
+            .unwrap_or_else(|| primary_key.to_vec());
+        let Ok((epoch, group, _)) = directory.route_user_key(&route_key) else {
+            all_applied = false;
+            continue;
+        };
+        let cmd = TxRaftCmd::Extend2pcLease {
+            txn_id,
+            coord_node_id,
+            expire_hlc,
+            start_hlc,
+            rename_fence_token: rename_token,
+            target_user_keys: keys,
+        };
+        let Ok(payload) = encode_proposed_command(fresh_proposal_id(), &cmd) else {
+            all_applied = false;
+            continue;
+        };
+        match group.propose(epoch, now, payload).await {
+            Ok(response) => match response.result {
+                Ok(_) => {}
+                Err(error) if lease_renew_is_fatal(&error) => return false,
+                Err(_) => all_applied = false,
+            },
+            Err(error) if lease_renew_is_fatal(&error) => return false,
+            Err(_) => all_applied = false,
+        }
+    }
+    if all_applied {
+        keeper.publish_durable(proposed_ms);
+    }
+    true
+}
+
+/// Fatal renew results are the typed [`MetaDbError::LeaseRenewRejected`] variant.
+/// A missing record (`TransactionAborted`) and transport or routing errors are
+/// retried and must not move the in-memory deadline.
+fn lease_renew_is_fatal(error: &MetaDbError) -> bool {
+    matches!(error, MetaDbError::LeaseRenewRejected(_))
+}
+
 /// Executes both `1-RTT` single-shard pushdown and Primary-Anchored `2PC` across `ShardRaftGroup`s.
 pub struct DistributedTxRouter {
     coord_node_id: u64,
     clock: Arc<HybridLogicalClock>,
     directory: Arc<dyn ShardDirectory>,
     ttl_ms: u64,
+    /// Hard cap past `start_hlc`. Defaults to [`MAX_2PC_LEASE_LIFETIME_MS`].
+    max_lease_lifetime_ms: u64,
     forward_secret: String,
+    pre_prepare_hold: Duration,
+    post_prepare_gate: Option<Arc<TwoPcPrepareGate>>,
+    abandon_after_prepare_gate: bool,
+    lease_publish_probe: Option<Arc<AtomicU64>>,
+    renew_transient_faults: Option<Arc<AtomicU32>>,
 }
 
 impl DistributedTxRouter {
@@ -192,8 +472,56 @@ impl DistributedTxRouter {
             clock,
             directory,
             ttl_ms: DEFAULT_2PC_TTL_MS,
+            max_lease_lifetime_ms: MAX_2PC_LEASE_LIFETIME_MS,
             forward_secret: String::new(),
+            pre_prepare_hold: Duration::ZERO,
+            post_prepare_gate: None,
+            abandon_after_prepare_gate: false,
+            lease_publish_probe: None,
+            renew_transient_faults: None,
         }
+    }
+
+    /// Records the minimum durable participant `expire_hlc` after Prepare and
+    /// after a renew that every prepared participant applied.
+    pub fn with_lease_publish_probe(mut self, probe: Arc<AtomicU64>) -> Self {
+        self.lease_publish_probe = Some(probe);
+        self
+    }
+
+    /// Skips this many participant renew proposals as transient failures.
+    pub fn with_renew_transient_faults(mut self, faults: Arc<AtomicU32>) -> Self {
+        self.renew_transient_faults = Some(faults);
+        self
+    }
+
+    /// Lowers the renewal cap for tests. The value is clamped to the protocol
+    /// maximum and to at least one TTL, so a test can prove work past the cap
+    /// aborts without waiting out the production cap.
+    pub fn with_max_lease_lifetime_ms(mut self, max_lease_lifetime_ms: u64) -> Self {
+        self.max_lease_lifetime_ms = max_lease_lifetime_ms
+            .max(self.ttl_ms)
+            .min(MAX_2PC_LEASE_LIFETIME_MS);
+        self
+    }
+
+    /// Sleeps once before the first Prepare proposal. Renewal is already running,
+    /// and the Prepare command's `expire_hlc` is computed after the sleep.
+    pub fn with_pre_prepare_hold(mut self, hold: Duration) -> Self {
+        self.pre_prepare_hold = hold;
+        self
+    }
+
+    pub fn with_post_prepare_gate(mut self, gate: Arc<TwoPcPrepareGate>) -> Self {
+        self.post_prepare_gate = Some(gate);
+        self
+    }
+
+    /// After the post-prepare gate is released, abort the prepared transaction
+    /// instead of committing. Used to check rollback after a long lease.
+    pub fn with_abandon_after_prepare_gate(mut self, abandon: bool) -> Self {
+        self.abandon_after_prepare_gate = abandon;
+        self
     }
 
     pub fn with_forward_secret(mut self, secret: impl Into<String>) -> Self {
@@ -203,6 +531,9 @@ impl DistributedTxRouter {
 
     pub fn with_ttl_ms(mut self, ttl_ms: u64) -> Self {
         self.ttl_ms = ttl_ms.max(10);
+        if self.max_lease_lifetime_ms < self.ttl_ms {
+            self.max_lease_lifetime_ms = self.ttl_ms.min(MAX_2PC_LEASE_LIFETIME_MS);
+        }
         self
     }
 
@@ -281,17 +612,6 @@ impl DistributedTxRouter {
     ///
     /// `propose` itself forwards one hop when the local replica already knows the leader.
     /// This loop covers a stale hint and an epoch bumped by membership or split.
-    async fn propose_participant(
-        &self,
-        user_key: &[u8],
-        cmd: &TxRaftCmd,
-        hlc: HlcTimestamp,
-    ) -> Result<(ShardEpoch, Arc<ShardRaftGroup>, HlcTimestamp, TxRaftOutput)> {
-        let proposal_id = fresh_proposal_id();
-        self.propose_participant_id(user_key, cmd, hlc, proposal_id)
-            .await
-    }
-
     async fn propose_participant_id(
         &self,
         user_key: &[u8],
@@ -300,6 +620,18 @@ impl DistributedTxRouter {
         proposal_id: u128,
     ) -> Result<(ShardEpoch, Arc<ShardRaftGroup>, HlcTimestamp, TxRaftOutput)> {
         let deadline = tokio::time::Instant::now() + ROUTE_RETRY_TIMEOUT;
+        self.propose_participant_until(user_key, cmd, hlc, proposal_id, deadline)
+            .await
+    }
+
+    async fn propose_participant_until(
+        &self,
+        user_key: &[u8],
+        cmd: &TxRaftCmd,
+        hlc: HlcTimestamp,
+        proposal_id: u128,
+        deadline: tokio::time::Instant,
+    ) -> Result<(ShardEpoch, Arc<ShardRaftGroup>, HlcTimestamp, TxRaftOutput)> {
         let mut last = None;
         while tokio::time::Instant::now() < deadline {
             let (epoch, group, _) = match self.route_user_key_once(user_key) {
@@ -1080,6 +1412,47 @@ impl DistributedTxRouter {
         })
     }
 
+    fn spawn_lease_task(
+        &self,
+        keeper: Arc<LeaseKeeper>,
+        txn_id: TxnId,
+        primary_key: Vec<u8>,
+        start_hlc: HlcTimestamp,
+        rename_token: Option<u64>,
+    ) -> LeaseTask {
+        let keeper_task = keeper.clone();
+        let directory = self.directory.clone();
+        let clock = self.clock.clone();
+        let ttl_ms = self.ttl_ms;
+        let coord_node_id = self.coord_node_id;
+        let handle = tokio::spawn(async move {
+            let interval = Duration::from_millis((ttl_ms / 3).max(1));
+            loop {
+                tokio::time::sleep(interval).await;
+                if keeper_task.cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                let renewed = renew_open_lease(
+                    directory.as_ref(),
+                    clock.as_ref(),
+                    keeper_task.as_ref(),
+                    txn_id,
+                    coord_node_id,
+                    &primary_key,
+                    start_hlc,
+                    rename_token,
+                    ttl_ms,
+                )
+                .await;
+                if !renewed {
+                    keeper_task.failed.store(true, Ordering::Release);
+                    return;
+                }
+            }
+        });
+        LeaseTask { keeper, handle }
+    }
+
     async fn execute_two_pc(
         &self,
         primary_key: &[u8],
@@ -1113,29 +1486,76 @@ impl DistributedTxRouter {
         }
 
         // Waiting for split publication must not consume a transaction's lease
-        // before its first prepare. An external rename lease cannot be extended
-        // here, so fail explicitly if that lease expired while routing.
+        // before its first prepare. A directory-rename lease is not renewed during
+        // that wait; if it already expired, fail before writing intents.
         let start_hlc = self.clock.now();
-        let expire_hlc = lease_opt
-            .map(|l| l.expire_hlc)
-            .unwrap_or_else(|| HlcTimestamp::new(start_hlc.physical_ms() + self.ttl_ms, 0));
-        if expire_hlc <= start_hlc {
+        let rename_fence_token = lease_opt.map(|lease| lease.rename_fence_token);
+        let rename_cap_ms = lease_opt
+            .map(|lease| lease.expire_hlc.physical_ms())
+            .unwrap_or(u64::MAX);
+        if lease_opt.is_some_and(|lease| lease.expire_hlc <= start_hlc) {
             return Err(MetaDbError::TransactionAborted(
                 "directory rename lease expired while waiting for shard routing".into(),
             ));
         }
-        let rename_fence_token = lease_opt.map(|l| l.rename_fence_token);
+        let deadline_ms = start_hlc
+            .physical_ms()
+            .saturating_add(self.max_lease_lifetime_ms);
+        let initial_expire_ms = if lease_opt.is_some() {
+            rename_cap_ms.min(deadline_ms)
+        } else {
+            start_hlc
+                .physical_ms()
+                .saturating_add(self.ttl_ms)
+                .min(deadline_ms)
+        };
+        let keeper = Arc::new(LeaseKeeper::new(
+            initial_expire_ms,
+            deadline_ms,
+            rename_cap_ms.min(deadline_ms),
+            self.lease_publish_probe.clone(),
+            self.renew_transient_faults.clone(),
+        ));
+        // Renewal starts before the first Prepare so a NotLeader retry that
+        // outlasts the initial TTL can refresh expire_hlc and extend any shard
+        // that has already prepared.
+        let _lease_task = self.spawn_lease_task(
+            keeper.clone(),
+            txn_id,
+            primary_key.to_vec(),
+            start_hlc,
+            rename_fence_token,
+        );
 
         // Phase 1: regroup after a split. A batch that straddles two children must not
         // be retried unchanged against only the child that owns the routing key.
         let prepare_deadline = tokio::time::Instant::now() + ROUTE_RETRY_TIMEOUT;
         let mut prepared_shards: Vec<PreparedShardBatch> = Vec::new();
         let mut max_prepared_hlc = start_hlc;
+        let mut held_before_prepare = false;
         let primary_shard_id = loop {
+            if keeper.failed() {
+                self.abort_prepared_shards(txn_id, &prepared_shards).await;
+                return Err(MetaDbError::TransactionAborted(
+                    "2PC lease expired while preparing".into(),
+                ));
+            }
             if tokio::time::Instant::now() >= prepare_deadline {
                 self.abort_prepared_shards(txn_id, &prepared_shards).await;
                 return Err(MetaDbError::ShardRoutingError(
                     "prepare exhausted retries while shard routes were changing".to_string(),
+                ));
+            }
+            if !held_before_prepare && !self.pre_prepare_hold.is_zero() {
+                held_before_prepare = true;
+                tokio::time::sleep(self.pre_prepare_hold).await;
+            }
+            let now = self.clock.now();
+            let expire_hlc = keeper.expire_for(now, self.ttl_ms);
+            if expire_hlc <= now {
+                self.abort_prepared_shards(txn_id, &prepared_shards).await;
+                return Err(MetaDbError::TransactionAborted(
+                    "2PC lease expired while preparing".into(),
                 ));
             }
             let (_primary_epoch, primary_group, _) = match self.route_user_key(primary_key).await {
@@ -1196,24 +1616,47 @@ impl DistributedTxRouter {
                     .first()
                     .cloned()
                     .unwrap_or_else(|| primary_key.to_vec());
+                // Recompute immediately before this proposal. A NotLeader retry
+                // longer than the remaining TTL must not reuse a stale expire.
+                let attempt_now = self.clock.now();
+                let attempt_expire = keeper.expire_for(attempt_now, self.ttl_ms);
+                if attempt_expire <= attempt_now {
+                    self.abort_prepared_shards(txn_id, &prepared_shards).await;
+                    self.abort_prepared_shards(txn_id, &prepared_this_round)
+                        .await;
+                    return Err(MetaDbError::TransactionAborted(
+                        "2PC lease expired while preparing".into(),
+                    ));
+                }
                 let prep_cmd = TxRaftCmd::Prepare2pcChecked {
                     txn_id,
                     is_primary: sid == shard_id,
                     primary_key: primary_key.to_vec(),
                     participant_keys: all_participant_keys.clone(),
                     start_hlc,
-                    expire_hlc,
+                    expire_hlc: attempt_expire,
                     rename_fence_token,
                     intents: shard_intents,
                     expected_values: shard_expected_values,
                 };
+                let attempt_budget = Duration::from_millis((self.ttl_ms / 2).max(1));
+                let attempt_deadline = tokio::time::Instant::now() + attempt_budget;
                 match self
-                    .propose_participant(&route_key, &prep_cmd, start_hlc)
+                    .propose_participant_until(
+                        &route_key,
+                        &prep_cmd,
+                        attempt_now,
+                        fresh_proposal_id(),
+                        attempt_deadline,
+                    )
                     .await
                 {
                     Ok((epoch, group, _, TxRaftOutput::Prepared { prepared_hlc })) => {
                         max_prepared_hlc = max_prepared_hlc.max(prepared_hlc);
-                        prepared_this_round.push((epoch, group, shard_keys));
+                        let batch = (epoch, group, shard_keys);
+                        keeper.observe(batch.clone());
+                        keeper.note_prepared_expire(attempt_expire.physical_ms());
+                        prepared_this_round.push(batch);
                     }
                     Ok(_) => {
                         prepared_shards.extend(prepared_this_round);
@@ -1222,7 +1665,11 @@ impl DistributedTxRouter {
                             "unexpected Prepare2pc output".to_string(),
                         ));
                     }
-                    Err(MetaDbError::EpochMismatch { .. } | MetaDbError::ShardRoutingError(_)) => {
+                    Err(
+                        MetaDbError::EpochMismatch { .. }
+                        | MetaDbError::ShardRoutingError(_)
+                        | MetaDbError::RetryableConsensus { .. },
+                    ) => {
                         regroup = true;
                         break;
                     }
@@ -1234,6 +1681,7 @@ impl DistributedTxRouter {
                 }
             }
             if regroup {
+                keeper.clear();
                 self.abort_prepared_shards(txn_id, &prepared_this_round)
                     .await;
                 tokio::time::sleep(ROUTE_RETRY_INTERVAL).await;
@@ -1243,9 +1691,33 @@ impl DistributedTxRouter {
             break shard_id;
         };
 
+        if keeper.failed() {
+            self.abort_prepared_shards(txn_id, &prepared_shards).await;
+            return Err(MetaDbError::TransactionAborted(
+                "2PC lease expired while preparing".into(),
+            ));
+        }
+
         if crash_stage == TwoPcCrashStage::StopAfterPrepareBeforePrimaryCommit {
             return Err(MetaDbError::RpcError(
                 "injected crash after Prepare before CommitPrimary2pc".to_string(),
+            ));
+        }
+
+        if let Some(gate) = &self.post_prepare_gate {
+            gate.prepared.notify_one();
+            gate.release.notified().await;
+            if self.abandon_after_prepare_gate {
+                self.abort_prepared_shards(txn_id, &prepared_shards).await;
+                return Err(MetaDbError::TransactionAborted(
+                    "2PC abandoned after prepare".into(),
+                ));
+            }
+        }
+        if keeper.failed() || self.clock.now() > keeper.published() {
+            self.abort_prepared_shards(txn_id, &prepared_shards).await;
+            return Err(MetaDbError::TransactionAborted(
+                "2PC lease expired before commit".into(),
             ));
         }
 
@@ -1309,6 +1781,105 @@ impl DistributedTxRouter {
         }
 
         Ok(final_commit_hlc)
+    }
+
+    /// Renews a pending transaction after this coordinator restarts.
+    ///
+    /// The deadline is the durable `expire_hlc` on the primary `TxnRecord`. A
+    /// restart can push that deadline forward only while the record is still
+    /// `Pending` and the caller is the coordinator that allocated `txn_id`.
+    pub async fn resume_pending_lease(
+        &self,
+        primary_key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<HlcTimestamp> {
+        if (txn_id >> 64) as u64 != self.coord_node_id {
+            return Err(MetaDbError::TransactionAborted(
+                "2PC lease renewal is not held by this coordinator".into(),
+            ));
+        }
+        let (epoch, group, _) = self.route_user_key(primary_key).await?;
+        let (_, snap) = group.linearizable_read(epoch).await?;
+        let raw = group
+            .engine()
+            .get_with_snapshot(&TxnRecordKey { txn_id }.encode(), &snap)?
+            .ok_or_else(|| {
+                MetaDbError::TransactionAborted(
+                    "2PC lease renewal found no live transaction".into(),
+                )
+            })?;
+        drop(snap);
+        let rec = TxnStatusRecord::decode(&raw)?;
+        match rec.state {
+            TxnState::Aborted => {
+                return Err(MetaDbError::TransactionAborted(
+                    "2PC lease renewal cannot revive an aborted transaction".into(),
+                ));
+            }
+            TxnState::Committed { .. } => {
+                return Err(MetaDbError::TransactionAborted(
+                    "2PC lease renewal found no live transaction".into(),
+                ));
+            }
+            TxnState::Pending => {}
+        }
+        let now = self.clock.now();
+        if now > rec.expire_hlc {
+            return Err(MetaDbError::TransactionAborted(
+                "2PC lease renewal rejected after expiry".into(),
+            ));
+        }
+        let cap = rec
+            .start_hlc
+            .physical_ms()
+            .saturating_add(self.max_lease_lifetime_ms.min(MAX_2PC_LEASE_LIFETIME_MS));
+        if now.physical_ms() >= cap {
+            return Err(MetaDbError::TransactionAborted(
+                "2PC lease renewal exceeds lifetime cap".into(),
+            ));
+        }
+        let mut proposed = now.physical_ms().saturating_add(self.ttl_ms).min(cap);
+        if let Some(token) = rec.rename_fence_token {
+            match self
+                .directory
+                .extend_dir_rename_lease(token, self.ttl_ms)
+                .await
+            {
+                Ok(Some(expire)) => proposed = proposed.min(expire.physical_ms()),
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let expire_hlc = HlcTimestamp::new(proposed.max(rec.expire_hlc.physical_ms()), 0);
+        if expire_hlc.physical_ms() > cap {
+            return Err(MetaDbError::TransactionAborted(
+                "2PC lease renewal exceeds lifetime cap".into(),
+            ));
+        }
+        let mut grouped: HashMap<ShardId, (Vec<u8>, Vec<Vec<u8>>)> = HashMap::new();
+        for key in &rec.participant_keys {
+            let (_, shard, _) = self.route_user_key(key).await?;
+            let entry = grouped
+                .entry(shard.shard_id())
+                .or_insert_with(|| (key.clone(), Vec::new()));
+            entry.1.push(key.clone());
+        }
+        if grouped.is_empty() {
+            grouped.insert(0, (primary_key.to_vec(), vec![primary_key.to_vec()]));
+        }
+        for (_, (route_key, keys)) in grouped {
+            let cmd = TxRaftCmd::Extend2pcLease {
+                txn_id,
+                coord_node_id: self.coord_node_id,
+                expire_hlc,
+                start_hlc: rec.start_hlc,
+                rename_fence_token: rec.rename_fence_token,
+                target_user_keys: keys,
+            };
+            self.propose_participant_retry_epoch(&route_key, &cmd, now)
+                .await?;
+        }
+        Ok(expire_hlc)
     }
 
     async fn abort_prepared_shards(&self, txn_id: TxnId, prepared: &[PreparedShardBatch]) {

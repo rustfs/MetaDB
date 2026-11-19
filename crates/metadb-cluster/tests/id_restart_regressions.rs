@@ -39,7 +39,7 @@ fn rename_lease_ttl_overflow_returns_error_without_poisoning_allocator() {
     let dir = tempfile::tempdir().unwrap();
     let alloc = DurableIdAllocator::open(dir.path()).unwrap();
     assert!(alloc
-        .acquire_dir_rename_lease(HlcTimestamp::new(1000, 0), u64::MAX)
+        .acquire_dir_rename_lease(HlcTimestamp::new(1000, 0), u64::MAX, 60_000)
         .is_err());
     assert!(alloc.allocate_block(2, AllocIdKind::FileId, 1).is_ok());
 }

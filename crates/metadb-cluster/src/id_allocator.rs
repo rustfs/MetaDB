@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use metadb_core::codec;
 use metadb_core::{
     append_crc32c_le, make_file_inode_id, verify_crc32c_le, FileId, HlcTimestamp, InodeId,
-    MetaDbError, Result, ShardId,
+    LeaseRenewReject, MetaDbError, Result, ShardId,
 };
 use metadb_storage::sstable::sync_dir;
 
@@ -22,8 +22,17 @@ pub const CELL_FILE_ID_BLOCK_SIZE: u64 = 4_096;
 pub const CELL_DIR_AFFINITY_BLOCK_SIZE: u64 = 256;
 pub const GLOBAL_SHARD_ID_BLOCK_SIZE: u64 = 1_024;
 const MAX_CACHED_GRANT_UUIDS: usize = 4_096;
-const ALLOCATOR_FORMAT_MAGIC: &[u8; 8] = b"MIDA0002";
+const ALLOCATOR_FORMAT_MAGIC_V2: &[u8; 8] = b"MIDA0002";
+const ALLOCATOR_FORMAT_MAGIC: &[u8; 8] = b"MIDA0003";
 const ALLOCATOR_HEADER_LEN: usize = 41;
+
+#[derive(Debug, Clone, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]
+struct ActiveRenameLease {
+    token: u64,
+    expire_hlc: HlcTimestamp,
+    /// Renewal cannot move `expire_hlc` past this instant.
+    deadline_hlc: HlcTimestamp,
+}
 
 #[derive(
     Debug,
@@ -50,7 +59,7 @@ struct PersistedAllocatorState {
     next_file_id: FileId,
     next_shard_id: ShardId,
     rename_fence_token: u64,
-    active_rename_lease: Option<(u64, HlcTimestamp)>,
+    active_rename_lease: Option<ActiveRenameLease>,
     recent_grants: BTreeMap<u128, CachedIdGrant>,
     grant_fifo: VecDeque<u128>,
     /// Next low 64 bits of a `LocalIdBuffer` request UUID. Persisted so a reopened
@@ -94,6 +103,19 @@ impl Default for PersistedAllocatorState {
 }
 
 #[derive(Deserialize, wincode::SchemaRead)]
+struct PersistedAllocatorStateV2 {
+    next_file_inode_seq: u64,
+    next_dir_inode_id: InodeId,
+    next_file_id: FileId,
+    next_shard_id: ShardId,
+    rename_fence_token: u64,
+    active_rename_lease: Option<(u64, HlcTimestamp)>,
+    recent_grants: BTreeMap<u128, CachedIdGrant>,
+    grant_fifo: VecDeque<u128>,
+    next_client_seq: u64,
+}
+
+#[derive(Deserialize, wincode::SchemaRead)]
 struct LegacyAllocatorState {
     next_file_inode_seq: u64,
     next_dir_inode_id: InodeId,
@@ -105,18 +127,51 @@ struct LegacyAllocatorState {
     grant_fifo: VecDeque<u128>,
 }
 
+fn allocator_header_ok(body: &[u8]) -> bool {
+    body.len() >= ALLOCATOR_HEADER_LEN
+        && body[8..40].iter().all(|byte| *byte == 0)
+        && body[40] == 0xff
+}
+
+fn lease_from_v2(active: Option<(u64, HlcTimestamp)>) -> Option<ActiveRenameLease> {
+    active.map(|(token, expire_hlc)| ActiveRenameLease {
+        token,
+        expire_hlc,
+        // A lease granted before renewal existed cannot be pushed past the
+        // expiry that was already published.
+        deadline_hlc: expire_hlc,
+    })
+}
+
 fn decode_allocator_state(body: &[u8]) -> Result<PersistedAllocatorState> {
     if body.starts_with(ALLOCATOR_FORMAT_MAGIC) {
-        if body.len() < ALLOCATOR_HEADER_LEN
-            || body[8..40].iter().any(|byte| *byte != 0)
-            || body[40] != 0xff
-        {
+        if !allocator_header_ok(body) {
             return Err(MetaDbError::CodecError(
-                "invalid allocator version 2 header".to_string(),
+                "invalid allocator version 3 header".to_string(),
             ));
         }
         return codec::deserialize(&body[ALLOCATOR_HEADER_LEN..])
             .map_err(|e| MetaDbError::CodecError(e.to_string()));
+    }
+    if body.starts_with(ALLOCATOR_FORMAT_MAGIC_V2) {
+        if !allocator_header_ok(body) {
+            return Err(MetaDbError::CodecError(
+                "invalid allocator version 2 header".to_string(),
+            ));
+        }
+        let old: PersistedAllocatorStateV2 = codec::deserialize(&body[ALLOCATOR_HEADER_LEN..])
+            .map_err(|e| MetaDbError::CodecError(e.to_string()))?;
+        return Ok(PersistedAllocatorState {
+            next_file_inode_seq: old.next_file_inode_seq,
+            next_dir_inode_id: old.next_dir_inode_id,
+            next_file_id: old.next_file_id,
+            next_shard_id: old.next_shard_id,
+            rename_fence_token: old.rename_fence_token,
+            active_rename_lease: lease_from_v2(old.active_rename_lease),
+            recent_grants: old.recent_grants,
+            grant_fifo: old.grant_fifo,
+            next_client_seq: old.next_client_seq,
+        });
     }
     if let Ok(current) = codec::deserialize::<PersistedAllocatorState>(body) {
         return Ok(current);
@@ -145,7 +200,7 @@ fn decode_allocator_state(body: &[u8]) -> Result<PersistedAllocatorState> {
         next_file_id: old.next_file_id,
         next_shard_id: old.next_shard_id,
         rename_fence_token: old.rename_fence_token,
-        active_rename_lease: old.active_rename_lease,
+        active_rename_lease: lease_from_v2(old.active_rename_lease),
         recent_grants,
         grant_fifo: old.grant_fifo,
         next_client_seq: 1,
@@ -366,38 +421,100 @@ impl DurableIdAllocator {
 
     /// Acquires a monotonic fenced `DirRenameLease` (`Resolution B13`), rejecting concurrent leases
     /// until the active lease is released or expired.
+    ///
+    /// `max_lifetime_ms` is the hard cap measured from this grant. Renewal can push
+    /// `expire_hlc` forward, but not past `now + max_lifetime_ms`.
     pub fn acquire_dir_rename_lease(
         &self,
         now_hlc: HlcTimestamp,
         ttl_ms: u64,
+        max_lifetime_ms: u64,
     ) -> Result<(u64, HlcTimestamp)> {
         let mut guard = self.state.lock().unwrap();
-        if let Some((_, active_exp)) = guard.active_rename_lease {
-            if now_hlc <= active_exp {
+        if let Some(active) = &guard.active_rename_lease {
+            if now_hlc <= active.expire_hlc {
                 return Err(MetaDbError::TransactionAborted(
                     "another cross-directory directory rename lease is currently active"
                         .to_string(),
                 ));
             }
         }
+        let ttl = ttl_ms.max(100);
+        let lifetime = max_lifetime_ms.max(ttl);
+        let expire_ms = now_hlc
+            .physical_ms()
+            .checked_add(ttl)
+            .ok_or_else(|| MetaDbError::StorageIoError("rename lease TTL overflow".to_string()))?;
+        let deadline_ms = now_hlc.physical_ms().checked_add(lifetime).ok_or_else(|| {
+            MetaDbError::StorageIoError("rename lease lifetime overflow".to_string())
+        })?;
         let mut next = guard.clone();
         next.rename_fence_token = next.rename_fence_token.saturating_add(1);
         let token = next.rename_fence_token;
-        let expire_ms = now_hlc
-            .physical_ms()
-            .checked_add(ttl_ms.max(100))
-            .ok_or_else(|| MetaDbError::StorageIoError("rename lease TTL overflow".to_string()))?;
         let expire_hlc = HlcTimestamp::new(expire_ms, 0);
-        next.active_rename_lease = Some((token, expire_hlc));
+        next.active_rename_lease = Some(ActiveRenameLease {
+            token,
+            expire_hlc,
+            deadline_hlc: HlcTimestamp::new(deadline_ms, 0),
+        });
         self.persist_sync(&next)?;
         *guard = next;
         Ok((token, expire_hlc))
     }
 
+    /// Extends the active lease for `token` only. A different token, an expired
+    /// lease, or a deadline that has already passed is rejected and does not
+    /// move `expire_hlc`.
+    pub fn extend_dir_rename_lease(
+        &self,
+        token: u64,
+        now_hlc: HlcTimestamp,
+        ttl_ms: u64,
+    ) -> Result<HlcTimestamp> {
+        let mut guard = self.state.lock().unwrap();
+        let Some(active) = guard.active_rename_lease.clone() else {
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameLeaseNotActive,
+            ));
+        };
+        if active.token != token {
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameLeaseTokenMismatch,
+            ));
+        }
+        if now_hlc > active.expire_hlc {
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameLeaseExpired,
+            ));
+        }
+        let deadline_ms = active.deadline_hlc.physical_ms();
+        if now_hlc.physical_ms() >= deadline_ms {
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameLeaseCap,
+            ));
+        }
+        let expire_ms = now_hlc
+            .physical_ms()
+            .saturating_add(ttl_ms.max(100))
+            .min(deadline_ms);
+        if expire_ms <= active.expire_hlc.physical_ms() {
+            return Ok(active.expire_hlc);
+        }
+        let expire_hlc = HlcTimestamp::new(expire_ms, 0);
+        let mut next = guard.clone();
+        next.active_rename_lease = Some(ActiveRenameLease {
+            expire_hlc,
+            ..active
+        });
+        self.persist_sync(&next)?;
+        *guard = next;
+        Ok(expire_hlc)
+    }
+
     pub fn release_dir_rename_lease(&self, token: u64) -> Result<()> {
         let mut guard = self.state.lock().unwrap();
-        if let Some((active_tok, _)) = guard.active_rename_lease {
-            if active_tok == token {
+        if let Some(active) = &guard.active_rename_lease {
+            if active.token == token {
                 let mut next = guard.clone();
                 next.active_rename_lease = None;
                 self.persist_sync(&next)?;
