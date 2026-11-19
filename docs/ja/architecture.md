@@ -88,7 +88,6 @@ MVCC の版は `storage.mvcc_retention_ms`（既定 5,000）のあいだメモ�
 
 ローカルの各シャードは `openraft` 0.10 のグループです。ログは `.../shards/<id>/raft` 以下の分割された CRC32C ファイルです。既定値は TOML から **読み込まれません**（`raft_options` は `#[serde(skip)]`）:
 
-That skip is current `main`. Unmerged pull request #38 proposes loading `[raft]`. If it merges, this paragraph has to be rewritten. Loading `[raft]` is not current behavior.
 
 | 項目 | 既定 |
 | :--- | :--- |

@@ -88,7 +88,6 @@ MVCC 版本在内存中保留 `storage.mvcc_retention_ms`（默认 5,000）。�
 
 每个本地分片是一个 `openraft` 0.10 组。日志是 `.../shards/<id>/raft` 下的分段 CRC32C 文件。下列默认值 **不** 从 TOML 加载（`raft_options` 为 `#[serde(skip)]`）：
 
-That skip is current `main`. Unmerged pull request #38 proposes loading `[raft]`. If it merges, this paragraph has to be rewritten. Loading `[raft]` is not current behavior.
 
 | 字段 | 默认 |
 | :--- | :--- |

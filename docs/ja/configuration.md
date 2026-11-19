@@ -4,7 +4,7 @@
 
 `metadbd --config` と `ServerTomlConfig::from_toml_file` / `from_toml_str` は TOML を読みます（`crates/metadb-server/src/config.rs`）。既知のセクションは省略できます。省略した項目は次の既定値になります。
 
-On current `main`, a key inside `[security]` other than `shared_secret` fails parsing. TLS-like keys (`tls`, `ssl`, `cert`) and secret-like keys (`secret`, `password`, `token`, `credential`, `auth`) fail anywhere, including nested tables. Unknown keys that do not match those names are still ignored. Unmerged pull request #35 also rejects `anonymous` and `insecure` anywhere and accepts `[security].allow_unauthenticated` beside `shared_secret`. The empty-secret rules later in this file describe #35, not current `main`. Until #35 merges, `main` still accepts an empty secret on loopback and does not implement `allow_unauthenticated`.
+A key inside `[security]` other than `shared_secret` and `allow_unauthenticated` fails parsing. TLS-like keys (`tls`, `ssl`, `cert`) and keys named like a secret or an authentication switch (`secret`, `password`, `token`, `credential`, `auth`, `anonymous`, `insecure`) fail anywhere, including nested tables. Unknown keys that do not match those names are still ignored. An empty `shared_secret` does not start the process. Development without credentials requires `allow_unauthenticated = true` and a literal loopback bind (`127.0.0.1` or `::1`). The hostname `localhost` is not accepted for that flag. A wildcard or any other non-loopback address cannot use it. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected.
 
 ## 既定値
 
@@ -27,11 +27,10 @@ On current `main`, a key inside `[security]` other than `shared_secret` fails pa
 | `sharding.bootstrap_table_shards` | `true` | する。`true` はシャード 1、2、3 を作る。`false` は `[0x01, 0x04)` を覆うシャード 1 を作る |
 | `sharding.shard_split_threshold_bytes` | `4294967296`（4 GiB） | する。分割判定はシャードの概算サイズを使う |
 | `security.shared_secret` | `""` | Empty does not start the process. Loopback without credentials requires `allow_unauthenticated = true`. A non-empty secret requires the same bearer on gRPC and metrics. A whitespace-only secret is rejected |
-| `security.allow_unauthenticated` | `false` | Explicit opt-in for an empty secret on loopback only. Rejected together with a usable secret. Rejected on a wildcard or any other non-loopback bind. A whitespace-only secret is rejected even with this flag |
+| `security.allow_unauthenticated` | `false` | Explicit opt-in for an empty secret on a literal loopback IP (`127.0.0.1` or `::1`) only. The hostname `localhost` is not accepted. Rejected together with a usable secret. Rejected on a wildcard or any other non-loopback bind. A whitespace-only secret is rejected even with this flag |
 
 `[raft]` テーブルはありません。`ServerTomlConfig.raft_options` は serde がスキップし、`RaftNodeOptions::default()` のままです（ハートビート 150 ms、選挙 450–900 ms、スナップショットログ保持 0、セグメント 64 MiB）。
 
-That skip is current `main`. Unmerged pull request #38 proposes loading a `[raft]` table. If #38 merges, this sentence has to be rewritten. Loading `[raft]` is not current behavior.
 
 `to_lsm_config` は常に `auto_locality_compaction: true` を設定します。
 
@@ -78,7 +77,7 @@ CLI フラグはファイルを解析したあとで上書きします。`--node
 
 `shared_secret` が空でないとき、`MetadataService`、`TransactionService`、`ControlPlaneService`、`RaftTransportService` は `authorization` が `Bearer <shared_secret>` と完全に一致することを要求します。`metrics_listen_addr` の `GET /metrics` も同じ `Authorization` ヘッダを要求します。ヘッダの欠落、空のベアラ、接頭辞、より長いトークンは拒否されます。失敗したメトリクス応答の本体は Prometheus テキストではありません。Raft ピアは同じベアラを送ります。`metadb-ctl --auth-token`（環境変数 `METADB_AUTH_TOKEN`）と `metadbd --join` / `--cell-manager` も送ります。`metadb-ctl cluster status` は `GetRoutes` を呼び、同じインターセプタの対象です。
 
-An empty secret does not start the process, including when every listener is loopback (`127.0.0.0/8`, `::1`, or the name `localhost`). Loopback development without credentials requires `allow_unauthenticated = true`. That flag still refuses a wildcard (`0.0.0.0`, `::`) or any other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. Listeners stay plaintext. Keep an opted-in listener on a trusted network, or put every service behind a proxy that authenticates the client and block direct access to this process.
+An empty secret does not start the process. Loopback is not an implicit exception. Development without credentials requires `allow_unauthenticated = true` and every listener on a literal loopback IP (`127.0.0.1` or `::1`). The hostname `localhost` is not accepted for that flag. A wildcard (`0.0.0.0`, `::`) or any other non-loopback address cannot use it. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. Listeners stay plaintext. Keep an opted-in listener on a trusted network, or put every service behind a proxy that authenticates the client and block direct access to this process.
 
 ## 設定できないもの
 

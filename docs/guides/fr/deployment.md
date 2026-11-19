@@ -34,12 +34,25 @@ locality_tombstone_ratio = 0.50
 [sharding]
 bootstrap_table_shards = true
 shard_split_threshold_bytes = 4294967296 # 4 Gio
+
+[security]
+# Loopback development only. Literal 127.0.0.1. Remove this flag when you set shared_secret.
+allow_unauthenticated = true
 ```
 
-Rust 1.100.0 (`rust-toolchain.toml`). Only `all-in-one` starts. This process does not terminate TLS. An empty `[security].shared_secret` does not start the process, including on the default `127.0.0.1` bind. Loopback development without credentials requires `allow_unauthenticated = true`. That flag still refuses a wildcard or any other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with `allow_unauthenticated` is rejected. A non-empty secret requires `authorization: Bearer <secret>` for metadata, transactions, the control plane, Raft on the same port, and `GET /metrics`.
+Rust 1.100.0 (`rust-toolchain.toml`). Only `all-in-one` starts. This process does not terminate TLS.
+
+The `[security]` block above is the explicit loopback development opt-in. It is not a credential. `grpc_listen_addr` and `metrics_listen_addr` stay on the literal IP `127.0.0.1`. The hostname `localhost` is not accepted for `allow_unauthenticated`. An empty secret without that flag does not start the process.
 
 ```bash
 metadbd --config /etc/metadb/standalone.toml
+```
+
+To require `authorization: Bearer <secret>` on metadata, transaction, control-plane, Raft transport, and `GET /metrics`, replace that `[security]` block. Do not leave `allow_unauthenticated` in the file. Both together are rejected. A whitespace-only secret is rejected even if the flag remains. Peer Raft clients send the same token. `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --join` / `--cell-manager` send that header.
+
+```toml
+[security]
+shared_secret = "replace-with-a-long-random-string"
 ```
 
 ---

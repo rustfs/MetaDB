@@ -88,7 +88,6 @@ MVCC-Versionen leben `storage.mvcc_retention_ms` (Vorgabe 5.000) lang im Speiche
 
 Jeder lokale Shard ist eine `openraft`-0.10-Gruppe. Das Log ist eine segmentierte CRC32C-Datei unter `.../shards/<id>/raft`. Vorgaben, die **nicht** aus TOML geladen werden (`raft_options` ist `#[serde(skip)]`):
 
-That skip is current `main`. Unmerged pull request #38 proposes loading `[raft]`. If it merges, this paragraph has to be rewritten. Loading `[raft]` is not current behavior.
 
 | Feld | Vorgabe |
 | :--- | :--- |
