@@ -1,0 +1,10 @@
+[package]
+name = "metadb-transport"
+description = "Transport capability policy. TCP/gRPC is the only carried transport; RDMA is recognized and rejected."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

@@ -24,6 +24,7 @@ metadb-raft = { workspace = true }
 metadb-tx = { workspace = true }
 metadb-cluster = { workspace = true }
 metadb-proxy = { workspace = true }
+metadb-transport = { workspace = true }
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }

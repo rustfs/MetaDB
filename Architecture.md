@@ -14,7 +14,7 @@
 
 Modern exabyte-scale storage systems—including flat object storage (S3/BOS), hierarchical object namespaces (HDFS-compatible Mantle), and POSIX distributed file systems (CFS)—increasingly delegate metadata management to distributed transactional databases. However, Baidu's five-year production experience reported in `arXiv:2610.32247v1` (operating clusters across **1,000+ metadata machines**, **tens of trillions of metadata records**, and **exabytes of storage**) demonstrates a fundamental architectural lesson: **treating a general-purpose distributed database (such as TiDB or CockroachDB) as a "black box" for file-system metadata leaves 2.2x–4.1x throughput untapped and wastes ~50% of cluster hardware.**
 
-**MetaDB** (`rustfs/MetaDB`) is a 100% pure-Rust, file-system structure-aware, semantic-aware, and lifecycle-aware transactional metadata database engine built for [RustFS](https://github.com/rustfs). It is engineered across an 8-crate workspace to support **seamless online evolution from an embedded or standalone single-node deployment (`1-Voter` OpenRaft) to a multi-cell distributed cluster (`3-Voter` Multi-Raft) designed to scale from single-host workloads to 100 billion – 10+ trillion metadata records.**
+**MetaDB** (`rustfs/MetaDB`) is a 100% pure-Rust, file-system structure-aware, semantic-aware, and lifecycle-aware transactional metadata database engine built for [RustFS](https://github.com/rustfs). It is engineered as a pure-Rust workspace to support **seamless online evolution from an embedded or standalone single-node deployment (`1-Voter` OpenRaft) to a multi-cell distributed cluster (`3-Voter` Multi-Raft) designed to scale from single-host workloads to 100 billion – 10+ trillion metadata records.** The phase 1–6 data path is eight crates. `metadb-transport` is a later policy crate: it does not carry RDMA.
 
 > **Distinguishing Reference Benchmarks from Repository Status**:
 > Production scale figures cited from `arXiv:2610.32247v1` (e.g., Baidu's 575-node BOS2 cluster managing 1.848 trillion records) represent empirical results from Baidu's production C++ deployment validating this architecture. `rustfs/MetaDB` is an independent clean-room Rust implementation whose milestone-by-milestone implementation status is tracked transparently in [Section 12](#12-implementation-status-matrix-paper-vs-repository) and [`docs/DEVELOPMENT_PLAN.md`](./docs/DEVELOPMENT_PLAN.md).
@@ -54,6 +54,7 @@ Following the empirical findings of the Baidu MetaDB paper (`arXiv:2610.32247v1`
 2. **Arbitrary Multi-Table SQL Joins or Subqueries**: Only the canonical metadata tables (`MetaTable`, `QuotaTable`, `SecondaryIndexTable`) and fixed metadata SQL templates are supported.
 3. **Data-Plane Object Payload Storage**: Raw data blocks/chunks live in the RustFS object/file data plane; MetaDB stores namespace hierarchy, attributes, quotas, and `FID -> (PID, name)` reverse mappings.
 4. **C/C++ Storage Dependencies**: External C/C++ engines (e.g., `librocksdb-sys`) are explicitly excluded in favor of a verifiable 100% Rust storage stack.
+5. **RDMA as a carried transport**: The name `rdma` may appear in configuration so the request can fail closed. InfiniBand, RoCE, iWARP, Soft-RoCE, and userspace verbs are not linked, emulated, or selected. See [`docs/designs/rdma_transport.md`](docs/designs/rdma_transport.md).
 
 ---
 
@@ -197,13 +198,13 @@ MetaDB executes the **exact same `LsmStorageBackend` and `openraft` state machin
 
 ---
 
-## 8. Workspace Crate Architecture (8 Pure-Rust Crates)
+## 8. Workspace Crate Architecture
 
 ```text
 rustfs/MetaDB
 ├── Architecture.md                              # Master technical specification (English)
 ├── README.md                                    # Project overview, status, and links
-├── Cargo.toml                                   # 8-crate Cargo workspace manifest
+├── Cargo.toml                                   # Cargo workspace manifest
 ├── _agents/skills/metadb_elephant/SKILL.md      # EGM Elephant project context skill
 ├── docs/
 │   ├── README.md                                # Multilingual documentation hub
@@ -215,7 +216,8 @@ rustfs/MetaDB
 │   │   ├── storage_lsm_mvcc.md
 │   │   ├── consensus_and_transactions.md
 │   │   ├── sharding_and_control_plane.md
-│   │   └── review_report.md
+│   │   ├── review_report.md
+│   │   └── rdma_transport.md                    # Transport policy. RDMA is not implemented.
 │   └── guides/{en,ja,fr,zh,de}/                 # User & Operator Guides in 5 Languages
 └── crates/
     ├── metadb-core/                             # HLC (+ drift guard), 0x01..0x07 binary codecs,
@@ -232,7 +234,10 @@ rustfs/MetaDB
     ├── metadb-cluster/                          # PID & DualMode splitter, Epoch fencing, Jumbo isolation,
     │                                            # CellLocalManager, GlobalManager, MetaCache, IdAllocator
     ├── metadb-proxy/                            # 20 parameterized SQL templates + Epoch-aware router
-    └── metadb-server/                           # Embedded MetaDbEngine SDK + metadbd + metadb-ctl
+    ├── metadb-server/                           # Embedded MetaDbEngine SDK + metadbd + metadb-ctl
+    └── metadb-transport/                        # Transport policy only. TCP/gRPC is the only
+                                                 # carried transport. RDMA is recognized and rejected.
+                                                 # No C/C++ FFI, queue pairs, or registered memory.
 ```
 
 ---
@@ -249,6 +254,8 @@ rustfs/MetaDB
    * *Rejected*: Dual durability code paths break crash-recovery symmetry for `MemMvccStore`, `AsyncAttrAggregator`, and `AuxOutbox` during online `1-Voter -> 3-Voter` promotion. A `1-Voter` OpenRaft log performs a single sequential disk append identical in I/O cost to a WAL while keeping 100% state-machine parity.
 5. **Time-Bounded Eager LSM Compaction (Lethe / Acheron)**:
    * *Rejected*: Rigid age-based compaction rewrites cold SSTable levels with high write amplification; `LocalityCompactor` compacts strictly those narrow prefix buckets experiencing high tombstone density.
+6. **RDMA via Rust bindings to libibverbs, UCX, or libfabric**:
+   * *Not implemented*: Maintainable Rust RDMA APIs (`async-rdma`, `rdma-sys`, `sideway`, `ibverbs`) link or `dlopen` C libraries. That contradicts the zero C/C++ FFI rule, and their upstream licenses (GPL-3.0, MPL-2.0, and rdma-core's GPL-2.0 OR BSD-2-Clause) are outside the workspace allow list. No pure-Rust verbs implementation is vendored. This environment has no authorized RDMA device, so a backend could not be validated here. The repository records the rejection in `metadb-transport` instead of labeling TCP as RDMA.
 
 ---
 
@@ -291,3 +298,4 @@ Detailed Zero-Decision subsystem blueprints are maintained under [`docs/designs/
 | Epoch-Fenced `PID` Split, Jumbo Isolation & `DualMode` | Production | **Implemented & Tested** (3-stage `ExecuteSplit`, `JumboIsolationPlanner`, `DualModeFineGrained` scatter-gather) | `metadb-cluster` |
 | Two-Tier Control Plane (`GlobalManager` + `CellLocalManager`) | Production (575+ nodes/cluster) | **Implemented & Tested** (`DurableGlobalManager`, `DurableCellManager`, `CompositeMetaCache`, `DurableIdAllocator`) | `metadb-cluster` |
 | 20 Parameterized SQL Templates + `metadbd` & `metadb-ctl` | Production (~20 SQL patterns) | **Implemented & Tested** (`SqlTemplateParser` 20 templates + `PersistentMetaDbCluster` + `metadbd` + `metadb-ctl`) | `metadb-proxy` / `metadb-server` |
+| RDMA transport | Not a carried transport in this repository | **Not implemented.** `RDMA_BACKEND_IMPLEMENTED` is false. `mode = "rdma"` refuses startup before bind. `prefer-rdma` selects tonic gRPC over TCP and records `backend-not-implemented`. No libibverbs, UCX, or libfabric link, and no queue pairs or registered memory. | `metadb-transport` |
