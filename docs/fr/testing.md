@@ -12,7 +12,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-`cargo test --workspace` construit la bibliothèque, les tests d'intégration et les deux binaires. Il n'y a pas de cible `[[bench]]` ni de répertoire `benches/`. Le générateur de charge livré dans cet arbre est `metadb-ctl bench`, ci-dessous.
+`cargo test --workspace` construit la bibliothèque, les tests d'intégration et les deux binaires. Il n'y a pas de cible `[[bench]]` ni de répertoire `benches/`. Les générateurs de charge livrés dans cet arbre sont `metadb-ctl bench` et `cargo test -p metadb-server --test stress_harness`, ci-dessous.
 
 Commandes plus étroites utiles :
 
@@ -31,6 +31,7 @@ cargo test -p metadb-proxy --test sql_templates_tests
 cargo test -p metadb-storage --test lsm_recovery_tests
 cargo test -p metadb-storage --test mvcc_snapshot_tests
 cargo test -p metadb-storage --test locality_compaction_tests
+cargo test -p metadb-server --test stress_harness
 ```
 
 ## Ce que chaque suite exerce réellement
@@ -99,31 +100,61 @@ cargo run -p metadb-server --bin metadb-ctl -- \
   bench --workload bulk-ttl-delete --concurrency 16 --ops 1000
 ```
 
-Options : `--workload` vaut `hotspot-create` (le défaut), `bulk-ttl-delete` ou `mixed`. `--concurrency` vaut 16 s'il est omis. `--ops` vaut 1000 par défaut. `--embedded` ou `--workload mixed` démarre un nœud all-in-one temporaire et le harnais de stress dans le processus, au lieu d'appeler `--endpoint`.
+Options : `--workload` vaut `hotspot-create` (le défaut), `bulk-ttl-delete` ou `mixed`. Pour les charges distantes, `--concurrency` vaut 16 s'il est omis et `--ops` vaut 1000 par défaut. `--profile` n'est lu que sur le chemin embarqué. `--embedded` ou `--workload mixed` n'appelle pas `--endpoint` et n'utilise pas `--ops`. La commande démarre un nœud all-in-one temporaire et exécute le harnais de stress dans le processus. Voir [Harnais de stress dans le processus](#harnais-de-stress-dans-le-processus).
 
 Comportement issu de `crates/metadb-server/src/bin/metadb-ctl.rs` pour les charges distantes :
 
-- Le client alloue un identifiant de répertoire, puis des blocs d'inodes et d'identifiants de fichier de longueur `--ops`. Une attribution au mauvais compte ou qui déborde est refusée.
+- Le client alloue un identifiant de répertoire, puis des blocs d'inodes et d'identifiants de fichier de longueur `--ops`, et refuse une attribution dont le compte ou la fin déborde.
 - Il imprime un objet JSON avec `bench_pid`, `workload` et `requested_ops`, puis crée autant de fichiers de 4096 octets dans un nouveau répertoire.
-- Chaque phase imprime du JSON avec `attempted`, `succeeded`, `failed`, `transport_failed`, `application_failed`, `errors_by_kind` et des percentiles de latence. Le processus se termine en erreur si `succeeded` n'est pas égal à `--ops`.
-- `bulk-ttl-delete` supprime les noms créés, puis liste le répertoire avec `limit = 1`.
-- Une seconde exécution alloue un nouveau `bench_pid`. Les créations rejetées ne comptent pas comme des succès.
+- Chaque phase imprime du JSON avec `attempted`, `succeeded`, `failed`, `transport_failed`, `application_failed`, `errors_by_kind` et des percentiles de latence (`p50_ms`, `p99_ms`, `p999_ms`). Le processus se termine en erreur si `succeeded` n'est pas égal à `--ops`.
+- `bulk-ttl-delete` supprime les noms créés, puis liste le répertoire avec `limit = 1` et imprime si cette page est vide.
+- Une seconde exécution alloue un nouveau `bench_pid`. Elle ne réutilise pas un inode fixe, et elle ne compte pas les créations rejetées comme des succès.
 
-Ne pas traiter un nombre issu de cette commande comme un résultat du dépôt. Il dépend de la machine, du profil de compilation et du serveur visé. Cet arbre n'enregistre pas d'échantillon.
+Ne pas traiter un nombre issu de cette commande comme un résultat du dépôt. Une exécution distante dépend de la machine, du profil de compilation et du serveur visé. Une exécution embarquée dépend de la machine et du profil de compilation. Cet arbre n'enregistre un échantillon ni de l'une ni de l'autre.
 
-## Pull request ouverte n° 2
+## Harnais de stress dans le processus
 
-La [pull request n° 2](https://github.com/rustfs/MetaDB/pull/2) est ouverte et ne fait pas partie de cette branche. Elle ajoute des tests de topologie persistants et un harnais de stress embarqué. Sa propre description dit :
+`crates/metadb-server/tests/stress_harness.rs` et `metadb-ctl bench --embedded` appellent tous deux `metadb_server::stress` (`crates/metadb-server/src/stress.rs`). Il n'y a pas de troisième profil nommé `mixed`. `--workload mixed` sélectionne ce harnais. Les deux profils exécutent la même charge mixte : create, lookup, dirstat, listdir, rename et unlink contre un nœud all-in-one persistant, sur un répertoire de données temporaire. Après la boucle minutée, le harnais exécute des ticks de maintenance, puis vérifie les listes de répertoire, dirstat et le quota par rapport aux opérations qui ont réussi. Un tick de maintenance en échec ajoute un à `errors`, met `correctness_errors` à 1 et saute cette vérification. L'exécution est un processus du système d'exploitation et un répertoire de données. Ce n'est pas trois processus `metadbd`, et ce n'est pas la [charge officielle par préfixe](../en/testing.md#prefix-load).
 
-- Le test mono-nœud appelle `PersistentMetaDbCluster::open_and_serve` sur un répertoire temporaire.
-- Le test de montée en charge force un découpage à frontière de PID dans ce même processus.
-- Le test distribué est un processus avec trois votants Raft sur localhost. Il appelle `DurableCellManager::scale_out_replicas`. Il ne lance pas trois processus `metadbd` du système d'exploitation.
-- `open_and_serve` rejette toujours tout rôle autre que `all-in-one`. Les rôles désagrégés et une seconde cellule restent non implémentés.
+| Profil | Test | Durée | Concurrence | Répertoires | Quand il s'exécute |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `smoke` | `stress_smoke_mixed_workload` | 5 secondes | 4 | 4 | `cargo test -p metadb-server --test stress_harness`, y compris `cargo test --workspace`. Ignore `METADB_STRESS_*`. |
+| `local` | `stress_local_mixed_workload` | 30 secondes sauf remplacement | 8 sauf remplacement | 16 sauf remplacement | `#[ignore]`. Absent de `cargo test --workspace`. Lit `METADB_STRESS_DURATION_SECS`, `METADB_STRESS_CONCURRENCY`, `METADB_STRESS_KEYSPACE` et `METADB_STRESS_SEED`. |
 
-Le rapport de cette pull request, sur la machine virtuelle de l'auteur avec Rust 1.100.0 (le matériel n'est pas nommé), contient une ligne smoke du harnais que cette branche ne contient pas :
+```bash
+cargo test -p metadb-server --test stress_harness stress_smoke -- --nocapture
 
-```text
-metadb stress profile=smoke ops=12219 errors=0 correctness_errors=0 elapsed_ms=5221 ops_per_s=2340.3 latency_us p50=1318 p99=5207 max=12449
+METADB_STRESS_DURATION_SECS=120 \
+METADB_STRESS_CONCURRENCY=16 \
+METADB_STRESS_KEYSPACE=32 \
+METADB_STRESS_SEED=7 \
+  cargo test -p metadb-server --test stress_harness stress_local -- --ignored --nocapture
+
+cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile smoke
+cargo run -p metadb-server --bin metadb-ctl -- bench --embedded --profile local
 ```
 
-Cette ligne est une seule exécution d'un test non fusionné. Ce n'est pas une cible de service et elle n'est pas reproduite par `metadb-ctl bench` sur cette branche. Des commandes telles que `cargo test -p metadb-server --test topology_distributed` et `metadb-ctl bench --embedded` n'existent que sur la branche de cette pull request.
+`METADB_STRESS_*` s'applique au profil local, y compris `metadb-ctl bench --embedded --profile local`. Sur `metadb-ctl bench --embedded`, `--duration-secs`, `--concurrency`, `--keyspace` et `--seed` remplacent le profil choisi, après la lecture de l'environnement. Le profil local de `cargo test` n'a pas ces remplacements par option ; il ne lit que ces variables. Une durée, une concurrence ou un nombre de répertoires inférieur à 1 est relevé à 1. `--profile` vaut `smoke` par défaut. `--profile ci` est le même profil smoke. Toute autre valeur de `--profile` termine la commande en erreur. Le profil smoke ne lit pas `METADB_STRESS_*`. Les charges distantes `hotspot-create` et `bulk-ttl-delete` ignorent `--profile`.
+
+Le test imprime une ligne et exige `errors = 0`, `correctness_errors = 0` et `ops > 0`. `metadb-ctl bench --embedded` imprime `embedded metadbd listening on <addr>` et la même ligne, et se termine en erreur lorsque `errors` ou `correctness_errors` est supérieur à zéro. Les champs de la ligne sont :
+
+```text
+metadb stress profile=<name> ops=<count> errors=<count> correctness_errors=<count> elapsed_ms=<ms> ops_per_s=<rate> latency_us p50=<us> p99=<us> max=<us>
+```
+
+`ops` compte seulement les opérations de la boucle mixte qui ont réussi. `ops_per_s` divise ce compte par le temps écoulé. `errors` compte celles qui n'ont pas réussi. Un tick de maintenance en échec est aussi ajouté à `errors`, et il met `correctness_errors` à 1 sans exécuter la vérification. Lorsque la vérification s'exécute, `correctness_errors` compte à la fois les écarts de liste, de dirstat et de quota, et les appels de vérification en échec (`dirstat`, `listdir` et `get_quota`). `latency_us` `p50`, `p99` et `max` sont des percentiles de chaque tentative de la boucle mixte, y compris les échecs, en microsecondes. Ce ne sont pas des percentiles de `ops`. Ils sont imprimés. Cet arbre n'impose pas de seuil de latence.
+
+Une ligne issue de l'une ou l'autre commande est un résultat pour la machine qui l'a imprimée. Ce dépôt n'en enregistre pas. Ce n'est pas un résultat de niveau service, pas une validation de première livraison, et pas la charge officielle de 1 000 000 créations.
+
+## Topologie persistante et jointure
+
+Ces commandes sont dans cet arbre. La CI les exécute avec `cargo test --workspace --locked`.
+
+- `cargo test -p metadb-server --test topology_single_node` ouvre `PersistentMetaDbCluster` sur un répertoire temporaire.
+- `cargo test -p metadb-server --test topology_scale_out` force un découpage à frontière de PID dans ce processus.
+- `cargo test -p metadb-server --test topology_distributed` utilise un processus et `DurableCellManager::scale_out_replicas` pour trois votants localhost, y compris la perte du leader sous une charge de créations.
+- `cargo test -p metadb-server --test stress_crash_restart` s'arrête sans vider le memtable pendant qu'une création est dans `propose`, puis rouvre le même `data_dir`.
+- `cargo test -p metadb-server --test join_existing_group` couvre deux jointures différentes. `metadbd_processes_join_existing_group_and_fail_over` démarre de vrais processus `metadbd`, joint le groupe Raft du premier processus et bascule le leader. `join_sends_the_shared_secret` ouvre deux serveurs `PersistentMetaDbCluster` dans le processus de test et vérifie que le secret partagé est envoyé sur cette jointure. Ce cas ne démarre pas deux processus `metadbd` du système d'exploitation.
+- `open_and_serve` rejette toujours tout rôle autre que `all-in-one`. Une seconde cellule reste non implémentée. `RegisterCell` renvoie une erreur.
+
+Le profil smoke et le profil local ignoré sont le [harnais de stress dans le processus](#harnais-de-stress-dans-le-processus). `topology_distributed` reste un processus du système d'exploitation avec trois votants Raft sur localhost, et non trois processus `metadbd`. Les rôles désagrégés et une seconde cellule ne sont toujours pas des déploiements vivants.
