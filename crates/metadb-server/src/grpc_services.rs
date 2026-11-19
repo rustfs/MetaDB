@@ -1013,12 +1013,22 @@ impl ControlPlaneService for MetaDbGrpcService {
                 }));
             }
         };
+        let observation_generation =
+            match metadb_proto::convert::decode_optional_u128_be(&req.observation_generation) {
+                Ok(id) => id,
+                Err(error) => {
+                    return Ok(Response::new(StoreHeartbeatResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                    }));
+                }
+            };
         match cell.accept_remote_heartbeat(
             req.node_id,
             req.monotonic_seq,
             disk_free,
             reported,
             instance_id,
+            observation_generation,
         ) {
             Ok(()) => Ok(Response::new(StoreHeartbeatResponse { error: None })),
             Err(error) => Ok(Response::new(StoreHeartbeatResponse {

@@ -20,6 +20,7 @@ fn heartbeat_request(seq: u64, node_id: u64, disk_free_bytes: u64) -> StoreHeart
         monotonic_seq: seq,
         disk_free_known: true,
         instance_id: Vec::new(),
+        observation_generation: metadb_proto::convert::encode_u128_be(11).to_vec(),
         shards: vec![ShardHeartbeatStatsProto {
             descriptor: Some(ShardDescriptorProto {
                 cell_id: 1,
@@ -72,6 +73,7 @@ async fn control_plane_does_not_pretend_missing_topology_ops_succeeded() {
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.path().to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
     let svc = MetaDbGrpcService::new(
         cluster.global_manager().clone(),
@@ -94,6 +96,7 @@ async fn control_plane_does_not_pretend_missing_topology_ops_succeeded() {
             monotonic_seq: 1,
             disk_free_known: true,
             instance_id: Vec::new(),
+            observation_generation: metadb_proto::convert::encode_u128_be(11).to_vec(),
             shards: vec![ShardHeartbeatStatsProto {
                 descriptor: Some(ShardDescriptorProto {
                     cell_id: 1,

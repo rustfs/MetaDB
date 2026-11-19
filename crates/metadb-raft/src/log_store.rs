@@ -789,6 +789,25 @@ impl SegmentedRaftLogStore {
             || !guard.entries.is_empty()
     }
 
+    /// Commit or purge index that startup replay must apply before the shard can serve.
+    ///
+    /// `None` when the store has neither. A non-empty uncommitted tail does not
+    /// count: those entries are not yet a committed prefix the state machine must replay.
+    pub fn committed_or_purged_index(&self) -> Option<u64> {
+        let guard = self.inner.lock().unwrap();
+        let committed = guard.hard_state.committed.as_ref().map(|id| id.index);
+        let purged = guard
+            .hard_state
+            .last_purged_log_id
+            .as_ref()
+            .map(|id| id.index);
+        match (committed, purged) {
+            (None, None) => None,
+            (Some(index), None) | (None, Some(index)) => Some(index),
+            (Some(committed), Some(purged)) => Some(committed.max(purged)),
+        }
+    }
+
     /// Test hook. The next `n` append fsyncs fail and roll the in-memory log back.
     pub fn testing_fail_next_syncs(&self, n: u32) {
         self.inner.lock().unwrap().fail_syncs = n;

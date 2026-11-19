@@ -26,6 +26,9 @@ grpc_listen_addr = "127.0.0.1:0"
 [sharding]
 bootstrap_table_shards = true
 shard_split_threshold_bytes = 4294967296
+
+[security]
+allow_unauthenticated = true
 "#,
         dir.display()
     );

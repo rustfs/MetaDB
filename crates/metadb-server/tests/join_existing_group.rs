@@ -40,6 +40,9 @@ shard_split_threshold_bytes = 4294967296
 
 [cluster]
 join = "{join}"
+
+[security]
+allow_unauthenticated = true
 "#,
         dir.display()
     );
@@ -462,6 +465,7 @@ async fn join_sends_the_shared_secret() {
     let dir = tempdir().unwrap();
     let mut cfg1 = fast_config(&dir.path().join("n1"), 1, "");
     cfg1.security.shared_secret = "join-secret".to_string();
+    cfg1.security.allow_unauthenticated = false;
     let (node1, addr1) = PersistentMetaDbCluster::open_and_serve(cfg1).await.unwrap();
     node1
         .tx_router()
@@ -471,6 +475,7 @@ async fn join_sends_the_shared_secret() {
     assert!(create_named(&node1, "before_join.dat", 100, 500).await);
     let mut cfg2 = fast_config(&dir.path().join("n2"), 2, &addr1);
     cfg2.security.shared_secret = "join-secret".to_string();
+    cfg2.security.allow_unauthenticated = false;
     let (node2, _) = PersistentMetaDbCluster::open_and_serve(cfg2).await.unwrap();
     wait_applied(&node2, "before_join.dat").await;
     assert_eq!(voter_set(&node1), BTreeSet::from([1, 2]));
@@ -564,6 +569,9 @@ shard_split_threshold_bytes = 4294967296
 
 [cluster]
 join = "{join}"
+
+[security]
+allow_unauthenticated = true
 "#,
         data_dir.display()
     )

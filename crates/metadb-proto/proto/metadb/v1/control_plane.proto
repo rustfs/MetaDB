@@ -40,6 +40,10 @@ message StoreHeartbeatRequest {
   // bound to an instance. Empty does not authenticate the caller. This is not a
   // shard epoch and does not schedule placement.
   bytes instance_id = 7;
+  // 16-byte big-endian heartbeat-file generation. Required and non-zero.
+  // A receiver with no row accepts this generation's current sequence.
+  // The same generation still rejects jumps above 64. This is not a shard epoch.
+  bytes observation_generation = 8;
 }
 
 message StoreHeartbeatResponse {

@@ -27,12 +27,12 @@ use metadb_storage::LsmEngineConfig;
 use metadb_tx::{RoutedShardHandle, TxStateMachineHandler};
 
 use crate::control_plane_state::{
-    decide_heartbeat, normalize_ids, remote_heartbeat_is_too_soon, unix_ms, HeartbeatDecision,
-    HeartbeatWrite, PersistedControlPlane, StoredHeartbeat, StoredPlacement, CONTROL_PLANE_FILE,
-    CONTROL_PLANE_VERSION, PLACEMENT_RETRY_MS,
+    decide_heartbeat, decode_control_plane, normalize_ids, remote_heartbeat_is_too_soon, unix_ms,
+    HeartbeatDecision, HeartbeatWrite, PersistedControlPlane, StoredHeartbeat, StoredPlacement,
+    CONTROL_PLANE_FILE, CONTROL_PLANE_VERSION, PLACEMENT_RETRY_MS,
 };
 use crate::id_allocator::{AllocIdKind, DurableIdAllocator};
-use crate::identity::{node_id_in_ha_range, ClusterIdentity};
+use crate::identity::{node_id_in_ha_range, random_id, ClusterIdentity};
 use crate::jumbo::JumboIsolationPlanner;
 use crate::jumbo_placement::{
     automatic_leadership_transfer_allowed, executable_placement_actions,
@@ -2010,7 +2010,11 @@ impl DurableCellManager {
         };
         let hosted = normalize_ids(hosted).map_err(MetaDbError::ShardRoutingError)?;
         let mut guard = self.control.lock().unwrap();
-        let seq = guard.next_local_seq.max(1);
+        let mut next = guard.clone();
+        if next.observation_generation == 0 {
+            next.observation_generation = random_id()?;
+        }
+        let seq = next.next_local_seq.max(1);
         let write = HeartbeatWrite {
             node_id: me,
             seq,
@@ -2018,13 +2022,18 @@ impl DurableCellManager {
             disk_free_bytes: None,
             reported_shard_ids: Vec::new(),
             local_hosted_shard_ids: hosted,
+            observation_generation: next.observation_generation,
         };
         let decision = decide_heartbeat(guard.heartbeats.get(&me), &write)
             .map_err(MetaDbError::ShardRoutingError)?;
         match decision {
-            HeartbeatDecision::Replay(existing) => Ok(existing),
+            HeartbeatDecision::Replay(existing) => {
+                if guard.observation_generation == 0 {
+                    self.store_control(&mut guard, next)?;
+                }
+                Ok(existing)
+            }
             HeartbeatDecision::Store(heartbeat) => {
-                let mut next = guard.clone();
                 next.heartbeats.insert(me, heartbeat.clone());
                 next.next_local_seq = seq.saturating_add(1);
                 self.store_control(&mut guard, next)?;
@@ -2042,6 +2051,7 @@ impl DurableCellManager {
         disk_free_bytes: Option<u64>,
         reported_shard_ids: Vec<ShardId>,
         instance_id: Option<u128>,
+        observation_generation: u128,
     ) -> Result<()> {
         node_id_in_ha_range(node_id)?;
         if node_id == self.host.node_id() {
@@ -2073,6 +2083,7 @@ impl DurableCellManager {
             disk_free_bytes,
             reported_shard_ids: reported,
             local_hosted_shard_ids: Vec::new(),
+            observation_generation,
         };
         let mut guard = self.control.lock().unwrap();
         let decision = decide_heartbeat(guard.heartbeats.get(&node_id), &write)
@@ -2582,15 +2593,7 @@ impl DurableCellManager {
         let mut raw = Vec::new();
         File::open(&path)?.read_to_end(&mut raw)?;
         let body = verify_crc32c_le(&raw, CONTROL_PLANE_FILE)?;
-        let state: PersistedControlPlane = codec::deserialize(body)
-            .map_err(|error| MetaDbError::CodecError(format!("{CONTROL_PLANE_FILE}: {error}")))?;
-        if state.version != CONTROL_PLANE_VERSION {
-            return Err(MetaDbError::CodecError(format!(
-                "{CONTROL_PLANE_FILE} version {} is not supported",
-                state.version
-            )));
-        }
-        Ok(state)
+        decode_control_plane(body)
     }
 
     fn write_control_file(

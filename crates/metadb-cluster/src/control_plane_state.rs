@@ -10,7 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use metadb_core::{InodeId, NodeId, ShardId};
+use metadb_core::codec;
+use metadb_core::{InodeId, MetaDbError, NodeId, ShardId};
 
 use crate::jumbo_placement::{CommittedMove, PlacementPhase};
 
@@ -26,8 +27,10 @@ pub const CONTROL_PLANE_FILE: &str = "CELL_CONTROL_PLANE";
 /// Upper bound on shard ids stored from one heartbeat. The ids are annotations.
 pub const MAX_REPORTED_SHARD_IDS: usize = 1_024;
 
-/// Largest forward jump accepted from the stored sequence. A first record must
-/// also sit inside `1..=MAX_HEARTBEAT_SEQ_ADVANCE`. `u64::MAX` cannot wedge the node.
+/// Largest forward jump accepted inside one observation generation.
+/// A receiver with no row, and a new generation, accept the sender's current
+/// sequence even when it is larger. `u64::MAX` still cannot jump an established
+/// generation. Heartbeats are not a scheduling epoch.
 pub const MAX_HEARTBEAT_SEQ_ADVANCE: u64 = 64;
 
 /// Minimum gap between two remote heartbeats that carry a new sequence.
@@ -49,6 +52,9 @@ pub struct PersistedControlPlane {
     /// do not consume it. Zero is never assigned.
     pub next_local_seq: u64,
     pub placements: BTreeMap<ShardId, StoredPlacement>,
+    /// Identity of this process's heartbeat file. Zero means not minted yet.
+    /// Losing the file mints a new value. It is not a Raft epoch.
+    pub observation_generation: u128,
 }
 
 impl Default for PersistedControlPlane {
@@ -58,6 +64,7 @@ impl Default for PersistedControlPlane {
             heartbeats: BTreeMap::new(),
             next_local_seq: 1,
             placements: BTreeMap::new(),
+            observation_generation: 0,
         }
     }
 }
@@ -74,6 +81,8 @@ pub struct StoredHeartbeat {
     pub disk_free_bytes: Option<u64>,
     pub reported_shard_ids: Vec<ShardId>,
     pub local_hosted_shard_ids: Vec<ShardId>,
+    /// Sender heartbeat-file generation. Not a node instance id and not a shard epoch.
+    pub observation_generation: u128,
 }
 
 #[derive(
@@ -114,6 +123,7 @@ pub struct HeartbeatWrite {
     pub disk_free_bytes: Option<u64>,
     pub reported_shard_ids: Vec<ShardId>,
     pub local_hosted_shard_ids: Vec<ShardId>,
+    pub observation_generation: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,7 +141,9 @@ pub fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn normalize_ids(ids: impl IntoIterator<Item = ShardId>) -> Result<Vec<ShardId>, String> {
+pub fn normalize_ids(
+    ids: impl IntoIterator<Item = ShardId>,
+) -> std::result::Result<Vec<ShardId>, String> {
     let mut out: Vec<ShardId> = ids.into_iter().filter(|id| *id != 0).collect();
     out.sort_unstable();
     out.dedup();
@@ -146,42 +158,29 @@ pub fn normalize_ids(ids: impl IntoIterator<Item = ShardId>) -> Result<Vec<Shard
 
 /// Decide whether `write` may update `existing`.
 ///
-/// A lower sequence is rejected and the stored record stays. An equal sequence with the
-/// same body is a replay. An equal sequence with a different body is a conflict and must
-/// not overwrite. A higher sequence replaces the record.
+/// No stored row, or a different `observation_generation`, is first contact: any
+/// non-zero sequence is the new baseline. That covers a leader that has never
+/// stored this sender, a receiver that lost its file, and a sender that lost its
+/// file and minted a new generation. The same generation still rejects a sequence
+/// older than the stored one, a conflicting body, and a forward jump above
+/// [`MAX_HEARTBEAT_SEQ_ADVANCE`]. None of these records schedule placement.
 pub fn decide_heartbeat(
     existing: Option<&StoredHeartbeat>,
     write: &HeartbeatWrite,
-) -> Result<HeartbeatDecision, String> {
+) -> std::result::Result<HeartbeatDecision, String> {
     if write.seq == 0 {
         return Err(
             "monotonic_seq must be non-zero; client shard descriptors are not applied to routes"
                 .to_string(),
         );
     }
-    if let Some(previous) = existing {
-        if write.seq > previous.seq && write.seq - previous.seq > MAX_HEARTBEAT_SEQ_ADVANCE {
-            return Err(format!(
-                "heartbeat seq {} jumps {} past {}; the stored record was kept. A heartbeat is not a scheduling epoch",
-                write.seq,
-                write.seq - previous.seq,
-                previous.seq
-            ));
-        }
-    } else if write.seq > MAX_HEARTBEAT_SEQ_ADVANCE {
-        return Err(format!(
-            "initial heartbeat seq {} exceeds {MAX_HEARTBEAT_SEQ_ADVANCE}; the stored record was kept. A heartbeat is not a scheduling epoch",
-            write.seq
-        ));
+    if write.observation_generation == 0 {
+        return Err(
+            "observation generation must be non-zero; a heartbeat is not a scheduling epoch"
+                .to_string(),
+        );
     }
-    let stored = StoredHeartbeat {
-        node_id: write.node_id,
-        seq: write.seq,
-        observed_unix_ms: write.observed_unix_ms,
-        disk_free_bytes: write.disk_free_bytes,
-        reported_shard_ids: write.reported_shard_ids.clone(),
-        local_hosted_shard_ids: write.local_hosted_shard_ids.clone(),
-    };
+    let stored = stored_from_write(write);
     let Some(previous) = existing else {
         return Ok(HeartbeatDecision::Store(stored));
     };
@@ -190,6 +189,9 @@ pub fn decide_heartbeat(
             "heartbeat map key {} does not match body node {}",
             previous.node_id, write.node_id
         ));
+    }
+    if previous.observation_generation != write.observation_generation {
+        return Ok(HeartbeatDecision::Store(stored));
     }
     if write.seq < previous.seq {
         return Err(format!(
@@ -206,7 +208,27 @@ pub fn decide_heartbeat(
             write.seq
         ));
     }
+    if write.seq - previous.seq > MAX_HEARTBEAT_SEQ_ADVANCE {
+        return Err(format!(
+            "heartbeat seq {} jumps {} past {}; the stored record was kept. A heartbeat is not a scheduling epoch",
+            write.seq,
+            write.seq - previous.seq,
+            previous.seq
+        ));
+    }
     Ok(HeartbeatDecision::Store(stored))
+}
+
+fn stored_from_write(write: &HeartbeatWrite) -> StoredHeartbeat {
+    StoredHeartbeat {
+        node_id: write.node_id,
+        seq: write.seq,
+        observed_unix_ms: write.observed_unix_ms,
+        disk_free_bytes: write.disk_free_bytes,
+        reported_shard_ids: write.reported_shard_ids.clone(),
+        local_hosted_shard_ids: write.local_hosted_shard_ids.clone(),
+        observation_generation: write.observation_generation,
+    }
 }
 
 /// A new remote sequence inside the interval is rejected. An equal sequence is a
@@ -219,6 +241,72 @@ pub fn remote_heartbeat_is_too_soon(
 ) -> bool {
     incoming_seq != stored_seq
         && now_ms.saturating_sub(previous_observed_unix_ms) < MIN_REMOTE_HEARTBEAT_INTERVAL_MS
+}
+
+/// Reads version 1 files written before `observation_generation` existed.
+/// Those rows keep generation 0 until a real sender presents a generation.
+pub fn decode_control_plane(
+    body: &[u8],
+) -> std::result::Result<PersistedControlPlane, MetaDbError> {
+    if let Ok(state) = codec::deserialize::<PersistedControlPlane>(body) {
+        if state.version != CONTROL_PLANE_VERSION {
+            return Err(MetaDbError::CodecError(format!(
+                "{CONTROL_PLANE_FILE} version {} is not supported",
+                state.version
+            )));
+        }
+        return Ok(state);
+    }
+    let legacy: LegacyPersistedControlPlane = codec::deserialize(body)
+        .map_err(|error| MetaDbError::CodecError(format!("{CONTROL_PLANE_FILE}: {error}")))?;
+    if legacy.version != CONTROL_PLANE_VERSION {
+        return Err(MetaDbError::CodecError(format!(
+            "{CONTROL_PLANE_FILE} version {} is not supported",
+            legacy.version
+        )));
+    }
+    Ok(PersistedControlPlane {
+        version: CONTROL_PLANE_VERSION,
+        heartbeats: legacy
+            .heartbeats
+            .into_iter()
+            .map(|(node_id, heartbeat)| {
+                (
+                    node_id,
+                    StoredHeartbeat {
+                        node_id: heartbeat.node_id,
+                        seq: heartbeat.seq,
+                        observed_unix_ms: heartbeat.observed_unix_ms,
+                        disk_free_bytes: heartbeat.disk_free_bytes,
+                        reported_shard_ids: heartbeat.reported_shard_ids,
+                        local_hosted_shard_ids: heartbeat.local_hosted_shard_ids,
+                        observation_generation: 0,
+                    },
+                )
+            })
+            .collect(),
+        next_local_seq: legacy.next_local_seq,
+        placements: legacy.placements,
+        observation_generation: 0,
+    })
+}
+
+#[derive(Debug, Deserialize, wincode::SchemaRead)]
+struct LegacyStoredHeartbeat {
+    node_id: NodeId,
+    seq: u64,
+    observed_unix_ms: u64,
+    disk_free_bytes: Option<u64>,
+    reported_shard_ids: Vec<ShardId>,
+    local_hosted_shard_ids: Vec<ShardId>,
+}
+
+#[derive(Debug, Deserialize, wincode::SchemaRead)]
+struct LegacyPersistedControlPlane {
+    version: u32,
+    heartbeats: BTreeMap<NodeId, LegacyStoredHeartbeat>,
+    next_local_seq: u64,
+    placements: BTreeMap<ShardId, StoredPlacement>,
 }
 
 fn same_body(stored: &StoredHeartbeat, write: &HeartbeatWrite) -> bool {
@@ -239,12 +327,20 @@ mod tests {
             disk_free_bytes: disk,
             reported_shard_ids: reported.to_vec(),
             local_hosted_shard_ids: Vec::new(),
+            observation_generation: 11,
         }
     }
 
     #[test]
     fn sequence_rules_keep_the_stored_body() {
         assert!(decide_heartbeat(None, &write(0, None, &[])).is_err());
+        let missing_generation = HeartbeatWrite {
+            observation_generation: 0,
+            ..write(1, None, &[])
+        };
+        assert!(decide_heartbeat(None, &missing_generation)
+            .unwrap_err()
+            .contains("generation"));
         let stored = match decide_heartbeat(None, &write(1, Some(5), &[9])).unwrap() {
             HeartbeatDecision::Store(heartbeat) => heartbeat,
             HeartbeatDecision::Replay(_) => panic!("first write stores"),
@@ -276,8 +372,31 @@ mod tests {
             .contains("stale"));
         let poisoned = decide_heartbeat(Some(&next), &write(u64::MAX, None, &[4])).unwrap_err();
         assert!(poisoned.contains("jumps"), "{poisoned}");
-        let initial = decide_heartbeat(None, &write(u64::MAX, None, &[])).unwrap_err();
-        assert!(initial.contains("exceeds"), "{initial}");
+        let first_high = match decide_heartbeat(None, &write(65, None, &[])).unwrap() {
+            HeartbeatDecision::Store(heartbeat) => heartbeat,
+            HeartbeatDecision::Replay(_) => panic!("empty receiver accepts seq 65"),
+        };
+        assert_eq!(first_high.seq, 65);
+        let restarted = HeartbeatWrite {
+            observation_generation: 22,
+            seq: 1,
+            ..write(1, None, &[])
+        };
+        let recovered = match decide_heartbeat(Some(&first_high), &restarted).unwrap() {
+            HeartbeatDecision::Store(heartbeat) => heartbeat,
+            HeartbeatDecision::Replay(_) => panic!("new generation is a new baseline"),
+        };
+        assert_eq!(recovered.seq, 1);
+        assert_eq!(recovered.observation_generation, 22);
+        let same_again = decide_heartbeat(Some(&recovered), &restarted).unwrap();
+        assert!(matches!(same_again, HeartbeatDecision::Replay(_)));
+        let conflict = HeartbeatWrite {
+            disk_free_bytes: Some(3),
+            ..restarted
+        };
+        assert!(decide_heartbeat(Some(&recovered), &conflict)
+            .unwrap_err()
+            .contains("conflicts"));
         assert!(remote_heartbeat_is_too_soon(1_000, 1_500, 2, 1));
         assert!(!remote_heartbeat_is_too_soon(1_000, 1_500, 1, 1));
         assert!(!remote_heartbeat_is_too_soon(1_000, 3_000, 2, 1));
