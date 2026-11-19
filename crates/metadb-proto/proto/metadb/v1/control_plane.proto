@@ -36,6 +36,10 @@ message StoreHeartbeatRequest {
   uint64 monotonic_seq = 5;
   // When false, disk_free_bytes is not a measurement and is stored as unknown.
   bool disk_free_known = 6;
+  // 16-byte big-endian instance id. Required only when that node id is already
+  // bound to an instance. Empty does not authenticate the caller. This is not a
+  // shard epoch and does not schedule placement.
+  bytes instance_id = 7;
 }
 
 message StoreHeartbeatResponse {

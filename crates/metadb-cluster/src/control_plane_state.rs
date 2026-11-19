@@ -26,6 +26,19 @@ pub const CONTROL_PLANE_FILE: &str = "CELL_CONTROL_PLANE";
 /// Upper bound on shard ids stored from one heartbeat. The ids are annotations.
 pub const MAX_REPORTED_SHARD_IDS: usize = 1_024;
 
+/// Largest forward jump accepted from the stored sequence. A first record must
+/// also sit inside `1..=MAX_HEARTBEAT_SEQ_ADVANCE`. `u64::MAX` cannot wedge the node.
+pub const MAX_HEARTBEAT_SEQ_ADVANCE: u64 = 64;
+
+/// Minimum gap between two remote heartbeats that carry a new sequence.
+pub const MIN_REMOTE_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
+
+/// Heartbeats are an unreplicated local observation. They are not a shard epoch
+/// and must not schedule splits, membership changes, or leadership transfer.
+pub fn heartbeat_is_scheduling_truth() -> bool {
+    false
+}
+
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
 )]
@@ -146,6 +159,21 @@ pub fn decide_heartbeat(
                 .to_string(),
         );
     }
+    if let Some(previous) = existing {
+        if write.seq > previous.seq && write.seq - previous.seq > MAX_HEARTBEAT_SEQ_ADVANCE {
+            return Err(format!(
+                "heartbeat seq {} jumps {} past {}; the stored record was kept. A heartbeat is not a scheduling epoch",
+                write.seq,
+                write.seq - previous.seq,
+                previous.seq
+            ));
+        }
+    } else if write.seq > MAX_HEARTBEAT_SEQ_ADVANCE {
+        return Err(format!(
+            "initial heartbeat seq {} exceeds {MAX_HEARTBEAT_SEQ_ADVANCE}; the stored record was kept. A heartbeat is not a scheduling epoch",
+            write.seq
+        ));
+    }
     let stored = StoredHeartbeat {
         node_id: write.node_id,
         seq: write.seq,
@@ -179,6 +207,18 @@ pub fn decide_heartbeat(
         ));
     }
     Ok(HeartbeatDecision::Store(stored))
+}
+
+/// A new remote sequence inside the interval is rejected. An equal sequence is a
+/// replay or a conflict and is not rate-limited here.
+pub fn remote_heartbeat_is_too_soon(
+    previous_observed_unix_ms: u64,
+    now_ms: u64,
+    incoming_seq: u64,
+    stored_seq: u64,
+) -> bool {
+    incoming_seq != stored_seq
+        && now_ms.saturating_sub(previous_observed_unix_ms) < MIN_REMOTE_HEARTBEAT_INTERVAL_MS
 }
 
 fn same_body(stored: &StoredHeartbeat, write: &HeartbeatWrite) -> bool {
@@ -234,6 +274,14 @@ mod tests {
         assert!(decide_heartbeat(Some(&next), &write(1, None, &[4]))
             .unwrap_err()
             .contains("stale"));
+        let poisoned = decide_heartbeat(Some(&next), &write(u64::MAX, None, &[4])).unwrap_err();
+        assert!(poisoned.contains("jumps"), "{poisoned}");
+        let initial = decide_heartbeat(None, &write(u64::MAX, None, &[])).unwrap_err();
+        assert!(initial.contains("exceeds"), "{initial}");
+        assert!(remote_heartbeat_is_too_soon(1_000, 1_500, 2, 1));
+        assert!(!remote_heartbeat_is_too_soon(1_000, 1_500, 1, 1));
+        assert!(!remote_heartbeat_is_too_soon(1_000, 3_000, 2, 1));
+        assert!(!heartbeat_is_scheduling_truth());
     }
 
     #[test]

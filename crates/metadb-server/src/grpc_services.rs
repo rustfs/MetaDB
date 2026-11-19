@@ -1004,7 +1004,22 @@ impl ControlPlaneService for MetaDbGrpcService {
             }
         }
         let disk_free = req.disk_free_known.then_some(req.disk_free_bytes);
-        match cell.accept_remote_heartbeat(req.node_id, req.monotonic_seq, disk_free, reported) {
+        let instance_id = match metadb_proto::convert::decode_optional_u128_be(&req.instance_id) {
+            Ok(0) => None,
+            Ok(id) => Some(id),
+            Err(error) => {
+                return Ok(Response::new(StoreHeartbeatResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                }));
+            }
+        };
+        match cell.accept_remote_heartbeat(
+            req.node_id,
+            req.monotonic_seq,
+            disk_free,
+            reported,
+            instance_id,
+        ) {
             Ok(()) => Ok(Response::new(StoreHeartbeatResponse { error: None })),
             Err(error) => Ok(Response::new(StoreHeartbeatResponse {
                 error: Some(ErrorDetailProto::from(&error)),

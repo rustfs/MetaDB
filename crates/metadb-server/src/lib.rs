@@ -941,6 +941,14 @@ impl PersistentMetaDbCluster {
                 disk_free_known: heartbeat.disk_free_bytes.is_some(),
                 monotonic_seq: heartbeat.seq,
                 shards: Vec::new(),
+                instance_id: {
+                    let instance = self.cell_manager.node_instance_id();
+                    if instance == 0 {
+                        Vec::new()
+                    } else {
+                        metadb_proto::convert::encode_u128_be(instance).to_vec()
+                    }
+                },
             })
             .await
             .map_err(|error| {

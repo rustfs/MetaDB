@@ -23,7 +23,10 @@ pub use cell_manager::{
     SplitPlanRecord, SplitPlanState,
 };
 pub use control_plane::{CellId, CellLocalManager, GlobalManager, MetaCache, ShardRoute};
-pub use control_plane_state::{StoredHeartbeat, StoredPlacement, HEARTBEAT_INTERVAL_MS};
+pub use control_plane_state::{
+    heartbeat_is_scheduling_truth, StoredHeartbeat, StoredPlacement, HEARTBEAT_INTERVAL_MS,
+    MAX_HEARTBEAT_SEQ_ADVANCE,
+};
 pub use global_manager::DurableGlobalManager;
 pub use id_allocator::{
     AllocIdKind, DurableIdAllocator, LocalIdBuffer, CELL_DIR_AFFINITY_BLOCK_SIZE,
@@ -32,9 +35,10 @@ pub use id_allocator::{
 pub use identity::{node_id_in_ha_range, ClusterIdentity, CLUSTER_IDENTITY_FILE};
 pub use jumbo::JumboIsolationPlanner;
 pub use jumbo_placement::{
-    fault_tolerance, jumbo_membership_change_allowed, plan_jumbo_placement, CommittedMove,
-    MembershipRefusal, PlacementAction, PlacementDecision, PlacementObservation, PlacementPhase,
-    ShardVoters,
+    automatic_leadership_transfer_allowed, executable_placement_actions, fault_tolerance,
+    jumbo_membership_change_allowed, leadership_move_recorded, plan_jumbo_placement,
+    transfer_poll_covers_election, CommittedMove, MembershipRefusal, PlacementAction,
+    PlacementDecision, PlacementObservation, PlacementPhase, ShardVoters,
 };
 pub use meta_cache::{CompositeMetaCache, CompositeShardRoute};
 pub use shard::{

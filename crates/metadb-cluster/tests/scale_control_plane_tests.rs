@@ -57,24 +57,25 @@ async fn heartbeat_survives_reopen_and_a_lower_sequence_does_not_replace_it() {
     );
     let second = cell.publish_local_heartbeat().unwrap();
     assert_eq!(second.seq, 2);
-    let stale = cell.accept_remote_heartbeat(1, 1, None, vec![999]);
+    let stale = cell.accept_remote_heartbeat(1, 1, None, vec![999], None);
     assert!(
         stale.is_err(),
         "the local node does not accept its own remote heartbeat"
     );
     cell.register_node(4, "127.0.0.1:4".to_string()).unwrap();
-    cell.accept_remote_heartbeat(4, 3, Some(8), vec![999, 999])
+    cell.accept_remote_heartbeat(4, 3, Some(8), vec![999, 999], None)
         .unwrap();
     let peer = cell.stored_heartbeat(4).unwrap();
     assert_eq!(peer.reported_shard_ids, vec![999]);
     assert!(cell.list_routes().iter().all(|route| route.shard_id != 999));
-    let conflict = cell.accept_remote_heartbeat(4, 3, Some(9), vec![999]);
+    let conflict = cell.accept_remote_heartbeat(4, 3, Some(9), vec![999], None);
     assert!(conflict.unwrap_err().to_string().contains("conflicts"));
     assert_eq!(cell.stored_heartbeat(4).unwrap().disk_free_bytes, Some(8));
-    let older = cell.accept_remote_heartbeat(4, 2, Some(8), vec![999]);
+    let older = cell.accept_remote_heartbeat(4, 2, Some(8), vec![999], None);
     assert!(older.unwrap_err().to_string().contains("stale"));
+    cell.testing_age_stored_heartbeat(4, 5_000);
     cell.testing_fail_next_control_persists(1);
-    let failed = cell.accept_remote_heartbeat(4, 4, Some(8), vec![999]);
+    let failed = cell.accept_remote_heartbeat(4, 4, Some(8), vec![999], None);
     assert!(failed.is_err());
     assert_eq!(cell.stored_heartbeat(4).unwrap().seq, 3);
 
@@ -108,6 +109,11 @@ async fn single_voter_jumbo_placement_does_not_change_membership() {
     assert_eq!(local.phase, PlacementPhase::LeaderOnDedicated);
     assert_ne!(local.phase, PlacementPhase::DedicatedNodeNotShared);
     assert!(local.committed_moves.is_empty(), "{local:?}");
+    assert!(
+        !metadb_cluster::leadership_move_recorded(false, true),
+        "an already-correct leader is not this process's LeadershipTransferred"
+    );
+    assert!(!metadb_cluster::automatic_leadership_transfer_allowed());
     assert!(
         local.blocked_reason.contains("proven voter")
             || local.blocked_reason.contains("fault tolerance"),
@@ -176,4 +182,58 @@ async fn a_corrupt_control_plane_file_refuses_to_open() {
         text.contains("CELL_CONTROL_PLANE") || text.contains("checksum"),
         "{text}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn directory_sync_failure_after_rename_keeps_the_new_sequence() {
+    let dir = tempdir().unwrap();
+    let (host, cell) = open_cell(dir.path()).await;
+    assert_eq!(cell.publish_local_heartbeat().unwrap().seq, 1);
+    cell.testing_fail_next_control_dirsync(1);
+    let failed = cell.publish_local_heartbeat().unwrap_err();
+    assert!(failed.to_string().contains("directory sync"), "{failed}");
+    assert_eq!(
+        cell.stored_heartbeat(1).unwrap().seq,
+        2,
+        "a renamed control file must stay in memory"
+    );
+    assert_eq!(cell.publish_local_heartbeat().unwrap().seq, 3);
+    host.shutdown_all().await.unwrap();
+    drop(cell);
+    drop(host);
+
+    let (host, cell) = open_cell(dir.path()).await;
+    assert_eq!(cell.stored_heartbeat(1).unwrap().seq, 3);
+    host.shutdown_all().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_heartbeat_rejects_a_poison_sequence_and_a_fast_repeat() {
+    let dir = tempdir().unwrap();
+    let (host, cell) = open_cell(dir.path()).await;
+    cell.register_node(4, "127.0.0.1:4".to_string()).unwrap();
+    cell.accept_remote_heartbeat(4, 1, None, Vec::new(), None)
+        .unwrap();
+    let too_soon = cell
+        .accept_remote_heartbeat(4, 2, None, Vec::new(), None)
+        .unwrap_err();
+    assert!(too_soon.to_string().contains("rate"), "{too_soon}");
+    assert_eq!(cell.stored_heartbeat(4).unwrap().seq, 1);
+    let poisoned = cell
+        .accept_remote_heartbeat(4, u64::MAX, None, Vec::new(), None)
+        .unwrap_err();
+    assert!(
+        poisoned.to_string().contains("jumps") || poisoned.to_string().contains("exceeds"),
+        "{poisoned}"
+    );
+    assert_eq!(cell.stored_heartbeat(4).unwrap().seq, 1);
+    cell.testing_age_stored_heartbeat(4, 5_000);
+    cell.accept_remote_heartbeat(4, 2, None, Vec::new(), None)
+        .unwrap();
+    assert_eq!(cell.stored_heartbeat(4).unwrap().seq, 2);
+    assert!(!metadb_cluster::heartbeat_is_scheduling_truth());
+    assert!(!metadb_cluster::automatic_leadership_transfer_allowed());
+    assert!(!metadb_cluster::leadership_move_recorded(false, true));
+    assert!(!metadb_cluster::transfer_poll_covers_election(3_000, 5_000));
+    host.shutdown_all().await.unwrap();
 }

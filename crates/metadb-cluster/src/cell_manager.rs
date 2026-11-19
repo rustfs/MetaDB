@@ -27,16 +27,17 @@ use metadb_storage::LsmEngineConfig;
 use metadb_tx::{RoutedShardHandle, TxStateMachineHandler};
 
 use crate::control_plane_state::{
-    decide_heartbeat, normalize_ids, unix_ms, HeartbeatDecision, HeartbeatWrite,
-    PersistedControlPlane, StoredHeartbeat, StoredPlacement, CONTROL_PLANE_FILE,
+    decide_heartbeat, normalize_ids, remote_heartbeat_is_too_soon, unix_ms, HeartbeatDecision,
+    HeartbeatWrite, PersistedControlPlane, StoredHeartbeat, StoredPlacement, CONTROL_PLANE_FILE,
     CONTROL_PLANE_VERSION, PLACEMENT_RETRY_MS,
 };
 use crate::id_allocator::{AllocIdKind, DurableIdAllocator};
 use crate::identity::{node_id_in_ha_range, ClusterIdentity};
 use crate::jumbo::JumboIsolationPlanner;
 use crate::jumbo_placement::{
+    automatic_leadership_transfer_allowed, executable_placement_actions,
     jumbo_membership_change_allowed, plan_jumbo_placement, CommittedMove, PlacementAction,
-    PlacementObservation, PlacementPhase, ShardVoters,
+    PlacementObservation, PlacementPhase, ShardVoters, AUTOMATIC_TRANSFER_DISABLED_REASON,
 };
 use crate::meta_cache::{CompositeMetaCache, CompositeShardRoute};
 use crate::shard::{ShardHealthState, ShardSplitMode};
@@ -149,6 +150,8 @@ pub struct DurableCellManager {
     control: Mutex<PersistedControlPlane>,
     /// Test hook: the next `n` `CELL_CONTROL_PLANE` persists fail before touching disk.
     fail_control_persists: AtomicU32,
+    /// Test hook: the next `n` persists rename the file and then fail the directory sync.
+    fail_control_dirsync: AtomicU32,
 }
 
 impl DurableCellManager {
@@ -292,6 +295,7 @@ impl DurableCellManager {
             instance_bindings: Arc::new(Mutex::new(BTreeMap::new())),
             control: Mutex::new(control_plane),
             fail_control_persists: AtomicU32::new(0),
+            fail_control_dirsync: AtomicU32::new(0),
         });
 
         if let Err(error) = mgr.boot_local_shards().await {
@@ -402,6 +406,7 @@ impl DurableCellManager {
             instance_bindings: Arc::new(Mutex::new(BTreeMap::new())),
             control: Mutex::new(control_plane),
             fail_control_persists: AtomicU32::new(0),
+            fail_control_dirsync: AtomicU32::new(0),
         }))
     }
 
@@ -1921,6 +1926,19 @@ impl DurableCellManager {
         self.fail_control_persists.store(n, Ordering::Relaxed);
     }
 
+    /// The next `n` control-plane writes rename the file and then fail `sync_dir`.
+    pub fn testing_fail_next_control_dirsync(&self, n: u32) {
+        self.fail_control_dirsync.store(n, Ordering::Relaxed);
+    }
+
+    /// Moves one stored heartbeat's observation time backward in memory only.
+    /// The sequence is unchanged. Tests use this to open the remote rate window.
+    pub fn testing_age_stored_heartbeat(&self, node_id: NodeId, earlier_by_ms: u64) {
+        if let Some(heartbeat) = self.control.lock().unwrap().heartbeats.get_mut(&node_id) {
+            heartbeat.observed_unix_ms = heartbeat.observed_unix_ms.saturating_sub(earlier_by_ms);
+        }
+    }
+
     pub fn stored_heartbeat(&self, node_id: NodeId) -> Option<StoredHeartbeat> {
         self.control
             .lock()
@@ -2009,8 +2027,7 @@ impl DurableCellManager {
                 let mut next = guard.clone();
                 next.heartbeats.insert(me, heartbeat.clone());
                 next.next_local_seq = seq.saturating_add(1);
-                self.persist_control(&next)?;
-                *guard = next;
+                self.store_control(&mut guard, next)?;
                 Ok(heartbeat)
             }
         }
@@ -2024,6 +2041,7 @@ impl DurableCellManager {
         seq: u64,
         disk_free_bytes: Option<u64>,
         reported_shard_ids: Vec<ShardId>,
+        instance_id: Option<u128>,
     ) -> Result<()> {
         node_id_in_ha_range(node_id)?;
         if node_id == self.host.node_id() {
@@ -2038,6 +2056,13 @@ impl DurableCellManager {
                 return Err(MetaDbError::ShardRoutingError(format!(
                     "node {node_id} is not registered; client shard descriptors are not applied to routes"
                 )));
+            }
+            if let Some(bound) = state.node_instances.get(&node_id).copied() {
+                if instance_id != Some(bound) {
+                    return Err(MetaDbError::ShardRoutingError(format!(
+                        "heartbeat for node {node_id} does not carry the bound instance; registration is not a TransferLeader capability and this record is not a shard epoch"
+                    )));
+                }
             }
         }
         let reported = normalize_ids(reported_shard_ids).map_err(MetaDbError::ShardRoutingError)?;
@@ -2055,11 +2080,22 @@ impl DurableCellManager {
         match decision {
             HeartbeatDecision::Replay(_) => Ok(()),
             HeartbeatDecision::Store(heartbeat) => {
+                if let Some(previous) = guard.heartbeats.get(&node_id) {
+                    if remote_heartbeat_is_too_soon(
+                        previous.observed_unix_ms,
+                        write.observed_unix_ms,
+                        write.seq,
+                        previous.seq,
+                    ) {
+                        return Err(MetaDbError::ShardRoutingError(
+                            "heartbeat rate limit; the stored record was kept. A heartbeat is not a scheduling epoch"
+                                .to_string(),
+                        ));
+                    }
+                }
                 let mut next = guard.clone();
                 next.heartbeats.insert(node_id, heartbeat);
-                self.persist_control(&next)?;
-                *guard = next;
-                Ok(())
+                self.store_control(&mut guard, next)
             }
         }
     }
@@ -2081,7 +2117,7 @@ impl DurableCellManager {
             .as_ref()
             .map(|record| record.committed_moves.clone())
             .unwrap_or_default();
-        let mut transfer_attempt = previous
+        let transfer_attempt = previous
             .as_ref()
             .map(|record| record.last_transfer_attempt_unix_ms)
             .unwrap_or(0);
@@ -2111,7 +2147,27 @@ impl DurableCellManager {
                 self.sync_route_voters_from_raft(shard.shard_id)?;
             }
             let decision = plan_jumbo_placement(&observation);
-            let Some(action) = decision.actions.first().cloned() else {
+            let actions = executable_placement_actions(&decision.actions);
+            if !automatic_leadership_transfer_allowed()
+                && decision
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action, PlacementAction::TransferLeadership { .. }))
+            {
+                let reason =
+                    append_reason(&decision.blocked_reason, AUTOMATIC_TRANSFER_DISABLED_REASON);
+                return self.finish_placement(placement_record(
+                    shard_id,
+                    dominant_pid,
+                    dedicated_node,
+                    PlacementPhase::Blocked,
+                    reason,
+                    committed_moves,
+                    transfer_attempt,
+                    replace_attempt,
+                ));
+            }
+            let Some(action) = actions.first().cloned() else {
                 return self.finish_placement(placement_record(
                     shard_id,
                     dominant_pid,
@@ -2136,62 +2192,16 @@ impl DurableCellManager {
                 ));
             }
             match action {
-                PlacementAction::TransferLeadership {
-                    shard_id: target,
-                    to,
-                } => {
-                    let now = unix_ms();
-                    if transfer_attempt != 0
-                        && now.saturating_sub(transfer_attempt) < PLACEMENT_RETRY_MS
-                    {
-                        let reason = append_reason(
-                            &decision.blocked_reason,
-                            "leadership transfer is in cooldown and was not submitted again",
-                        );
-                        return self.finish_placement(placement_record(
-                            shard_id,
-                            dominant_pid,
-                            dedicated_node,
-                            PlacementPhase::Recorded,
-                            reason,
-                            committed_moves,
-                            transfer_attempt,
-                            replace_attempt,
-                        ));
-                    }
-                    transfer_attempt = now;
-                    self.save_placement(&placement_record(
-                        shard_id,
-                        dominant_pid,
-                        dedicated_node,
-                        decision.phase,
-                        decision.blocked_reason.clone(),
-                        committed_moves.clone(),
-                        transfer_attempt,
-                        replace_attempt,
-                    ))?;
-                    let moved = self.transfer_leadership(target, to).await?;
-                    if moved {
-                        push_move(
-                            &mut committed_moves,
-                            CommittedMove::LeadershipTransferred {
-                                shard_id: target,
-                                to,
-                            },
-                        );
-                        continue;
-                    }
-                    let reason = append_reason(
-                        &decision.blocked_reason,
-                        &format!(
-                            "transfer_leader to {to} did not make that node the leader within 3s; the move is not recorded as committed"
-                        ),
-                    );
+                PlacementAction::TransferLeadership { .. } => {
+                    // Unreachable while automatic transfer is disabled. The filter
+                    // above drops the variant. Do not call `trigger().transfer_leader`.
+                    let reason =
+                        append_reason(&decision.blocked_reason, AUTOMATIC_TRANSFER_DISABLED_REASON);
                     return self.finish_placement(placement_record(
                         shard_id,
                         dominant_pid,
                         dedicated_node,
-                        PlacementPhase::Recorded,
+                        PlacementPhase::Blocked,
                         reason,
                         committed_moves,
                         transfer_attempt,
@@ -2234,7 +2244,10 @@ impl DurableCellManager {
                         replace_attempt,
                     ))?;
                     match self.replace_dedicated_voter(target, remove, add).await {
-                        Ok(true) => {
+                        ReplaceOutcome::NotProposed => {}
+                        ReplaceOutcome::Committed {
+                            route_persist_error,
+                        } => {
                             push_move(
                                 &mut committed_moves,
                                 CommittedMove::VoterReplaced {
@@ -2243,13 +2256,31 @@ impl DurableCellManager {
                                     added: add,
                                 },
                             );
+                            let reason = match &route_persist_error {
+                                Some(error) => format!(
+                                    "membership committed but the route record failed to persist: {error}; committed_moves keeps VoterReplaced"
+                                ),
+                                None => decision.blocked_reason.clone(),
+                            };
+                            self.save_placement(&placement_record(
+                                shard_id,
+                                dominant_pid,
+                                dedicated_node,
+                                decision.phase,
+                                reason,
+                                committed_moves.clone(),
+                                transfer_attempt,
+                                replace_attempt,
+                            ))?;
+                            if let Some(error) = route_persist_error {
+                                return Err(error);
+                            }
                         }
-                        Ok(false) => {}
-                        Err(error) => {
+                        ReplaceOutcome::Rejected(error) => {
                             let reason = append_reason(
                                 &decision.blocked_reason,
                                 &format!(
-                                    "peer voter replacement failed: {error}; voters were not reported as drained"
+                                    "peer voter replacement was not committed: {error}; no VoterReplaced was recorded"
                                 ),
                             );
                             return self.finish_placement(placement_record(
@@ -2342,94 +2373,112 @@ impl DurableCellManager {
         self.persist_voter_set(shard_id, &live, group.current_epoch())
     }
 
-    async fn transfer_leadership(&self, shard_id: ShardId, to: NodeId) -> Result<bool> {
-        let (_, group, _) = self.lookup_local_handle(shard_id)?;
-        if group.current_leader() == Some(to) {
-            return Ok(true);
-        }
-        if group.current_leader() != Some(self.host.node_id()) {
-            return Ok(false);
-        }
-        let voters = group.uniform_voter_addrs()?;
-        if !voters.contains_key(&to) {
-            return Err(MetaDbError::ConsensusError(format!(
-                "refusing to transfer leadership of shard {shard_id} to node {to}; that node is not a voter"
-            )));
-        }
-        group
-            .raft()
-            .trigger()
-            .transfer_leader(to)
-            .await
-            .map_err(|error| {
-                MetaDbError::ConsensusError(format!("transfer_leader({to}) failed: {error}"))
-            })?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            if group.current_leader() == Some(to) {
-                return Ok(true);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(false);
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    /// `Ok(true)` only after the committed voter set is the planned set.
-    /// `Ok(false)` means this process did not propose a change.
+    /// Does not call `trigger().transfer_leader`. An already-correct leader is not a
+    /// committed move. A matching voter set that this call did not propose is
+    /// [`ReplaceOutcome::NotProposed`].
     async fn replace_dedicated_voter(
         &self,
         shard_id: ShardId,
         remove: NodeId,
         add: NodeId,
-    ) -> Result<bool> {
-        let (_, group, _) = self.lookup_local_handle(shard_id)?;
+    ) -> ReplaceOutcome {
+        let (_, group, _) = match self.lookup_local_handle(shard_id) {
+            Ok(handle) => handle,
+            Err(error) => return ReplaceOutcome::Rejected(error),
+        };
         if group.current_leader() != Some(self.host.node_id()) {
-            return Ok(false);
+            return ReplaceOutcome::NotProposed;
         }
-        let current = group.uniform_voter_addrs()?;
+        let current = match group.uniform_voter_addrs() {
+            Ok(voters) => voters,
+            Err(error) => return ReplaceOutcome::Rejected(error),
+        };
         let old: BTreeSet<NodeId> = current.keys().copied().collect();
         if !old.contains(&remove) {
-            return Ok(false);
+            return ReplaceOutcome::NotProposed;
         }
         let mut proposed = old.clone();
         proposed.remove(&remove);
         proposed.insert(add);
-        jumbo_membership_change_allowed(&old, &proposed).map_err(|refusal| {
-            MetaDbError::ConsensusError(format!(
+        if let Err(refusal) = jumbo_membership_change_allowed(&old, &proposed) {
+            return ReplaceOutcome::Rejected(MetaDbError::ConsensusError(format!(
                 "refusing jumbo voter change on shard {shard_id}: {refusal:?}"
-            ))
-        })?;
-        if !self.node_is_proven_voter(add)? {
-            return Err(MetaDbError::ConsensusError(format!(
+            )));
+        }
+        let proven = match self.node_is_proven_voter(add) {
+            Ok(proven) => proven,
+            Err(error) => return ReplaceOutcome::Rejected(error),
+        };
+        if !proven {
+            return ReplaceOutcome::Rejected(MetaDbError::ConsensusError(format!(
                 "refusing to add node {add} on shard {shard_id}; it is not already a voter of a local shard"
             )));
         }
-        if current.contains_key(&add) {
-            ConfChangeOrchestrator::change_voters(group.raft(), proposed.clone()).await?;
+        let proposed_change = if current.contains_key(&add) {
+            ConfChangeOrchestrator::change_voters(group.raft(), proposed.clone()).await
         } else {
-            let addr = self.proven_voter_addr(add)?;
-            let min_matched = group.prepare_learner_snapshot().await?;
-            ConfChangeOrchestrator::add_learners_and_promote_voters(
-                group.raft(),
-                &[(add, addr)],
-                proposed.clone(),
-                64,
-                Duration::from_secs(20),
-                min_matched,
-            )
-            .await?;
+            match self.proven_voter_addr(add) {
+                Ok(addr) => match group.prepare_learner_snapshot().await {
+                    Ok(min_matched) => {
+                        ConfChangeOrchestrator::add_learners_and_promote_voters(
+                            group.raft(),
+                            &[(add, addr)],
+                            proposed.clone(),
+                            64,
+                            Duration::from_secs(20),
+                            min_matched,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = proposed_change {
+            return self.finish_replace_after_proposal(group.as_ref(), &proposed, error);
         }
-        let committed = group.wait_uniform_voter_addrs().await?;
+        match group.wait_uniform_voter_addrs().await {
+            Ok(committed) => self.committed_replace(shard_id, group.as_ref(), &proposed, committed),
+            Err(error) => self.finish_replace_after_proposal(group.as_ref(), &proposed, error),
+        }
+    }
+
+    fn finish_replace_after_proposal(
+        &self,
+        group: &metadb_raft::ShardRaftGroup,
+        proposed: &BTreeSet<NodeId>,
+        error: MetaDbError,
+    ) -> ReplaceOutcome {
+        match group.uniform_voter_addrs() {
+            Ok(live) if live.keys().copied().collect::<BTreeSet<_>>() == *proposed => {
+                self.committed_replace(group.shard_id(), group, proposed, live)
+            }
+            _ => ReplaceOutcome::Rejected(error),
+        }
+    }
+
+    fn committed_replace(
+        &self,
+        shard_id: ShardId,
+        group: &metadb_raft::ShardRaftGroup,
+        proposed: &BTreeSet<NodeId>,
+        committed: BTreeMap<NodeId, String>,
+    ) -> ReplaceOutcome {
         let committed_ids: BTreeSet<NodeId> = committed.keys().copied().collect();
-        if committed_ids != proposed {
-            return Err(MetaDbError::ConsensusError(format!(
-                "shard {shard_id} committed voters {committed_ids:?} but the plan required {proposed:?}; the placement is not marked drained"
+        if committed_ids != *proposed {
+            return ReplaceOutcome::Rejected(MetaDbError::ConsensusError(format!(
+                "shard {shard_id} voters {committed_ids:?} are not the planned set {proposed:?}; no VoterReplaced was recorded"
             )));
         }
-        self.persist_voter_set(shard_id, &committed, group.current_epoch())?;
-        Ok(true)
+        match self.persist_voter_set(shard_id, &committed, group.current_epoch()) {
+            Ok(()) => ReplaceOutcome::Committed {
+                route_persist_error: None,
+            },
+            Err(error) => ReplaceOutcome::Committed {
+                route_persist_error: Some(error),
+            },
+        }
     }
 
     fn node_is_proven_voter(&self, node_id: NodeId) -> Result<bool> {
@@ -2478,25 +2527,51 @@ impl DurableCellManager {
         }
         let mut next = guard.clone();
         next.placements.insert(record.shard_id, record.clone());
-        self.persist_control(&next)?;
-        *guard = next;
-        Ok(())
+        self.store_control(&mut guard, next)
     }
 
-    fn persist_control(&self, state: &PersistedControlPlane) -> Result<()> {
+    /// Installs `next` when the new file is the visible directory entry, including
+    /// when the directory fsync fails after rename. A later persist then continues
+    /// from that state instead of writing the previous sequence back over it.
+    fn store_control(
+        &self,
+        guard: &mut PersistedControlPlane,
+        next: PersistedControlPlane,
+    ) -> Result<()> {
+        match self.persist_control(&next) {
+            Ok(()) => {
+                *guard = next;
+                Ok(())
+            }
+            Err(ControlPersistError::NotVisible(error)) => Err(error),
+            Err(ControlPersistError::VisibleDirSyncFailed(error)) => {
+                *guard = next;
+                Err(error)
+            }
+        }
+    }
+
+    fn persist_control(
+        &self,
+        state: &PersistedControlPlane,
+    ) -> std::result::Result<(), ControlPersistError> {
         if state.version != CONTROL_PLANE_VERSION {
-            return Err(MetaDbError::CodecError(format!(
-                "{CONTROL_PLANE_FILE} version {} is not supported",
-                state.version
+            return Err(ControlPersistError::NotVisible(MetaDbError::CodecError(
+                format!(
+                    "{CONTROL_PLANE_FILE} version {} is not supported",
+                    state.version
+                ),
             )));
         }
         if self.fail_control_persists.load(Ordering::Relaxed) > 0 {
             self.fail_control_persists.fetch_sub(1, Ordering::Relaxed);
-            return Err(MetaDbError::StorageIoError(
-                "injected CELL_CONTROL_PLANE persist failure".to_string(),
+            return Err(ControlPersistError::NotVisible(
+                MetaDbError::StorageIoError(
+                    "injected CELL_CONTROL_PLANE persist failure".to_string(),
+                ),
             ));
         }
-        Self::write_control_file(&self.state_dir, state)
+        self.write_control_file(&self.state_dir, state)
     }
 
     fn load_control_plane(dir: &Path) -> Result<PersistedControlPlane> {
@@ -2518,19 +2593,26 @@ impl DurableCellManager {
         Ok(state)
     }
 
-    fn write_control_file(dir: &Path, state: &PersistedControlPlane) -> Result<()> {
+    fn write_control_file(
+        &self,
+        dir: &Path,
+        state: &PersistedControlPlane,
+    ) -> std::result::Result<(), ControlPersistError> {
         let _shard_set = if dir
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("cell_"))
         {
             let root = dir.parent().unwrap_or_else(|| Path::new("."));
-            Some(metadb_raft::backup::lock_be_shard_set(&root.join("be"))?)
+            metadb_raft::backup::lock_be_shard_set(&root.join("be"))
+                .map(Some)
+                .map_err(ControlPersistError::NotVisible)?
         } else {
             None
         };
-        let mut raw =
-            codec::serialize(state).map_err(|error| MetaDbError::CodecError(error.to_string()))?;
+        let mut raw = codec::serialize(state).map_err(|error| {
+            ControlPersistError::NotVisible(MetaDbError::CodecError(error.to_string()))
+        })?;
         append_crc32c_le(&mut raw);
         let tmp = dir.join(format!("{CONTROL_PLANE_FILE}.tmp"));
         let dst = dir.join(CONTROL_PLANE_FILE);
@@ -2539,12 +2621,27 @@ impl DurableCellManager {
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(&tmp)?;
-            file.write_all(&raw)?;
-            file.sync_data()?;
+                .open(&tmp)
+                .map_err(|error| ControlPersistError::NotVisible(error.into()))?;
+            file.write_all(&raw)
+                .map_err(|error| ControlPersistError::NotVisible(error.into()))?;
+            file.sync_data()
+                .map_err(|error| ControlPersistError::NotVisible(error.into()))?;
         }
-        fs::rename(&tmp, &dst)?;
-        sync_dir(dir)?;
+        fs::rename(&tmp, &dst).map_err(|error| ControlPersistError::NotVisible(error.into()))?;
+        if self.fail_control_dirsync.load(Ordering::Relaxed) > 0 {
+            self.fail_control_dirsync.fetch_sub(1, Ordering::Relaxed);
+            return Err(ControlPersistError::VisibleDirSyncFailed(
+                MetaDbError::StorageIoError(
+                    "injected CELL_CONTROL_PLANE directory sync failure after rename".to_string(),
+                ),
+            ));
+        }
+        sync_dir(dir).map_err(|error| {
+            ControlPersistError::VisibleDirSyncFailed(MetaDbError::StorageIoError(format!(
+                "CELL_CONTROL_PLANE directory sync failed after rename: {error}"
+            )))
+        })?;
         Ok(())
     }
 
@@ -2598,6 +2695,27 @@ impl DurableCellManager {
         sync_dir(dir)?;
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+enum ControlPersistError {
+    /// The previous file is still the visible record. Memory must stay unchanged.
+    NotVisible(MetaDbError),
+    /// `rename` has published the new file. Memory must keep that state so a later
+    /// persist cannot write an older sequence over it. The directory fsync did not finish.
+    VisibleDirSyncFailed(MetaDbError),
+}
+
+enum ReplaceOutcome {
+    /// This call did not propose a voter change. An already-matching set is observation.
+    NotProposed,
+    /// Raft's uniform voter set matches the plan. `route_persist_error` is set when
+    /// that fact did not reach `CELL_MANAGER_STATE`.
+    Committed {
+        route_persist_error: Option<MetaDbError>,
+    },
+    /// No matching voter set was observed. Do not record `VoterReplaced`.
+    Rejected(MetaDbError),
 }
 
 #[allow(clippy::too_many_arguments)]

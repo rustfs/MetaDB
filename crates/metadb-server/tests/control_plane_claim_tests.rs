@@ -19,6 +19,7 @@ fn heartbeat_request(seq: u64, node_id: u64, disk_free_bytes: u64) -> StoreHeart
         disk_free_bytes,
         monotonic_seq: seq,
         disk_free_known: true,
+        instance_id: Vec::new(),
         shards: vec![ShardHeartbeatStatsProto {
             descriptor: Some(ShardDescriptorProto {
                 cell_id: 1,
@@ -92,6 +93,7 @@ async fn control_plane_does_not_pretend_missing_topology_ops_succeeded() {
             disk_free_bytes: 1,
             monotonic_seq: 1,
             disk_free_known: true,
+            instance_id: Vec::new(),
             shards: vec![ShardHeartbeatStatsProto {
                 descriptor: Some(ShardDescriptorProto {
                     cell_id: 1,
@@ -178,6 +180,9 @@ async fn control_plane_does_not_pretend_missing_topology_ops_succeeded() {
             .disk_free_bytes,
         Some(4)
     );
+    cluster
+        .cell_manager()
+        .testing_age_stored_heartbeat(7, 5_000);
     cluster.cell_manager().testing_fail_next_control_persists(1);
     let failed = svc
         .store_heartbeat(Request::new(heartbeat_request(2, 7, 4)))

@@ -1,9 +1,9 @@
 //! Membership-safe Jumbo placement decisions.
 //!
 //! `JumboIsolated` on a route is a detection flag. It does not by itself move a replica.
-//! This module plans the only moves this increment will attempt:
-//! leadership transfer onto a node that is already a voter, and a same-size voter
-//! replacement that keeps Raft fault tolerance and an old-majority overlap.
+//! This module plans a same-size voter replacement that keeps Raft fault tolerance
+//! and an old-majority overlap. Automatic leadership transfer is not planned:
+//! OpenRaft disables the leader lease before peers answer `TransferLeader`.
 //!
 //! A plan that cannot do either is `Blocked` or `LeaderOnDedicated` with a reason.
 //! Neither of those is a completed eviction.
@@ -36,8 +36,47 @@ pub struct PlacementObservation {
     pub reserved_dedicated_nodes: BTreeSet<NodeId>,
 }
 
+/// OpenRaft 0.10 `trigger().transfer_leader` marks the transfer and disables the
+/// leader lease before any peer answers `TransferLeader`. Older peers do not
+/// implement that RPC. Registration in the node map is not proof that they do.
+/// Automatic transfer stays off until a check that does not touch the lease can
+/// show every current voter implements it.
+pub const AUTOMATIC_LEADERSHIP_TRANSFER_ENABLED: bool = false;
+
+pub const AUTOMATIC_TRANSFER_DISABLED_REASON: &str = "automatic leadership transfer is disabled; peer TransferLeader capability is unknown, and OpenRaft disables the leader lease before the RPC is known to succeed. Node registration is not that capability";
+
+pub fn automatic_leadership_transfer_allowed() -> bool {
+    AUTOMATIC_LEADERSHIP_TRANSFER_ENABLED
+}
+
+/// A transfer poll shorter than the configured election timeout can return while
+/// OpenRaft is still rejecting writes. Pull request #38 (`f55cc6cf`) loads
+/// `election_timeout_max_ms`. This process does not start that poll.
+pub fn transfer_poll_covers_election(poll_ms: u64, election_timeout_max_ms: u64) -> bool {
+    election_timeout_max_ms > 0 && poll_ms >= election_timeout_max_ms
+}
+
+/// `committed_moves` records only a transfer this process initiated and then
+/// observed on the target. An already-correct leader is observation, not our move.
+pub fn leadership_move_recorded(initiated_transfer: bool, target_became_leader: bool) -> bool {
+    initiated_transfer && target_became_leader
+}
+
+/// Drops leadership transfer unless [`automatic_leadership_transfer_allowed`] is true.
+pub fn executable_placement_actions(actions: &[PlacementAction]) -> Vec<PlacementAction> {
+    actions
+        .iter()
+        .filter(|action| match action {
+            PlacementAction::TransferLeadership { .. } => automatic_leadership_transfer_allowed(),
+            PlacementAction::ReplaceDedicatedOnPeer { .. } => true,
+        })
+        .cloned()
+        .collect()
+}
+
 /// One Raft action the executor may attempt. The planner never emits an action that
 /// drops fault tolerance or addresses a node that has not already joined a shard.
+/// `TransferLeadership` is not executable while automatic transfer is disabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlacementAction {
     TransferLeadership {
@@ -169,14 +208,8 @@ pub fn plan_jumbo_placement(obs: &PlacementObservation) -> PlacementDecision {
 
     let mut actions = Vec::new();
     let leader_here = jumbo.leader == Some(obs.dedicated_node);
-    if !leader_here {
-        if jumbo.leader.is_none() {
-            return blocked("jumbo shard has no current leader; leadership was not transferred");
-        }
-        actions.push(PlacementAction::TransferLeadership {
-            shard_id: jumbo.shard_id,
-            to: obs.dedicated_node,
-        });
+    if !leader_here && jumbo.leader.is_none() {
+        return blocked("jumbo shard has no current leader; transfer_leader was not called");
     }
 
     let mut reasons = Vec::new();
@@ -205,26 +238,21 @@ pub fn plan_jumbo_placement(obs: &PlacementObservation) -> PlacementDecision {
                 .to_string(),
         );
     }
+    if !leader_here {
+        reasons.push(AUTOMATIC_TRANSFER_DISABLED_REASON.to_string());
+    }
 
-    let phase = if !leader_here && jumbo.leader.is_some() {
-        PlacementPhase::Recorded
-    } else if reasons.is_empty() && other_shards > 0 && leader_here {
+    let replace_pending = actions
+        .iter()
+        .any(|action| matches!(action, PlacementAction::ReplaceDedicatedOnPeer { .. }));
+    let phase = if !leader_here {
+        PlacementPhase::Blocked
+    } else if reasons.is_empty() && other_shards > 0 && !replace_pending {
         PlacementPhase::DedicatedNodeNotShared
     } else if leader_here {
         PlacementPhase::LeaderOnDedicated
     } else {
         PlacementPhase::Blocked
-    };
-
-    // A replacement that has not been applied yet is not the unshared condition.
-    let phase = if actions
-        .iter()
-        .any(|action| matches!(action, PlacementAction::ReplaceDedicatedOnPeer { .. }))
-        && phase == PlacementPhase::DedicatedNodeNotShared
-    {
-        PlacementPhase::LeaderOnDedicated
-    } else {
-        phase
     };
 
     PlacementDecision {
@@ -347,23 +375,37 @@ mod tests {
     }
 
     #[test]
-    fn uniform_three_voters_transfer_leadership_and_refuse_to_shrink() {
+    fn uniform_three_voters_do_not_transfer_or_shrink() {
         let decision = plan_jumbo_placement(&obs(
             2,
             vec![shard(1, &[1, 2, 3], Some(1)), shard(2, &[1, 2, 3], Some(1))],
             &[1, 2, 3],
         ));
-        assert_eq!(decision.phase, PlacementPhase::Recorded);
-        assert_eq!(
-            decision.actions,
-            vec![PlacementAction::TransferLeadership { shard_id: 1, to: 2 }]
-        );
+        assert_eq!(decision.phase, PlacementPhase::Blocked);
         assert!(
-            decision.blocked_reason.contains("fault tolerance")
-                || decision.blocked_reason.contains("proven voter"),
+            decision
+                .actions
+                .iter()
+                .all(|action| !matches!(action, PlacementAction::TransferLeadership { .. })),
+            "{decision:?}"
+        );
+        assert!(executable_placement_actions(&decision.actions).is_empty());
+        assert!(
+            decision
+                .blocked_reason
+                .contains("automatic leadership transfer is disabled"),
             "{}",
             decision.blocked_reason
         );
+        assert!(!automatic_leadership_transfer_allowed());
+        assert!(!leadership_move_recorded(false, true));
+        assert!(leadership_move_recorded(true, true));
+        // #38 can set election_timeout_max_ms above a 3s poll. Covering the
+        // timeout is not enough to enable transfer.
+        assert!(!transfer_poll_covers_election(3_000, 5_000));
+        assert!(transfer_poll_covers_election(5_000, 5_000));
+        let forced = vec![PlacementAction::TransferLeadership { shard_id: 1, to: 2 }];
+        assert!(executable_placement_actions(&forced).is_empty());
     }
 
     #[test]
