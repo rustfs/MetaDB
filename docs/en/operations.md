@@ -149,7 +149,7 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 
 This is a single-node operator path for one data directory. It is not a multi-Cell or Jumbo backup, and it is not a production backup system. There is no independent Raft WAL. If the segmented log, the complete snapshot, and the flushed LSM image are all missing, committed keys are not reconstructed. A passing test run does not make this path a first-ship pass.
 
-The restorable image is the newest flushed LSM checkpoint, or the complete snapshot the hold protects when that checkpoint does not cover the purged log prefix, plus the segmented Raft log that is still on disk. Keys that are only in an unflushed memtable are restored by replaying that log. The copy does not rename or truncate files in the live data directory.
+The restorable image is the newest flushed LSM checkpoint, or the complete snapshot the hold protects when that checkpoint does not cover the purged log prefix, plus the segmented Raft log that is still on disk. The cell directory's `CLUSTER_IDENTITY` is copied with that image so the restored process keeps the same node instance id. Keys that are only in an unflushed memtable are restored by replaying that log. The copy does not rename or truncate files in the live data directory.
 
 ### Hold lifetime
 
@@ -175,6 +175,8 @@ metadb-ctl backup release --data-dir /var/lib/metadb
 metadb-ctl backup restore --backup /var/backups/metadb-2026-11-19 --data-dir /var/lib/metadb-restored
 metadbd --config restored.toml
 ```
+
+Publication holds `be/SHARD_SET.lock` from the final shard-directory and registry check through the artifact rename. Shard directory creation, split publication, registry updates, and cell-state writes take that same lock, so a shard that becomes visible in that window cannot be omitted from a backup that still reports success. A directory or registry entry that appears before the locked check fails the backup instead. Offline backup reads each source `MANIFEST` without opening it for append. A crash scratch directory named exactly `.backup-ckpt-` plus a 20-digit shard id is removed before the next online checkpoint on that shard. A symlink or any other name is left in place.
 
 `backup create` fails when no active hold is installed, when a shard is not listed on that hold, when the log is purged past the hold floor, or when neither the flushed LSM nor a protected complete snapshot covers the purged prefix. The artifact contains `BACKUP_MANIFEST` and `tree/`. Restore checks the manifest version, every file length and CRC32C, the Raft log (a torn tail is rejected rather than repaired), and that each shard LSM checkpoint matches the manifest and covers the purged index. It does not invent keys.
 

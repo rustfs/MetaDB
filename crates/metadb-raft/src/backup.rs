@@ -8,7 +8,7 @@
 //! expires on the wall clock so a missed release cannot pin purge forever.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -78,6 +78,7 @@ pub const BACKUP_TREE_DIR: &str = "tree";
 pub const BACKUP_JOB_FILE: &str = "BACKUP_JOB";
 pub const BACKUP_JOB_RUNNING: &str = "BACKUP_JOB.running";
 pub const BACKUP_JOB_RESULT: &str = "BACKUP_JOB_RESULT";
+pub const SHARD_SET_LOCK: &str = "SHARD_SET.lock";
 pub const BACKUP_HOLD_VERSION: u32 = 1;
 pub const BACKUP_MANIFEST_VERSION: u32 = 1;
 pub const HOLD_PHASE_PENDING: u8 = 1;
@@ -582,6 +583,40 @@ pub fn list_shard_ids(data_dir: &Path) -> Result<Vec<ShardId>> {
     Ok(ids)
 }
 
+/// Exclusive lock covering shard-directory creation and registry publication.
+///
+/// Backup holds it from the final shard-set check through the artifact rename so a
+/// new shard cannot appear in that window and still be reported as a successful copy.
+pub struct ShardSetLock {
+    _file: File,
+}
+
+pub fn lock_be_shard_set(be_dir: &Path) -> Result<ShardSetLock> {
+    fs::create_dir_all(be_dir)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(be_dir.join(SHARD_SET_LOCK))?;
+    file.lock()
+        .map_err(|error| backup_error(format!("shard set lock: {error}")))?;
+    Ok(ShardSetLock { _file: file })
+}
+
+/// `be` directory when `shard_dir` is `<data>/be/shards/<id>`.
+pub fn be_dir_for_shard(shard_dir: &Path) -> Option<PathBuf> {
+    let shards = shard_dir.parent()?;
+    if shards.file_name()? != "shards" {
+        return None;
+    }
+    let be = shards.parent()?;
+    if be.file_name()? != "be" {
+        return None;
+    }
+    Some(be.to_path_buf())
+}
+
 pub fn lsm_directory_is_locked(data_dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(data_dir.join("be").join("shards")) else {
         return false;
@@ -864,13 +899,8 @@ fn backup_online_shard(
     let live_index = shard.engine.durable_checkpoint().flushed_raft_index;
     let (kind, image_index) = if live_index >= purged_now {
         // Hard-linked checkpoints must stay on the source filesystem.
-        let temp = data_dir.join(format!(".backup-ckpt-{:020}", shard.shard_id));
-        if temp.exists() {
-            return Err(backup_error(format!(
-                "checkpoint scratch {} already exists; refusing to delete it",
-                temp.display()
-            )));
-        }
+        let temp = data_dir.join(checkpoint_scratch_name(shard.shard_id));
+        clear_checkpoint_scratch(data_dir, shard.shard_id)?;
         let checkpoint = shard.engine.create_checkpoint(&temp).map_err(|error| {
             let _ = fs::remove_dir_all(&temp);
             backup_error(format!(
@@ -947,9 +977,7 @@ fn backup_stopped_shard(
     copy_protected_snapshot(&raft_dir, floor, &relative_raft, tree, files)?;
     let lsm_dir = shard_directory.join("lsm");
     let live_index = if lsm_dir.join("CURRENT").is_file() {
-        let (manifest, recovered) = ManifestLog::open_existing(&lsm_dir)?;
-        drop(manifest);
-        recovered.checkpoint.flushed_raft_index
+        ManifestLog::read_checkpoint_readonly(&lsm_dir)?.flushed_raft_index
     } else {
         0
     };
@@ -1172,8 +1200,7 @@ fn finish_manifest(
     }
     let parent = destination_parent(destination);
     sync_directory_and_ancestors(&parent)?;
-    fs::rename(staging, destination)?;
-    staging_guard.disarm();
+    publish_staging_under_shard_lock(data_dir, &copied, staging, destination, staging_guard)?;
     sync_dir(&parent)?;
     Ok(BackupSummary {
         hold_id: manifest.hold_id,
@@ -1181,6 +1208,73 @@ fn finish_manifest(
         file_count: manifest.files.len(),
         destination: destination.to_path_buf(),
     })
+}
+
+#[cfg(test)]
+static BEFORE_LOCKED_RENAME: Mutex<Option<fn(&Path)>> = Mutex::new(None);
+
+fn publish_staging_under_shard_lock(
+    data_dir: &Path,
+    copied: &BTreeSet<ShardId>,
+    staging: &Path,
+    destination: &Path,
+    staging_guard: &mut Staging,
+) -> Result<()> {
+    let _shard_set = lock_be_shard_set(&data_dir.join("be"))?;
+    reject_uncovered_live_shards(data_dir, copied)?;
+    #[cfg(test)]
+    {
+        if let Some(hook) = BEFORE_LOCKED_RENAME.lock().unwrap().take() {
+            hook(data_dir);
+        }
+    }
+    reject_uncovered_live_shards(data_dir, copied)?;
+    fs::rename(staging, destination)?;
+    staging_guard.disarm();
+    Ok(())
+}
+
+fn reject_uncovered_live_shards(data_dir: &Path, copied: &BTreeSet<ShardId>) -> Result<()> {
+    for shard_id in list_shard_ids(data_dir)? {
+        if !copied.contains(&shard_id) {
+            return Err(backup_error(format!(
+                "shard {shard_id} appeared during the backup and is not in the artifact"
+            )));
+        }
+    }
+    let registry = data_dir.join("be").join("NODE_SHARD_REGISTRY");
+    if registry.is_file() {
+        for shard_id in crate::group_host::shard_ids_in_registry_file(&registry)? {
+            if !copied.contains(&shard_id) {
+                return Err(backup_error(format!(
+                    "NODE_SHARD_REGISTRY references shard {shard_id} which was not copied"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn checkpoint_scratch_name(shard_id: ShardId) -> String {
+    format!(".backup-ckpt-{shard_id:020}")
+}
+
+/// Removes one crash scratch directory. A symlink or a non-directory is left in place.
+fn clear_checkpoint_scratch(data_dir: &Path, shard_id: ShardId) -> Result<()> {
+    let path = data_dir.join(checkpoint_scratch_name(shard_id));
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(backup_error(format!(
+            "checkpoint scratch {} is not a plain directory; refusing to delete it",
+            path.display()
+        )));
+    }
+    fs::remove_dir_all(&path)?;
+    Ok(())
 }
 
 fn ensure_registry_matches(root: &Path, copied: &BTreeSet<ShardId>) -> Result<()> {
@@ -1829,6 +1923,122 @@ mod tests {
         let copied = BTreeSet::from([1u64]);
         let error = ensure_registry_matches(dir.path(), &copied).unwrap_err();
         assert!(error.to_string().contains("shard 99"), "{error}");
+    }
+
+    #[test]
+    fn offline_backup_without_a_hold_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("be").join("shards")).unwrap();
+        let destination = dir.path().join("out");
+        let error = create_offline_backup(dir.path(), &destination, &|_| Ok(())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("install a hold before copying so purge cannot remove the image"),
+            "{error}"
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn shard_directory_cannot_appear_while_the_publish_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = dir.path().join("be");
+        fs::create_dir_all(be.join("shards")).unwrap();
+        let guard = lock_be_shard_set(&be).unwrap();
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let created = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let be_thread = be.clone();
+        let started_thread = started.clone();
+        let created_thread = created.clone();
+        let handle = thread::spawn(move || {
+            started_thread.store(true, std::sync::atomic::Ordering::Release);
+            let shard = be_thread.join("shards").join(format!("{:020}", 99u64));
+            if let Some(parent) = be_dir_for_shard(&shard) {
+                let _held = lock_be_shard_set(&parent).unwrap();
+                fs::create_dir_all(&shard).unwrap();
+            }
+            created_thread.store(true, std::sync::atomic::Ordering::Release);
+        });
+        while !started.load(std::sync::atomic::Ordering::Acquire) {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert!(!created.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!be.join("shards").join(format!("{:020}", 99u64)).exists());
+        drop(guard);
+        handle.join().unwrap();
+        assert!(created.load(std::sync::atomic::Ordering::Acquire));
+        assert!(be.join("shards").join(format!("{:020}", 99u64)).is_dir());
+    }
+
+    #[test]
+    fn a_shard_created_before_rename_rejects_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(
+            dir.path()
+                .join("be")
+                .join("shards")
+                .join(format!("{:020}", 1u64)),
+        )
+        .unwrap();
+        let staging_parent = dir.path().join("stage-parent");
+        fs::create_dir_all(&staging_parent).unwrap();
+        let destination = staging_parent.join("artifact");
+        let mut staging = Staging::create(&destination).unwrap();
+        fs::write(staging.path.join("marker"), b"ok").unwrap();
+        *BEFORE_LOCKED_RENAME.lock().unwrap() = Some(|data_dir| {
+            fs::create_dir_all(
+                data_dir
+                    .join("be")
+                    .join("shards")
+                    .join(format!("{:020}", 99u64)),
+            )
+            .unwrap();
+        });
+        let copied = BTreeSet::from([1u64]);
+        let staging_path = staging.path.clone();
+        let error = publish_staging_under_shard_lock(
+            dir.path(),
+            &copied,
+            &staging_path,
+            &destination,
+            &mut staging,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("shard 99"), "{error}");
+        assert!(!destination.exists());
+        assert!(dir
+            .path()
+            .join("be")
+            .join("shards")
+            .join(format!("{:020}", 99u64))
+            .is_dir());
+    }
+
+    #[test]
+    fn crash_checkpoint_scratch_is_removed_without_touching_other_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join(checkpoint_scratch_name(1));
+        fs::create_dir_all(scratch.join("nested")).unwrap();
+        fs::write(scratch.join("nested").join("marker"), b"old").unwrap();
+        let decoy = dir.path().join(".backup-ckpt-0001");
+        fs::create_dir_all(&decoy).unwrap();
+        fs::write(decoy.join("keep"), b"keep").unwrap();
+        let keep_dir = dir.path().join("keep-me");
+        fs::create_dir_all(&keep_dir).unwrap();
+        clear_checkpoint_scratch(dir.path(), 1).unwrap();
+        assert!(!scratch.exists());
+        assert_eq!(fs::read(decoy.join("keep")).unwrap(), b"keep");
+        assert!(keep_dir.is_dir());
+
+        let target = dir.path().join("real-data");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("KEEP"), b"live").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(checkpoint_scratch_name(2))).unwrap();
+        let error = clear_checkpoint_scratch(dir.path(), 2).unwrap_err();
+        assert!(error.to_string().contains("refusing to delete"), "{error}");
+        assert_eq!(fs::read(target.join("KEEP")).unwrap(), b"live");
     }
 
     #[test]

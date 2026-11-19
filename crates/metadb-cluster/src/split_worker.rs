@@ -504,9 +504,12 @@ impl RaftShardSplitWorker {
                 },
             )?;
             drop(child_lsm);
-            fs::rename(&child_tmp_dir, &child_final_dir)?;
-            if let Some(parent_fs_dir) = child_final_dir.parent() {
-                sync_dir(parent_fs_dir)?;
+            let _shard_set = metadb_raft::backup::lock_be_shard_set(host.data_dir())?;
+            if !child_final_dir.exists() {
+                fs::rename(&child_tmp_dir, &child_final_dir)?;
+                if let Some(parent_fs_dir) = child_final_dir.parent() {
+                    sync_dir(parent_fs_dir)?;
+                }
             }
         }
         Self::bail_crash(crash_at, SplitCrashPoint::AfterChildDirRename)?;

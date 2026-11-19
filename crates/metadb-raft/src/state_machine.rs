@@ -693,7 +693,12 @@ impl ShardStateMachine {
         watermarks: Arc<ShardWatermarkTracker>,
     ) -> Result<(Self, watch::Receiver<AppliedFrontier>)> {
         let shard_dir = shard_dir.as_ref().to_path_buf();
-        fs::create_dir_all(&shard_dir)?;
+        if let Some(be_dir) = crate::backup::be_dir_for_shard(&shard_dir) {
+            let _shard_set = crate::backup::lock_be_shard_set(&be_dir)?;
+            fs::create_dir_all(&shard_dir)?;
+        } else {
+            fs::create_dir_all(&shard_dir)?;
+        }
 
         // Recover interrupted `lsm_installing_*` or `lsm_old_*` swap if power failed mid-install.
         let lsm_dir = shard_dir.join("lsm");
