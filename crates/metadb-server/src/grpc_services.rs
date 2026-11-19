@@ -983,18 +983,58 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<StoreHeartbeatRequest>,
     ) -> Result<Response<StoreHeartbeatResponse>, Status> {
-        // Client heartbeat descriptors are not a routing source. Installing them
-        // replaced `CompositeMetaCache` entries and could wedge `route_user_key`
-        // onto a shard id this process does not host. Split scheduling still runs
-        // from the local maintenance tick, not from this RPC.
-        let _req = request.into_inner();
-        let e = MetaDbError::ShardRoutingError(
-            "StoreHeartbeat does not update routes or schedule splits; client shard descriptors are not applied"
-                .to_string(),
-        );
-        Ok(Response::new(StoreHeartbeatResponse {
-            error: Some(ErrorDetailProto::from(&e)),
-        }))
+        // Shard descriptors in this RPC are annotations. They are not installed
+        // into `CompositeMetaCache` and they do not schedule splits.
+        let req = request.into_inner();
+        let Some(cell) = self.global_manager.get_cell(req.cell_id) else {
+            let error = MetaDbError::ShardRoutingError(format!(
+                "unknown cell {}; client shard descriptors are not applied to routes",
+                req.cell_id
+            ));
+            return Ok(Response::new(StoreHeartbeatResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+            }));
+        };
+        let mut reported = Vec::new();
+        for shard in &req.shards {
+            if let Some(descriptor) = &shard.descriptor {
+                if descriptor.shard_id != 0 {
+                    reported.push(descriptor.shard_id);
+                }
+            }
+        }
+        let disk_free = req.disk_free_known.then_some(req.disk_free_bytes);
+        let instance_id = match metadb_proto::convert::decode_optional_u128_be(&req.instance_id) {
+            Ok(0) => None,
+            Ok(id) => Some(id),
+            Err(error) => {
+                return Ok(Response::new(StoreHeartbeatResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                }));
+            }
+        };
+        let observation_generation =
+            match metadb_proto::convert::decode_optional_u128_be(&req.observation_generation) {
+                Ok(id) => id,
+                Err(error) => {
+                    return Ok(Response::new(StoreHeartbeatResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                    }));
+                }
+            };
+        match cell.accept_remote_heartbeat(
+            req.node_id,
+            req.monotonic_seq,
+            disk_free,
+            reported,
+            instance_id,
+            observation_generation,
+        ) {
+            Ok(()) => Ok(Response::new(StoreHeartbeatResponse { error: None })),
+            Err(error) => Ok(Response::new(StoreHeartbeatResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+            })),
+        }
     }
 
     async fn get_routes(

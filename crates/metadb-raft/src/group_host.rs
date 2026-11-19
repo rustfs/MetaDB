@@ -1298,18 +1298,24 @@ mod tests {
 
     #[test]
     fn raft_option_bounds_fail_before_a_group_starts() {
-        let mut options = RaftNodeOptions::default();
-        options.max_segment_bytes = 0;
+        let options = RaftNodeOptions {
+            max_segment_bytes: 0,
+            ..RaftNodeOptions::default()
+        };
         assert!(options.validate().is_err());
 
-        options = RaftNodeOptions::default();
-        options.heartbeat_interval_ms = 450;
+        let options = RaftNodeOptions {
+            heartbeat_interval_ms: 450,
+            ..RaftNodeOptions::default()
+        };
         let heartbeat = options.validate().unwrap_err().to_string();
         assert!(heartbeat.contains("invalid [raft] options"), "{heartbeat}");
 
-        options = RaftNodeOptions::default();
-        options.election_timeout_min_ms = 900;
-        options.election_timeout_max_ms = 900;
+        let options = RaftNodeOptions {
+            election_timeout_min_ms: 900,
+            election_timeout_max_ms: 900,
+            ..RaftNodeOptions::default()
+        };
         assert!(options.validate().is_err());
     }
 }
