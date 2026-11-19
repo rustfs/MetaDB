@@ -8,10 +8,12 @@
 
 pub mod cell_manager;
 pub mod control_plane;
+pub mod control_plane_state;
 pub mod global_manager;
 pub mod id_allocator;
 pub mod identity;
 pub mod jumbo;
+pub mod jumbo_placement;
 pub mod meta_cache;
 pub mod shard;
 pub mod split_worker;
@@ -21,6 +23,7 @@ pub use cell_manager::{
     SplitPlanRecord, SplitPlanState,
 };
 pub use control_plane::{CellId, CellLocalManager, GlobalManager, MetaCache, ShardRoute};
+pub use control_plane_state::{StoredHeartbeat, StoredPlacement, HEARTBEAT_INTERVAL_MS};
 pub use global_manager::DurableGlobalManager;
 pub use id_allocator::{
     AllocIdKind, DurableIdAllocator, LocalIdBuffer, CELL_DIR_AFFINITY_BLOCK_SIZE,
@@ -28,6 +31,11 @@ pub use id_allocator::{
 };
 pub use identity::{node_id_in_ha_range, ClusterIdentity, CLUSTER_IDENTITY_FILE};
 pub use jumbo::JumboIsolationPlanner;
+pub use jumbo_placement::{
+    fault_tolerance, jumbo_membership_change_allowed, plan_jumbo_placement, CommittedMove,
+    MembershipRefusal, PlacementAction, PlacementDecision, PlacementObservation, PlacementPhase,
+    ShardVoters,
+};
 pub use meta_cache::{CompositeMetaCache, CompositeShardRoute};
 pub use shard::{
     PolicyShardSplitter, RaftMemberRole, RaftMembership, ShardDescriptor, ShardHealthState,

@@ -10,8 +10,8 @@ use openraft::entry::RaftEntry;
 use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, AppendResult, SnapshotResponse, VoteRequest,
-    VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, AppendResult, SnapshotResponse,
+    TransferLeaderRequest, TransferLeaderResponse, VoteRequest, VoteResponse,
 };
 use openraft::type_config::alias::{SnapshotMetaOf, SnapshotOf, VoteOf};
 use openraft::{BasicNode, OptionalSend, Raft, Snapshot};
@@ -290,6 +290,36 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
         codec::deserialize_serde(&reply.bincode_payload).map_err(Self::unreachable)
     }
 
+    async fn transfer_leader(
+        &mut self,
+        rpc: TransferLeaderRequest<MetaDbTypeConfig>,
+        _option: RPCOption,
+    ) -> Result<TransferLeaderResponse<MetaDbTypeConfig>, RPCError<MetaDbTypeConfig>> {
+        let channel = self
+            .pool
+            .connect(&self.target_addr)
+            .await
+            .map_err(Self::unreachable)?;
+        let mut client = RaftTransportServiceClient::new(channel);
+        let bincode_payload = codec::serialize_serde(&rpc).map_err(Self::unreachable)?;
+        let reply = client
+            .transfer_leader(
+                self.pool
+                    .authenticate(Request::new(RaftRpcEnvelope {
+                        shard_id: self.shard_id,
+                        bincode_payload,
+                    }))
+                    .map_err(Self::unreachable)?,
+            )
+            .await
+            .map_err(Self::unreachable)?
+            .into_inner();
+        if !reply.error_message.is_empty() {
+            return Err(Self::unreachable(reply.error_message));
+        }
+        codec::deserialize_serde(&reply.bincode_payload).map_err(Self::unreachable)
+    }
+
     async fn full_snapshot(
         &mut self,
         vote: VoteOf<MetaDbTypeConfig>,
@@ -425,6 +455,36 @@ impl RaftTransportService for MultiRaftTransportServer {
             Err(err) => Ok(Response::new(RaftRpcReply {
                 bincode_payload: Vec::new(),
                 error_message: err.to_string(),
+            })),
+        }
+    }
+
+    async fn transfer_leader(
+        &self,
+        request: Request<RaftRpcEnvelope>,
+    ) -> Result<Response<RaftRpcReply>, Status> {
+        let env = request.into_inner();
+        let Some(raft) = self.router.get_group(env.shard_id) else {
+            return Ok(Response::new(RaftRpcReply {
+                bincode_payload: Vec::new(),
+                error_message: format!("unknown shard {}", env.shard_id),
+            }));
+        };
+        let req: TransferLeaderRequest<MetaDbTypeConfig> =
+            codec::deserialize_serde(&env.bincode_payload)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        match raft.handle_transfer_leader(req).await {
+            Ok(response) => {
+                let bincode_payload = codec::serialize_serde(&response)
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                Ok(Response::new(RaftRpcReply {
+                    bincode_payload,
+                    error_message: String::new(),
+                }))
+            }
+            Err(error) => Ok(Response::new(RaftRpcReply {
+                bincode_payload: Vec::new(),
+                error_message: error.to_string(),
             })),
         }
     }

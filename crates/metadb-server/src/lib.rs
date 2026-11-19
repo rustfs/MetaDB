@@ -109,6 +109,7 @@ impl Interceptor for BearerAuthClient {
     }
 }
 
+use metadb_cluster::HEARTBEAT_INTERVAL_MS;
 use metadb_cluster::{
     CellDirectoryRole, CellId, CellLocalManager, CompositeMetaCache, DurableCellManager,
     DurableGlobalManager, DurableIdAllocator, GlobalManager, LocalIdBuffer, MetaCache,
@@ -124,7 +125,9 @@ use metadb_proto::control_plane_service_server::ControlPlaneServiceServer;
 use metadb_proto::metadata_service_server::MetadataServiceServer;
 use metadb_proto::raft_transport_service_server::RaftTransportServiceServer;
 use metadb_proto::transaction_service_server::TransactionServiceServer;
-use metadb_proto::{GetRoutesRequest, RegisterNodeRequest, ScaleShardReplicasRequest};
+use metadb_proto::{
+    GetRoutesRequest, RegisterNodeRequest, ScaleShardReplicasRequest, StoreHeartbeatRequest,
+};
 use metadb_proxy::{MetadataSqlCommand, SqlTemplateParser, StatelessProxyRouter};
 use metadb_raft::backup::{self, OnlineShard};
 use metadb_raft::{
@@ -877,6 +880,75 @@ impl PersistentMetaDbCluster {
                 }
                 grp.flush_snapshot_and_purge().await?;
             }
+        }
+        if let Err(error) = self.publish_control_heartbeat_if_due().await {
+            tracing::warn!(%error, "control heartbeat was not published");
+        }
+        Ok(())
+    }
+
+    async fn publish_control_heartbeat_if_due(&self) -> Result<()> {
+        let now = metadb_cluster::control_plane_state::unix_ms();
+        if self
+            .cell_manager
+            .local_heartbeat_is_fresh(now, HEARTBEAT_INTERVAL_MS)
+        {
+            return Ok(());
+        }
+        self.publish_control_heartbeat().await
+    }
+
+    /// Persists this process's heartbeat, then sends that same sequence to the current
+    /// Raft leader when this process is not the leader. The sender does not include
+    /// shard descriptors. A failed send does not roll the local sequence back: the
+    /// next interval uses a new sequence, and a replay of this sequence is idempotent.
+    pub async fn publish_control_heartbeat(&self) -> Result<()> {
+        let heartbeat = self.cell_manager.publish_local_heartbeat()?;
+        let leaders = self.cell_manager.remote_leader_addrs();
+        for addr in leaders {
+            if let Err(error) = self.send_heartbeat_with_retry(&addr, &heartbeat).await {
+                tracing::warn!(%error, %addr, "leader did not accept the control heartbeat");
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_heartbeat_with_retry(
+        &self,
+        addr: &str,
+        heartbeat: &metadb_cluster::StoredHeartbeat,
+    ) -> Result<()> {
+        let first = self.send_heartbeat_once(addr, heartbeat).await;
+        if first.is_ok() {
+            return Ok(());
+        }
+        self.send_heartbeat_once(addr, heartbeat).await
+    }
+
+    async fn send_heartbeat_once(
+        &self,
+        addr: &str,
+        heartbeat: &metadb_cluster::StoredHeartbeat,
+    ) -> Result<()> {
+        let endpoint = normalize_rpc_addr(addr);
+        let mut client =
+            control_plane_client(&endpoint, &self.config.security.shared_secret).await?;
+        let response = client
+            .store_heartbeat(StoreHeartbeatRequest {
+                cell_id: self.cell_manager.cell_id(),
+                node_id: heartbeat.node_id,
+                disk_free_bytes: heartbeat.disk_free_bytes.unwrap_or(0),
+                disk_free_known: heartbeat.disk_free_bytes.is_some(),
+                monotonic_seq: heartbeat.seq,
+                shards: Vec::new(),
+            })
+            .await
+            .map_err(|error| {
+                MetaDbError::ConsensusError(format!("store_heartbeat at {endpoint}: {error}"))
+            })?
+            .into_inner();
+        if let Some(error) = rpc_app_error(response.error) {
+            return Err(error);
         }
         Ok(())
     }

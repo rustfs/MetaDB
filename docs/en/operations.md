@@ -97,7 +97,7 @@ What works inside one process:
 
 - More shards. Growth past `shard_split_threshold_bytes`, or `metadb-ctl shard split`, can add shard groups under the same `be/shards` directory. The parent keeps a left key range and the child boots as another 1-voter group on this node. Restart reopens both.
 - Dual-mode flag. `shard enable-dual-mode` marks one parent id. A later split of that shard may cut on `(pid, name)`.
-- Jumbo flag. When one parent is more than 85% of `MetaTable` bytes on the shard, or the shard has a single parent, the route becomes `JumboIsolated`. The dedicated node id is chosen from nodes already registered in this cell. With one node, the flag names this process. No files are moved to another host.
+- Jumbo flag. When one parent is more than 85% of `MetaTable` bytes on the shard, or the shard has a single parent, the route becomes `JumboIsolated`. The dedicated node id is chosen from nodes already registered in this cell. With one node, the flag names this process. No files are moved to another host. A placement record in `CELL_CONTROL_PLANE` says whether that node is already a voter and whether peer shards still list it. See [Scale control plane](./scale-control-plane-status.md).
 - In-process voters. `DurableCellManager::scale_out_replicas` can add learners and promote them when those node ids are registered **and** each address already serves `RaftTransportService` for that shard's group. `crates/metadb-raft/tests/multi_raft_failover_tests.rs` does this with three listeners in one test process and a basic KV state machine, not the metadata state machine, and not three `metadbd` processes.
 
 What does not work as an operator procedure:
@@ -135,12 +135,12 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 
 - Role `all-in-one` only. `be`, `proxy`, `cell-manager`, and `global-manager` are rejected before listen.
 - A second all-in-one process can join the same cell with `[cluster] join`. It does not create a second cell. `RegisterCell` returns an error.
-- `GetRoutes` fails closed for an unknown non-zero `cell_id`. `StoreHeartbeat` does not replace cached routes.
+- `GetRoutes` fails closed for an unknown non-zero `cell_id`. `StoreHeartbeat` does not replace cached routes. A registered node's heartbeat is fsynced in `CELL_CONTROL_PLANE`. Shard ids inside that RPC stay annotations.
 - User names `.`, `..`, `/`, `\`, `_attr_`, empty, and NUL are rejected. A negative file size is rejected. A directory rename into its own descendant fails closed, including chains deeper than 1024.
 - The HLC saturates at the 48-bit physical ceiling instead of wrapping the logical counter. `Prepare2pc` follows `header.shard_id`, not the primary-key shard.
 - Quota cursor rows are written after the outbox lock is released, so a flush that already holds the memtable lock can still take the outbox lock.
-- Jumbo isolation is a route flag plus a node id chosen from the local node map. It does not evict other shards from a disk.
-- Heartbeats are an RPC with no sender in `metadbd`. `StoreHeartbeat` does not persist.
+- Jumbo isolation is still not a move of shard files onto a dedicated disk. The route flag names a node. `CELL_CONTROL_PLANE` records whether a membership-safe leadership transfer or same-size voter replacement was committed. A one-voter cell does not change its voter set.
+- Heartbeats are a 3-second liveness record. `metadbd` persists its own and sends it to the current leader when this process is not the leader. The sender does not include shard descriptors. The record does not schedule splits.
 - A non-empty shared secret authenticates Raft, the other three gRPC services, and the metrics listener with the same bearer. An empty secret is accepted only for loopback binds and leaves those listeners unauthenticated. A wildcard bind with an empty secret refuses to start. The process does not terminate TLS.
 - `memtable_size_bytes` seals and flushes the active memtable. `max_imm_memtables` caps queued immutable tables. Raft timer fields do not change runtime behavior through TOML.
 - `metadb-ctl bench` for `hotspot-create` and `bulk-ttl-delete` prints JSON lines: a header with `bench_pid`, then phase reports with attempted, succeeded, failed, and latency percentiles. The process exits non-zero unless every requested operation succeeds. `--workload mixed` or `--embedded` runs the in-process stress harness. `sql` prints the response as JSON and exits non-zero on an application error.
@@ -196,7 +196,7 @@ These items are missing from the product, so this guide cannot describe a proced
 
 1. A multi-process layout for `be`, `proxy`, `cell-manager`, and `global-manager`.
 2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
-3. Placing a jumbo shard on its own machine and moving other shards off that machine.
-4. Native TLS. This process does not terminate TLS. Config keys that ask for TLS or a certificate are rejected instead of serving plaintext. Put termination in an external proxy. Raft and metrics use the same bearer as the other services when a secret is set; that bearer is not mutual TLS. A heartbeat-driven control loop is not implemented.
+3. Placing a jumbo shard on its own machine and moving other shard files off that disk. Leadership transfer and a same-size voter replacement exist only when the nodes are already voters and the change keeps Raft fault tolerance. A node that has not joined a shard is not added.
+4. Native TLS. This process does not terminate TLS. Config keys that ask for TLS or a certificate are rejected instead of serving plaintext. Put termination in an external proxy. Raft and metrics use the same bearer as the other services when a secret is set; that bearer is not mutual TLS. The 3-second heartbeat records liveness. It does not drive splits, cell federation, or disk drain.
 5. A Raft timer that operators can set and observe.
 6. A checked-in service-level result for `metadb-ctl bench`. The command prints numbers for the machine you run it on. This repository does not record one. See [Tests and benches](./testing.md).

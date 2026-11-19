@@ -125,7 +125,7 @@ A directory rename also holds one `DirRenameLease` in the ID allocator. Renewal 
 - Otherwise it picks a parent-id boundary near half the bytes. The split key is a PID prefix, so `_attr_` and the direct children of one parent stay together.
 - If the route is already `DualModeFineGrained` for that parent, the split key is a `(pid, name)` midpoint, excluding `_attr_`.
 
-A jumbo candidate does **not** move the shard directory. `JumboIsolationPlanner` writes `ShardHealthState::JumboIsolated { dedicated_node, dominant_pid }` onto the route. The chosen node is the registered node with the fewest jumbo routes, then the fewest other routes. With only the bootstrap node registered, that node is this process.
+A jumbo candidate does **not** move the shard directory. `JumboIsolationPlanner` writes `ShardHealthState::JumboIsolated { dedicated_node, dominant_pid }` onto the route. The chosen node is the registered node with the fewest jumbo routes, then the fewest other routes. With only the bootstrap node registered, that node is this process. That flag is detection. `reconcile_jumbo_placement` then writes `CELL_CONTROL_PLANE`. On one voter it records `LeaderOnDedicated` or `Blocked` and does not change the voter set. It transfers leadership only when the dedicated node is already a voter and this process is the leader. It replaces that node on another shard only when a node that is already a voter of some local shard can take the seat without lowering Raft fault tolerance. `DedicatedNodeNotShared` means that membership condition holds. It does not mean shard files moved to another machine. See [Scale control plane](./scale-control-plane-status.md).
 
 `enable_dual_mode_split` persists `split_mode = DualModeFineGrained` and `dual_mode_pid`. It does not itself copy keys. A later split uses the `(pid, name)` rule. The in-memory simulator (`CellLocalManager` in `control_plane.rs`) is a different type: its jumbo path returns `UnsplittableJumboShard` and its "scale to 3 voters" only edits a `BTreeMap`. Tests `T1`–`T6` exercise that simulator.
 
@@ -136,7 +136,7 @@ Split plans are stored in `CELL_MANAGER_STATE`. Crash points covered by `split_c
 | RPC | Behavior in this tree |
 | :--- | :--- |
 | `RegisterNode` | Inserts `(node_id, grpc_addr)` into this cell's `CELL_MANAGER_STATE` |
-| `StoreHeartbeat` | Does not install caller-supplied shard descriptors into the route cache. `metadbd` never sends this RPC |
+| `StoreHeartbeat` | For a registered node, fsyncs liveness into `CELL_CONTROL_PLANE` when `monotonic_seq` is newer. The same sequence and body is a replay. A lower sequence or a different body at the same sequence is rejected and the stored record stays. Shard descriptors in the request are stored as annotations and are not installed as routes. An unregistered node is rejected. The maintenance loop sends this process's own record, without shard descriptors, about every 3 seconds |
 | `GetRoutes` | `cell_id = 0` lists every cached route. An unknown non-zero `cell_id` returns an error instead of an empty shard list |
 | `AllocateIdBlock` | Allocates from the local durable allocator |
 | `AllocSplitPlan` / `ActivateSplit` | Forwards to the local cell manager |

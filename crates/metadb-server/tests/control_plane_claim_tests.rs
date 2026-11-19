@@ -12,6 +12,35 @@ use metadb_server::{MetaDbGrpcService, PersistentMetaDbCluster, ServerRole, Serv
 use tempfile::tempdir;
 use tonic::Request;
 
+fn heartbeat_request(seq: u64, node_id: u64, disk_free_bytes: u64) -> StoreHeartbeatRequest {
+    StoreHeartbeatRequest {
+        cell_id: 1,
+        node_id,
+        disk_free_bytes,
+        monotonic_seq: seq,
+        disk_free_known: true,
+        shards: vec![ShardHeartbeatStatsProto {
+            descriptor: Some(ShardDescriptorProto {
+                cell_id: 1,
+                shard_id: 999,
+                start_key: vec![0x01],
+                end_key: vec![0x02],
+                epoch: None,
+                leader_node_id: node_id,
+                peers: vec![],
+                dual_mode_fine_grained: false,
+                jumbo_isolated: true,
+                dominant_pid: 1,
+            }),
+            approximate_bytes: 1,
+            qps: 1,
+            unsplittable_jumbo: true,
+            dominant_pid: 1,
+            safe_purge_index: 0,
+        }],
+    }
+}
+
 #[tokio::test]
 async fn disaggregated_roles_are_rejected_before_listen() {
     for role in [
@@ -61,6 +90,8 @@ async fn control_plane_does_not_pretend_missing_topology_ops_succeeded() {
             cell_id: 1,
             node_id: 99,
             disk_free_bytes: 1,
+            monotonic_seq: 1,
+            disk_free_known: true,
             shards: vec![ShardHeartbeatStatsProto {
                 descriptor: Some(ShardDescriptorProto {
                     cell_id: 1,
@@ -84,14 +115,86 @@ async fn control_plane_does_not_pretend_missing_topology_ops_succeeded() {
         .await
         .unwrap()
         .into_inner();
-    let heartbeat_err = heartbeat.error.expect("heartbeat must not succeed");
+    let heartbeat_err = heartbeat
+        .error
+        .expect("unregistered heartbeat must not succeed");
     assert!(
-        heartbeat_err.message.contains("does not update routes"),
+        heartbeat_err.message.contains("not registered"),
         "{}",
         heartbeat_err.message
     );
+    assert!(
+        heartbeat_err.message.contains("not applied"),
+        "{}",
+        heartbeat_err.message
+    );
+    cluster
+        .cell_manager()
+        .register_node(7, "127.0.0.1:9".to_string())
+        .unwrap();
+    let forged = heartbeat_request(1, 7, 4);
+    let accepted = svc
+        .store_heartbeat(Request::new(forged))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(accepted.error.is_none(), "{:?}", accepted.error);
+    let stored = cluster
+        .cell_manager()
+        .stored_heartbeat(7)
+        .expect("registered heartbeat is durable");
+    assert_eq!(stored.seq, 1);
+    assert_eq!(stored.reported_shard_ids, vec![999]);
+    assert!(stored.local_hosted_shard_ids.is_empty());
+    let replay = svc
+        .store_heartbeat(Request::new(heartbeat_request(1, 7, 4)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(replay.error.is_none(), "{:?}", replay.error);
+    assert_eq!(
+        cluster.cell_manager().stored_heartbeat(7).unwrap().seq,
+        1,
+        "an identical sequence must not allocate a new record"
+    );
+    let conflict = svc
+        .store_heartbeat(Request::new(heartbeat_request(1, 7, 9)))
+        .await
+        .unwrap()
+        .into_inner();
+    let conflict_err = conflict
+        .error
+        .expect("a conflicting sequence must not overwrite");
+    assert!(
+        conflict_err.message.contains("conflicts"),
+        "{}",
+        conflict_err.message
+    );
+    assert_eq!(
+        cluster
+            .cell_manager()
+            .stored_heartbeat(7)
+            .unwrap()
+            .disk_free_bytes,
+        Some(4)
+    );
+    cluster.cell_manager().testing_fail_next_control_persists(1);
+    let failed = svc
+        .store_heartbeat(Request::new(heartbeat_request(2, 7, 4)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        failed.error.is_some(),
+        "a failed heartbeat fsync must not be reported as stored"
+    );
+    assert_eq!(cluster.cell_manager().stored_heartbeat(7).unwrap().seq, 1);
     let after = cluster.global_manager().meta_cache().all_routes();
     assert_eq!(after.len(), before.len());
+    assert!(
+        after.iter().all(|route| route.shard_id != 999),
+        "a heartbeat annotation must not become a route"
+    );
     assert_eq!(
         after
             .iter()
