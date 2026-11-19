@@ -13,7 +13,7 @@
 | `node.role` | `all-in-one` | Oui. Toute autre valeur renvoie une erreur |
 | `node.data_dir` | `./metadb-data` | Oui |
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | Oui. Adresse de liaison |
-| `node.metrics_listen_addr` | non défini | Oui, seulement s'il est défini. Écouteur TCP séparé. Une adresse non locale exige un secret non vide |
+| `node.metrics_listen_addr` | non défini | Applied only when set. Separate TCP listener. An empty secret does not listen unless `allow_unauthenticated = true`, and that flag is loopback-only |
 | `clock.max_clock_drift_ms` | `500` | Oui. `HybridLogicalClock::with_max_drift_ms` |
 | `storage.memtable_size_bytes` | `33554432` (32 Mio) | Oui. Scelle et vide le memtable actif dès que ses octets comptabilisés atteignent cette taille. Les valeurs inférieures à 1 sont traitées comme 1 |
 | `storage.max_imm_memtables` | `4` | Oui. Les écritures attendent au lieu de mettre en file plus de memtables immuables que ce plafond |
@@ -24,7 +24,8 @@
 | `storage.locality_tombstone_ratio` | `0.50` | Oui. Multiplié par 1000, borné à 1..=1000, stocké dans `tombstone_min_ratio_permille` |
 | `sharding.bootstrap_table_shards` | `true` | Oui. `true` crée les shards 1, 2 et 3. `false` crée le shard 1 sur `[0x01, 0x04)` |
 | `sharding.shard_split_threshold_bytes` | `4294967296` (4 Gio) | Oui. Le contrôle de découpage utilise la taille approximative du shard |
-| `security.shared_secret` | `""` | Oui. Vide n'est accepté que si chaque écouteur est en boucle locale. Non vide exige le même bearer pour le gRPC et les métriques |
+| `security.shared_secret` | `""` | Empty does not start the process. Loopback without credentials requires `allow_unauthenticated = true`. A non-empty secret requires the same bearer on gRPC and metrics. A whitespace-only secret is rejected |
+| `security.allow_unauthenticated` | `false` | Explicit opt-in for an empty secret on loopback only. Rejected together with a usable secret. Rejected on a wildcard or any other non-loopback bind. A whitespace-only secret is rejected even with this flag |
 
 Il n'y a pas de table `[raft]`. `ServerTomlConfig.raft_options` est ignoré par serde et reste à `RaftNodeOptions::default()` (battement 150 ms, élection 450–900 ms, conservation du journal d'instantané 0, segment 64 Mio).
 
@@ -73,7 +74,7 @@ Ce processus ne termine pas TLS. Aucune configuration de certificat n'active un 
 
 Lorsque `shared_secret` n'est pas vide, `MetadataService`, `TransactionService`, `ControlPlaneService` et `RaftTransportService` exigent que `authorization` soit exactement `Bearer <shared_secret>`. `GET /metrics` sur `metrics_listen_addr` exige le même en-tête `Authorization`. Un en-tête absent, un bearer vide, un préfixe ou un jeton plus long est rejeté. Le corps d'échec des métriques n'est pas du texte Prometheus. Les pairs Raft envoient le même bearer. `metadb-ctl --auth-token` (variable d'environnement `METADB_AUTH_TOKEN`) et `metadbd --join` / `--cell-manager` l'envoient. `metadb-ctl cluster status` appelle `GetRoutes` et passe par le même intercepteur.
 
-Un secret vide ou composé seulement d'espaces n'est accepté que si `grpc_listen_addr` et `metrics_listen_addr` (s'il est défini) sont en boucle locale (`127.0.0.0/8`, `::1`, ou le nom `localhost`). Un joker (`0.0.0.0`, `::`) ou toute autre adresse refuse d'écouter. Un secret vide en boucle locale produit un avertissement au démarrage. Les écouteurs restent en clair. Les garder sur un réseau de confiance, ou placer chaque service derrière un proxy qui authentifie le client, et bloquer l'accès direct à ce processus.
+An empty secret does not start the process, including when every listener is loopback (`127.0.0.0/8`, `::1`, or the name `localhost`). Loopback development without credentials requires `allow_unauthenticated = true`. That flag still refuses a wildcard (`0.0.0.0`, `::`) or any other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. Listeners stay plaintext. Keep an opted-in listener on a trusted network, or put every service behind a proxy that authenticates the client and block direct access to this process.
 
 ## Ce que l'on ne peut pas configurer
 

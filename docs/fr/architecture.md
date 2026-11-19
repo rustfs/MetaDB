@@ -9,13 +9,13 @@ Cette page suit le code de `crates/`. Elle ne décrit pas un déploiement de cel
 `PersistentMetaDbCluster::open_and_serve` (`crates/metadb-server/src/lib.rs`) :
 
 1. Rejette tout `node.role` autre que `all-in-one`.
-2. Refuse un joker ou une autre adresse non locale dans `grpc_listen_addr` ou `metrics_listen_addr` lorsque `shared_secret` est vide. Lie ensuite `node.grpc_listen_addr` (défaut `127.0.0.1:7800` ; `127.0.0.1:0` demande un port au système).
+2. An empty `shared_secret` does not start the process unless `allow_unauthenticated = true`, and that flag is loopback-only. A whitespace-only secret is rejected even with the flag. A usable secret plus the flag is rejected. A wildcard or other non-loopback address cannot use the opt-in. It then binds `node.grpc_listen_addr` (default `127.0.0.1:7800`; `127.0.0.1:0` asks the OS for a port).
 3. Ouvre `DurableIdAllocator` dans `<data_dir>/global_allocator`.
 4. Ouvre `ShardGroupHost` dans `<data_dir>/be`.
 5. Ouvre ou amorce `DurableCellManager` dans `<data_dir>/cell_<cell_id>`.
 6. Enregistre cette unique cellule sur `DurableGlobalManager` pour l'intervalle de clés `[0x01, 0x04)`.
 7. Garantit que l'inode racine `1` (`ROOT_INODE_ID`) possède un enregistrement d'attributs.
-8. Sert quatre services gRPC sur le même écouteur. Les quatre prennent le même intercepteur bearer. Lorsque `metrics_listen_addr` est défini, `GET /metrics` sur cette adresse exige le même secret. Un secret non vide rejette un bearer absent ou incorrect. Un secret vide n'est accepté que pour les liaisons en boucle locale. Ce processus ne termine pas TLS.
+8. Serves four gRPC services on one listener. All four use the same bearer interceptor. When `metrics_listen_addr` is set, `GET /metrics` on that address requires the same secret. A non-empty secret rejects a missing or wrong bearer. An empty secret does not listen unless `allow_unauthenticated = true`, and that flag is loopback-only. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. This process does not terminate TLS.
 9. Lance une tâche de maintenance toutes les 250 ms.
 
 `metadbd` est une fine enveloppe : il charge le TOML, applique les remplacements CLI, appelle `open_and_serve`, appelle éventuellement `RegisterNode` sur `--cell-manager`, et sur Ctrl-C appelle `shutdown`. Les métriques, lorsqu'elles sont configurées, sont servies dans `open_and_serve`.

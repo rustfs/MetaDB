@@ -34,7 +34,7 @@ bootstrap_table_shards = true
 shard_split_threshold_bytes = 4294967296 # 4 GiB
 ```
 
-Rust 1.100.0 (`rust-toolchain.toml`). Nur die Rolle `all-in-one` startet. Dieser Prozess beendet TLS nicht. Ohne `[security].shared_secret` gibt es keine Authentifizierung, und nur Loopback-Binds werden akzeptiert. Der Default ist `127.0.0.1`. Eine Wildcard oder eine andere Adresse mit leerem Geheimnis verweigert den Start. Ein nicht leeres `shared_secret` verlangt `authorization: Bearer <secret>` für Metadaten, Transaktionen, die Control Plane, Raft auf demselben Port und `GET /metrics`.
+Rust 1.100.0 (`rust-toolchain.toml`). Only `all-in-one` starts. This process does not terminate TLS. An empty `[security].shared_secret` does not start the process, including on the default `127.0.0.1` bind. Loopback development without credentials requires `allow_unauthenticated = true`. That flag still refuses a wildcard or any other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with `allow_unauthenticated` is rejected. A non-empty secret requires `authorization: Bearer <secret>` for metadata, transactions, the control plane, Raft on the same port, and `GET /metrics`.
 
 ```bash
 metadbd --config /etc/metadb/standalone.toml

@@ -42,7 +42,7 @@ shard_split_threshold_bytes = 4294967296 # 4 GiB 分片分裂阈值
 
 工具链固定为 Rust **1.100.0**（`rust-toolchain.toml`）。当前只有 `all-in-one` 会真正启动；`be` / `proxy` / `cell-manager` / `global-manager` 会被拒绝，而不是静默变成全功能进程。
 
-gRPC 的 metadata、transaction、control-plane、Raft 传输以及指标监听器**都不终结 TLS**。`[security].shared_secret` 为空时也没有应用层认证，并且只接受环回绑定。通配或其他非环回地址如果没有非空密钥，会拒绝启动。默认 `grpc_listen_addr` 是 `127.0.0.1:7800`。文件里的 TLS 或证书键会被拒绝，而不是当作明文服务。非空 `shared_secret` 要求 metadata、transaction、control-plane、同一端口上的 Raft 传输以及 `GET /metrics` 都携带 `authorization: Bearer <secret>`。对等 Raft 客户端发送同一个令牌。
+Metadata, transaction, control-plane, and Raft gRPC, and the metrics listener, do not terminate TLS. An empty `[security].shared_secret` does not start the process, including on the default `127.0.0.1:7800` bind. Loopback development without credentials requires `allow_unauthenticated = true`. That flag still refuses a wildcard or any other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with `allow_unauthenticated` is rejected. A non-empty secret requires `authorization: Bearer <secret>` for metadata, transactions, the control plane, Raft on the same port, and `GET /metrics`. Peer Raft clients send the same token. A TLS or certificate key in the file is rejected rather than served as plaintext.
 
 ```bash
 metadbd --config /etc/metadb/standalone.toml

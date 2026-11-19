@@ -31,7 +31,7 @@ General-purpose distributed databases (such as TiDB, CockroachDB, and Foundation
 ### 1. Tree-Topology-Induced Sharding and Execution (`metadb-cluster` & `metadb-tx`)
 * **Colocated Schema (`(PID, "_attr_")`)**: `MetaTable` is keyed by `(PID, name)` with `group_key = PID`. A directory's own attributes are stored in a reserved child entry `(PID, "_attr_")` physically adjacent to its direct children `(PID, child_name)`.
 * **Epoch-Fenced `PID`-Boundary Sharding & Jumbo Defense**: Shards split strictly along `group_key = PID` boundaries under `ShardEpoch` fencing. In this tree, jumbo isolation is a `JumboIsolated` route flag. It does not migrate peer shards to a dedicated host. **`DualModeFineGrained` `(PID, name)` splitting** uses shard-local `DirShardDelta` records for `1-RTT` writes and `1-hop` scatter-gather `dirstat`.
-* **Single-Shard Pushdown + Crash-Recoverable 2PC**: Executes single-directory Read-Modify-Write (`create`, `unlink`, `setattr`, `lookup`, `dirstat`, `listdir`, and colocated `mkdir`/`rmdir`) in `1 RTT` on the shard leader, reserving Primary-Anchored 2PC (`WriteIntent` + `TxnRecord`) for cross-shard `rename` (`<3%` of workload) and cross-shard `mkdir`/`rmdir`.
+* **Single-Shard Pushdown + Crash-Recoverable 2PC**: Executes single-directory Read-Modify-Write (`create`, `unlink`, `setattr`, `lookup`, `dirstat`, `listdir`, and colocated `mkdir`/`rmdir`) in `1 RTT` on the shard leader, reserving Primary-Anchored 2PC (`WriteIntent` + `TxnRecord`) for cross-shard `rename` and cross-shard `mkdir`/`rmdir`. The `<3%` share of cross-directory `rename` is a Baidu paper workload figure (`arXiv:2610.32247v1`, Table 2), not a benchmark of this repository.
 
 ### 2. Semantic-Aware Off-Critical-Path Processing (`metadb-tx`)
 * **Conflict-Free Asynchronous Attribute Aggregation**: Removes parent directory attribute locks from the foreground write path. Child mutations append deterministic deltas to `AsyncAttrAggregator`, folded into `(PID, "_attr_")` at the L0 SSTable **Coordinated Flush Barrier** while **Read-Path Reconciliation** guarantees linearizable `dirstat` reads.
@@ -39,7 +39,7 @@ General-purpose distributed databases (such as TiDB, CockroachDB, and Foundation
 
 ### 3. Lifecycle-Aware Pure-Rust Storage Engine (`metadb-storage` & `metadb-raft`)
 * **WAL-less LSM + 3-Watermark OpenRaft**: Disables local KV WAL files in favor of segmented CRC32C Raft logs (`openraft`), clamping log purge to `min(state_flushed_index, aux_outbox_durable_index, last_snapshot_index)`.
-* **`SnapshotGuard` In-Memory MVCC**: Retains multi-version chains in memory for the `5s` transaction window, gating unversioned L0 SSTable collapse-flushes on `ActiveSnapshotRegistry` (`min_active_snapshot_hlc >= imm.max_hlc`) to eliminate persisted MVCC tombstones (`~60%` fewer KV writes) with zero future-read anomalies.
+* **`SnapshotGuard` In-Memory MVCC**: Retains multi-version chains in memory for the `5s` transaction window and gates an unversioned L0 collapse-flush on `ActiveSnapshotRegistry` (`min_active_snapshot_hlc >= imm.max_hlc`). That flush may keep only the latest value of a key. It does not pin every historical version, and it does not stop an unversioned SSTable from dropping older versions of other keys. A range read at `start_hlc` can therefore include later values of keys an open 2PC lease does not cover. Point reads of the keys that lease records stay at the pre-image until commit. The `~60%` fewer KV writes figure is a paper/model claim from `arXiv:2610.32247v1`, not a measurement of this repository. The same range-read limit is in [docs/en/architecture.md](./docs/en/architecture.md).
 * **Bottommost-Safe Locality-Aware Compaction**: Tracks tombstone density per 9-byte prefix bucket and compacts hot deletion ranges down to the deepest overlapping SSTable level. A flat `listdir` P99 under `<4ms` is a design target in `arXiv:2610.32247v1`, not a measurement of this repository.
 
 ---
@@ -48,7 +48,7 @@ General-purpose distributed databases (such as TiDB, CockroachDB, and Foundation
 
 The design keeps one `StorageBackend` and one `openraft` state machine from an embedded single-binary node toward a multi-Cell cluster. Stage 3 is a design target. This binary does not deploy it.
 
-* **Stage 1 — Single-Node All-in-One (`1-Voter` OpenRaft)**: Zero network coordination; sequential Raft log persistence + embedded Rust SDK or `metadbd --role all-in-one`.
+* **Stage 1 — Single-Node All-in-One (`1-Voter` OpenRaft)**: Zero network coordination; sequential Raft log persistence with `metadbd --role all-in-one` or the persistent API `MetaDbEngine::open` / `PersistentMetaDbCluster`. `MetaDbEngine::new_single_node` is a separate in-memory simulator: no data directory, no OpenRaft group, and no WAL-less LSM.
 * **Stage 2 — Dynamic Multi-Shard Split**: Splits shards along `group_key = PID` boundaries on a single host.
 * **Stage 3 — Multi-Cell Distributed Cluster (design only)**: The design describes `AddLearner`, SSTable snapshot catch-up, joint-consensus voter promotion, decentralized `HLC` clocks, stateless `MetaCache`, and a two-tier control plane. Role-trimmed `be`, `proxy`, `cell-manager`, and `global-manager` processes are not a deployment this tree runs.
 

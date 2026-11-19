@@ -64,7 +64,7 @@ cargo run -p metadb-server --bin metadbd -- --config ./standalone.toml
 
 日志使用 `tracing-subscriber` 的 `EnvFilter`。默认过滤器是 `info`。用标准环境变量 `RUST_LOG` 覆盖，例如 `RUST_LOG=debug`。
 
-`security.shared_secret` 为空时，进程在启动时记录一条警告：环回 gRPC 没有认证。默认绑定是 `127.0.0.1`。通配或其他非环回地址如果密钥为空、缺失或拼错，会拒绝监听。非空的 `[security].shared_secret` 对元数据、事务、控制面、Raft 传输和 `GET /metrics` 要求同一个持有者令牌。进程不终结 TLS。配置里的 TLS 或证书键会使启动失败，而不是以明文提供服务。把监听器留在可信网络上，或把每个服务放到会认证客户端的代理后面，并阻断对本进程的直接访问。
+An empty `security.shared_secret` does not start the process, including on the default `127.0.0.1` bind. Loopback development without credentials requires `allow_unauthenticated = true`. That flag still refuses a wildcard or any other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. A misspelled secret still fails startup. A non-empty `[security].shared_secret` requires the same bearer for metadata, transaction, control-plane, and Raft transport RPCs, and for `GET /metrics`. The process does not terminate TLS. A TLS or certificate key in the configuration fails startup instead of serving plaintext. Keep an opted-in listener on a trusted network, or put every service behind a proxy that authenticates the client and block direct access to this process.
 
 Ctrl-C 会刷出分片状态并停止 OpenRaft 组（`cluster.shutdown()`）。
 

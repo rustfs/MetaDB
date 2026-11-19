@@ -71,7 +71,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ## 指标
 
-设置 `node.metrics_listen_addr`（例如 `127.0.0.1:9100`）。`open_and_serve` 在该地址接受 TCP 连接。`GET /metrics` 返回 Prometheus 文本。其他路径返回 404，其他方法返回 405。`[security].shared_secret` 非空时，该监听器上的每个请求都必须发送 `Authorization: Bearer <shared_secret>`。缺失、空或错误的令牌返回 HTTP 401，正文不是指标文本，包括对 `/status` 的请求。空密钥配合非环回的指标地址会拒绝启动。该监听器不终结 TLS。
+设置 `node.metrics_listen_addr`（例如 `127.0.0.1:9100`）。`open_and_serve` 在该地址接受 TCP 连接。`GET /metrics` 返回 Prometheus 文本。其他路径返回 404，其他方法返回 405。`[security].shared_secret` 非空时，该监听器上的每个请求都必须发送 `Authorization: Bearer <shared_secret>`。缺失、空或错误的令牌返回 HTTP 401，正文不是指标文本，包括对 `/status` 的请求。An empty secret does not start the process on any address, including loopback, unless `allow_unauthenticated = true`. That flag is loopback-only and still refuses a wildcard or other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. This listener does not terminate TLS.
 
 `render_prometheus_metrics` 的计量与计数：
 
@@ -136,7 +136,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 - 未知且非零的 `cell_id` 上，`GetRoutes` 失败关闭。`StoreHeartbeat` 不会替换缓存路由。
 - 巨型隔离是路由标志加上从本地节点表选出的节点标识。它不会把其他分片从磁盘上赶走。
 - 心跳是一个 RPC，`metadbd` 里没有发送方。`StoreHeartbeat` 不持久化。
-- 非空共享密钥用同一个持有者令牌认证 Raft、另外三个 gRPC 服务和指标监听器。空密钥只接受环回绑定，这些监听器不认证。通配绑定加上空密钥会拒绝启动。进程不终结 TLS。
+- A non-empty shared secret authenticates Raft, the other three gRPC services, and the metrics listener with the same bearer. An empty secret does not start the process, including on loopback. `allow_unauthenticated = true` is the explicit opt-in for empty-secret loopback development and still refuses a wildcard or any other non-loopback bind. A whitespace-only secret is rejected even with that opt-in. A usable secret combined with the opt-in is rejected. The process does not terminate TLS.
 - `memtable_size_bytes` 会封印并刷出活动 memtable。`max_imm_memtables` 限制已排队的不可变表数量。Raft 计时字段不会通过 TOML 改变运行行为。
 - `hotspot-create` 和 `bulk-ttl-delete` 的 `metadb-ctl bench` 打印 JSON 行：先是带 `bench_pid` 的头，然后是包含 attempted、succeeded、failed 和延迟分位数的阶段报告。只要有一次请求的操作失败，进程就以非零状态退出。`--workload mixed` 或 `--embedded` 运行进程内的压力工具。`sql` 把响应打印成 JSON，遇到应用错误时以非零状态退出。
 

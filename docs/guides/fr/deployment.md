@@ -34,7 +34,7 @@ bootstrap_table_shards = true
 shard_split_threshold_bytes = 4294967296 # 4 Gio
 ```
 
-Rust 1.100.0 (`rust-toolchain.toml`). Seul le rôle `all-in-one` démarre. Ce processus ne termine pas TLS. Sans `[security].shared_secret`, il n'y a pas d'authentification, et seules les liaisons en boucle locale sont acceptées. Le défaut est `127.0.0.1`. Un joker ou une autre adresse avec un secret vide refuse de démarrer. Un `shared_secret` non vide exige `authorization: Bearer <secret>` pour les métadonnées, les transactions, le plan de contrôle, Raft sur le même port, et `GET /metrics`.
+Rust 1.100.0 (`rust-toolchain.toml`). Only `all-in-one` starts. This process does not terminate TLS. An empty `[security].shared_secret` does not start the process, including on the default `127.0.0.1` bind. Loopback development without credentials requires `allow_unauthenticated = true`. That flag still refuses a wildcard or any other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with `allow_unauthenticated` is rejected. A non-empty secret requires `authorization: Bearer <secret>` for metadata, transactions, the control plane, Raft on the same port, and `GET /metrics`.
 
 ```bash
 metadbd --config /etc/metadb/standalone.toml

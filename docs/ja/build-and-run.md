@@ -64,7 +64,7 @@ cargo run -p metadb-server --bin metadbd -- --config ./standalone.toml
 
 ログは `tracing-subscriber` の `EnvFilter` を使います。既定のフィルタは `info` です。標準の環境変数 `RUST_LOG` で上書きします。例: `RUST_LOG=debug`。
 
-`security.shared_secret` が空のとき、起動時にループバックの gRPC には認証が無いという警告が出ます。既定のバインドは `127.0.0.1` です。ワイルドカードまたはループバック以外のアドレスで、シークレットが空、欠落、または綴り違いなら待受を拒否します。空でない `[security].shared_secret` は、メタデータ、トランザクション、コントロールプレーン、Raft 転送、および `GET /metrics` に同じベアラを要求します。プロセスは TLS を終端しません。設定中の TLS または証明書キーは、平文で提供する代わりに起動を失敗させます。リスナーを信頼できるネットワークに留めるか、すべてのサービスを、クライアントを認証するプロキシの後ろに置き、このプロセスへの直接アクセスを塞いでください。
+An empty `security.shared_secret` does not start the process, including on the default `127.0.0.1` bind. Loopback development without credentials requires `allow_unauthenticated = true`. That flag still refuses a wildcard or any other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. A misspelled secret still fails startup. A non-empty `[security].shared_secret` requires the same bearer for metadata, transaction, control-plane, and Raft transport RPCs, and for `GET /metrics`. The process does not terminate TLS. A TLS or certificate key in the configuration fails startup instead of serving plaintext. Keep an opted-in listener on a trusted network, or put every service behind a proxy that authenticates the client and block direct access to this process.
 
 Ctrl-C はシャード状態をフラッシュし、OpenRaft グループを止めます（`cluster.shutdown()`）。
 

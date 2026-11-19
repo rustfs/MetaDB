@@ -13,7 +13,7 @@
 | `node.role` | `all-in-one` | Ja. Jeder andere Wert liefert einen Fehler |
 | `node.data_dir` | `./metadb-data` | Ja |
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | Ja. Bind-Adresse |
-| `node.metrics_listen_addr` | nicht gesetzt | Ja, nur wenn gesetzt. Eigener TCP-Listener. Eine Nicht-Loopback-Adresse verlangt ein nicht leeres Geheimnis |
+| `node.metrics_listen_addr` | nicht gesetzt | Applied only when set. Separate TCP listener. An empty secret does not listen unless `allow_unauthenticated = true`, and that flag is loopback-only |
 | `clock.max_clock_drift_ms` | `500` | Ja. `HybridLogicalClock::with_max_drift_ms` |
 | `storage.memtable_size_bytes` | `33554432` (32 MiB) | Ja. Versiegelt und schreibt die aktive Memtable aus, sobald ihre angerechneten Bytes diese Größe erreichen. Werte unter 1 gelten als 1 |
 | `storage.max_imm_memtables` | `4` | Ja. Schreiber warten, statt mehr unveränderliche Memtables als diese Obergrenze einzureihen |
@@ -24,7 +24,8 @@
 | `storage.locality_tombstone_ratio` | `0.50` | Ja. Mal 1000, auf 1..=1000 begrenzt, gespeichert als `tombstone_min_ratio_permille` |
 | `sharding.bootstrap_table_shards` | `true` | Ja. `true` erzeugt die Shards 1, 2 und 3. `false` erzeugt Shard 1 über `[0x01, 0x04)` |
 | `sharding.shard_split_threshold_bytes` | `4294967296` (4 GiB) | Ja. Die Split-Prüfung nutzt die ungefähre Shard-Größe |
-| `security.shared_secret` | `""` | Ja. Leer ist nur zulässig, wenn jeder Listener Loopback ist. Nicht leer verlangt denselben Bearer für gRPC und Metriken |
+| `security.shared_secret` | `""` | Empty does not start the process. Loopback without credentials requires `allow_unauthenticated = true`. A non-empty secret requires the same bearer on gRPC and metrics. A whitespace-only secret is rejected |
+| `security.allow_unauthenticated` | `false` | Explicit opt-in for an empty secret on loopback only. Rejected together with a usable secret. Rejected on a wildcard or any other non-loopback bind. A whitespace-only secret is rejected even with this flag |
 
 Es gibt keine Tabelle `[raft]`. `ServerTomlConfig.raft_options` wird von serde übersprungen und bleibt bei `RaftNodeOptions::default()` (Heartbeat 150 ms, Wahl 450–900 ms, Snapshot-Log-Behalten 0, Segment 64 MiB).
 
@@ -73,7 +74,7 @@ Dieser Prozess beendet TLS nicht. Es gibt keine Zertifikatskonfiguration, die na
 
 Wenn `shared_secret` nicht leer ist, verlangen `MetadataService`, `TransactionService`, `ControlPlaneService` und `RaftTransportService`, dass `authorization` genau `Bearer <shared_secret>` ist. `GET /metrics` auf `metrics_listen_addr` verlangt denselben `Authorization`-Header. Ein fehlender Header, ein leerer Bearer, ein Präfix oder ein längerer Token wird abgelehnt. Der Fehlerkörper der Metriken ist kein Prometheus-Text. Raft-Peers senden denselben Bearer. `metadb-ctl --auth-token` (Umgebungsvariable `METADB_AUTH_TOKEN`) und `metadbd --join` / `--cell-manager` senden ihn. `metadb-ctl cluster status` ruft `GetRoutes` auf und liegt unter demselben Interceptor.
 
-Ein leeres oder nur aus Leerzeichen bestehendes Geheimnis ist nur zulässig, wenn `grpc_listen_addr` und, falls gesetzt, `metrics_listen_addr` Loopback sind (`127.0.0.0/8`, `::1` oder der Name `localhost`). Eine Wildcard (`0.0.0.0`, `::`) oder jede andere Adresse verweigert das Binden. Ein leeres Loopback-Geheimnis wird beim Start gewarnt. Die Listener bleiben Klartext. Sie in einem vertrauenswürdigen Netz lassen, oder jeden Dienst hinter einen Proxy setzen, der den Client authentifiziert, und den direkten Zugriff auf diesen Prozess sperren.
+An empty secret does not start the process, including when every listener is loopback (`127.0.0.0/8`, `::1`, or the name `localhost`). Loopback development without credentials requires `allow_unauthenticated = true`. That flag still refuses a wildcard (`0.0.0.0`, `::`) or any other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. Listeners stay plaintext. Keep an opted-in listener on a trusted network, or put every service behind a proxy that authenticates the client and block direct access to this process.
 
 ## Was sich nicht konfigurieren lässt
 

@@ -71,7 +71,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ## メトリクス
 
-`node.metrics_listen_addr` を設定します（例: `127.0.0.1:9100`）。`open_and_serve` がそのアドレスで TCP 接続を受けます。`GET /metrics` は Prometheus テキストを返します。他のパスは 404、他のメソッドは 405 です。`[security].shared_secret` が空でないとき、このリスナーのすべての要求は `Authorization: Bearer <shared_secret>` を送らなければなりません。欠落、空、または誤ったベアラは HTTP 401 を返し、本体はメトリクス本文ではありません。`/status` への要求も同じです。空のシークレットでループバック以外のメトリクスアドレスは起動を拒否します。このリスナーは TLS を終端しません。
+`node.metrics_listen_addr` を設定します（例: `127.0.0.1:9100`）。`open_and_serve` がそのアドレスで TCP 接続を受けます。`GET /metrics` は Prometheus テキストを返します。他のパスは 404、他のメソッドは 405 です。`[security].shared_secret` が空でないとき、このリスナーのすべての要求は `Authorization: Bearer <shared_secret>` を送らなければなりません。欠落、空、または誤ったベアラは HTTP 401 を返し、本体はメトリクス本文ではありません。`/status` への要求も同じです。An empty secret does not start the process on any address, including loopback, unless `allow_unauthenticated = true`. That flag is loopback-only and still refuses a wildcard or other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. This listener does not terminate TLS.
 
 `render_prometheus_metrics` のゲージとカウンタ:
 
@@ -136,7 +136,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 - 未知で非ゼロの `cell_id` に対する `GetRoutes` は失敗して閉じる。`StoreHeartbeat` はキャッシュ済みルートを置き換えない。
 - ジャンボ隔離はルートフラグと、ローカルノード表から選んだノード ID である。他のシャードをディスクから追い出すことはしない。
 - ハートビートは RPC であり、`metadbd` に送信側はない。`StoreHeartbeat` は永続化しない。
-- 空でない共有シークレットは、Raft、他の 3 つの gRPC サービス、およびメトリクスリスナーを同じベアラで認証する。空のシークレットはループバックのバインドだけを受け付け、それらのリスナーは無認証のままである。空のシークレットでのワイルドカードバインドは起動を拒否する。プロセスは TLS を終端しない。
+- A non-empty shared secret authenticates Raft, the other three gRPC services, and the metrics listener with the same bearer. An empty secret does not start the process, including on loopback. `allow_unauthenticated = true` is the explicit opt-in for empty-secret loopback development and still refuses a wildcard or any other non-loopback bind. A whitespace-only secret is rejected even with that opt-in. A usable secret combined with the opt-in is rejected. The process does not terminate TLS.
 - `memtable_size_bytes` はアクティブな memtable を封印してフラッシュする。`max_imm_memtables` はキューに積まれた不変テーブルの数を抑える。Raft のタイマ項目は、TOML 経由で実行時の挙動を変えない。
 - `hotspot-create` と `bulk-ttl-delete` の `metadb-ctl bench` は JSON 行を印字する。`bench_pid` を含むヘッダのあと、attempted、succeeded、failed とレイテンシのパーセンタイルを持つフェーズ報告が続く。要求した操作がすべて成功しない限り、プロセスは非ゼロで終了する。`--workload mixed` または `--embedded` はプロセス内のストレステストを実行する。`sql` は応答を JSON で印字し、アプリケーションエラーでは非ゼロで終了する。
 
