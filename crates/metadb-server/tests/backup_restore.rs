@@ -283,7 +283,13 @@ fn set_files_readonly(root: &Path, readonly: bool) {
             continue;
         }
         let mut permissions = std::fs::metadata(&current).unwrap().permissions();
-        permissions.set_readonly(readonly);
+        let mode = std::os::unix::fs::PermissionsExt::mode(&permissions);
+        let mode = if readonly {
+            mode & !0o222
+        } else {
+            mode | 0o200
+        };
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, mode);
         std::fs::set_permissions(&current, permissions).unwrap();
     }
 }
@@ -335,6 +341,63 @@ fn copy_tree(source: &Path, dest: &Path) {
         .status()
         .unwrap();
     assert!(status.success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offline_backup_does_not_mutate_source_manifests() {
+    let dir = tempdir().unwrap();
+    let cfg = persistent_cfg(dir.path());
+    let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
+    cluster
+        .create_file_auto_id(ROOT_INODE_ID, "offline.dat", 4, 0o644, 8)
+        .await
+        .unwrap();
+    cluster.run_maintenance_tick().await.unwrap();
+    cluster
+        .acquire_backup_hold(Duration::from_secs(120))
+        .unwrap();
+    cluster.shutdown().await.unwrap();
+
+    let manifests = walk_files(dir.path())
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("MANIFEST-"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !manifests.is_empty(),
+        "maintenance did not write a MANIFEST"
+    );
+    let before = manifests
+        .iter()
+        .map(|path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            (
+                path.clone(),
+                std::fs::read(path).unwrap(),
+                std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (path, _, mode) in &before {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, mode & !0o222);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+    let outside = tempdir().unwrap();
+    let output = outside.path().join("offline-artifact");
+    let result =
+        backup::create_offline_backup(dir.path(), &output, &metadb_server::check_backup_tree);
+    for (path, bytes, mode) in &before {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, *mode);
+        std::fs::set_permissions(path, permissions).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), *bytes);
+    }
+    result.expect("a read-only source MANIFEST must still produce an offline backup");
+    assert!(output.join("BACKUP_MANIFEST").is_file());
 }
 
 fn walk_files(root: &Path) -> Vec<std::path::PathBuf> {

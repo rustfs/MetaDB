@@ -1833,6 +1833,16 @@ impl DurableCellManager {
     }
 
     fn write_state_file(dir: &Path, st: &PersistedCellState) -> Result<()> {
+        let _shard_set = if dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("cell_"))
+        {
+            let root = dir.parent().unwrap_or_else(|| Path::new("."));
+            Some(metadb_raft::backup::lock_be_shard_set(&root.join("be"))?)
+        } else {
+            None
+        };
         let mut raw = codec::serialize(st).map_err(|e| MetaDbError::CodecError(e.to_string()))?;
         append_crc32c_le(&mut raw);
         let tmp = dir.join("CELL_MANAGER_STATE.tmp");

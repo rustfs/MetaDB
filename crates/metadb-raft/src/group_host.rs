@@ -933,6 +933,7 @@ impl ShardGroupHost {
         shard_id: ShardId,
         state: RegistryShardState,
     ) -> Result<()> {
+        let _shard_set = crate::backup::lock_be_shard_set(&self.data_dir)?;
         let mut guard = self.registry.write().unwrap();
         guard.insert(shard_id, state);
         Self::persist_registry(&self.data_dir, &guard)

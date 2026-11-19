@@ -309,6 +309,32 @@ impl ManifestLog {
         Self::open_internal(lsm_dir, false)
     }
 
+    /// Reads the flushed checkpoint without opening `MANIFEST` for append or repairing it.
+    ///
+    /// Offline backup uses this so a read of the source image cannot change the live file.
+    pub fn read_checkpoint_readonly(lsm_dir: &Path) -> Result<DurableShardCheckpoint> {
+        let current_path = lsm_dir.join("CURRENT");
+        let manifest_name = fs::read_to_string(&current_path)?.trim().to_string();
+        if manifest_name.contains('/')
+            || manifest_name.contains('\\')
+            || manifest_name.contains("..")
+        {
+            return Err(MetaDbError::ManifestCorrupted(format!(
+                "invalid CURRENT content '{manifest_name}'"
+            )));
+        }
+        let manifest_path = lsm_dir.join(&manifest_name);
+        let mut raw = Vec::new();
+        File::open(&manifest_path)?.read_to_end(&mut raw)?;
+        let (state, torn) = Self::replay_manifest_bytes(&raw)?;
+        if torn.is_some() {
+            return Err(MetaDbError::ManifestCorrupted(
+                "incomplete MANIFEST in existing checkpoint".to_string(),
+            ));
+        }
+        Ok(state.checkpoint)
+    }
+
     fn open_internal(lsm_dir: &Path, recover: bool) -> Result<(Self, RecoveredManifestState)> {
         if recover {
             fs::create_dir_all(lsm_dir)?;
@@ -385,11 +411,57 @@ impl ManifestLog {
             ));
         }
 
+        let (recovered, truncate_to) = Self::replay_manifest_bytes(&raw)?;
+        let next_file_id = recovered.next_file_id;
+        let next_flush_generation = recovered.next_flush_generation;
+        let checkpoint = recovered.checkpoint;
+        let live_files = recovered.live_files;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&manifest_path)?;
+        if let Some(valid_len) = truncate_to {
+            if !recover {
+                return Err(MetaDbError::ManifestCorrupted(
+                    "incomplete MANIFEST in existing checkpoint".to_string(),
+                ));
+            }
+            let trunc_file = OpenOptions::new().write(true).open(&manifest_path)?;
+            trunc_file.set_len(valid_len as u64)?;
+            trunc_file.sync_data()?;
+        }
+
+        if recover {
+            Self::cleanup_orphan_files(lsm_dir, &live_files, &manifest_name)?;
+        }
+
+        Ok((
+            Self {
+                lsm_dir: lsm_dir.to_path_buf(),
+                manifest_seq: seq,
+                manifest_path,
+                file,
+            },
+            RecoveredManifestState {
+                next_file_id,
+                next_flush_generation,
+                checkpoint,
+                live_files,
+            },
+        ))
+    }
+
+    fn replay_manifest_bytes(raw: &[u8]) -> Result<(RecoveredManifestState, Option<usize>)> {
+        if raw.is_empty() {
+            return Err(MetaDbError::ManifestCorrupted(
+                "MANIFEST has no baseline record".to_string(),
+            ));
+        }
         let mut next_file_id = 1u64;
         let mut next_flush_generation = 1u64;
         let mut checkpoint = DurableShardCheckpoint::default();
         let mut live_files: BTreeMap<(u8, u64), SstFileMeta> = BTreeMap::new();
-
         let mut offset = 0usize;
         let mut truncate_to: Option<usize> = None;
 
@@ -472,42 +544,17 @@ impl ManifestLog {
                 next_flush_generation = next_flush_generation.max(following_generation);
                 live_files.insert((add.level, add.file_id), add);
             }
-
             offset = record_end;
         }
 
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&manifest_path)?;
-        if let Some(valid_len) = truncate_to {
-            if !recover {
-                return Err(MetaDbError::ManifestCorrupted(
-                    "incomplete MANIFEST in existing checkpoint".to_string(),
-                ));
-            }
-            let trunc_file = OpenOptions::new().write(true).open(&manifest_path)?;
-            trunc_file.set_len(valid_len as u64)?;
-            trunc_file.sync_data()?;
-        }
-
-        if recover {
-            Self::cleanup_orphan_files(lsm_dir, &live_files, &manifest_name)?;
-        }
-
         Ok((
-            Self {
-                lsm_dir: lsm_dir.to_path_buf(),
-                manifest_seq: seq,
-                manifest_path,
-                file,
-            },
             RecoveredManifestState {
                 next_file_id,
                 next_flush_generation,
                 checkpoint,
                 live_files,
             },
+            truncate_to,
         ))
     }
 
