@@ -137,7 +137,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 - 巨型隔离是路由标志加上从本地节点表选出的节点标识。它不会把其他分片从磁盘上赶走。
 - 心跳是一个 RPC，`metadbd` 里没有发送方。`StoreHeartbeat` 不持久化。
 - 非空共享密钥用同一个持有者令牌认证 Raft、另外三个 gRPC 服务和指标监听器。空密钥只接受环回绑定，这些监听器不认证。通配绑定加上空密钥会拒绝启动。进程不终结 TLS。
-- `memtable_size_bytes` 和所有 Raft 计时字段不会通过 TOML 改变运行行为。
+- `memtable_size_bytes` 会封印并刷出活动 memtable。`max_imm_memtables` 限制已排队的不可变表数量。Raft 计时字段不会通过 TOML 改变运行行为。
 - `hotspot-create` 和 `bulk-ttl-delete` 的 `metadb-ctl bench` 打印 JSON 行：先是带 `bench_pid` 的头，然后是包含 attempted、succeeded、failed 和延迟分位数的阶段报告。只要有一次请求的操作失败，进程就以非零状态退出。`--workload mixed` 或 `--embedded` 运行进程内的压力工具。`sql` 把响应打印成 JSON，遇到应用错误时以非零状态退出。
 
 ## 文档缺口
@@ -149,5 +149,5 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 3. 创建第二个单元并路由到它。
 4. 把巨型分片放到独立机器上，并把其他分片从那台机器移走。
 5. 本进程内的 TLS。进程不终结 TLS。要求 TLS 或证书的配置键会被拒绝，而不是以明文提供服务。请在外部代理终结 TLS。密钥非空时，Raft 和指标与其他服务使用同一个持有者令牌；这不是双向 TLS。由心跳驱动的控制循环没有实现。
-6. 运维人员可以设置并观察到的 memtable 大小或 Raft 计时器。
+6. 运维人员可以设置并观察到的 Raft 计时器。
 7. 记入仓库的 `metadb-ctl bench` 服务级结果。该命令打印你运行它的那台机器上的数字。本仓库没有记录一份。未合并的拉取请求 2 报告了另一套嵌入式工具；那些命令不在本树中。见 [测试与压测](./testing.md)。

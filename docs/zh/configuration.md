@@ -15,7 +15,8 @@
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | 是。绑定地址 |
 | `node.metrics_listen_addr` | 未设置 | 仅在设置时应用。单独的 TCP 监听器。非环回地址要求非空密钥 |
 | `clock.max_clock_drift_ms` | `500` | 是。`HybridLogicalClock::with_max_drift_ms` |
-| `storage.memtable_size_bytes` | `33554432`（32 MiB） | **否。** 字段被保存，从不读取 |
+| `storage.memtable_size_bytes` | `33554432`（32 MiB） | 是。计入的字节达到该大小时，封印并刷出活动 memtable。小于 1 的值按 1 处理 |
+| `storage.max_imm_memtables` | `4` | 是。写入方会等待，而不是把超过该上限的不可变 memtable 继续排队 |
 | `storage.block_cache_bytes` | `67108864`（64 MiB） | 是。16 路块缓存的总预算 |
 | `storage.mvcc_retention_ms` | `5000` | 是 |
 | `storage.bloom_bits_per_key` | `10` | 是 |
@@ -31,7 +32,7 @@
 
 ## 示例
 
-除了明确的数据目录、指标端口和密钥，这个文件与默认值一致。写出 `memtable_size_bytes` 是为了避免抄来的配置让人意外；改它不会改变刷盘行为。
+除了明确的数据目录、指标端口和密钥，这个文件与默认值一致。`memtable_size_bytes` 是活动 memtable 的刷盘阈值。`max_imm_memtables` 是不可变表的反压上限。
 
 ```toml
 [node]
@@ -47,6 +48,7 @@ max_clock_drift_ms = 500
 
 [storage]
 memtable_size_bytes = 33554432
+max_imm_memtables = 4
 block_cache_bytes = 67108864
 mvcc_retention_ms = 5000
 bloom_bits_per_key = 10
@@ -78,5 +80,5 @@ shared_secret = "replace-with-a-long-random-string"
 - 按角色裁剪子系统。角色字段是允许或拒绝的开关，不是功能集合。
 - 对等体列表、投票者集合或加入令牌。成员关系从这一个进程开始。额外对等体只在 `RegisterNode` 加上 `ScaleShardReplicas` 之后出现，而且这些对等体必须已经是同一分片日志上会说 `RaftTransportService` 的 Raft 成员。第二个 all-in-one 进程不会这样做。见 [运维](./operations.md)。
 - 第二个单元的键范围。`RegisterCell` 返回错误并且什么都不保存。空数据目录上的第二个 all-in-one 进程用 `[cluster] join` 加入当前 leader，这仍是同一个单元。
-- memtable 字节上限、Raft 计时器，或局部性压缩的开关。
+- Raft 计时器，或局部性压缩的开关。
 - 本进程内的 TLS 证书。配置中的 TLS 键会被拒绝。终结应放在外部代理。

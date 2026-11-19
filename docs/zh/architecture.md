@@ -82,7 +82,7 @@
 
 MVCC 版本在内存中保留 `storage.mvcc_retention_ms`（默认 5,000）。协调刷盘封印 memtable，运行属性聚合钩子，并写出 L0 SSTable。没有单独的用户 KV WAL。崩溃恢复靠 Raft 日志加上 LSM 清单。`LocalityCompactor` 按 9 字节前缀桶跟踪墓碑，并在 `locality_tombstone_threshold` 与 `locality_tombstone_ratio` 同时越过时压缩热点删除范围。`ServerTomlConfig::to_lsm_config` 总是把 `auto_locality_compaction` 设为 `true`；TOML 文件不能关掉它。
 
-`storage.memtable_size_bytes` 会被反序列化，但从不读取。刷盘大小不取自该字段。
+`storage.memtable_size_bytes` 是活动 memtable 的刷盘阈值。`storage.max_imm_memtables`（默认 4）是不可变表的反压上限：写入方会等到一张不可变表刷盘，而不是再排入一张。
 
 ## Raft
 
