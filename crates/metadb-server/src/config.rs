@@ -185,7 +185,11 @@ pub struct ServerTomlConfig {
     pub sharding: ShardingSection,
     pub security: SecuritySection,
     pub cluster: ClusterSection,
-    #[serde(skip)]
+    /// OpenRaft timers and the segmented-log size. The TOML table is `[raft]`.
+    ///
+    /// Field names are not secret or TLS keys, so the security-key walk in
+    /// `from_toml_str` does not treat this table as an auth setting.
+    #[serde(default, rename = "raft")]
     pub raft_options: RaftNodeOptions,
     /// Overrides the 45-second join budget. `None` keeps that budget.
     /// Not read from TOML; tests use it so a refused seed returns without waiting.
@@ -198,8 +202,11 @@ impl ServerTomlConfig {
         let value: toml::Value = toml::from_str(s)
             .map_err(|e| MetaDbError::CodecError(format!("invalid TOML config: {e}")))?;
         reject_unsupported_security_keys(&value)?;
-        ServerTomlConfig::deserialize(value)
-            .map_err(|e| MetaDbError::CodecError(format!("invalid TOML config: {e}")))
+        let parsed = ServerTomlConfig::deserialize(value)
+            .map_err(|e| MetaDbError::CodecError(format!("invalid TOML config: {e}")))?;
+        // Timer checks only. This does not read or rewrite [security].
+        parsed.raft_options.validate()?;
+        Ok(parsed)
     }
 
     pub fn from_toml_file(path: impl AsRef<Path>) -> Result<Self> {

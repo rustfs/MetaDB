@@ -55,7 +55,7 @@ metadbd --config /etc/metadb/standalone.toml
 
 `MetadataService`, `TransactionService`, `ControlPlaneService`, `RaftTransportService`, and the metrics listener do **not** terminate TLS. An empty `[security].shared_secret` does not start the process, including on the default `127.0.0.1:7800` bind. Set `allow_unauthenticated = true` only for development on a literal loopback IP such as `127.0.0.1`. The hostname `localhost` is not accepted for that flag. A wildcard or other non-loopback address without a non-empty secret still refuses to start. A TLS, certificate, anonymous, or insecure key in this file is rejected rather than served as plaintext.
 
-To require `authorization: Bearer <secret>` on metadata, transaction, control-plane, Raft transport, and `GET /metrics`, replace the `[security]` table above. Do not leave `allow_unauthenticated` in the file. A whitespace-only `shared_secret` is rejected even if that flag remains. Peer Raft clients propagate the same token. `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --cell-manager` send that header:
+To require `authorization: Bearer <secret>` on metadata, transaction, control-plane, Raft transport, and every metrics-listener request (`GET /metrics`, `/livez`, `/readyz`, `/healthz`), replace the `[security]` table above. Do not leave `allow_unauthenticated` in the file. A whitespace-only `shared_secret` is rejected even if that flag remains, and it is not accepted as the bearer on those probes. `/readyz` reports traffic readiness, not merely that the port is open. See [Operability](../../en/operability.md). Peer Raft clients propagate the same token. `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --cell-manager` send that header:
 
 ```toml
 [security]

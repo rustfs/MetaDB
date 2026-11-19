@@ -15,7 +15,7 @@ This page follows the code in `crates/`. It does not describe a multi-process Ce
 5. Opens or bootstraps `DurableCellManager` at `<data_dir>/cell_<cell_id>`.
 6. Registers that one cell on `DurableGlobalManager` for the key range `[0x01, 0x04)`.
 7. Ensures root directory inode `1` (`ROOT_INODE_ID`) has an attribute record.
-8. Serves four gRPC services on the same listener. All four take the same bearer interceptor. When `metrics_listen_addr` is set, `GET /metrics` on that address requires the same secret. A secret that contains a non-whitespace character rejects a missing or wrong bearer. An empty secret listens only when `allow_unauthenticated` is set, and only on loopback. A whitespace-only secret does not reach this step. This process does not terminate TLS.
+8. Serves four gRPC services on the same listener. All four take the same bearer interceptor. When `metrics_listen_addr` is set, `GET /metrics`, `GET /livez`, `GET /readyz`, and `GET /healthz` use `classify_secret`. A secret that contains a non-whitespace character rejects a missing or wrong bearer. A whitespace-only secret is 401 on those paths and does not match `Bearer` plus the same spaces. An empty secret listens only when `allow_unauthenticated` is set, and only for a literal loopback IP. The bound metrics address is checked again after that socket binds. This process does not terminate TLS.
 9. Spawns a maintenance task on a 250 ms interval.
 
 `metadbd` is a thin wrapper: it loads TOML, applies CLI overrides, calls `open_and_serve`, optionally calls `RegisterNode` on `--cell-manager`, and on Ctrl-C calls `shutdown`. Metrics, when configured, are served inside `open_and_serve`.
@@ -86,7 +86,7 @@ MVCC versions live in memory for `storage.mvcc_retention_ms` (default 5,000). A 
 
 ## Raft
 
-Each local shard is an `openraft` 0.10 group. The log is a segmented CRC32C file under `.../shards/<id>/raft`. Default options, which are **not** loaded from TOML (`raft_options` is `#[serde(skip)]`):
+Each local shard is an `openraft` 0.10 group. The log is a segmented CRC32C file under `.../shards/<id>/raft`. Defaults, loaded from `[raft]` when that table or a field is omitted:
 
 | Field | Default |
 | :--- | :--- |

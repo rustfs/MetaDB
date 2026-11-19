@@ -15,6 +15,7 @@ use tokio::task::JoinSet;
 
 use crate::bearer_header_matches;
 use crate::classify_secret;
+use crate::operability::{health_body, live_body, ready_body, unavailable_report, ReadinessReport};
 use crate::render_prometheus_metrics;
 use crate::PersistentMetaDbCluster;
 use crate::SecretMaterial;
@@ -61,7 +62,17 @@ async fn metrics_connection(
         let cluster = cluster.clone();
         let shared_secret = shared_secret.clone();
         async move {
-            let (status, body, prometheus) = metrics_decision(&request, &cluster, &shared_secret);
+            let authorization = request
+                .headers()
+                .get(hyper::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok());
+            let (status, body, prometheus) = metrics_decision(
+                request.method(),
+                request.uri().path(),
+                authorization,
+                &cluster,
+                &shared_secret,
+            );
             let mut response = Response::new(Full::new(Bytes::from(body)));
             *response.status_mut() = status;
             let content_type = if prometheus {
@@ -97,46 +108,217 @@ async fn metrics_connection(
 }
 
 fn metrics_decision(
-    request: &Request<Incoming>,
+    method: &Method,
+    path: &str,
+    authorization: Option<&str>,
     cluster: &Weak<PersistentMetaDbCluster>,
     shared_secret: &str,
 ) -> (StatusCode, String, bool) {
+    // Whitespace is not a credential. Do not fall through to an exact bearer
+    // compare: `Authorization: Bearer <spaces>` must still be 401.
     match classify_secret(shared_secret) {
         SecretMaterial::Absent => {}
         SecretMaterial::WhitespaceOnly => {
             return (StatusCode::UNAUTHORIZED, "unauthorized\n".to_owned(), false);
         }
         SecretMaterial::Configured => {
-            let presented = request
-                .headers()
-                .get(hyper::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("");
-            if !bearer_header_matches(presented, shared_secret) {
+            if !bearer_header_matches(authorization.unwrap_or(""), shared_secret) {
                 return (StatusCode::UNAUTHORIZED, "unauthorized\n".to_owned(), false);
             }
         }
     }
-    if request.method() != Method::GET {
+    if method != Method::GET {
         return (
             StatusCode::METHOD_NOT_ALLOWED,
             "method not allowed\n".to_owned(),
             false,
         );
     }
-    if request.uri().path() != "/metrics" {
-        return (StatusCode::NOT_FOUND, "not found\n".to_owned(), false);
-    }
     let Some(cluster) = cluster.upgrade() else {
+        return route_probe(path, None, "");
+    };
+    let report = cluster.readiness();
+    let metrics = render_prometheus_metrics(&cluster.metrics_snapshot());
+    route_probe(path, Some(&report), &metrics)
+}
+
+/// Routes an authenticated GET. `/metrics` stays 200 while the process is not
+/// ready so a scrape can see `metadb_ready 0`. `/healthz` and `/readyz` do not.
+fn route_probe(
+    path: &str,
+    report: Option<&ReadinessReport>,
+    metrics: &str,
+) -> (StatusCode, String, bool) {
+    let Some(report) = report else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable\n".to_owned(),
+            format!("not live: {}\n", unavailable_report().reason),
             false,
         );
     };
-    (
-        StatusCode::OK,
-        render_prometheus_metrics(&cluster.metrics_snapshot()),
-        true,
-    )
+    match path {
+        "/metrics" => (StatusCode::OK, metrics.to_owned(), true),
+        "/livez" => {
+            let status = if report.live {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            (status, live_body(report), false)
+        }
+        "/readyz" => {
+            let status = if report.ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            (status, ready_body(report), false)
+        }
+        "/healthz" => {
+            let status = if report.ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            (status, health_body(report), false)
+        }
+        _ => (StatusCode::NOT_FOUND, "not found\n".to_owned(), false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operability::{evaluate_readiness, ProcessPhase, ShardGate};
+    use std::sync::Weak;
+
+    #[test]
+    fn probes_do_not_echo_tokens_or_treat_a_bound_listener_as_ready() {
+        let secret = "super-secret-token";
+        let (status, body, prometheus) = metrics_decision(
+            &Method::GET,
+            "/readyz",
+            Some("Bearer wrong-token"),
+            &Weak::new(),
+            secret,
+        );
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, "unauthorized\n");
+        assert!(!prometheus);
+        assert!(!body.contains(secret));
+        assert!(!body.contains("wrong-token"));
+
+        let (status, body, _) = metrics_decision(
+            &Method::GET,
+            "/healthz",
+            Some(&format!("Bearer {secret}")),
+            &Weak::new(),
+            secret,
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "not live: unavailable\n");
+        assert!(!body.contains(secret));
+
+        let starting = evaluate_readiness(ProcessPhase::Starting, &[ShardGate::servable()]);
+        let (ready_status, ready_body, ready_prom) =
+            route_probe("/readyz", Some(&starting), "metrics");
+        assert_eq!(ready_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(ready_body, "not ready: starting\n");
+        assert!(!ready_prom);
+
+        let (health_status, health_text, _) = route_probe("/healthz", Some(&starting), "metrics");
+        assert_eq!(health_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(health_text.contains("ready=0"));
+        assert!(health_text.contains("live=1"));
+
+        let (live_status, live_text, _) = route_probe("/livez", Some(&starting), "metrics");
+        assert_eq!(live_status, StatusCode::OK);
+        assert_eq!(live_text, "live\n");
+
+        let (metrics_status, metrics_body, metrics_prom) =
+            route_probe("/metrics", Some(&starting), "metadb_ready 0\n");
+        assert_eq!(metrics_status, StatusCode::OK);
+        assert!(metrics_prom);
+        assert_eq!(metrics_body, "metadb_ready 0\n");
+
+        let serving = evaluate_readiness(ProcessPhase::Serving, &[ShardGate::servable()]);
+        let (status, body, _) = route_probe("/readyz", Some(&serving), "");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "ready\n");
+        let (status, _, _) = route_probe("/healthz", Some(&serving), "");
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body, prom) = route_probe("/status", Some(&serving), "secret-metrics");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "not found\n");
+        assert!(!prom);
+        assert!(!body.contains("secret-metrics"));
+    }
+
+    #[test]
+    fn whitespace_secret_rejects_probes_even_when_the_bearer_matches() {
+        let secret = " \t ";
+        let exact = format!("Bearer {secret}");
+        for path in ["/metrics", "/livez", "/readyz", "/healthz"] {
+            for presented in [None, Some(exact.as_str()), Some("Bearer secret")] {
+                let (status, body, prometheus) =
+                    metrics_decision(&Method::GET, path, presented, &Weak::new(), secret);
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} {presented:?}");
+                assert_eq!(body, "unauthorized\n");
+                assert!(!prometheus);
+                assert!(!body.contains("Bearer"));
+            }
+        }
+    }
+
+    #[test]
+    fn default_empty_config_is_not_an_opt_in_and_absent_secret_does_not_challenge_probes() {
+        use crate::config::ServerTomlConfig;
+
+        let cfg = ServerTomlConfig::from_toml_str(
+            r#"
+            [node]
+            metrics_listen_addr = "127.0.0.1:9100"
+            [raft]
+            heartbeat_interval_ms = 80
+            election_timeout_min_ms = 250
+            election_timeout_max_ms = 450
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.security.shared_secret.is_empty());
+        assert!(!cfg.security.allow_unauthenticated);
+        assert_eq!(cfg.raft_options.heartbeat_interval_ms, 80);
+        let startup = cfg
+            .reject_unauthenticated_bind("127.0.0.1:9100")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            startup.contains("allow_unauthenticated"),
+            "default empty secret must not start: {startup}"
+        );
+
+        let whitespace = ServerTomlConfig::from_toml_str(
+            r#"
+            [security]
+            shared_secret = "   "
+            allow_unauthenticated = true
+            "#,
+        )
+        .unwrap();
+        let whitespace_err = whitespace
+            .security
+            .validate_for_startup()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            whitespace_err.contains("whitespace-only"),
+            "{whitespace_err}"
+        );
+
+        let (status, body, _) = metrics_decision(&Method::GET, "/readyz", None, &Weak::new(), "");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "not live: unavailable\n");
+        assert!(!body.contains("unauthorized"));
+    }
 }
