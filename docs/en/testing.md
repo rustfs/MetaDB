@@ -52,6 +52,10 @@ cargo test -p metadb-server --test prefix_load
 
 `T6` does not start Raft and does not start a second cell process. The name describes the simulator's membership object.
 
+### Seeded simulation catalog
+
+`cargo test -p metadb-server --test simulation_catalog` runs the seeded catalog. The comparison with FoundationDB's testing design, and the standard for that catalog, are in [Simulation testing](./simulation-testing.md). It names three layers and runs only the first two: in-memory `MetaDbEngine::new_single_node`, and a single-process `PersistentMetaDbCluster` restart (unflushed, or flush plus purge, then reopen in the same OS process). Real multi-process workloads are not in the catalog. Official three-replica coverage/delete and concurrent `add_learner` stay deferred until the Aliyun 1-to-5 rehearsal. A passing run is the scripted directory invariant for the seeds in the test. It is not a first-ship pass, not the official million-operation load, and not three-VM evidence. Trillion-scale figures in arXiv:2610.32247v1 are Baidu production data, not results of this run.
+
 ### Persistent single process
 
 | Test | What it checks |

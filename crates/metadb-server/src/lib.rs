@@ -9,6 +9,7 @@
 pub mod config;
 pub mod grpc_services;
 pub mod metrics;
+pub mod simulation;
 pub mod stress;
 
 mod metrics_http;
