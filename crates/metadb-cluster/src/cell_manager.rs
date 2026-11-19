@@ -282,11 +282,28 @@ impl DurableCellManager {
             let _ = mgr.host.shutdown_all().await;
             return Err(error);
         }
+        if mgr.cluster_id() == 0 && mgr.replicated_membership() {
+            let _ = mgr.host.shutdown_all().await;
+            return Err(MetaDbError::IdentityRejected(
+                "legacy replicated cell directory has no shared CLUSTER_IDENTITY; refusing to invent a per-member cluster id"
+                    .to_string(),
+            ));
+        }
+        if let Err(error) = mgr.recover_incomplete_splits().await {
+            let _ = mgr.host.shutdown_all().await;
+            return Err(error);
+        }
+        if let Err(error) = mgr.ingest_engine_bindings() {
+            let _ = mgr.host.shutdown_all().await;
+            return Err(error);
+        }
         if mgr.cluster_id() == 0 {
-            if mgr.replicated_membership() {
+            // A restored log already names this node's instance. Minting a new id
+            // would be rejected as a reused node identity.
+            if mgr.bound_instance(mgr.host.node_id()).is_some() {
                 let _ = mgr.host.shutdown_all().await;
                 return Err(MetaDbError::IdentityRejected(
-                    "legacy replicated cell directory has no shared CLUSTER_IDENTITY; refusing to invent a per-member cluster id"
+                    "CLUSTER_IDENTITY is missing but this node is already bound; refusing to mint a new instance id"
                         .to_string(),
                 ));
             }
@@ -298,14 +315,6 @@ impl DurableCellManager {
                     return Err(error);
                 }
             }
-        }
-        if let Err(error) = mgr.recover_incomplete_splits().await {
-            let _ = mgr.host.shutdown_all().await;
-            return Err(error);
-        }
-        if let Err(error) = mgr.ingest_engine_bindings() {
-            let _ = mgr.host.shutdown_all().await;
-            return Err(error);
         }
         if let Err(error) = mgr.bind_local_instance().await {
             let _ = mgr.host.shutdown_all().await;

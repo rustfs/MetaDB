@@ -705,11 +705,22 @@ impl PersistentMetaDbCluster {
         let bg_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
                     _ = bg_rx.changed() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                        let Some(c) = bg_cluster.upgrade() else { break; };
-                        let _ = c.run_maintenance_tick_inner(false).await;
-                    }
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
+                if *bg_rx.borrow() {
+                    break;
+                }
+                let Some(c) = bg_cluster.upgrade() else {
+                    break;
+                };
+                // Drop an in-flight tick when shutdown is signaled. The tick proposes
+                // through Raft, and a missing voter can leave that proposal unable to commit.
+                tokio::select! {
+                    biased;
+                    _ = bg_rx.changed() => break,
+                    _ = c.run_maintenance_tick_inner(false) => {}
                 }
             }
         });
@@ -886,10 +897,21 @@ impl PersistentMetaDbCluster {
         self.metrics_addr.get().map(String::as_str)
     }
 
-    /// Gracefully stops gRPC/background loops, flushes all shard state to disk, and stops OpenRaft groups.
+    /// Stops gRPC and maintenance, drains auxiliary work, flushes memtables, and stops OpenRaft.
+    ///
+    /// The drain proposes through Raft. After a peer is gone that proposal cannot commit,
+    /// so a stuck drain cannot pin process exit. Committed entries that are not in the
+    /// memtable flush stay in the Raft log and replay on the next open.
     pub async fn shutdown(&self) -> Result<()> {
         self.stop_tasks().await;
-        self.flush_all().await?;
+        match tokio::time::timeout(Duration::from_secs(10), self.flush_all()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                for group in self.host.all_groups() {
+                    group.state_machine().flush_to_lsm()?;
+                }
+            }
+        }
         let result = self.host.shutdown_all().await;
         backup::unregister_runtime(&self.config.node.data_dir);
         result
