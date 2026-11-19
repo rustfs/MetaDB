@@ -309,6 +309,7 @@ async fn run_backup(command: BackupCmd) -> Result<(), Box<dyn std::error::Error 
             println!("backup hold released");
         }
         BackupCmd::Create { data_dir, output } => {
+            let output = absolute_new_path(&output)?;
             if metadb_raft::backup::lsm_directory_is_locked(&data_dir) {
                 metadb_raft::backup::write_backup_job(&data_dir, &output)?;
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -331,7 +332,11 @@ async fn run_backup(command: BackupCmd) -> Result<(), Box<dyn std::error::Error 
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             } else {
-                let summary = metadb_raft::backup::create_offline_backup(&data_dir, &output)?;
+                let summary = metadb_raft::backup::create_offline_backup(
+                    &data_dir,
+                    &output,
+                    &metadb_server::check_backup_tree,
+                )?;
                 println!(
                     "backup wrote {} files={} shards={} hold_id={}",
                     summary.destination.display(),
@@ -347,7 +352,12 @@ async fn run_backup(command: BackupCmd) -> Result<(), Box<dyn std::error::Error 
                     "backup restore rejected: destination is open by a running process".into(),
                 );
             }
-            let summary = metadb_raft::backup::restore_backup(&backup, &data_dir)?;
+            let data_dir = absolute_new_path(&data_dir)?;
+            let summary = metadb_raft::backup::restore_backup(
+                &backup,
+                &data_dir,
+                &metadb_server::check_backup_tree,
+            )?;
             println!(
                 "backup restore wrote {} files={} shards={} hold_id={}",
                 summary.destination.display(),
@@ -358,6 +368,21 @@ async fn run_backup(command: BackupCmd) -> Result<(), Box<dyn std::error::Error 
         }
     }
     Ok(())
+}
+
+fn absolute_new_path(
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    if path.as_os_str().is_empty() {
+        return Err("backup path is empty".into());
+    }
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    let parent = std::fs::canonicalize(parent)?;
+    let name = path.file_name().ok_or("backup path has no file name")?;
+    Ok(parent.join(name))
 }
 
 fn print_hold(label: &str, record: &metadb_raft::backup::BackupHoldRecord) {

@@ -161,7 +161,7 @@ A purge that has already chosen its cutoff before the hold file is visible can f
 
 ### Commands
 
-Stop is not required. If a shard `lsm/LOCK` is held, the command asks the running `metadbd` (its 250 ms maintenance loop) to latch the hold and to copy the log under the log lock. If the process is stopped, the same commands read the directory directly. Do not start `metadbd` while a stopped-directory command is running.
+Stop is not required. If a shard `lsm/LOCK` is held, the command asks the running `metadbd` (its 250 ms maintenance loop) to latch the hold and to copy the log under the log lock. `--output` is resolved to an absolute path in the client before that request is written, so the server does not interpret it against its own working directory. If the process is stopped, the same commands read the directory directly. Do not start `metadbd` while a stopped-directory command is running. The command refuses an existing staging directory instead of deleting it. Releasing the hold lets the normal 250 ms loop purge again even when it does not build a new snapshot.
 
 ```bash
 metadb-ctl backup hold --data-dir /var/lib/metadb --ttl-secs 900

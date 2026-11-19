@@ -605,6 +605,7 @@ pub fn create_online_backup(
     data_dir: &Path,
     destination: &Path,
     shards: &[OnlineShard<'_>],
+    check_tree: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<BackupSummary> {
     let hold = require_active_hold(data_dir)?;
     reject_destination(data_dir, destination)?;
@@ -615,7 +616,7 @@ pub fn create_online_backup(
     let mut images = Vec::new();
     let mut covered = BTreeSet::new();
     for shard in shards {
-        let image = backup_online_shard(&hold, shard, &tree, &staging.path, &mut files)?;
+        let image = backup_online_shard(&hold, shard, data_dir, &tree, &mut files)?;
         covered.insert(image.shard_id);
         images.push(image);
     }
@@ -637,10 +638,15 @@ pub fn create_online_backup(
         &staging_path,
         destination,
         &mut staging,
+        check_tree,
     )
 }
 
-pub fn create_offline_backup(data_dir: &Path, destination: &Path) -> Result<BackupSummary> {
+pub fn create_offline_backup(
+    data_dir: &Path,
+    destination: &Path,
+    check_tree: &dyn Fn(&Path) -> Result<()>,
+) -> Result<BackupSummary> {
     if lsm_directory_is_locked(data_dir) {
         return Err(backup_error(
             "the data directory is open by a running process; run the command again so that process copies the log under its lock",
@@ -679,10 +685,15 @@ pub fn create_offline_backup(data_dir: &Path, destination: &Path) -> Result<Back
         &staging_path,
         destination,
         &mut staging,
+        check_tree,
     )
 }
 
-pub fn restore_backup(artifact: &Path, destination: &Path) -> Result<BackupSummary> {
+pub fn restore_backup(
+    artifact: &Path,
+    destination: &Path,
+    check_tree: &dyn Fn(&Path) -> Result<()>,
+) -> Result<BackupSummary> {
     let manifest = read_manifest(artifact)?;
     if manifest.version != BACKUP_MANIFEST_VERSION {
         return Err(restore_error(format!(
@@ -724,7 +735,6 @@ pub fn restore_backup(artifact: &Path, destination: &Path) -> Result<BackupSumma
             "backup tree contains files that are not listed in the manifest",
         ));
     }
-    validate_manifest_tree(&tree, &manifest)?;
     if destination.exists() {
         let mut entries = fs::read_dir(destination)?;
         if entries.next().is_some() {
@@ -740,21 +750,30 @@ pub fn restore_backup(artifact: &Path, destination: &Path) -> Result<BackupSumma
         let bytes = fs::read(tree.join(&relative))?;
         write_new_bytes(&staging.path.join(&relative), &bytes)?;
     }
+    // Open MANIFEST on the writable staging copy. The source artifact stays read-only.
+    validate_manifest_tree(&staging.path, &manifest)?;
+    check_tree(&staging.path).map_err(|error| restore_error(error.to_string()))?;
+    sync_tree(&staging.path)?;
     if destination.exists() {
         for file in &manifest.files {
             let relative = safe_relative(&file.path).map_err(restore_error)?;
             let bytes = fs::read(staging.path.join(&relative))?;
             write_new_bytes(&destination.join(&relative), &bytes)?;
         }
+        sync_tree(destination)?;
         staging.disarm();
-        let _ = fs::remove_dir_all(&staging.path);
-    } else if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
+        fs::remove_dir_all(&staging.path)?;
+    } else {
+        let parent = destination_parent(destination);
+        fs::create_dir_all(&parent)?;
         fs::rename(&staging.path, destination)?;
         staging.disarm();
-        sync_dir(parent)?;
-    } else {
-        return Err(restore_error("destination has no parent directory"));
+        sync_dir(&parent)?;
+        if let Some(grandparent) = parent.parent() {
+            if !grandparent.as_os_str().is_empty() {
+                let _ = sync_dir(grandparent);
+            }
+        }
     }
     Ok(BackupSummary {
         hold_id: manifest.hold_id,
@@ -775,12 +794,12 @@ pub fn write_backup_job(data_dir: &Path, output_dir: &Path) -> Result<()> {
 
 pub fn claim_backup_job(data_dir: &Path) -> Result<Option<BackupJobRecord>> {
     let source = data_dir.join(BACKUP_JOB_FILE);
+    let running = data_dir.join(BACKUP_JOB_RUNNING);
+    if running.is_file() {
+        return read_record!(&running).map(Some);
+    }
     if !source.is_file() {
         return Ok(None);
-    }
-    let running = data_dir.join(BACKUP_JOB_RUNNING);
-    if running.exists() {
-        let _ = fs::remove_file(&running);
     }
     fs::rename(&source, &running)?;
     match read_record!(&running) {
@@ -818,7 +837,6 @@ pub fn complete_backup_job(
     };
     write_record!(&data_dir.join(BACKUP_JOB_RESULT), &record)?;
     let _ = fs::remove_file(data_dir.join(BACKUP_JOB_RUNNING));
-    let _ = fs::remove_file(data_dir.join(BACKUP_JOB_FILE));
     Ok(())
 }
 
@@ -833,8 +851,8 @@ pub fn read_backup_job_result(data_dir: &Path) -> Result<Option<BackupJobResultR
 fn backup_online_shard(
     hold: &BackupHoldRecord,
     shard: &OnlineShard<'_>,
+    data_dir: &Path,
     tree: &Path,
-    scratch: &Path,
     files: &mut Vec<BackupFileRecord>,
 ) -> Result<ShardImageRecord> {
     let floor = floor_for_shard(hold, shard.shard_id)?;
@@ -850,9 +868,13 @@ fn backup_online_shard(
     // during the checkpoint are still in the log copy, and the hold blocks purge.
     let live_index = shard.engine.durable_checkpoint().flushed_raft_index;
     let (kind, image_index) = if live_index >= purged_now {
-        let temp = scratch.join(format!("ckpt-{:020}", shard.shard_id));
+        // Hard-linked checkpoints must stay on the source filesystem.
+        let temp = data_dir.join(format!(".backup-ckpt-{:020}", shard.shard_id));
         if temp.exists() {
-            fs::remove_dir_all(&temp)?;
+            return Err(backup_error(format!(
+                "checkpoint scratch {} already exists; refusing to delete it",
+                temp.display()
+            )));
         }
         let checkpoint = shard.engine.create_checkpoint(&temp).map_err(|error| {
             let _ = fs::remove_dir_all(&temp);
@@ -1088,6 +1110,7 @@ fn copy_node_metadata(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_manifest(
     data_dir: &Path,
     hold: &BackupHoldRecord,
@@ -1096,6 +1119,7 @@ fn finish_manifest(
     staging: &Path,
     destination: &Path,
     staging_guard: &mut Staging,
+    check_tree: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<BackupSummary> {
     let current = require_active_hold(data_dir)?;
     if current.hold_id != hold.hold_id {
@@ -1103,6 +1127,25 @@ fn finish_manifest(
             "backup hold changed while the copy was running",
         ));
     }
+    let copied: BTreeSet<ShardId> = shards.iter().map(|shard| shard.shard_id).collect();
+    let tree = staging.join(BACKUP_TREE_DIR);
+    ensure_registry_matches(&tree, &copied)?;
+    for shard_id in list_shard_ids(data_dir)? {
+        if !copied.contains(&shard_id) {
+            return Err(backup_error(format!(
+                "shard {shard_id} appeared during the backup and is not in the artifact"
+            )));
+        }
+    }
+    for floor in &current.floors {
+        if !copied.contains(&floor.shard_id) && shard_dir(data_dir, floor.shard_id).is_dir() {
+            return Err(backup_error(format!(
+                "hold covers shard {} but that shard was not copied",
+                floor.shard_id
+            )));
+        }
+    }
+    check_tree(&tree)?;
     shards.sort_by_key(|shard| shard.shard_id);
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let manifest = BackupManifest {
@@ -1113,20 +1156,22 @@ fn finish_manifest(
         shards,
     };
     write_record!(&staging.join(BACKUP_MANIFEST_FILE), &manifest)?;
-    sync_dir(staging)?;
+    sync_tree(staging)?;
     if destination.exists() {
         return Err(backup_error(format!(
             "destination {} already exists",
             destination.display()
         )));
     }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-        fs::rename(staging, destination)?;
-        staging_guard.disarm();
-        sync_dir(parent)?;
-    } else {
-        return Err(backup_error("destination has no parent directory"));
+    let parent = destination_parent(destination);
+    fs::create_dir_all(&parent)?;
+    fs::rename(staging, destination)?;
+    staging_guard.disarm();
+    sync_dir(&parent)?;
+    if let Some(grandparent) = parent.parent() {
+        if !grandparent.as_os_str().is_empty() {
+            let _ = sync_dir(grandparent);
+        }
     }
     Ok(BackupSummary {
         hold_id: manifest.hold_id,
@@ -1134,6 +1179,40 @@ fn finish_manifest(
         file_count: manifest.files.len(),
         destination: destination.to_path_buf(),
     })
+}
+
+fn ensure_registry_matches(root: &Path, copied: &BTreeSet<ShardId>) -> Result<()> {
+    let registry = root.join("be").join("NODE_SHARD_REGISTRY");
+    let referenced = crate::group_host::shard_ids_in_registry_file(&registry)?;
+    for shard_id in referenced {
+        if !copied.contains(&shard_id) {
+            return Err(backup_error(format!(
+                "NODE_SHARD_REGISTRY references shard {shard_id} which was not copied"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn destination_parent(destination: &Path) -> PathBuf {
+    match destination.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+fn sync_tree(dir: &Path) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            sync_tree(&path)?;
+        }
+    }
+    sync_dir(dir)?;
+    Ok(())
 }
 
 fn validate_manifest_tree(tree: &Path, manifest: &BackupManifest) -> Result<()> {
@@ -1148,6 +1227,8 @@ fn validate_manifest_tree(tree: &Path, manifest: &BackupManifest) -> Result<()> 
     if !listed.contains("be/NODE_SHARD_REGISTRY") {
         return Err(restore_error("NODE_SHARD_REGISTRY is missing"));
     }
+    let copied: BTreeSet<ShardId> = manifest.shards.iter().map(|shard| shard.shard_id).collect();
+    ensure_registry_matches(tree, &copied).map_err(|error| restore_error(error.to_string()))?;
     if !manifest
         .files
         .iter()
@@ -1278,9 +1359,9 @@ fn reject_destination(data_dir: &Path, destination: &Path) -> Result<()> {
         )));
     }
     let data = canonical_data_dir(data_dir)?;
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let parent = fs::canonicalize(parent)?;
+    let parent = destination_parent(destination);
+    fs::create_dir_all(&parent)?;
+    let parent = fs::canonicalize(&parent)?;
     if parent.starts_with(&data) {
         return Err(backup_error(
             "backup destination must be outside the live data directory",
@@ -1557,18 +1638,23 @@ struct Staging {
 
 impl Staging {
     fn create(destination: &Path) -> Result<Self> {
-        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)?;
+        let parent = destination_parent(destination);
+        fs::create_dir_all(&parent)?;
         let name = destination
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "backup".to_string());
         let path = parent.join(format!(".{name}.partial"));
-        if path.exists() {
-            fs::remove_dir_all(&path)?;
+        match fs::create_dir(&path) {
+            Ok(()) => Ok(Self { path, armed: true }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(backup_error(format!(
+                    "staging directory {} already exists; refusing to delete it",
+                    path.display()
+                )))
+            }
+            Err(error) => Err(error.into()),
         }
-        fs::create_dir_all(&path)?;
-        Ok(Self { path, armed: true })
     }
 
     fn disarm(&mut self) {
@@ -1627,5 +1713,45 @@ mod tests {
         assert_eq!(hold_purge_cap(&raft), None);
         assert!(!snapshot_index_protected(&raft.join("snapshots"), 4));
         release_hold(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn staging_refuses_to_delete_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("archive");
+        let staging = dir.path().join(".archive.partial");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("KEEP"), b"live").unwrap();
+        let error = match Staging::create(&destination) {
+            Err(error) => error,
+            Ok(_) => panic!("staging creation deleted or reused an existing directory"),
+        };
+        assert!(error.to_string().contains("refusing to delete"), "{error}");
+        assert_eq!(fs::read(staging.join("KEEP")).unwrap(), b"live");
+    }
+
+    #[test]
+    fn relative_destination_parent_is_the_current_directory() {
+        assert_eq!(
+            destination_parent(Path::new("restored")),
+            PathBuf::from(".")
+        );
+        assert_eq!(
+            destination_parent(Path::new("/var/lib/archive")),
+            PathBuf::from("/var/lib")
+        );
+    }
+
+    #[test]
+    fn completing_a_job_leaves_a_newer_request_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        write_backup_job(dir.path(), Path::new("/tmp/a")).unwrap();
+        let job = claim_backup_job(dir.path()).unwrap().unwrap();
+        write_backup_job(dir.path(), Path::new("/tmp/b")).unwrap();
+        complete_backup_job(dir.path(), &job.output_dir, Err("stopped".into())).unwrap();
+        assert!(dir.path().join(BACKUP_JOB_FILE).is_file());
+        assert!(!dir.path().join(BACKUP_JOB_RUNNING).is_file());
+        let next = claim_backup_job(dir.path()).unwrap().unwrap();
+        assert_eq!(next.output_dir, "/tmp/b");
     }
 }

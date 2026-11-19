@@ -1102,6 +1102,21 @@ impl DurableCellManager {
         Ok(())
     }
 
+    /// Shard ids named by a `CELL_MANAGER_STATE` file: published routes and split plans.
+    pub fn shard_ids_in_cell_state_file(path: &Path) -> Result<BTreeSet<ShardId>> {
+        let mut raw = Vec::new();
+        File::open(path)?.read_to_end(&mut raw)?;
+        let body = verify_crc32c_le(&raw, "CELL_MANAGER_STATE")?;
+        let state = decode_cell_state(body)?;
+        let mut ids = BTreeSet::new();
+        ids.extend(state.routes.keys().copied());
+        for plan in state.split_plans.values() {
+            ids.insert(plan.parent_shard_id);
+            ids.insert(plan.child_shard_id);
+        }
+        Ok(ids)
+    }
+
     fn load_state_file(dir: &Path) -> Result<PersistedCellState> {
         let state_path = dir.join("CELL_MANAGER_STATE");
         if !state_path.exists() {
