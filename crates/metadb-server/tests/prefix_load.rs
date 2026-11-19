@@ -184,8 +184,46 @@ fn shard_range(total: usize, workers: usize, tid: usize) -> std::ops::Range<usiz
     start..start + count
 }
 
-fn env_usize(key: &str) -> Option<usize> {
-    env::var(key).ok().and_then(|raw| raw.parse().ok())
+/// First try uses `index`, so a successful run spreads RPCs across the voter list.
+/// Later attempts rotate from that slot.
+fn endpoint_index(client_count: usize, index: usize, attempt: usize) -> usize {
+    (index + attempt) % client_count.max(1)
+}
+
+fn prefix_dir_name(dir_id: u64) -> String {
+    format!("loadp{dir_id}")
+}
+
+/// `None` when the variable is unset. A present value that is empty or not an
+/// unsigned integer is an error, so a typo cannot fall through to the official load.
+fn parse_override(key: &str, raw: Option<String>) -> Result<Option<usize>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "{key} is set but empty; refusing to fall back to the official load"
+        ));
+    }
+    trimmed.parse::<usize>().map(Some).map_err(|_| {
+        format!(
+            "{key}={raw:?} is not an unsigned integer; refusing to fall back to the official load"
+        )
+    })
+}
+
+fn env_usize(key: &str) -> Result<Option<usize>, String> {
+    let raw = match env::var(key) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(value)) => {
+            return Err(format!(
+                "{key} is not Unicode ({value:?}); refusing to fall back to the official load"
+            ));
+        }
+    };
+    parse_override(key, raw)
 }
 
 fn refuse_actions_scale(profile: &LoadProfile) {
@@ -329,7 +367,7 @@ async fn apply_with_retry(
     let attempts = clients.len().saturating_mul(4).max(4);
     let mut last = String::from("no attempt");
     for attempt in 0..attempts {
-        let mut client = clients[attempt % clients.len()].clone();
+        let mut client = clients[endpoint_index(clients.len(), index, attempt)].clone();
         match apply_once(&mut client, plan, phase, index).await {
             Ok(()) => return Ok(()),
             Err(OpError::Fatal(msg)) => {
@@ -400,7 +438,7 @@ async fn lookup_size(
     let attempts = clients.len().saturating_mul(4).max(4);
     let mut last = String::from("no attempt");
     for attempt in 0..attempts {
-        let mut client = clients[attempt % clients.len()].clone();
+        let mut client = clients[endpoint_index(clients.len(), index, attempt)].clone();
         match client
             .lookup(LookupRequest {
                 header: None,
@@ -473,24 +511,40 @@ async fn run_load(endpoints: &[String], token: &str, profile: &LoadProfile) -> R
     let mut dir_ids = Vec::with_capacity(profile.prefixes);
     for index in 0..profile.prefixes {
         let dir_id = dir_start + index as u64;
-        let name = format!("loadp{index}");
-        let response = metadata[0]
-            .mkdir(MkdirRequest {
-                header: None,
-                pid: ROOT_INODE_ID,
-                name: name.clone(),
-                dir_id,
-                uid: FILE_UID,
-                mode: DIR_MODE,
-            })
-            .await
-            .map_err(|err| format!("mkdir {name}: {err}"))?
-            .into_inner();
-        if let Some(error) = response.error {
-            return Err(format!(
-                "mkdir {name}: {} {}",
-                error.error_kind, error.message
-            ));
+        let name = prefix_dir_name(dir_id);
+        let attempts = metadata.len().saturating_mul(4).max(4);
+        let mut last = String::from("no attempt");
+        let mut created = false;
+        for attempt in 0..attempts {
+            let slot = endpoint_index(metadata.len(), index, attempt);
+            match metadata[slot]
+                .mkdir(MkdirRequest {
+                    header: None,
+                    pid: ROOT_INODE_ID,
+                    name: name.clone(),
+                    dir_id,
+                    uid: FILE_UID,
+                    mode: DIR_MODE,
+                })
+                .await
+            {
+                Ok(response) => match classify_app(response.into_inner().error) {
+                    Ok(()) => {
+                        created = true;
+                        break;
+                    }
+                    Err(OpError::Fatal(msg)) => return Err(format!("mkdir {name}: {msg}")),
+                    Err(OpError::Retry(msg)) => last = msg,
+                },
+                Err(status) => match classify_status(status) {
+                    OpError::Fatal(msg) => return Err(format!("mkdir {name}: {msg}")),
+                    OpError::Retry(msg) => last = msg,
+                },
+            }
+            tokio::time::sleep(Duration::from_millis(15 * (attempt as u64 + 1))).await;
+        }
+        if !created {
+            return Err(format!("mkdir {name} exhausted retries: {last}"));
         }
         dir_ids.push(dir_id);
     }
@@ -559,33 +613,29 @@ async fn run_load(endpoints: &[String], token: &str, profile: &LoadProfile) -> R
     Ok(())
 }
 
-fn official_profile_from_env() -> LoadProfile {
+fn official_profile_from_env() -> Result<LoadProfile, String> {
     let mut profile = LoadProfile::official();
     let mut overridden = false;
-    if let Some(value) = env_usize("METADB_LOAD_PREFIXES") {
-        profile.prefixes = value;
-        overridden = true;
-    }
-    if let Some(value) = env_usize("METADB_LOAD_CREATES_PER_PREFIX") {
-        profile.creates_per_prefix = value;
-        overridden = true;
-    }
-    if let Some(value) = env_usize("METADB_LOAD_SETATTR") {
-        profile.setattr_ops = value;
-        overridden = true;
-    }
-    if let Some(value) = env_usize("METADB_LOAD_DELETES") {
-        profile.delete_ops = value;
-        overridden = true;
-    }
-    if let Some(value) = env_usize("METADB_LOAD_CONCURRENCY") {
-        profile.concurrency = value;
-        overridden = true;
+    for (key, slot) in [
+        ("METADB_LOAD_PREFIXES", &mut profile.prefixes),
+        (
+            "METADB_LOAD_CREATES_PER_PREFIX",
+            &mut profile.creates_per_prefix,
+        ),
+        ("METADB_LOAD_SETATTR", &mut profile.setattr_ops),
+        ("METADB_LOAD_DELETES", &mut profile.delete_ops),
+        ("METADB_LOAD_CONCURRENCY", &mut profile.concurrency),
+    ] {
+        if let Some(value) = env_usize(key)? {
+            *slot = value;
+            overridden = true;
+        }
     }
     if overridden {
         profile.name = "official-override";
     }
-    profile
+    profile.validate()?;
+    Ok(profile)
 }
 
 #[test]
@@ -603,6 +653,39 @@ fn ci_profile_stays_below_the_official_load() {
     assert_eq!(official.delete_ops, 100_000);
     assert_eq!(official.concurrency, 64);
     assert_ne!(ci, official);
+}
+
+#[test]
+fn invalid_override_does_not_select_the_official_profile() {
+    let err = parse_override("METADB_LOAD_PREFIXES", Some("2x".into())).unwrap_err();
+    assert!(
+        err.contains("2x") && err.contains("refusing to fall back"),
+        "{err}"
+    );
+    assert!(parse_override("METADB_LOAD_PREFIXES", None)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        parse_override("METADB_LOAD_PREFIXES", Some(" 2 ".into())).unwrap(),
+        Some(2)
+    );
+    assert!(parse_override("METADB_LOAD_PREFIXES", Some("".into())).is_err());
+}
+
+#[test]
+fn successful_ops_start_on_different_endpoints() {
+    assert_eq!(endpoint_index(3, 0, 0), 0);
+    assert_eq!(endpoint_index(3, 1, 0), 1);
+    assert_eq!(endpoint_index(3, 2, 0), 2);
+    assert_eq!(endpoint_index(3, 3, 0), 0);
+    assert_eq!(endpoint_index(3, 1, 1), 2);
+}
+
+#[test]
+fn prefix_names_include_the_allocated_directory_id() {
+    assert_eq!(prefix_dir_name(40), "loadp40");
+    assert_ne!(prefix_dir_name(40), prefix_dir_name(41));
+    assert_ne!(prefix_dir_name(40), "loadp0");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -636,6 +719,6 @@ async fn official_prefix_load() {
     let token = env::var("METADB_LOAD_TOKEN")
         .or_else(|_| env::var("METADB_AUTH_TOKEN"))
         .unwrap_or_default();
-    let profile = official_profile_from_env();
+    let profile = official_profile_from_env().unwrap();
     run_load(&endpoints, &token, &profile).await.unwrap();
 }

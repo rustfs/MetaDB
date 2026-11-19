@@ -174,7 +174,7 @@ metadbd --config /etc/metadb/node3.toml --node-id 3 --listen 10.0.0.13:7800 --jo
 metadb-ctl --endpoint 10.0.0.11:7800 --auth-token "$SECRET" cluster status
 ```
 
-From a machine that can reach all three listeners, unset any `METADB_LOAD_PREFIXES`, `METADB_LOAD_CREATES_PER_PREFIX`, `METADB_LOAD_SETATTR`, `METADB_LOAD_DELETES`, or `METADB_LOAD_CONCURRENCY` left over from a dry run. The first endpoint grants the id blocks. Data RPCs are spread across the list. A `NotLeader` or unavailable response is retried on another endpoint. An application error fails the run.
+From a machine that can reach all three listeners, unset any `METADB_LOAD_PREFIXES`, `METADB_LOAD_CREATES_PER_PREFIX`, `METADB_LOAD_SETATTR`, `METADB_LOAD_DELETES`, or `METADB_LOAD_CONCURRENCY` left over from a dry run. A variable that is set to an empty string or a non-integer fails the run before any endpoint is dialed. The first endpoint grants the id blocks. Each create, `SetAttr`, delete, and prefix `mkdir` starts on `index % endpoint_count` and rotates to the next endpoint after `NotLeader` or an unavailable response. An application error fails the run. Prefix directory names are `loadp<allocated-dir-id>`, so a dry run can leave its directories in place and a later run still creates new ones.
 
 ```bash
 METADB_LOAD_ENDPOINTS=http://10.0.0.11:7800,http://10.0.0.12:7800,http://10.0.0.13:7800 \
