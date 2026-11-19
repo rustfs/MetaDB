@@ -27,9 +27,9 @@ use metadb_storage::LsmEngineConfig;
 use metadb_tx::{RoutedShardHandle, TxStateMachineHandler};
 
 use crate::control_plane_state::{
-    decide_heartbeat, decode_control_plane, normalize_ids, remote_heartbeat_is_too_soon, unix_ms,
-    HeartbeatDecision, HeartbeatWrite, PersistedControlPlane, StoredHeartbeat, StoredPlacement,
-    CONTROL_PLANE_FILE, CONTROL_PLANE_VERSION, PLACEMENT_RETRY_MS,
+    decide_heartbeat, decode_control_plane, normalize_ids, remote_state_change_is_too_soon,
+    unix_ms, HeartbeatDecision, HeartbeatWrite, PersistedControlPlane, StoredHeartbeat,
+    StoredPlacement, CONTROL_PLANE_FILE, CONTROL_PLANE_VERSION, PLACEMENT_RETRY_MS,
 };
 use crate::id_allocator::{AllocIdKind, DurableIdAllocator};
 use crate::identity::{node_id_in_ha_range, random_id, ClusterIdentity};
@@ -2092,14 +2092,12 @@ impl DurableCellManager {
             HeartbeatDecision::Replay(_) => Ok(()),
             HeartbeatDecision::Store(heartbeat) => {
                 if let Some(previous) = guard.heartbeats.get(&node_id) {
-                    if remote_heartbeat_is_too_soon(
+                    if remote_state_change_is_too_soon(
                         previous.observed_unix_ms,
                         write.observed_unix_ms,
-                        write.seq,
-                        previous.seq,
                     ) {
                         return Err(MetaDbError::ShardRoutingError(
-                            "heartbeat rate limit; the stored record was kept. A heartbeat is not a scheduling epoch"
+                            "heartbeat rate limit; the stored record was kept, including a generation change. A heartbeat is not a scheduling epoch"
                                 .to_string(),
                         ));
                     }

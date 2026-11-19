@@ -33,6 +33,29 @@ async fn open_cell(dir: &std::path::Path) -> (Arc<ShardGroupHost>, Arc<DurableCe
     (host, cell)
 }
 
+async fn open_receiver(dir: &std::path::Path) -> (Arc<ShardGroupHost>, Arc<DurableCellManager>) {
+    let cache = Arc::new(ShardedBlockCache::new(8 * 1024 * 1024));
+    let clock = Arc::new(HybridLogicalClock::new());
+    let host = Arc::new(ShardGroupHost::open(2, dir.join("be"), cache, clock).unwrap());
+    let alloc = Arc::new(DurableIdAllocator::open(dir.join("alloc")).unwrap());
+    let cell = DurableCellManager::open_or_bootstrap(
+        1,
+        dir.join("cell_1"),
+        host.clone(),
+        "127.0.0.1:2".to_string(),
+        true,
+        4 * 1024 * 1024 * 1024,
+        LsmEngineConfig::default(),
+        RaftNodeOptions::default(),
+        alloc,
+        Arc::new(CompositeMetaCache::new()),
+    )
+    .await
+    .unwrap();
+    cell.register_node(1, "127.0.0.1:1".to_string()).unwrap();
+    (host, cell)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn heartbeat_survives_reopen_and_a_lower_sequence_does_not_replace_it() {
     let dir = tempdir().unwrap();
@@ -259,5 +282,91 @@ async fn empty_receiver_accepts_a_sender_sequence_above_64() {
     let recovered = cell.stored_heartbeat(5).unwrap();
     assert_eq!(recovered.observation_generation, 42);
     assert_eq!(recovered.seq, 1);
+    host.shutdown_all().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_sequence_generation_spam_is_rate_limited_and_a_retired_generation_is_not_remembered()
+{
+    let dir = tempdir().unwrap();
+    let (host, cell) = open_cell(dir.path()).await;
+    cell.register_node(4, "127.0.0.1:4".to_string()).unwrap();
+    cell.accept_remote_heartbeat(4, 5, None, Vec::new(), None, 11)
+        .unwrap();
+    let spam = cell
+        .accept_remote_heartbeat(4, 5, None, Vec::new(), None, 12)
+        .unwrap_err();
+    assert!(spam.to_string().contains("rate"), "{spam}");
+    assert_eq!(cell.stored_heartbeat(4).unwrap().observation_generation, 11);
+    cell.testing_age_stored_heartbeat(4, 5_000);
+    cell.accept_remote_heartbeat(4, 5, None, Vec::new(), None, 12)
+        .unwrap();
+    assert_eq!(cell.stored_heartbeat(4).unwrap().observation_generation, 12);
+    cell.testing_age_stored_heartbeat(4, 5_000);
+    // No retired-generation set. A delayed older generation replaces the row
+    // once the rate window allows another state change. It does not schedule.
+    cell.accept_remote_heartbeat(4, 5, None, Vec::new(), None, 11)
+        .unwrap();
+    assert_eq!(cell.stored_heartbeat(4).unwrap().observation_generation, 11);
+    assert!(!metadb_cluster::heartbeat_is_scheduling_truth());
+    host.shutdown_all().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sender_file_loss_remints_generation_and_restarts_the_sequence() {
+    let dir = tempdir().unwrap();
+    let (host, cell) = open_cell(dir.path()).await;
+    let first = cell.publish_local_heartbeat().unwrap();
+    assert_ne!(first.observation_generation, 0);
+    host.shutdown_all().await.unwrap();
+    drop(cell);
+    drop(host);
+    std::fs::remove_file(dir.path().join("cell_1").join("CELL_CONTROL_PLANE")).unwrap();
+
+    let (host, cell) = open_cell(dir.path()).await;
+    let restarted = cell.publish_local_heartbeat().unwrap();
+    assert_eq!(restarted.seq, 1);
+    assert_ne!(
+        restarted.observation_generation,
+        first.observation_generation
+    );
+    assert_ne!(restarted.observation_generation, 0);
+    host.shutdown_all().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_file_loss_accepts_sender_sequence_above_64() {
+    let sender_dir = tempdir().unwrap();
+    let (sender_host, sender) = open_cell(sender_dir.path()).await;
+    let mut published = sender.publish_local_heartbeat().unwrap();
+    for _ in 0..64 {
+        published = sender.publish_local_heartbeat().unwrap();
+    }
+    assert!(published.seq > 64, "{}", published.seq);
+    let generation = published.observation_generation;
+    let seq = published.seq;
+    sender_host.shutdown_all().await.unwrap();
+
+    let receiver_dir = tempdir().unwrap();
+    let (host, cell) = open_receiver(receiver_dir.path()).await;
+    cell.accept_remote_heartbeat(1, seq, None, Vec::new(), None, generation)
+        .unwrap();
+    assert_eq!(cell.stored_heartbeat(1).unwrap().seq, seq);
+    host.shutdown_all().await.unwrap();
+    drop(cell);
+    drop(host);
+    std::fs::remove_file(
+        receiver_dir
+            .path()
+            .join("cell_1")
+            .join("CELL_CONTROL_PLANE"),
+    )
+    .unwrap();
+
+    let (host, cell) = open_receiver(receiver_dir.path()).await;
+    cell.accept_remote_heartbeat(1, seq, None, Vec::new(), None, generation)
+        .unwrap();
+    assert_eq!(cell.stored_heartbeat(1).unwrap().seq, seq);
+    assert!(cell.stored_heartbeat(1).unwrap().seq > 64);
     host.shutdown_all().await.unwrap();
 }

@@ -10,7 +10,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use metadb_core::codec;
 use metadb_core::{InodeId, MetaDbError, NodeId, ShardId};
 
 use crate::jumbo_placement::{CommittedMove, PlacementPhase};
@@ -231,41 +230,67 @@ fn stored_from_write(write: &HeartbeatWrite) -> StoredHeartbeat {
     }
 }
 
-/// A new remote sequence inside the interval is rejected. An equal sequence is a
-/// replay or a conflict and is not rate-limited here.
-pub fn remote_heartbeat_is_too_soon(
-    previous_observed_unix_ms: u64,
-    now_ms: u64,
-    incoming_seq: u64,
-    stored_seq: u64,
-) -> bool {
-    incoming_seq != stored_seq
-        && now_ms.saturating_sub(previous_observed_unix_ms) < MIN_REMOTE_HEARTBEAT_INTERVAL_MS
+/// Every accepted remote heartbeat that changes the stored row is limited,
+/// including a same-sequence generation replacement. An identical replay does
+/// not call this.
+pub fn remote_state_change_is_too_soon(previous_observed_unix_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(previous_observed_unix_ms) < MIN_REMOTE_HEARTBEAT_INTERVAL_MS
 }
 
-/// Reads version 1 files written before `observation_generation` existed.
-/// Those rows keep generation 0 until a real sender presents a generation.
+/// Reads a `CELL_CONTROL_PLANE` body after the CRC32C trailer has been checked.
+///
+/// The file frame is `body || crc32c_le`. This function sees only `body` and
+/// requires one layout to consume every byte:
+///
+/// - Current version 1 appends `observation_generation: u128` on the plane and
+///   on each stored heartbeat.
+/// - The previous version 1 body omits those two fields. It still decodes.
+///   Missing generations stay 0 until a sender presents a non-zero generation.
+///
+/// If both layouts consume the same bytes, the file is rejected. A heartbeat
+/// is not a scheduling epoch.
 pub fn decode_control_plane(
     body: &[u8],
 ) -> std::result::Result<PersistedControlPlane, MetaDbError> {
-    if let Ok(state) = codec::deserialize::<PersistedControlPlane>(body) {
-        if state.version != CONTROL_PLANE_VERSION {
-            return Err(MetaDbError::CodecError(format!(
-                "{CONTROL_PLANE_FILE} version {} is not supported",
-                state.version
-            )));
+    let current = decode_exact::<PersistedControlPlane>(body);
+    let legacy = decode_exact::<LegacyPersistedControlPlane>(body);
+    match (current, legacy) {
+        (Ok(state), Err(_)) => {
+            if state.version != CONTROL_PLANE_VERSION {
+                return Err(MetaDbError::CodecError(format!(
+                    "{CONTROL_PLANE_FILE} version {} is not supported",
+                    state.version
+                )));
+            }
+            Ok(state)
         }
-        return Ok(state);
+        (Err(_), Ok(legacy)) => {
+            if legacy.version != CONTROL_PLANE_VERSION {
+                return Err(MetaDbError::CodecError(format!(
+                    "{CONTROL_PLANE_FILE} version {} is not supported",
+                    legacy.version
+                )));
+            }
+            Ok(upgrade_legacy(legacy))
+        }
+        (Ok(_), Ok(_)) => Err(MetaDbError::CodecError(format!(
+            "{CONTROL_PLANE_FILE} matches both the current and the pre-generation layout"
+        ))),
+        (Err(error), Err(_)) => Err(MetaDbError::CodecError(format!(
+            "{CONTROL_PLANE_FILE}: {error}"
+        ))),
     }
-    let legacy: LegacyPersistedControlPlane = codec::deserialize(body)
-        .map_err(|error| MetaDbError::CodecError(format!("{CONTROL_PLANE_FILE}: {error}")))?;
-    if legacy.version != CONTROL_PLANE_VERSION {
-        return Err(MetaDbError::CodecError(format!(
-            "{CONTROL_PLANE_FILE} version {} is not supported",
-            legacy.version
-        )));
-    }
-    Ok(PersistedControlPlane {
+}
+
+fn decode_exact<T>(body: &[u8]) -> wincode::ReadResult<T>
+where
+    T: for<'de> wincode::SchemaRead<'de, wincode::config::DefaultConfig, Dst = T>,
+{
+    wincode::config::deserialize_exact(body, wincode::config::DefaultConfig::default())
+}
+
+fn upgrade_legacy(legacy: LegacyPersistedControlPlane) -> PersistedControlPlane {
+    PersistedControlPlane {
         version: CONTROL_PLANE_VERSION,
         heartbeats: legacy
             .heartbeats
@@ -288,10 +313,10 @@ pub fn decode_control_plane(
         next_local_seq: legacy.next_local_seq,
         placements: legacy.placements,
         observation_generation: 0,
-    })
+    }
 }
 
-#[derive(Debug, Deserialize, wincode::SchemaRead)]
+#[derive(Debug, Deserialize, wincode::SchemaRead, wincode::SchemaWrite)]
 struct LegacyStoredHeartbeat {
     node_id: NodeId,
     seq: u64,
@@ -301,7 +326,7 @@ struct LegacyStoredHeartbeat {
     local_hosted_shard_ids: Vec<ShardId>,
 }
 
-#[derive(Debug, Deserialize, wincode::SchemaRead)]
+#[derive(Debug, Deserialize, wincode::SchemaRead, wincode::SchemaWrite)]
 struct LegacyPersistedControlPlane {
     version: u32,
     heartbeats: BTreeMap<NodeId, LegacyStoredHeartbeat>,
@@ -318,6 +343,7 @@ fn same_body(stored: &StoredHeartbeat, write: &HeartbeatWrite) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metadb_core::codec;
 
     fn write(seq: u64, disk: Option<u64>, reported: &[u64]) -> HeartbeatWrite {
         HeartbeatWrite {
@@ -397,10 +423,63 @@ mod tests {
         assert!(decide_heartbeat(Some(&recovered), &conflict)
             .unwrap_err()
             .contains("conflicts"));
-        assert!(remote_heartbeat_is_too_soon(1_000, 1_500, 2, 1));
-        assert!(!remote_heartbeat_is_too_soon(1_000, 1_500, 1, 1));
-        assert!(!remote_heartbeat_is_too_soon(1_000, 3_000, 2, 1));
+        assert!(remote_state_change_is_too_soon(1_000, 1_500));
+        assert!(!remote_state_change_is_too_soon(1_000, 3_000));
         assert!(!heartbeat_is_scheduling_truth());
+    }
+
+    #[test]
+    fn control_plane_layouts_consume_exactly_one_body() {
+        let mut heartbeats = BTreeMap::new();
+        heartbeats.insert(
+            1,
+            StoredHeartbeat {
+                node_id: 1,
+                seq: 80,
+                observed_unix_ms: 9,
+                disk_free_bytes: None,
+                reported_shard_ids: Vec::new(),
+                local_hosted_shard_ids: vec![1],
+                observation_generation: 7,
+            },
+        );
+        let current = PersistedControlPlane {
+            version: CONTROL_PLANE_VERSION,
+            heartbeats,
+            next_local_seq: 81,
+            placements: BTreeMap::new(),
+            observation_generation: 7,
+        };
+        let bytes = codec::serialize(&current).unwrap();
+        assert_eq!(decode_control_plane(&bytes).unwrap(), current);
+        assert!(decode_exact::<LegacyPersistedControlPlane>(&bytes).is_err());
+
+        let legacy = LegacyPersistedControlPlane {
+            version: CONTROL_PLANE_VERSION,
+            heartbeats: BTreeMap::from([(
+                1,
+                LegacyStoredHeartbeat {
+                    node_id: 1,
+                    seq: 4,
+                    observed_unix_ms: 3,
+                    disk_free_bytes: Some(8),
+                    reported_shard_ids: Vec::new(),
+                    local_hosted_shard_ids: Vec::new(),
+                },
+            )]),
+            next_local_seq: 5,
+            placements: BTreeMap::new(),
+        };
+        let legacy_bytes = codec::serialize(&legacy).unwrap();
+        let upgraded = decode_control_plane(&legacy_bytes).unwrap();
+        assert_eq!(upgraded.observation_generation, 0);
+        assert_eq!(upgraded.heartbeats[&1].seq, 4);
+        assert_eq!(upgraded.heartbeats[&1].observation_generation, 0);
+        assert!(decode_exact::<PersistedControlPlane>(&legacy_bytes).is_err());
+
+        let mut extra = bytes.clone();
+        extra.push(0xAA);
+        assert!(decode_control_plane(&extra).is_err());
     }
 
     #[test]

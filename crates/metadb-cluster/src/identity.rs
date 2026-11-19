@@ -144,13 +144,15 @@ impl ClusterIdentity {
 }
 
 pub fn random_id() -> Result<u128> {
+    // `getrandom` 0.4 is already in this workspace. It uses the platform CSPRNG
+    // (including Windows) and does not open `/dev/urandom`.
     let mut bytes = [0u8; 16];
-    let mut file = File::open("/dev/urandom")?;
-    file.read_exact(&mut bytes)?;
+    getrandom::fill(&mut bytes)
+        .map_err(|error| MetaDbError::StorageIoError(format!("secure random failed: {error}")))?;
     let id = u128::from_le_bytes(bytes);
     if id == 0 {
         return Err(MetaDbError::StorageIoError(
-            "urandom returned a zero identity".to_string(),
+            "secure random returned a zero identity".to_string(),
         ));
     }
     Ok(id)
