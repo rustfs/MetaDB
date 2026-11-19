@@ -11,7 +11,7 @@
    * `MetadataService`: `CreateFile`, `Mkdir`, `Unlink`, `Rmdir`, `SetAttr`, `Lookup`, `DirStat`, `ListDir`, `ExecuteSql`, `GetQuota`, `SetQuotaLimit`, `ListQuotas`, `GetSecondaryIndex`, `ScanSecondaryIndex`.
    * `TransactionService`: `Rename` (automatisch `1-RTT` lokal oder primärverankertes `2PC` über Shards hinweg) sowie `Prepare2pc`, `CommitPrimary2pc`, `CommitSecondary2pc`, `Abort2pc`, `CheckTxnStatus`, `ApplyAuxBatch`.
    * `ControlPlaneService`: `GetRoutes`, `AllocateIdBlock`, `StoreHeartbeat`, `TriggerShardSplit`, `EnableDualModeSplit`, `ScaleShardReplicas`, `RegisterCell`.
-3. **20 Leichtgewichtige SQL-Vorlagen (`metadb-proxy`)**: Direkte Kompilierung in `<5 µs` ohne allgemeinen SQL-Optimizer (alle 20 literalen, `?`-parametrisierten und escapteten SQL-Vorlagen sind implementiert und getestet).
+3. **20 Leichtgewichtige SQL-Vorlagen (`metadb-proxy`)**: `sql_templates_tests` covers all 20 templates. A compile time under `5µs` is not a measurement of this repository.
 
 > **Reservierter Eintragsname**: Der Name `'_attr_'` (sowie Namen mit `'\0'`) ist für reguläre Dateien/Verzeichnisse gesperrt (`MetaDbError::ReservedEntryName`) und ausschließlich für Vorlage #7 (`DirStat`) reserviert.
 

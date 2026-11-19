@@ -10,28 +10,31 @@
 ## Guide Navigation
 
 1. **Overview & Embedded Quickstart** *(this page)*
-2. [**Deployment & Online Cluster Scale-Out**](./deployment.md) — Single-Node `metadbd`, `1-Voter -> 3-Voter` Multi-Raft promotion, and Multi-Cell `GlobalManager` / `CellLocalManager` / `MetaCache` topology.
+2. [**Deployment**](./deployment.md) — Single-node `metadbd`. Stage 3 role-split topology is a design note, not a deployment this binary performs.
 3. [**Client APIs, gRPC & 20 SQL Templates**](./client-apis-and-sql.md) — Embedded Rust SDK, `tonic` gRPC services, and the complete reference of 20 metadata SQL templates.
 4. [**Operations, `metadb-ctl` & Performance Tuning**](./operations-and-tuning.md) — CLI administration, Jumbo Shard isolation & Dual-Mode splitting, `SnapshotGuard` MVCC & `LocalityCompactor` tuning, the embedded stress harness, and troubleshooting.
 
 ---
 
-## Feature Readiness Matrix (Phases 1–6 Verified)
+## Feature readiness
 
-MetaDB's 8-crate pure-Rust implementation is verified across all core subsystems:
+The Baidu paper [`arXiv:2610.32247v1`](https://arxiv.org/html/2610.32247v1) reports Baidu production figures, including 575+ nodes per cluster and trillion-scale metadata. Those figures are not results of this repository. This matrix is not a first-launch pass and not a scale-gate result.
+
+Each status cell uses one label: **design claim**, **crate-tested**, or **multi-process unverified**. In-tree tests are crate or in-process coverage unless the cell says otherwise. They are not a multi-process 3-voter operator rehearsal and not a three-VM result. Operator detail is in [`docs/en/operations.md`](../../en/operations.md) and [`docs/en/architecture.md`](../../en/architecture.md). Applied memtable settings, in-flight 2PC lease renewal, and the seeded simulation catalog ([`docs/en/simulation-testing.md`](../../en/simulation-testing.md)) are on current `main`. They are not Baidu production measurements.
 
 | Feature Area | Repository Status | Implementation Crate / Binary |
 | :--- | :--- | :--- |
-| Embedded Rust SDKs (`PersistentMetaDbCluster` & `MetaDbEngine`) | **Implemented & Tested** (async persistent + sync in-memory) | `metadb-server` |
-| `(PID, "_attr_")` Colocation, `0x01..0x07` Codecs & `HLC` | **Implemented & Tested** (88B CRC32C + 500ms drift guard) | `metadb-core` |
-| Disk Persistence (Pure-Rust WAL-less SSTable LSM) | **Implemented & Tested** (`LsmStorageBackend`, `MANIFEST`, Bloom, LRU Cache) | `metadb-storage` |
-| `SnapshotGuard` `ReadCut` MVCC & `LocalityCompactor` | **Implemented & Tested** (`ActiveSnapshotRegistry` + bottommost compaction) | `metadb-storage` |
-| Multi-Raft Consensus (`1-Voter -> 3-Voter` + `ReadIndex`) | **Implemented & Tested** (`openraft` 0.10 + `.raftlog` + `tonic`) | `metadb-raft` |
-| `1-RTT` Pushdown, `ReplicatedAttrAggregator` & `AuxOutbox` | **Implemented & Tested** (Coordinated Flush Barrier + `[0x07]` local spill) | `metadb-tx` |
-| Cross-Shard 2PC (`Rename`, `Mkdir`, `Rmdir`, `SetAttr`) | **Implemented & Tested** (Primary-Anchored `TxnRecord` + `WriteIntent` recovery) | `metadb-tx` |
-| `PID`-Boundary Split, Jumbo Isolation & `DualMode` | **Implemented & Tested** (`ShardEpoch` fencing + `DirShardDelta` scatter-gather) | `metadb-cluster` |
-| 20 Parameterized SQL Templates | **Implemented & Tested** (all 20 `?` & escaped SQL templates) | `metadb-proxy` |
-| `metadbd` Server Daemon & `metadb-ctl` CLI | **Implemented & Tested** (`crates/metadb-server/src/bin/`) | `metadb-server` |
+| Embedded Rust SDKs (`PersistentMetaDbCluster` & `MetaDbEngine`) | **crate-tested**. `PersistentMetaDbCluster` is covered by single-process tests. `MetaDbEngine::new_single_node` is an in-memory simulator with no disk and no Raft. | `metadb-server` |
+| `(PID, "_attr_")` Colocation, `0x01..0x07` Codecs & `HLC` | **crate-tested**. `metadb-core` unit tests cover the 88B CRC32C `InodeAttr` and the 500ms drift guard. | `metadb-core` |
+| Disk Persistence (Pure-Rust WAL-less SSTable LSM) | **crate-tested**. `LsmStorageBackend`, `MANIFEST`, Bloom, and the LRU block cache are covered by storage crate tests. | `metadb-storage` |
+| `SnapshotGuard` `ReadCut` MVCC & `LocalityCompactor` | **crate-tested**. `ActiveSnapshotRegistry` and bottommost compaction are covered by storage crate tests. A flat `listdir` P99 under `<4ms` is a paper design target, not a measurement of this repository. | `metadb-storage` |
+| Multi-Raft Consensus (`1-Voter -> 3-Voter` + `ReadIndex`) | **multi-process unverified**. The checked-in 1-voter to 3-voter test runs three tonic listeners and a basic KV state machine inside one OS process. It does not start `metadbd`. `join_existing_group` starts a second `metadbd` and joins one group. A three-`metadbd` voter rehearsal is outside these tests. | `metadb-raft` |
+| `1-RTT` Pushdown, `ReplicatedAttrAggregator` & `AuxOutbox` | **crate-tested**. Coordinated flush-barrier aggregation and `[0x07]` local spill are covered by `metadb-tx` tests inside one process. | `metadb-tx` |
+| Cross-Shard 2PC (`Rename`, `Mkdir`, `Rmdir`, `SetAttr`) | **crate-tested**. Primary-anchored `TxnRecord` and `WriteIntent` recovery are covered by `two_pc_crash_tests`. A live coordinator renews the 3-second lease up to 60 seconds (`two_pc_lease_keepalive_tests`). | `metadb-tx` |
+| `PID`-boundary split & `DualMode` route flag | **crate-tested**. Epoch-fenced PID split is covered in-process. `enable_dual_mode_split` persists a route flag and does not itself copy keys. | `metadb-cluster` |
+| Jumbo isolation (dedicated host) | **design claim**. Jumbo isolation in this tree is a route flag plus a node id chosen from the local node map. With one node, the flag names this process. Files stay on this host. Peer shards stay on their current host. | `metadb-cluster` |
+| 20 Parameterized SQL Templates | **crate-tested**. `sql_templates_tests` covers all 20 templates. | `metadb-proxy` |
+| `metadbd` Server Daemon & `metadb-ctl` CLI | **crate-tested**. The all-in-one binaries live in `crates/metadb-server/src/bin/`. `open_and_serve` accepts only `all-in-one`. | `metadb-server` |
 
 ---
 

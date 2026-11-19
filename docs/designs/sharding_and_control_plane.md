@@ -1,6 +1,6 @@
 # EGM Subsystem Specification 3: Epoch-Fenced Topology Sharding, Jumbo Dual-Mode, Two-Tier Control Plane & Wire Protocols (`metadb-proto`, `metadb-cluster` & `metadb-proxy`)
 
-* **Status**: Phase 0 Approved Specification
+* **Status**: Phase 0 design note. Not a first-launch acceptance of the running tree.
 * **Target Crates**: `crates/metadb-proto`, `crates/metadb-cluster`, and `crates/metadb-proxy`
 * **Primary Reference**: Zebin Ren ([@ZebinRen](https://github.com/ZebinRen)), Biao Cao, Kang Chen ([@kangchenPKU](https://github.com/kangchenPKU)), Zhihui Yin, Qiushi Chen, Jielong Jian, Jiwei Xiong, Xinxing Wang, Yan Xing, Liguo Duan, Ran Zheng, Xianjun Meng, and Zhenyu Hou, *"MetaDB: Putting File-System Structure Back into Distributed Databases"*, [arXiv:2610.32247v1](https://arxiv.org/html/2610.32247v1) (Vrije Universiteit Amsterdam, Baidu & Peking University, 2026), §3.1, §3.2, §4.1, §8
 * **Semantic Boundaries**:
@@ -23,7 +23,7 @@ Scaling a file-system metadata engine from a single embedded node (`10^6` entrie
 
 ### Goals
 * **G1 (Unified `[0x01, 0x04)` User Keyspace & `ShardEpoch` Fencing)**: Partition `MetaTable` (`0x01`), `QuotaTable` (`0x02`), and `SecondaryIndexTable` (`0x03`) across contiguous byte intervals `[start_key, end_key)` protected by `ShardEpoch { conf_ver, version }`.
-* **G2 (Raft-Replicated `PID`-Boundary Splits & Two-Level Jumbo Defense)**: Split `MetaTable` shards cleanly on `[0x01][pid: 8B BE]` boundaries via deterministic `RaftCmd::ExecuteSplit`; isolate single-`PID` Jumbo Shards onto dedicated BE nodes (`JumboIsolated`); and provide `DualModeFineGrained` `(PID, name)` splitting with shard-local `DirShardDelta` (`[0x04]`) so writes stay `1-RTT` lock-free and `dirstat` uses `1-hop` parallel scatter-gather.
+* **G2 (Raft-Replicated `PID`-Boundary Splits & Two-Level Jumbo Defense)**: Split `MetaTable` shards on `[0x01][pid: 8B BE]` boundaries via `RaftCmd::ExecuteSplit`. In this tree, jumbo isolation writes `JumboIsolated { dedicated_node, dominant_pid }` on the route. `JumboIsolationPlanner` picks a node id already registered in the cell. It does not migrate peer shards onto a dedicated BE node. `EnableDualModeSplit` persists a mode flag and does not copy keys. A later split may cut on `(pid, name)` and use shard-local `DirShardDelta` (`[0x04]`).
 * **G3 (Two-Tier Control Plane + `MetaCache` + Hierarchical `IdRangeAllocator`)**: Partition cluster management into `GlobalManager` (coarse `[start_key, end_key) -> CellId` table + global ID block allocation) and per-Cell `CellLocalManager`s (`20K–50K` shards/Cell), fronted by `MetaCache`.
 * **G4 (Complete 20-Template SQL Compiler & Protobuf v1 Contracts)**: Compile all 20 parameterized/escaped metadata SQL templates in `<5µs` and expose typed `tonic` gRPC services (`MetadataService`, `TransactionService`, `RaftTransportService`, `ControlPlaneService`).
 
@@ -106,7 +106,7 @@ pub struct ShardEpoch {
    * Triggered when shard live + SSTable bytes `>= shard_split_threshold_bytes`.
    * Reads SSTable `IndexBlock` entries (no `DataBlock` disk reads) to build a cumulative byte histogram:
      * For `0x02` (`QuotaTable`) / `0x03` (`SecondaryIndexTable`): picks midpoint 9-byte key `[prefix][id: 8B BE]`.
-     * For `0x01` (`MetaTable`) in `ShardSplitMode::DirectoryColocated`: groups index keys by 9-byte prefix `[0x01][pid: 8B BE]`. If a valid `split_pid` exists with `>= 10%` bytes on both sides, selects `split_key = [0x01][split_pid: 8B BE]`; otherwise emits `UnsplittableJumboShard { shard_id, dominant_pid }`.
+     * For `0x01` (`MetaTable`) in `DirectoryColocated`: the durable splitter groups bytes by parent. If one parent owns more than 85% of those bytes, or the shard has a single parent, it returns `SplitCandidate::Jumbo` and the caller stores a route flag. It does not emit a dedicated-host move. The in-memory simulator in `control_plane.rs` returns `UnsplittableJumboShard` and also does not move files. The `>= 10%` both-sides rule is design text, not the 85% check in `split_worker.rs`.
      * For `0x01` (`MetaTable`) when `dominant_pid` has `DualModeFineGrained` enabled: selects midpoint full `MetaKey` `split_key = [0x01][dominant_pid: 8B BE][split_name_utf8]` (ensuring `split_name != "_attr_"`).
 2. **Stage A — Durable Control-Plane Registration & Intent Drain (`Planned`)**:
    * Parent leader calls `CellLocalManager::AllocSplitPlanRpc { request_uuid, parent_shard_id, split_key, target_version: old_version + 1 }`—which durably allocates `new_shard_id` (from `CellLocalManager`'s `GlobalManager`-leased `ShardId` pool) and persists `SplitPlanRecord::Planned` in `CellLocalManager`'s Raft log before replying.
@@ -141,10 +141,7 @@ pub struct ShardEpoch {
 
 ### 6.1 `CellLocalManager` (`crates/metadb-cluster/src/cell_manager.rs`)
 * Receives `StoreHeartbeat` every `3s` from each BE node in its Cell containing `(node_capacity, disk_free, cpu_load, Vec<ShardStats { shard_id, epoch, role, approx_bytes, qps, is_jumbo, dominant_pid }>)`.
-* **Jumbo Isolation Scheduler**: When a shard reports `UnsplittableJumboShard { dominant_pid }`:
-  1. Transitions shard state to `JumboIsolated { dedicated_node, dominant_pid }`.
-  2. Selects the lowest-loaded BE node (or a newly joined spare node), migrates leadership/voter replica of the Jumbo Shard there if needed, and issues `TransferLeader` + `ChangeMembership` commands to drain non-jumbo shards off `dedicated_node`.
-  3. If `approx_bytes > auto_dual_mode_threshold_bytes` (optional policy knob, disabled by default unless operator-approved or configured), automatically triggers `DualModeFineGrained` split.
+* **Jumbo route flag, not a placement move**: When `discover_split_key` returns `SplitCandidate::Jumbo`, `maybe_split_or_isolate_shard` stores `JumboIsolated { dedicated_node, dominant_pid }` from `JumboIsolationPlanner::select_dedicated_node`. The chosen id is a node already in this cell. With one node, the flag names this process. The call does not issue `TransferLeader` or `ChangeMembership`, and it does not drain other shards off a host. `enable_dual_mode_split` is a separate call. It writes `DualModeFineGrained` and `dual_mode_pid` and does not copy keys. A design that would migrate leadership and evict co-hosted shards is not what this function does.
 
 ### 6.2 `GlobalManager` & Durable `IdRangeAllocator` (`crates/metadb-cluster/src/global_manager.rs`)
 * Maintains:
@@ -222,6 +219,6 @@ Defined under `crates/metadb-proto/proto/metadb/v1/`:
 ## 10. Verification & Scale-Out Test Plan (`DetailedRange`)
 
 1. **T-SHARD-1 (`ShardEpoch` Live Split Under Concurrent Load)**: Run 8 concurrent client threads executing `CreateFile`, `Unlink`, and `ListDir` while forcing repeated `PID`-boundary `ExecuteSplit`s; verify `EpochMismatch` triggers `MetaCache` refresh + retry with zero client-visible errors and zero split mid-directory.
-2. **T-SHARD-2 (Jumbo Isolation & `DualModeFineGrained` Scatter-Gather)**: Insert 5,000 files into one `PID` exceeding threshold; verify `JumboIsolated` placement onto dedicated node, enable `DualModeFineGrained`, split `PID` across 3 sub-shards, verify `CreateFile`/`Unlink` execute `1-RTT` per sub-shard, `DirStat` reconciles exact sum across all 3 sub-shards, cursor `ListDir` returns exact sorted union, and 2PC `Rmdir` succeeds only once all 3 sub-shards are empty.
+2. **T-SHARD-2 (Jumbo flag & `DualModeFineGrained` scatter-gather)**: In-process tests cover a `JumboIsolated` route flag and later `(pid, name)` split behavior. They do not verify placement onto a dedicated host or eviction of peer shards. `EnableDualModeSplit` does not itself copy keys.
 3. **T-ID-1 (Locality-Aware `IdRangeAllocator` Collision-Free Test)**: Concurrently allocate 100,000 File and Directory IDs across multiple simulated restarts and Cells; verify zero duplicates, bit-63 File/Directory separation, and `>90%` single-shard `mkdir` colocation.
 4. **T-SQL-1 (All 20 SQL Templates & Escaping Fuzz Test)**: Verify all 20 templates with both inline escaped literals (`'it''s_a_file.txt'`, rejected `'_attr_'`) and `?` positional parameters, plus cursor pagination.

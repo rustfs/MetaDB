@@ -5,11 +5,13 @@
 MetaDB 提供三类客户端接入方式：
 1. **嵌入式 Rust SDK (`metadb-server`)** — 同进程零序列化调用（提供 `PersistentMetaDbCluster` 异步持久化版与 `MetaDbEngine` 同步内存版）。
 2. **强类型 `tonic` gRPC 接口 (`metadb-proto` & `metadb-server`)** — 面向分布式 RustFS 数据节点与代理的高吞吐多路复用 RPC。
-3. **20 条轻量级元数据 SQL 模板 (`metadb-proxy`)** — 省去通用 SQL 优化器开销，在 `<5µs` 内直接编译为存储执行计划（全部 20 条字面量、`?` 参数绑定与引号转义模式均已实现并验证）。
+3. **20 条轻量级元数据 SQL 模板 (`metadb-proxy`)** — `sql_templates_tests` covers all 20 templates. A compile time under `5µs` is not a measurement of this repository.
 
 ---
 
 ## 1. gRPC 服务契约概览 (`metadb.v1`) `[已实现]`
+
+`[已实现]` means one all-in-one process serves these RPCs. `RegisterCell` returns an error and stores nothing. Roles other than `all-in-one` are rejected before listen.
 
 * **`MetadataService` (`metadata.proto`)**：
   * 单分片 `1-RTT` 写操作：`CreateFile`、`Mkdir`、`Unlink`、`Rmdir`、`SetAttr`（`chmod`、`chown`、`truncate`、`utimes`）。

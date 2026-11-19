@@ -4,11 +4,11 @@
 
 This page is the exact contract for health probes, readiness, the low-cardinality metrics added with them, and the `[raft]` table. It describes the process that results from this change. It is not a first-ship acceptance test and it is not a trillion-scale operations guide.
 
-`[raft]` is loaded. `ServerTomlConfig.raft_options` is not `#[serde(skip)]`. The authentication rules in the next paragraph are the ones on `main` at `9b152ae4f820fa5f8e6971eab0862d23e5ca385f`.
+`[raft]` is loaded. `ServerTomlConfig.raft_options` is not `#[serde(skip)]`. The authentication rules in the next paragraph are unchanged by this `[raft]` loading.
 
 `allow_unauthenticated` accepts only a literal loopback IP (`127.0.0.0/8` or `::1`). The hostname `localhost` is not accepted and is not resolved. After the gRPC socket and the metrics socket bind, the bound address is checked again. A whitespace-only secret is rejected by `classify_secret` before any bearer compare.
 
-Locale configuration and architecture pages other than this English page still say `raft_options` is skipped. Those pages are not edited here. Aligning them with `[raft]` loading is a separate documentation change.
+Locale configuration and architecture pages describe the same `[raft]` loading. Unknown keys in that table fail parsing. Values apply when a group starts and are not reloaded. `max_segment_bytes` does not rewrite segments already on disk. `/readyz` does not wait for the 250 ms 2PC recovery pass.
 
 ## Where the probes live
 

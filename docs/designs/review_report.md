@@ -8,7 +8,7 @@
   * [`docs/designs/consensus_and_transactions.md`](./consensus_and_transactions.md)
   * [`docs/designs/sharding_and_control_plane.md`](./sharding_and_control_plane.md)
 * **Review Methodology**: Adversarial Zero-Context Goldfish Audit inspired by Google's [Elephant-Goldfish Model (EGM)](https://github.com/google/elephant-goldfish-model). Conducted by spawning an isolated zero-context review subagent (`rubber-duck`, reading strictly the markdown specification files above with zero access to `crates/**` or prior review notes) alongside independent cross-session Goldfish design critique—without invoking external EGM CLI plugins.
-* **Gate Status**: **Phase 0 Approved & Goldfish-Verified** — All 18 Blocking Findings (`B1`–`B18`) and 5 Non-Blocking Clarifications (`N1`–`N5`) are resolved directly in the specifications.
+* **Gate Status**: Phase 0 is a specification review. The Goldfish notes resolved findings `B1`–`B18` and `N1`–`N5` in the design text. That review is not a first-launch acceptance of the running tree.
 
 ---
 
@@ -44,7 +44,7 @@
 | **N1** | Watermark Naming | Unified `lsm_flushed_index` + `attr_flushed_index` (which advance atomically together at `on_flush_durable`) into `state_flushed_index`, making `safe_purge_index = min(state_flushed_index, aux_outbox_durable_index, last_snapshot_index)` cleanly match "3-watermark purge gate" across all documents. |
 | **N2** | Paginated `ListDir` Contract | Defined explicit POSIX/S3 **Keyset Continuation Semantics** (`name > after_name` per bounded linearizable page) and unconditional filtering of internal `"_attr_"` rows across SQL Templates #9–#11 (`sharding_and_control_plane.md` §5.4, §7). |
 | **N3** | `QuotaRecord` Map Growth | Specified pruning of retired `ShardId` keys from `QuotaRecord.applied_by_shard` once `GlobalManager` marks a retired shard's outbox fully acknowledged (`consensus_and_transactions.md` §7.3). |
-| **N4** | Phase-0 Status Vocabulary | Standardized status across `SITEMAP.md`, `Architecture.md`, `DEVELOPMENT_PLAN.md`, and `review_report.md` to `Phase 0 Approved & Goldfish-Verified`. |
+| **N4** | Phase-0 Status Vocabulary | The old shared label was `Phase 0 Approved & Goldfish-Verified`. That names a specification review, not a first-launch pass of the running tree. |
 | **N5** | 16-Bit HLC Logical Overflow | Specified advancing the 48-bit `physical_ms` field by `+1ms` (yielding briefly if approaching `max_clock_drift_ms = 500ms`) and strictly forbade `u16` wrap-around (`DEVELOPMENT_PLAN.md` Phase 1; `metadb_architecture.md` §3.2). |
 
 ---

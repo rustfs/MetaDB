@@ -1,6 +1,6 @@
 # EGM Specification: MetaDB Distributed Metadata Engine
 
-* **Status**: Phase 0 Approved Umbrella Specification
+* **Status**: Phase 0 is the design status of this umbrella note. It is not a first-launch acceptance of the running tree.
 * **Methodology**: [Google Elephant-Goldfish Model (EGM)](https://github.com/google/elephant-goldfish-model)
 * **Primary Reference**: Zebin Ren ([@ZebinRen](https://github.com/ZebinRen)), Biao Cao, Kang Chen ([@kangchenPKU](https://github.com/kangchenPKU)), Zhihui Yin, Qiushi Chen, Jielong Jian, Jiwei Xiong, Xinxing Wang, Yan Xing, Liguo Duan, Ran Zheng, Xianjun Meng, and Zhenyu Hou, *"MetaDB: Putting File-System Structure Back into Distributed Databases"*, [arXiv:2610.32247v1](https://arxiv.org/html/2610.32247v1) (Vrije Universiteit Amsterdam, Baidu & Peking University, 2026)
 * **Modular Subsystem Contracts**:
@@ -72,7 +72,7 @@ Furthermore, adopters need an engine that can run in **Single-Node All-in-One Mo
 * **Exact-Once FIFO `AuxOutbox`**: Dispatches `QuotaTable` and `SecondaryIndexTable` batches in strict ascending `origin_raft_index` order per `(origin_shard_id, target_shard_id)`, spilling overdue tasks to `[0x07]` on L0 flush.
 
 ### 3.5 Topology Sharding, Two-Tier Control Plane & Wire Contracts (`metadb-proto`, `metadb-cluster`, `metadb-proxy`, `metadb-server`)
-* **Unified `[0x01, 0x04)` Sharding**: `PolicyShardSplitter` splits `MetaTable` shards on `group_key = PID` boundaries via `RaftCmd::ExecuteSplit`, isolates single-`PID` Jumbo Shards (`JumboIsolated`), and supports `DualModeFineGrained` `(PID, name)` splits (`1-RTT` writes + `1-hop` parallel scatter-gather `dirstat`).
+* **Unified `[0x01, 0x04)` Sharding**: `PolicyShardSplitter` splits `MetaTable` shards on `group_key = PID` boundaries via `RaftCmd::ExecuteSplit`. `JumboIsolated` is a route flag, not a move of peer shards onto a dedicated host. `DualModeFineGrained` is a mode flag; a later split may cut on `(pid, name)`. The flag write does not copy keys.
 * **Two-Tier Control Plane**: `GlobalManager` + per-Cell `CellLocalManager` + `MetaCache` + bitspace-partitioned `IdRangeAllocator` (File bit-63 = `1`, Directory bit-63 = `0` with shard-locality leases).
 * **Interfaces**: 20 parameterized/escaped SQL templates in `metadb-proxy`, `tonic` gRPC services in `metadb-proto`, embedded `MetaDbEngine` SDK, `metadbd` daemon, and `metadb-ctl` CLI in `metadb-server`.
 
@@ -89,13 +89,15 @@ Furthermore, adopters need an engine that can run in **Single-Node All-in-One Mo
 
 ## 5. Risks & Mitigations (`FeatureRange`)
 
-1. **Single-Directory Skew (Jumbo Shard)**: Mitigated by (a) `CellLocalManager` `JumboIsolated` dedicated-node placement, and (b) `DualModeFineGrained` `(PID, name)` splitting using shard-local `[0x04] DirShardDelta` records so `create`/`unlink` remain `1-RTT` lock-free while `dirstat` uses `1-hop` scatter-gather.
+1. **Single-Directory Skew (Jumbo Shard)**: This tree writes `JumboIsolated { dedicated_node, dominant_pid }` on the route and does not place the shard on a dedicated host or evict peer shards. `DualModeFineGrained` is a route flag; a later split may use shard-local `[0x04] DirShardDelta` records. That later split is not performed by the flag write itself.
 2. **Unbounded Raft Log Growth During Remote Sink Partitions**: Mitigated by spilling overdue `AuxOutbox` entries into `[0x07] SpilledAuxOutbox` inside the local L0 SSTable flush, advancing `aux_outbox_durable_index` immediately.
-3. **Future-Read Anomaly & Stale Parent Attributes**: Mitigated by `ActiveSnapshotRegistry` gating unversioned L0 flushes until `min_active_snapshot_hlc >= imm.max_hlc` and `AsyncAttrAggregator` folding deltas via the Coordinated Flush Barrier + Read-Path Reconciliation.
+3. **Future-read limit and stale parent attributes**: `ActiveSnapshotRegistry` gates an unversioned L0 flush until `min_active_snapshot_hlc >= imm.max_hlc`. That gate does not remove the collapse-flush range-read limit: a range read at `start_hlc` can include later values of keys an open 2PC lease does not cover. Parent-attribute reconciliation is the coordinated flush barrier plus the read path, not a proof of zero future reads.
 
 ---
 
-## 6. Capacity & Scale Verification (`FeatureRange`)
+## 6. Capacity model (`FeatureRange`)
+
+The rows below are design arithmetic, not a scale measurement of this repository. Trillion-record figures in `arXiv:2610.32247v1` are Baidu production data. Role-trimmed BE fleets and extra cells are not deployed by this binary.
 
 * **Single-Node Starter (`10^8` records)**: `~18 GB` (`1-Voter`), `5–16` shards, `< 2 GiB` RAM on 1 `metadbd` node.
 * **100B Records (`10^11`)**: `~18 TB` logical (`~54 TB` 3-replica), `~4,500` shards (`4 GiB` each), served by 1 Cell (`~20` BE nodes).
@@ -125,7 +127,7 @@ Full step-by-step execution rules, invariants, and verification commands are spe
 3. **Phase 3 (`metadb-raft`)**: `openraft` Multi-Raft, segmented CRC32C `.raftlog` store, 3-watermark purge gate, batched `ReadIndex`, and online `1-Voter -> 3-Voter` `ConfChange`.
 4. **Phase 4 (`metadb-tx`)**: Deterministic `RaftStateMachine`, `PushdownExecutor`, Coordinated Flush Barrier `AsyncAttrAggregator`, FIFO `AuxOutbox` + `[0x07]` spill, and Primary-Anchored 2PC + `TxnRecoveryWorker`.
 5. **Phase 5 (`metadb-cluster` & `metadb-proxy`)**: Epoch-fenced `ExecuteSplit`, Jumbo isolation & `DualModeFineGrained` scatter-gather, Two-Tier Control Plane, `IdRangeAllocator`, and 20 parameterized SQL templates.
-6. **Phase 6 (`metadb-server`)**: Unified `MetaDbEngine` SDK, `metadbd` multi-role server, `metadb-ctl` CLI, and end-to-end Stage 1 -> Stage 2 -> Stage 3 evolution suite.
+6. **Phase 6 (`metadb-server`)**: `MetaDbEngine::open` / `PersistentMetaDbCluster` is the persistent engine. `new_single_node` is an in-memory simulator with no disk and no Raft. `metadbd` runs `all-in-one` only. `metadb-ctl` is the CLI. The end-to-end test is one all-in-one process, not a Stage 3 multi-cell suite.
 
 ---
 
@@ -134,7 +136,7 @@ Full step-by-step execution rules, invariants, and verification commands are spe
 Subsystem fault-injection tests (`T-LSM-*`, `T-MVCC-*`, `T-COMP-*`, `T-RAFT-*`, `T-TX-*`, `T-2PC-*`, `T-SHARD-*`, `T-ID-*`, `T-SQL-*`) are defined in the three modular specifications and culminate in the end-to-end cluster evolution suite (`e2e_cluster_evolution_tests.rs`) verifying:
 1. Persistent `1-Voter` crash recovery across torn `.raftlog` and `MANIFEST` tails.
 2. Live `group_key = PID` shard splitting under concurrent load with zero mid-directory splits and transparent `EpochMismatch` retry.
-3. Jumbo Shard dedicated-node isolation and `DualModeFineGrained` `(PID, name)` scatter-gather `dirstat` + paginated `listdir` + 2PC `rmdir`.
+3. A `JumboIsolated` route flag, not dedicated-node isolation, and in-process `DualModeFineGrained` behavior. The flag write does not copy keys or evict peer shards.
 4. Hotspot single-directory concurrent writes with linearizable Read-Path Reconciliation across L0 Coordinated Flush Barriers.
 5. Exact-once `QuotaTable` and `SecondaryIndexTable` convergence across network partitions (`[0x07]` local spill) and leader failovers.
 6. Crash-recoverable cross-shard 2PC `rename` (exclusive + overwrite + cycle rejection) and online `1-Voter -> Learner -> 3-Voter` Multi-Cell expansion.

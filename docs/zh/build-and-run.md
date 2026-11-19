@@ -44,27 +44,41 @@ cargo build --release -p metadb-server --bins
 
 除 `all-in-one` 以外的角色在绑定监听器之前失败，错误为 `server role ... is not implemented; only all-in-one runs a process`。
 
-示例，仅本机回环：
+`metadbd` with no config file uses an empty `shared_secret` and `allow_unauthenticated = false`, so that process does not start. The file below is the explicit loopback development opt-in. It is not a credential. Bind only a literal loopback IP (`127.0.0.1`). The hostname `localhost` is not accepted for this flag. Do not use it on a non-loopback address.
 
 ```bash
 mkdir -p /tmp/metadb-data
-cargo run -p metadb-server --bin metadbd -- \
-  --data-dir /tmp/metadb-data \
-  --listen 127.0.0.1:7800 \
-  --node-id 1 \
-  --cell-id 1 \
-  --role all-in-one
+cat > /tmp/metadb-loopback.toml <<'EOF'
+[node]
+data_dir = "/tmp/metadb-data"
+grpc_listen_addr = "127.0.0.1:7800"
+
+[security]
+allow_unauthenticated = true
+EOF
+cargo run -p metadb-server --bin metadbd -- --config /tmp/metadb-loopback.toml
 ```
 
-使用文件时见 [配置](./configuration.md)：
+A usable secret is a different file. Replace the `[security]` block. Do not set `allow_unauthenticated` in that same file. Both together are rejected. A whitespace-only secret is rejected.
 
 ```bash
-cargo run -p metadb-server --bin metadbd -- --config ./standalone.toml
+mkdir -p /tmp/metadb-data
+cat > /tmp/metadb-auth.toml <<'EOF'
+[node]
+data_dir = "/tmp/metadb-data"
+grpc_listen_addr = "127.0.0.1:7800"
+
+[security]
+shared_secret = "replace-with-a-long-random-string"
+EOF
+cargo run -p metadb-server --bin metadbd -- --config /tmp/metadb-auth.toml
 ```
+
+Pass that same secret to the client as `metadb-ctl --auth-token` or `METADB_AUTH_TOKEN`.
 
 日志使用 `tracing-subscriber` 的 `EnvFilter`。默认过滤器是 `info`。用标准环境变量 `RUST_LOG` 覆盖，例如 `RUST_LOG=debug`。
 
-`security.shared_secret` 为空时，进程在启动时记录一条警告：环回 gRPC 没有认证。默认绑定是 `127.0.0.1`。通配或其他非环回地址如果密钥为空、缺失或拼错，会拒绝监听。非空的 `[security].shared_secret` 对元数据、事务、控制面、Raft 传输和 `GET /metrics` 要求同一个持有者令牌。进程不终结 TLS。配置里的 TLS 或证书键会使启动失败，而不是以明文提供服务。把监听器留在可信网络上，或把每个服务放到会认证客户端的代理后面，并阻断对本进程的直接访问。
+An empty `security.shared_secret` does not start the process. Loopback is not an implicit exception. Development without credentials sets `allow_unauthenticated = true` and keeps every listener on a literal loopback IP (`127.0.0.1` or `::1`). The hostname `localhost` is not accepted for that opt-in. A wildcard or other non-loopback address refuses to listen. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. A non-empty `[security].shared_secret` requires the same bearer for metadata, transaction, control-plane, and Raft transport RPCs, and for `GET /metrics`. The process does not terminate TLS. A TLS, certificate, anonymous, or insecure key in the configuration fails startup instead of serving plaintext. Keep an opted-in listener on a trusted network, or put every service behind a proxy that authenticates the client and block direct access to this process.
 
 Ctrl-C 会刷出分片状态并停止 OpenRaft 组（`cluster.shutdown()`）。
 
