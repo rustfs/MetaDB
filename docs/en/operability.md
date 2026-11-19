@@ -2,13 +2,13 @@
 
 [Overview](./README.md) · [Configuration](./configuration.md) · [Operations](./operations.md)
 
-This page is the exact contract for health probes, readiness, the low-cardinality metrics added with them, and the `[raft]` table. It describes this stacked tree only. It is not a first-ship acceptance test and it is not a trillion-scale operations guide.
+This page is the exact contract for health probes, readiness, the low-cardinality metrics added with them, and the `[raft]` table. It describes the process that results from this change. It is not a first-ship acceptance test and it is not a trillion-scale operations guide.
 
-This branch is stacked on unmerged pull request #35 (`cursor/explicit-auth-opt-in-f050` at `8b276d3714ef8aef02179d93baefb1cdb0a933e1`). #35 has not landed on `main`. In this stacked tree, `[raft]` is loaded. `ServerTomlConfig.raft_options` is not `#[serde(skip)]`.
+`[raft]` is loaded. `ServerTomlConfig.raft_options` is not `#[serde(skip)]`. The authentication rules in the next paragraph are the ones on `main` at `9b152ae4f820fa5f8e6971eab0862d23e5ca385f`.
 
 `allow_unauthenticated` accepts only a literal loopback IP (`127.0.0.0/8` or `::1`). The hostname `localhost` is not accepted and is not resolved. After the gRPC socket and the metrics socket bind, the bound address is checked again. A whitespace-only secret is rejected by `classify_secret` before any bearer compare.
 
-Unmerged pull request #36 still describes `main` in its locale configuration and architecture pages, including the sentence that `raft_options` is skipped. Those locale pages are not edited here, and this pull request does not import #36's other wording. After the merge order of #35, #36, and this pull request is chosen, those locale pages need a separate pass so they no longer describe the skip as current.
+Locale configuration and architecture pages other than this English page still say `raft_options` is skipped. Those pages are not edited here. Aligning them with `[raft]` loading is a separate documentation change.
 
 ## Where the probes live
 
