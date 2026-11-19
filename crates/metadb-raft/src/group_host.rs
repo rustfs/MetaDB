@@ -1091,12 +1091,16 @@ enum LegacyRegistryShardState {
 }
 
 /// Shard ids named by a `NODE_SHARD_REGISTRY` file.
-pub fn shard_ids_in_registry_file(path: &Path) -> Result<std::collections::BTreeSet<ShardId>> {
+pub fn shard_ids_in_registry_bytes(raw: &[u8]) -> Result<std::collections::BTreeSet<ShardId>> {
     use std::collections::BTreeSet;
+    let body = verify_crc32c_le(raw, "NODE_SHARD_REGISTRY")?;
+    Ok(decode_registry(body)?.into_keys().collect::<BTreeSet<_>>())
+}
+
+pub fn shard_ids_in_registry_file(path: &Path) -> Result<std::collections::BTreeSet<ShardId>> {
     let mut raw = Vec::new();
     File::open(path)?.read_to_end(&mut raw)?;
-    let body = verify_crc32c_le(&raw, "NODE_SHARD_REGISTRY")?;
-    Ok(decode_registry(body)?.into_keys().collect::<BTreeSet<_>>())
+    shard_ids_in_registry_bytes(&raw)
 }
 
 fn decode_registry(body: &[u8]) -> Result<BTreeMap<ShardId, RegistryShardState>> {
