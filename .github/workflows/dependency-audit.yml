@@ -1,0 +1,40 @@
+name: Dependency audit
+
+on:
+  pull_request:
+  push:
+
+# Cancel a superseded run on the same ref. This does not change branch protection.
+concurrency:
+  group: dependency-audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit-and-deny:
+    name: cargo-audit and cargo-deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust 1.100.0
+        uses: dtolnay/rust-toolchain@1.100.0
+
+      - name: Install cargo-audit 0.23.0 and cargo-deny 0.21.0
+        run: |
+          cargo install cargo-audit --locked --version 0.23.0
+          cargo install cargo-deny --locked --version 0.21.0
+
+      - name: cargo audit
+        run: cargo audit -D unmaintained -D unsound -D yanked
+
+      - name: cargo deny
+        run: cargo deny --locked check

@@ -1,0 +1,39 @@
+# Initial reporting config for `.github/workflows/dependency-audit.yml`.
+# This is not a production-grade supply-chain policy.
+#
+# `unmaintained = "all"` and `unsound = "workspace"` make those advisory classes
+# errors. Vulnerability advisories are always errors. Yanked crates warn.
+# Duplicate versions warn via `[bans]`.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+unmaintained = "all"
+unsound = "workspace"
+yanked = "warn"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
