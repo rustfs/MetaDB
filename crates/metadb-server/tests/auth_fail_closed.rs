@@ -1,14 +1,27 @@
 //! Fail-closed checks for missing, empty, and mismatched shared secrets.
 //!
-//! These tests only send a missing or wrong bearer and expect rejection, or they
+//! These tests only send a missing or wrong credential and expect rejection, or they
 //! expect startup to refuse a listener. They do not attempt to bypass authentication.
+//!
+//! Two cases lock current behavior that is still a gap:
+//!
+//! - An empty `shared_secret` on `127.0.0.1` serves metadata, transactions, the
+//!   control plane, and metrics with no credentials. A post-merge run that used
+//!   loopback and an empty secret did not prove fail-closed authentication.
+//! - Unknown TOML keys that do not look like a secret or TLS setting are ignored.
+//!   A misspelled storage or join key still starts the process.
 
 use std::time::Duration;
 
+use metadb_core::{make_file_inode_id, ROOT_INODE_ID};
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::metadata_service_client::MetadataServiceClient;
 use metadb_proto::raft_transport_service_client::RaftTransportServiceClient;
-use metadb_proto::{GetRoutesRequest, LookupRequest, RaftRpcEnvelope};
+use metadb_proto::transaction_service_client::TransactionServiceClient;
+use metadb_proto::{
+    CheckTxnStatusRequest, CreateFileRequest, GetRoutesRequest, LookupRequest, RaftRpcEnvelope,
+    RenameRequest,
+};
 use metadb_server::{PersistentMetaDbCluster, ServerTomlConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -233,4 +246,407 @@ async fn configured_secret_rejects_missing_and_wrong_credentials() {
         "authenticated scrape missing metric text: {}",
         authed_metrics.1
     );
+}
+
+fn rejected_file(name: &str) -> CreateFileRequest {
+    CreateFileRequest {
+        header: None,
+        pid: ROOT_INODE_ID,
+        name: name.to_string(),
+        inode_id: make_file_inode_id(50),
+        fid: 50,
+        uid: 7,
+        mode: 0o644,
+        size_bytes: 128,
+    }
+}
+
+fn with_authorization(
+    request: CreateFileRequest,
+    value: &str,
+) -> tonic::Request<CreateFileRequest> {
+    let mut request = tonic::Request::new(request);
+    request
+        .metadata_mut()
+        .insert("authorization", value.parse().unwrap());
+    request
+}
+
+/// Loopback with an empty secret is the local-development path. It is not fail-closed.
+///
+/// A run that binds `127.0.0.1` and leaves `shared_secret` empty, including the
+/// post-merge Mac mini run, accepts callers that send no credentials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_secret_on_loopback_serves_without_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = ServerTomlConfig::default();
+    cfg.node.data_dir = dir.path().to_path_buf();
+    cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.node.metrics_listen_addr = Some("127.0.0.1:0".into());
+    cfg.security.shared_secret.clear();
+    let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
+    assert!(
+        grpc_addr.starts_with("127.0.0.1:"),
+        "empty-secret listener left loopback: {grpc_addr}"
+    );
+    let metrics_dial = loopback_dial(cluster.metrics_addr().expect("metrics listener"));
+    let channel = Endpoint::from_shared(format!("http://{grpc_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let mut status = ControlPlaneServiceClient::new(channel.clone());
+    let routes = status
+        .get_routes(GetRoutesRequest { cell_id: 0 })
+        .await
+        .expect("empty secret must allow GetRoutes with no authorization");
+    assert!(
+        routes.into_inner().error.is_none(),
+        "unauthenticated GetRoutes failed inside the handler"
+    );
+
+    let mut basic_status = tonic::Request::new(GetRoutesRequest { cell_id: 0 });
+    basic_status
+        .metadata_mut()
+        .insert("authorization", "Basic dGVzdDpzZWNyZXQ=".parse().unwrap());
+    status
+        .get_routes(basic_status)
+        .await
+        .expect("empty secret must ignore a Basic authorization header");
+
+    let mut metadata = MetadataServiceClient::new(channel.clone());
+    let created = metadata
+        .create_file(rejected_file("open-loopback.dat"))
+        .await
+        .expect("empty secret must allow CreateFile with no authorization")
+        .into_inner();
+    assert!(
+        created.error.is_none(),
+        "unauthenticated create was accepted by the interceptor and then failed: {:?}",
+        created.error
+    );
+    let mut garbage = tonic::Request::new(LookupRequest {
+        pid: ROOT_INODE_ID,
+        name: "open-loopback.dat".into(),
+        ..Default::default()
+    });
+    garbage
+        .metadata_mut()
+        .insert("authorization", "Bearer not-configured".parse().unwrap());
+    let found = metadata
+        .lookup(garbage)
+        .await
+        .expect("empty secret must ignore a bearer")
+        .into_inner();
+    assert!(found.found, "unauthenticated create did not become visible");
+
+    let mut transactions = TransactionServiceClient::new(channel);
+    let rename = transactions
+        .rename(RenameRequest {
+            src_pid: ROOT_INODE_ID,
+            src_name: "missing-for-rename.dat".into(),
+            dst_pid: ROOT_INODE_ID,
+            dst_name: "renamed.dat".into(),
+            overwrite: false,
+            caller_hlc: 0,
+        })
+        .await
+        .expect("empty secret must allow TransactionService with no authorization")
+        .into_inner();
+    assert!(
+        rename.error.is_some(),
+        "rename of a missing name should fail in the handler, not in the interceptor"
+    );
+
+    let metrics = http_exchange(&metrics_dial, None, "/metrics").await;
+    let basic_metrics =
+        http_exchange(&metrics_dial, Some("Basic dGVzdDpzZWNyZXQ="), "/metrics").await;
+    cluster.shutdown().await.unwrap();
+
+    assert_eq!(metrics.0, 200, "{}", metrics.1);
+    assert!(
+        metrics.1.contains("metadb_shards_total"),
+        "anonymous metrics scrape returned no metric text: {}",
+        metrics.1
+    );
+    assert_eq!(basic_metrics.0, 200, "{}", basic_metrics.1);
+    assert!(
+        basic_metrics.1.contains("metadb_shards_total"),
+        "Basic credentials were treated as authentication on an open listener: {}",
+        basic_metrics.1
+    );
+}
+
+/// A non-empty secret on loopback must reject failed authentication and must not apply the RPC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_secret_rejects_basic_auth_without_applying_the_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = ServerTomlConfig::default();
+    cfg.node.data_dir = dir.path().to_path_buf();
+    cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.node.metrics_listen_addr = Some("127.0.0.1:0".into());
+    cfg.security.shared_secret = "test-secret".into();
+    let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
+    let metrics_dial = loopback_dial(cluster.metrics_addr().expect("metrics listener"));
+    let channel = Endpoint::from_shared(format!("http://{grpc_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let mut metadata = MetadataServiceClient::new(channel.clone());
+    let name = "must-not-fail-open.dat";
+    let attempts = [
+        (
+            "missing",
+            metadata.create_file(rejected_file(name)).await.map(|_| ()),
+        ),
+        (
+            "basic",
+            metadata
+                .create_file(with_authorization(
+                    rejected_file(name),
+                    "Basic dGVzdDpzZWNyZXQ=",
+                ))
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "lowercase scheme",
+            metadata
+                .create_file(with_authorization(
+                    rejected_file(name),
+                    "bearer test-secret",
+                ))
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "secret without scheme",
+            metadata
+                .create_file(with_authorization(rejected_file(name), "test-secret"))
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "wrong bearer",
+            metadata
+                .create_file(with_authorization(
+                    rejected_file(name),
+                    "Bearer wrong-secret",
+                ))
+                .await
+                .map(|_| ()),
+        ),
+    ];
+
+    let mut transactions = TransactionServiceClient::new(channel.clone());
+    let rename = transactions
+        .rename(RenameRequest {
+            src_pid: ROOT_INODE_ID,
+            src_name: name.into(),
+            dst_pid: ROOT_INODE_ID,
+            dst_name: "renamed-open.dat".into(),
+            overwrite: false,
+            caller_hlc: 0,
+        })
+        .await
+        .map(|_| ());
+    let txn_status = transactions
+        .check_txn_status(CheckTxnStatusRequest {
+            header: None,
+            txn_id_be: vec![0; 16],
+            primary_key: vec![1, 2, 3],
+            caller_hlc: 0,
+        })
+        .await
+        .map(|_| ());
+
+    let mut authed = tonic::Request::new(LookupRequest {
+        pid: ROOT_INODE_ID,
+        name: name.into(),
+        ..Default::default()
+    });
+    authed
+        .metadata_mut()
+        .insert("authorization", "Bearer test-secret".parse().unwrap());
+    let lookup = metadata
+        .lookup(authed)
+        .await
+        .expect("lookup with the configured bearer");
+
+    let mut created_req = tonic::Request::new(rejected_file(name));
+    created_req
+        .metadata_mut()
+        .insert("authorization", "Bearer test-secret".parse().unwrap());
+    let created = metadata
+        .create_file(created_req)
+        .await
+        .expect("configured bearer must be accepted")
+        .into_inner();
+
+    let basic_metrics =
+        http_exchange(&metrics_dial, Some("Basic dGVzdDpzZWNyZXQ="), "/metrics").await;
+    let bearer_metrics = http_exchange(&metrics_dial, Some("Bearer test-secret"), "/metrics").await;
+    cluster.shutdown().await.unwrap();
+
+    for (label, result) in attempts {
+        assert_eq!(
+            result.unwrap_err().code(),
+            Code::Unauthenticated,
+            "{label} was not rejected"
+        );
+    }
+    assert_eq!(
+        rename.unwrap_err().code(),
+        Code::Unauthenticated,
+        "transaction rename failed open"
+    );
+    assert_eq!(
+        txn_status.unwrap_err().code(),
+        Code::Unauthenticated,
+        "transaction status check failed open"
+    );
+    let lookup = lookup.into_inner();
+    assert!(
+        lookup.error.is_none(),
+        "authenticated lookup failed: {:?}",
+        lookup.error
+    );
+    assert!(
+        !lookup.found,
+        "a rejected create or rename became visible; authentication failed open"
+    );
+    assert!(
+        created.error.is_none(),
+        "configured bearer create failed: {:?}",
+        created.error
+    );
+    assert_rejected_http(basic_metrics.0, &basic_metrics.1);
+    assert_eq!(bearer_metrics.0, 200, "{}", bearer_metrics.1);
+    assert!(bearer_metrics.1.contains("metadb_shards_total"));
+}
+
+/// Whitespace is not an empty secret once a listener is up. Loopback still starts,
+/// and a missing bearer is rejected instead of being treated as anonymous access.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn whitespace_secret_on_loopback_rejects_anonymous_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = ServerTomlConfig::default();
+    cfg.node.data_dir = dir.path().to_path_buf();
+    cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.node.metrics_listen_addr = Some("127.0.0.1:0".into());
+    cfg.security.shared_secret = "   ".into();
+    let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
+    let metrics_dial = loopback_dial(cluster.metrics_addr().expect("metrics listener"));
+    let channel = Endpoint::from_shared(format!("http://{grpc_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut status = ControlPlaneServiceClient::new(channel);
+    let anonymous = status.get_routes(GetRoutesRequest { cell_id: 0 }).await;
+    let mut exact = tonic::Request::new(GetRoutesRequest { cell_id: 0 });
+    exact
+        .metadata_mut()
+        .insert("authorization", "Bearer    ".parse().unwrap());
+    let accepted = status.get_routes(exact).await;
+    let metrics = http_exchange(&metrics_dial, None, "/metrics").await;
+    cluster.shutdown().await.unwrap();
+
+    assert_eq!(anonymous.unwrap_err().code(), Code::Unauthenticated);
+    assert!(accepted
+        .expect("exact whitespace bearer")
+        .into_inner()
+        .error
+        .is_none());
+    assert_rejected_http(metrics.0, &metrics.1);
+}
+
+/// Unknown keys that do not name a secret or TLS setting are still ignored.
+///
+/// This is a fail-open configuration hole: a misspelled storage or join field
+/// does not fail startup, and the process serves with the defaults. Secret-like
+/// and TLS-like keys remain rejected. If unknown keys start failing closed,
+/// update `docs/en/configuration.md` and `docs/en/testing.md` with the test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_toml_keys_are_ignored_and_loopback_still_serves() {
+    let defaults = ServerTomlConfig::default();
+    let mut cfg = ServerTomlConfig::from_toml_str(
+        r#"
+        [node]
+        grpc_listen_addrr = "0.0.0.0:9"
+        not_a_listener = true
+
+        [storage]
+        memtable_size_bytez = 1
+        flush_threshold = "ignored"
+
+        [cluster]
+        joinn = "10.9.9.9:7800"
+
+        [security]
+        shared_secret = ""
+        "#,
+    )
+    .expect("non-secret unknown keys are ignored and must not fail the parse");
+    assert_eq!(
+        cfg.node.grpc_listen_addr, defaults.node.grpc_listen_addr,
+        "a misspelled listen address was applied"
+    );
+    assert_eq!(
+        cfg.storage.memtable_size_bytes, defaults.storage.memtable_size_bytes,
+        "a misspelled storage key changed the memtable size"
+    );
+    assert!(
+        cfg.cluster.join.is_empty(),
+        "a misspelled join key was applied: {}",
+        cfg.cluster.join
+    );
+    assert!(cfg.security.shared_secret.is_empty());
+
+    let token_file = ServerTomlConfig::from_toml_str(
+        r#"
+        [node]
+        grpc_listen_addr = "127.0.0.1:7800"
+        token_file = "/tmp/token"
+        "#,
+    );
+    let token_err = token_file.unwrap_err().to_string();
+    assert!(
+        token_err.contains("refusing to start"),
+        "a token key must not be ignored: {token_err}"
+    );
+    let tls_note = ServerTomlConfig::from_toml_str(
+        r#"
+        [storage]
+        tls_mode = "off"
+        "#,
+    );
+    let tls_err = tls_note.unwrap_err().to_string();
+    assert!(
+        tls_err.contains("does not terminate TLS"),
+        "a TLS key must not be ignored: {tls_err}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    cfg.node.data_dir = dir.path().to_path_buf();
+    cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(cfg)
+        .await
+        .expect("ignored unknown keys must not stop the current process from serving");
+    let channel = Endpoint::from_shared(format!("http://{grpc_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut status = ControlPlaneServiceClient::new(channel);
+    let routes = status.get_routes(GetRoutesRequest { cell_id: 0 }).await;
+    cluster.shutdown().await.unwrap();
+    assert!(routes
+        .expect("server started from a config with ignored keys")
+        .into_inner()
+        .error
+        .is_none());
 }

@@ -58,6 +58,36 @@ jobs:
       - name: Run full workspace test suite
         run: cargo test --workspace --locked --no-fail-fast
 
+  prefix-load-ci:
+    name: CI-scale prefix load
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Protobuf Compiler (protoc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Setup pinned Rust toolchain (rust-toolchain.toml, 1.100.0)
+        uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.arch }}
+
+      - name: Run the small prefix load
+        run: cargo test -p metadb-server --test prefix_load --locked -- --test-threads=1
+
   package:
     name: Package ${{ matrix.triple }}
     runs-on: ${{ matrix.runner }}

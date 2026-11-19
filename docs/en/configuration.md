@@ -74,6 +74,10 @@ When `shared_secret` is non-empty, `MetadataService`, `TransactionService`, `Con
 
 An empty or whitespace-only secret is accepted only when `grpc_listen_addr` and `metrics_listen_addr` (if set) are loopback (`127.0.0.0/8`, `::1`, or the name `localhost`). A wildcard (`0.0.0.0`, `::`) or any other address refuses to listen. The code warns about an empty loopback secret at startup. The listeners are still plaintext. Keep them on a trusted network, or put every service behind a proxy that authenticates the client and block direct access to this process.
 
+`empty_secret_on_loopback_serves_without_credentials` locks the current gap: `127.0.0.1` and an empty secret serve metadata, transactions, the control plane, and `GET /metrics` with no credentials. A `Basic` header is not consulted. A configured secret on that same loopback bind does not fail open: a missing header, `Authorization: Basic ...`, a lowercase `bearer` scheme, and a wrong bearer are rejected, and the rejected create is not visible afterwards. A whitespace secret still starts on loopback, and an anonymous call is rejected rather than treated as no secret.
+
+Unknown keys that do not name a secret or TLS setting remain a fail-open hole. `unknown_toml_keys_are_ignored_and_loopback_still_serves` parses `grpc_listen_addrr`, `memtable_size_bytez`, and `joinn`, keeps the defaults, and serves. A `token_file` or `tls_mode` key still fails parsing. Closing that hole means rejecting those unknown keys, not teaching the server a new spelling.
+
 ## What you cannot configure
 
 - Per-role subsystem trimming. The role field is an allow/deny switch, not a feature set.

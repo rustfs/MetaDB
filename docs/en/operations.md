@@ -69,6 +69,8 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 See [Tests and benches](./testing.md#metadb-ctl-bench). This is a client against a running server. It is not a Cargo benchmark target. The repository does not check in a throughput number for it.
 
+The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `SetAttr` overwrites, then 100,000 deletes, concurrency 64) is documented in [Tests and benches](./testing.md#prefix-load). GitHub Actions runs only the small profile. It does not run the 1,000,000-create profile.
+
 ## Metrics
 
 Set `node.metrics_listen_addr` (for example `127.0.0.1:9100`). `open_and_serve` accepts TCP connections on that address. `GET /metrics` returns Prometheus text. Any other path returns 404, and any other method returns 405. When `[security].shared_secret` is non-empty, every request on this listener must send `Authorization: Bearer <shared_secret>`. A missing, empty, or wrong bearer returns HTTP 401 and a body that is not the metric text, including a request for `/status`. A non-loopback metrics address with an empty secret refuses to start. This listener does not terminate TLS.
