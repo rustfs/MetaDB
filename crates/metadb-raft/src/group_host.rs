@@ -140,6 +140,22 @@ fn legacy_proposal_not_retried() -> MetaDbError {
     )
 }
 
+/// A forwarded raw proposal must not come back as a retryable discarded-log error.
+pub(crate) fn normalize_discarded_legacy(payload: &[u8], error: MetaDbError) -> MetaDbError {
+    if matches!(
+        error,
+        MetaDbError::RetryableConsensus {
+            kind: metadb_core::RetryableConsensusKind::LogDiscarded,
+            ..
+        }
+    ) && !metadb_core::proposal_payload_is_enveloped(payload)
+    {
+        legacy_proposal_not_retried()
+    } else {
+        error
+    }
+}
+
 /// Active Multi-Raft group hosting one shard's consensus log, state machine, and `ReadIndexBatcher`.
 pub struct ShardRaftGroup {
     shard_id: ShardId,
@@ -715,7 +731,10 @@ impl ShardRaftGroup {
         )
         .await
         {
-            Ok(result) => result?,
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                return Err(normalize_discarded_legacy(&request.payload, error));
+            }
             Err(_) => {
                 return Err(MetaDbError::RpcError(
                     "forwarded proposal timed out".to_string(),
@@ -1063,5 +1082,20 @@ mod tests {
             voter_ids_from_joint_configs([BTreeSet::from([1, 2, 3])]),
             BTreeSet::from([1, 2, 3])
         );
+    }
+
+    #[test]
+    fn forwarded_raw_discard_is_not_retried() {
+        let discarded = MetaDbError::RetryableConsensus {
+            shard_id: 1,
+            leader_hint: Some(2),
+            kind: metadb_core::RetryableConsensusKind::LogDiscarded,
+        };
+        let raw = normalize_discarded_legacy(b"not-an-envelope", discarded.clone());
+        assert!(!raw.is_retryable_write_consensus(), "{raw}");
+        let mut enveloped = b"MDBP0001".to_vec();
+        enveloped.extend_from_slice(&[0; 24]);
+        let kept = normalize_discarded_legacy(&enveloped, discarded);
+        assert!(kept.is_retryable_write_consensus(), "{kept}");
     }
 }

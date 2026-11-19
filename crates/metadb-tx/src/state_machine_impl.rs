@@ -21,7 +21,8 @@ use metadb_core::{
 };
 use metadb_raft::{MetaDbRaftRequest, ShardApplyHandler, ShardWatermarkTracker};
 use metadb_storage::{
-    DurableShardCheckpoint, LifecycleStorageEngine, MvccValue, PreFlushHook, ViewAtRaftIndex,
+    DurableShardCheckpoint, LifecycleStorageEngine, MvccValue, PreFlushHook, ScanControl,
+    ViewAtRaftIndex,
 };
 
 use crate::aux_outbox::{ReplicatedAttrAggregator, ShardAuxOutbox, DEFAULT_OUTBOX_SPILL_THRESHOLD};
@@ -221,9 +222,15 @@ pub struct NodeInstanceRecord {
 
 /// Prefix for a committed proposal receipt. Not a user-table key.
 const PROPOSAL_RECEIPT_PREFIX: u8 = 0x0A;
+/// `[0x0B | commit_hlc BE | proposal_id BE]` orders receipts for bounded expiry.
+const PROPOSAL_EXPIRY_PREFIX: u8 = 0x0B;
+/// Resume key for the bounded legacy-receipt stamp sweep.
+const PROPOSAL_SWEEP_CURSOR: &[u8] = &[0x0C];
 const RECEIPT_VALUE_MAGIC: &[u8] = b"MDBR0001";
 /// Longer than the 30s write-retry budget and the 45s join budget.
 pub const PROPOSAL_RECEIPT_RETENTION_MS: u64 = 10 * 60 * 1000;
+const RECEIPT_EXPIRE_BATCH: usize = 32;
+const LEGACY_STAMP_BATCH: usize = 8;
 
 /// Allocates an id for one logical client write. Zero is reserved for legacy payloads.
 pub fn fresh_proposal_id() -> u128 {
@@ -332,18 +339,109 @@ fn receipt_expired(stored: HlcTimestamp, commit_hlc: HlcTimestamp) -> bool {
         > PROPOSAL_RECEIPT_RETENTION_MS
 }
 
-fn expire_proposal_receipts(
+fn expiry_index_key(commit_hlc: HlcTimestamp, proposal_id: u128) -> Vec<u8> {
+    let mut key = Vec::with_capacity(25);
+    key.push(PROPOSAL_EXPIRY_PREFIX);
+    key.extend_from_slice(&commit_hlc.as_u64().to_be_bytes());
+    key.extend_from_slice(&proposal_id.to_be_bytes());
+    key
+}
+
+fn proposal_id_from_receipt_key(key: &[u8]) -> Option<u128> {
+    if key.len() != 17 || key[0] != PROPOSAL_RECEIPT_PREFIX {
+        return None;
+    }
+    let mut raw = [0u8; 16];
+    raw.copy_from_slice(&key[1..]);
+    Some(u128::from_be_bytes(raw))
+}
+
+fn maintain_proposal_receipts(
     engine: &LifecycleStorageEngine,
     commit_hlc: HlcTimestamp,
     raft_index: u64,
 ) -> Result<()> {
-    let rows = TxStateMachineHandler::scan_latest_in_apply(engine, &[0x0A], &[0x0B])?;
-    for (key, value) in rows {
-        let (stored, _) = decode_receipt(&value);
-        if stored.is_some_and(|stored| receipt_expired(stored, commit_hlc)) {
-            engine.apply_committed_delete(key, commit_hlc, raft_index);
+    let snap = engine.acquire_linearizable_snapshot(raft_index)?;
+    let cutoff = HlcTimestamp::new(
+        commit_hlc
+            .physical_ms()
+            .saturating_sub(PROPOSAL_RECEIPT_RETENTION_MS),
+        0,
+    );
+    let mut expiry_end = vec![PROPOSAL_EXPIRY_PREFIX];
+    expiry_end.extend_from_slice(&cutoff.as_u64().to_be_bytes());
+    let mut expired = Vec::new();
+    engine.scan_live_until(&[PROPOSAL_EXPIRY_PREFIX], &expiry_end, &snap, |key, _| {
+        expired.push(key.to_vec());
+        if expired.len() >= RECEIPT_EXPIRE_BATCH {
+            Ok(ScanControl::Stop)
+        } else {
+            Ok(ScanControl::Continue)
         }
+    })?;
+    let cursor = engine
+        .get_with_snapshot(PROPOSAL_SWEEP_CURSOR, &snap)?
+        .unwrap_or_else(|| vec![PROPOSAL_RECEIPT_PREFIX]);
+    let mut legacy = Vec::new();
+    let mut sweep_finished = true;
+    engine.scan_live_until(&cursor, &[PROPOSAL_EXPIRY_PREFIX], &snap, |key, value| {
+        if key != PROPOSAL_SWEEP_CURSOR {
+            legacy.push((key.to_vec(), value.to_vec()));
+        }
+        if legacy.len() >= LEGACY_STAMP_BATCH {
+            sweep_finished = false;
+            return Ok(ScanControl::Stop);
+        }
+        Ok(ScanControl::Continue)
+    })?;
+    drop(snap);
+
+    for key in expired {
+        if key.len() != 25 || key[0] != PROPOSAL_EXPIRY_PREFIX {
+            continue;
+        }
+        let mut id_raw = [0u8; 16];
+        id_raw.copy_from_slice(&key[9..]);
+        let proposal_id = u128::from_be_bytes(id_raw);
+        engine.apply_committed_delete(proposal_receipt_key(proposal_id), commit_hlc, raft_index);
+        engine.apply_committed_delete(key, commit_hlc, raft_index);
     }
+    let mut next_cursor = if sweep_finished {
+        vec![PROPOSAL_RECEIPT_PREFIX]
+    } else {
+        let mut next = legacy.last().map(|(key, _)| key.clone()).unwrap_or(cursor);
+        next.push(0);
+        next
+    };
+    for (key, value) in &legacy {
+        if value.starts_with(RECEIPT_VALUE_MAGIC) {
+            continue;
+        }
+        let Some(proposal_id) = proposal_id_from_receipt_key(key) else {
+            continue;
+        };
+        engine.apply_committed_put(
+            key.clone(),
+            encode_receipt(commit_hlc, value),
+            commit_hlc,
+            raft_index,
+        );
+        engine.apply_committed_put(
+            expiry_index_key(commit_hlc, proposal_id),
+            Vec::new(),
+            commit_hlc,
+            raft_index,
+        );
+    }
+    if next_cursor.is_empty() {
+        next_cursor = vec![PROPOSAL_RECEIPT_PREFIX];
+    }
+    engine.apply_committed_put(
+        PROPOSAL_SWEEP_CURSOR.to_vec(),
+        next_cursor,
+        commit_hlc,
+        raft_index,
+    );
     Ok(())
 }
 
@@ -2456,7 +2554,7 @@ impl ShardApplyHandler for TxStateMachineHandler {
         request: &MetaDbRaftRequest,
         engine: &LifecycleStorageEngine,
     ) -> Result<Vec<u8>> {
-        expire_proposal_receipts(engine, commit_hlc, raft_index)?;
+        maintain_proposal_receipts(engine, commit_hlc, raft_index)?;
         let (proposal_id, cmd) = decode_proposed_command(&request.payload)?;
         if let Some(prior) = committed_proposal_result(engine, proposal_id, commit_hlc)? {
             return Ok(prior);
@@ -2469,6 +2567,12 @@ impl ShardApplyHandler for TxStateMachineHandler {
             engine.apply_committed_put(
                 proposal_receipt_key(proposal_id),
                 encode_receipt(commit_hlc, &bytes),
+                commit_hlc,
+                raft_index,
+            );
+            engine.apply_committed_put(
+                expiry_index_key(commit_hlc, proposal_id),
+                Vec::new(),
                 commit_hlc,
                 raft_index,
             );

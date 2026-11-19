@@ -226,3 +226,72 @@ fn proposal_receipt_expires_after_the_retention_window() {
         )
         .unwrap_err();
 }
+
+#[test]
+fn legacy_receipt_without_timestamp_is_stamped_then_expires() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = Arc::new(ShardedBlockCache::new(1024 * 1024));
+    let engine =
+        LifecycleStorageEngine::open_lsm(1, temp.path(), cache, LsmEngineConfig::default())
+            .unwrap();
+    let range = CompositeKeyRange::meta_pid_range(0, 1_000).unwrap();
+    let handler = TxStateMachineHandler::new(
+        1,
+        ShardEpoch::initial(),
+        range,
+        Arc::new(ShardWatermarkTracker::default()),
+    );
+    let proposal_id = fresh_proposal_id();
+    let key = proposal_receipt_key(proposal_id);
+    let stamped_at = HlcTimestamp::new(8_000, 0);
+    engine.apply_committed_put(key.clone(), b"prior-result".to_vec(), stamped_at, 1);
+    handler
+        .apply_command(
+            2,
+            stamped_at,
+            &MetaDbRaftRequest {
+                expected_epoch: handler.current_epoch(),
+                hlc: stamped_at,
+                payload: metadb_core::codec::serialize(&TxRaftCmd::InitDirAttr {
+                    dir_id: 10,
+                    parent_pid: 1,
+                    uid: 7,
+                    mode: 0o755,
+                })
+                .unwrap(),
+            },
+            &engine,
+        )
+        .unwrap();
+    let stamped = engine
+        .get(&key, HlcTimestamp::new(9_000, 0))
+        .unwrap()
+        .expect("legacy receipt is stamped");
+    assert!(stamped.starts_with(b"MDBR0001"));
+    let late = HlcTimestamp::new(8_000 + PROPOSAL_RECEIPT_RETENTION_MS + 1, 0);
+    handler
+        .apply_command(
+            3,
+            late,
+            &MetaDbRaftRequest {
+                expected_epoch: handler.current_epoch(),
+                hlc: late,
+                payload: metadb_core::codec::serialize(&TxRaftCmd::CreateFile {
+                    pid: 10,
+                    name: "after".to_string(),
+                    inode_id: 15,
+                    fid: 15,
+                    uid: 7,
+                    mode: 0o644,
+                    size_bytes: 1,
+                })
+                .unwrap(),
+            },
+            &engine,
+        )
+        .unwrap();
+    assert!(
+        engine.get(&key, late).unwrap().is_none(),
+        "a stamped legacy receipt expires after the retention window"
+    );
+}

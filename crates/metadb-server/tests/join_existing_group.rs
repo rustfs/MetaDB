@@ -847,30 +847,34 @@ async fn concurrent_scale_overlaps_learner_promotion() {
     let leader_for_two = Arc::clone(&node1);
     let leader_for_three = Arc::clone(&node1);
     let scale_two = async move {
+        let mut last = String::from("scale of node 2 was not attempted");
         for _ in 0..80 {
-            if leader_for_two
+            match leader_for_two
                 .cell_manager()
                 .scale_out_replicas_ensuring(3, Some(2))
                 .await
-                .is_ok()
             {
-                return;
+                Ok(_) => return,
+                Err(error) => last = error.to_string(),
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        panic!("concurrent scale of node 2 failed: {last}");
     };
     let scale_three = async move {
+        let mut last = String::from("scale of node 3 was not attempted");
         for _ in 0..80 {
-            if leader_for_three
+            match leader_for_three
                 .cell_manager()
                 .scale_out_replicas_ensuring(3, Some(3))
                 .await
-                .is_ok()
             {
-                return;
+                Ok(_) => return,
+                Err(error) => last = error.to_string(),
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        panic!("concurrent scale of node 3 failed: {last}");
     };
     let (node2, node3, _, _) = tokio::join!(
         PersistentMetaDbCluster::open_and_serve(fast_config(&dir.path().join("n2"), 2, &addr1)),
