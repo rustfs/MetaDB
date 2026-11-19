@@ -17,7 +17,7 @@ Modern exabyte-scale storage systems—including flat object storage (S3/BOS), h
 **MetaDB** (`rustfs/MetaDB`) is a 100% pure-Rust, file-system structure-aware, semantic-aware, and lifecycle-aware transactional metadata database engine built for [RustFS](https://github.com/rustfs). It is engineered across an 8-crate workspace to support **seamless online evolution from an embedded or standalone single-node deployment (`1-Voter` OpenRaft) to a multi-cell distributed cluster (`3-Voter` Multi-Raft) designed to scale from single-host workloads to 100 billion – 10+ trillion metadata records.**
 
 > **Distinguishing Reference Benchmarks from Repository Status**:
-> Production scale figures cited from `arXiv:2610.32247v1` (e.g., Baidu's 575-node BOS2 cluster managing 1.848 trillion records) represent empirical results from Baidu's production C++ deployment validating this architecture. `rustfs/MetaDB` is an independent clean-room Rust implementation whose milestone-by-milestone implementation status is tracked transparently in [Section 12](#12-implementation-status-matrix-paper-vs-repository) and [`docs/DEVELOPMENT_PLAN.md`](./docs/DEVELOPMENT_PLAN.md).
+> Production scale figures cited from `arXiv:2610.32247v1` (e.g., Baidu's 575-node BOS2 cluster managing 1.848 trillion records) are Baidu production results, not results of this repository. `rustfs/MetaDB` is an independent clean-room Rust implementation. It has not passed first-launch acceptance, and merging pull requests #18–#25 does not pass that gate. Status wording is in [Section 12](#12-implementation-status-matrix-paper-vs-repository). Operator behavior is in [`docs/en`](./docs/en/README.md).
 
 ---
 
@@ -151,19 +151,23 @@ flowchart TB
    * Sealed `ImmMemTable`s wait until `min_active_snapshot_hlc >= imm.max_hlc`, then write **only** the collapsed latest value (`Put`) or a single unversioned physical LSM `Delete` tombstone to a generation-ordered (`flush_generation`) L0 SSTable—mathematically preventing phantom/future-read anomalies while eliminating persisted MVCC tombstones (`~60%` fewer KV writes).
 3. **Bottommost-Safe Locality-Aware Compaction (`LocalityCompactor`)**:
    * Tracks physical tombstone counts and tombstone-to-live ratios per 9-byte `[table_prefix][group_key: 8B]` spatial bucket.
-   * When a bucket crosses `tombstone_density_threshold` (e.g., consecutive TTL expirations), `LocalityCompactor` triggers a targeted range compaction over `[bucket, bucket + 1)` spanning all overlapping SSTables down to the bottommost level for that range—legally dropping physical tombstones without rewriting cold neighboring directories and keeping `listdir` P99 latency flat (`<4ms`).
+   * When a bucket crosses `tombstone_density_threshold` (e.g., consecutive TTL expirations), `LocalityCompactor` triggers a targeted range compaction over `[bucket, bucket + 1)` spanning all overlapping SSTables down to the bottommost level for that range—legally dropping physical tombstones without rewriting cold neighboring directories. A flat `listdir` P99 under `<4ms` is a design target in `arXiv:2610.32247v1`, not a measured result of this repository. Latency numbers from the earlier single-node comparison on commit `f325f6a` are not results for this tree and are not repeated here.
 
 ---
 
-## 6. Capacity & Trillion-Scale Verification (`100M` to `10T+` Records)
+## 6. Capacity Model (`100M` to `10T+` Records)
 
-### 6.1 Reference Production Proof (`arXiv:2610.32247v1`, Table 1)
-Baidu's production clusters validate the horizontal scalability of this exact architecture:
+This section is not a verification of `rustfs/MetaDB`. Trillion-scale figures in §6.1 are Baidu production data from `arXiv:2610.32247v1`, not results of this repository. §6.2 is an arithmetic model from the assumptions stated there. It is not a load measurement, and it is not a first-launch or trillion-scale milestone. Merging pull requests #18–#25 does not supply either result.
+
+### 6.1 Baidu Production Figures (`arXiv:2610.32247v1`, Table 1)
+The following figures are Baidu's published production results. They do not measure this repository:
 * **BOS2 Cluster**: **575 BE nodes**, **1.848 trillion (`1.848 × 10^12`) metadata records**, **909 PB** backing storage, sustaining **2.063M read QPS** and **747K write QPS**.
 * **BOS1 & BOS3 Clusters**: **414** and **406 BE nodes** managing **1.343T** and **1.356T** records respectively.
-* **Hardware Efficiency**: Cuts metadata server count by `~50%` while delivering `2.2x–4.1x` higher throughput than general-purpose distributed SQL baselines.
+* **Hardware Efficiency**: For that Baidu deployment, the paper reports cutting metadata server count by `~50%` while delivering `2.2x–4.1x` higher throughput than general-purpose distributed SQL baselines.
 
 ### 6.2 Quantitative Capacity Model for `rustfs/MetaDB`
+
+The rows below multiply the assumptions in this paragraph. They were not measured on this repository.
 
 Assuming `~180 B` average prefix-compressed record footprint across primary + auxiliary tables, `4 GiB` target shard size, `10 bits/key` Bloom filter (`~1.25 B/key`), and sparse 4 KiB block index (`~12 B / 4 KiB` block $\approx 0.54\text{ B/key}$):
 
@@ -174,7 +178,8 @@ Assuming `~180 B` average prefix-compressed record footprint across primary + au
 | **1 Trillion (`10^12`)** | `1T` | `~180 TB` | `~540 TB` (`3-Voter`) | `~45,000` | `~48 GiB / node` across 160 BE nodes | `GlobalManager` + **4 Cells** (`160 BE nodes`) |
 | **10 Trillion (`10^13`)** | `10T` | `~1.8 PB` | `~5.4 PB` (`3-Voter`) | `~450,000` | `~64 GiB / node` across 1,000 BE nodes | `GlobalManager` + **20 Cells** (`1,000 BE nodes`) |
 
-### 6.3 Why There Is No Central Bottleneck at `10T+` Scale
+### 6.3 Design Argument: No Central Bottleneck in the `10T+` Model
+The points below are design arguments for the capacity model. They are not measurements of this repository at `10T+`.
 1. **Data Plane (`<4%` Multi-Shard Txns)**: `group_key = PID` colocation + async `AuxOutbox` eliminate cross-shard 2PC for `>96%` of writes, yielding linear QPS scaling with BE node count.
 2. **Control Plane (Two-Tier `GlobalManager` + `CellLocalManager`)**: Partitioning `450,000+` shards into independent **Cells** (`20K–30K` shards per `CellLocalManager`) bounds per-manager Raft heartbeat load while `GlobalManager` tracks `<1,000` coarse Cell range entries.
 3. **Timestamps (Decentralized `HLC` with Drift Guard)**: Eliminates central Timestamp Oracle (TSO) network round-trips and single points of write failure; bounded drift checks (`500ms`) protect causal ordering.
@@ -184,7 +189,7 @@ Assuming `~180 B` average prefix-compressed record footprint across primary + au
 
 ## 7. Seamless Three-Stage Evolution: Single-Node to Distributed Cluster
 
-MetaDB executes the **exact same `LsmStorageBackend` and `openraft` state machine** across every deployment stage:
+The stages below are the design path. [Section 12](#12-implementation-status-matrix-paper-vs-repository) records what this tree has exercised. `metadbd` serves `all-in-one` only, and `RegisterCell` does not store a second Cell. The design keeps the same `LsmStorageBackend` and `openraft` state machine across stages:
 
 1. **Stage 1 — Single-Node All-in-One (`1-Voter` OpenRaft)**:
    * A single `metadbd --role all-in-one` binary (or embedded `MetaDbEngine` library) runs `GlobalManager`, `CellLocalManager`, `MetaCache`, `Proxy`, and a `1-Voter` OpenRaft group in-process (`0` network hops for `ReadIndex` and consensus commit; sequential disk `fdatasync` only on Raft log segments).
@@ -279,15 +284,21 @@ Detailed Zero-Decision subsystem blueprints are maintained under [`docs/designs/
 
 ## 12. Implementation Status Matrix (Paper vs. Repository)
 
-| Capability / Subsystem | Baidu Paper (`arXiv:2610.32247v1`) | Current Repository Status (Phases 0–6 Verified) | Crate / Binary |
+Words in the repository column are not a first-launch acceptance and are not a scale-gate result. Merging pull requests #18–#25 does not pass either gate. The Baidu paper column quotes `arXiv:2610.32247v1`. Those production figures are not measurements of this repository.
+
+* **Design claim**: specified behavior. A flat `listdir` P99 under `<4ms` is a paper design target, not a measured result of this repository. Latency numbers from the earlier single-node comparison on commit `f325f6a` are not repeated here and are not results for this tree.
+* **Crate-tested**: a test in this workspace exercises the crate. `crates/metadb-storage/tests/first_ship_storage_regressions.rs` covers live-row `listdir` limit pushdown and density rebuild on open. Those tests are not first-launch evidence.
+* **Not yet verified for first launch**: process-restart `listdir`, and multi-process 3-voter failover `listdir`, with `entries_examined` assertions, are still required and are not present. What one process runs is described in [`docs/en`](./docs/en/README.md), including the 250 ms maintenance tick.
+
+| Capability / Subsystem | Baidu Paper (`arXiv:2610.32247v1`) | In-tree status (not a first-launch or scale gate) | Crate / Binary |
 | :--- | :--- | :--- | :--- |
-| `(PID, "_attr_")` Colocation, `0x01..0x07` Codecs & `HLC` | Production (C++) | **Implemented & Tested** (88B CRC32C `InodeAttr`, 500ms drift & `u16` overflow guards) | `metadb-core` |
-| Protobuf v1 / `tonic` gRPC Wire Contracts | Production RPC | **Implemented & Tested** (`MetadataService`, `TransactionService`, `RaftTransportService`, `ControlPlaneService`) | `metadb-proto` |
-| Pure-Rust WAL-less Disk LSM (SSTable, Manifest, Bloom, Cache) | Production RocksDB (WAL off) | **Implemented & Tested** (`LsmStorageBackend`, 64B footer, `flush_generation`, 16-shard LRU `BlockCache`) | `metadb-storage` |
-| `SnapshotGuard` `ReadCut` MVCC & `LocalityCompactor` | Production (`5s` window) | **Implemented & Tested** (`ActiveSnapshotRegistry` Safe-Flush Gate + bottommost range compaction) | `metadb-storage` |
-| Multi-Raft Consensus (`1-Voter -> 3-Voter` + `ReadIndex`) | Production Baidu `braft` | **Implemented & Tested** (`openraft` 0.10 + segmented CRC32C `.raftlog` + 3-watermark purge + SSTable snapshots) | `metadb-raft` |
-| `1-RTT` Pushdown, Coordinated `AttrAgg` & `AuxOutbox` Spill | Production | **Implemented & Tested** (`TxStateMachineHandler`, `ViewAtRaftIndex`, `[0x07]` `task_ordinal` spill & `AckAuxTasks`) | `metadb-tx` |
-| Crash-Recoverable 2PC (`Rename`, Cross-Shard `Mkdir`/`Rmdir`) | Production 2PC | **Implemented & Tested** (Primary-Anchored `TxnRecord` + `WriteIntent`, POSIX overwrite, `DirRenameLease`) | `metadb-tx` |
-| Epoch-Fenced `PID` Split, Jumbo Isolation & `DualMode` | Production | **Implemented & Tested** (3-stage `ExecuteSplit`, `JumboIsolationPlanner`, `DualModeFineGrained` scatter-gather) | `metadb-cluster` |
-| Two-Tier Control Plane (`GlobalManager` + `CellLocalManager`) | Production (575+ nodes/cluster) | **Implemented & Tested** (`DurableGlobalManager`, `DurableCellManager`, `CompositeMetaCache`, `DurableIdAllocator`) | `metadb-cluster` |
-| 20 Parameterized SQL Templates + `metadbd` & `metadb-ctl` | Production (~20 SQL patterns) | **Implemented & Tested** (`SqlTemplateParser` 20 templates + `PersistentMetaDbCluster` + `metadbd` + `metadb-ctl`) | `metadb-proxy` / `metadb-server` |
+| `(PID, "_attr_")` Colocation, `0x01..0x07` Codecs & `HLC` | Production (C++) | **Crate-tested** (88B CRC32C `InodeAttr`, 500ms drift & `u16` overflow guards) | `metadb-core` |
+| Protobuf v1 / `tonic` gRPC Wire Contracts | Production RPC | **Crate-tested** (`MetadataService`, `TransactionService`, `RaftTransportService`, `ControlPlaneService`) | `metadb-proto` |
+| Pure-Rust WAL-less Disk LSM (SSTable, Manifest, Bloom, Cache) | Production RocksDB (WAL off) | **Crate-tested** (`LsmStorageBackend`, 64B footer, `flush_generation`, 16-shard LRU `BlockCache`) | `metadb-storage` |
+| `SnapshotGuard` `ReadCut` MVCC & `LocalityCompactor` | Production (`5s` window); `<4ms` `listdir` P99 is a design target | **Crate-tested; first launch not verified.** Bottommost range compaction is in the crate. Live-row `listdir` limit pushdown and density rebuild on open are not a first-launch pass. The `<4ms` P99 figure is not a measurement of this repository. | `metadb-storage` |
+| Multi-Raft Consensus (`1-Voter -> 3-Voter` + `ReadIndex`) | Production Baidu `braft` | **Crate-tested in-process.** `openraft` 0.10, segmented CRC32C `.raftlog`, 3-watermark purge, and SSTable snapshots. This is not a multi-process 3-voter failover `listdir` with `entries_examined` assertions. | `metadb-raft` |
+| `1-RTT` Pushdown, Coordinated `AttrAgg` & `AuxOutbox` Spill | Production | **Crate-tested** (`TxStateMachineHandler`, `ViewAtRaftIndex`, `[0x07]` `task_ordinal` spill & `AckAuxTasks`) | `metadb-tx` |
+| Crash-Recoverable 2PC (`Rename`, Cross-Shard `Mkdir`/`Rmdir`) | Production 2PC | **Crate-tested** (Primary-Anchored `TxnRecord` + `WriteIntent`, POSIX overwrite, `DirRenameLease`) | `metadb-tx` |
+| Epoch-Fenced `PID` Split, Jumbo Isolation & `DualMode` | Production | **Crate-tested; not a scale-gate or first-launch pass.** In-tree tests cover 3-stage `ExecuteSplit`, `JumboIsolationPlanner`, and `DualModeFineGrained` scatter-gather. Dedicated-node Jumbo isolation is not a verified scale result. | `metadb-cluster` |
+| Two-Tier Control Plane (`GlobalManager` + `CellLocalManager`) | Production (575+ nodes/cluster; Baidu, not this repository) | **Crate-tested in one process; not a 575-node or trillion-scale result.** `DurableGlobalManager`, `DurableCellManager`, `CompositeMetaCache`, and `DurableIdAllocator` are in the tree. `RegisterCell` does not store a second Cell. | `metadb-cluster` |
+| 20 Parameterized SQL Templates + `metadbd` & `metadb-ctl` | Production (~20 SQL patterns) | **Crate-tested** (`SqlTemplateParser` 20 templates + `PersistentMetaDbCluster` + `metadbd` + `metadb-ctl`). `metadbd` serves `all-in-one` only. | `metadb-proxy` / `metadb-server` |
