@@ -258,6 +258,65 @@ fn releasing_one_holder_keeps_the_other_capture_and_checkpoint_keeps_live_rows()
 }
 
 #[test]
+fn pinned_snapshot_scan_keeps_the_cut_after_later_writes_are_flushed() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(dir.path());
+    let kept = MetaKey::child(4, "kept.txt").encode();
+    let overwritten = MetaKey::child(4, "old.txt").encode();
+    let deleted = MetaKey::child(4, "gone.txt").encode();
+    let created = MetaKey::child(4, "new.txt").encode();
+    let start = HlcTimestamp::new(1_000, 0);
+    engine.apply_committed_put(kept.clone(), b"kept".to_vec(), start, 1);
+    engine.apply_committed_put(overwritten.clone(), b"old".to_vec(), start, 2);
+    engine.apply_committed_put(deleted.clone(), b"gone".to_vec(), start, 3);
+    let snap = engine.acquire_linearizable_snapshot(3).unwrap();
+    engine.apply_committed_put(
+        overwritten.clone(),
+        b"new".to_vec(),
+        HlcTimestamp::new(2_000, 0),
+        4,
+    );
+    engine.apply_committed_delete(deleted.clone(), HlcTimestamp::new(2_000, 0), 5);
+    engine.apply_committed_put(
+        created.clone(),
+        b"created".to_vec(),
+        HlcTimestamp::new(2_000, 0),
+        6,
+    );
+    flush(&engine, 6, HlcTimestamp::new(2_000, 0));
+
+    let listed = engine
+        .scan_with_snapshot(
+            &MetaKey::encode_pid_prefix_start(4),
+            &MetaKey::encode_pid_prefix_end(4),
+            &snap,
+        )
+        .unwrap();
+    let value = |want: &[u8]| {
+        listed
+            .iter()
+            .find(|(key, _)| key.as_slice() == want)
+            .map(|(_, raw)| raw.clone())
+    };
+    assert_eq!(value(&kept).as_deref(), Some(b"kept".as_slice()));
+    assert_eq!(value(&overwritten).as_deref(), Some(b"old".as_slice()));
+    assert_eq!(value(&deleted).as_deref(), Some(b"gone".as_slice()));
+    assert!(value(&created).is_none());
+    drop(snap);
+    drop(listed);
+    flush(&engine, 6, HlcTimestamp::new(2_000, 0));
+    let historical = engine.scan_range(
+        &MetaKey::encode_pid_prefix_start(4),
+        &MetaKey::encode_pid_prefix_end(4),
+        start,
+    );
+    assert!(matches!(
+        historical,
+        Err(MetaDbError::TransactionTimeout { .. })
+    ));
+}
+
+#[test]
 fn releasing_the_hold_stops_serving_the_capture() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open(dir.path());
