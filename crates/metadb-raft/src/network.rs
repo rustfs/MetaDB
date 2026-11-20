@@ -79,6 +79,11 @@ impl MultiRaftRouter {
             .insert(shard_id, proposer);
     }
 
+    /// Drops the routed proposer for one shard so its LSM lock can be taken again.
+    pub fn remove_local_proposer(&self, shard_id: ShardId) {
+        self.local_proposers.write().unwrap().remove(&shard_id);
+    }
+
     pub fn get_local_proposer(
         &self,
         shard_id: ShardId,

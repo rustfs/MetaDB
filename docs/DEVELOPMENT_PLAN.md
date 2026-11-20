@@ -186,7 +186,7 @@ flowchart TD
   * `cargo test -p metadb-cluster -p metadb-proxy`
   * `cargo clippy -p metadb-cluster -p metadb-proxy --all-targets -- -D warnings`
 * **Acceptance Criteria**:
-  * In-process tests cover `PID`-boundary splits, a `JumboIsolated` route flag (not a move of peer shards onto a dedicated host), `DualModeFineGrained` scatter-gather inside one process, `IdRangeAllocator` uniqueness across restarts, and the 20 SQL templates. Dedicated-host jumbo placement is not what those tests run.
+  * In-process tests cover `PID`-boundary splits, a `JumboIsolated` route flag (not a move of peer shards onto a dedicated host), `DualModeFineGrained` scatter-gather inside one process, `IdRangeAllocator` uniqueness across restarts, and the 20 SQL templates. Dedicated-host jumbo placement is not what those tests run. A later loopback `MOVE_STAGED` / `MOVE_LIVE` placement is documented in `docs/en/scale-control-plane-status.md`. It does not call `transfer_leader`, does not replicate the cell directory, and is not this phase's acceptance.
 
 ---
 
