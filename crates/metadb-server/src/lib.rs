@@ -14,6 +14,7 @@ pub mod stress;
 
 mod metrics_http;
 mod operability;
+mod rbac_layer;
 
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
@@ -21,7 +22,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use metadb_security::TransportSecurity;
+use metadb_security::{InstalledRoles, RoleGrantSpec, RolePresentation, TransportSecurity};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -105,37 +106,51 @@ impl Interceptor for BearerAuth {
 
 /// Client interceptor. Attaches `authorization: Bearer <secret>` to outgoing RPCs.
 /// An empty secret leaves the request unchanged. A whitespace-only secret is rejected.
+/// An installed role, when present, is sent in addition to the bearer.
 #[derive(Clone)]
 pub struct BearerAuthClient {
     secret: std::sync::Arc<str>,
+    role: Option<RolePresentation>,
 }
 
 impl BearerAuthClient {
     pub fn new(secret: impl AsRef<str>) -> Self {
         Self {
             secret: std::sync::Arc::from(secret.as_ref()),
+            role: None,
         }
+    }
+
+    /// Presents an installed principal in addition to the shared bearer.
+    pub fn with_role(mut self, role: RolePresentation) -> Self {
+        self.role = Some(role);
+        self
     }
 }
 
 impl Interceptor for BearerAuthClient {
     fn call(&mut self, mut request: Request<()>) -> std::result::Result<Request<()>, Status> {
         match classify_secret(&self.secret) {
-            SecretMaterial::Absent => return Ok(request),
+            SecretMaterial::Absent => {}
             SecretMaterial::WhitespaceOnly => {
                 return Err(Status::unauthenticated(
                     "whitespace-only shared secret is not a credential",
                 ));
             }
-            SecretMaterial::Configured => {}
+            SecretMaterial::Configured => {
+                let mut token = String::from("Bearer ");
+                token.push_str(&self.secret);
+                let mut value = tonic::metadata::MetadataValue::try_from(token).map_err(|_| {
+                    Status::internal("shared secret is not a valid authorization header value")
+                })?;
+                value.set_sensitive(true);
+                request.metadata_mut().insert("authorization", value);
+            }
         }
-        let mut token = String::from("Bearer ");
-        token.push_str(&self.secret);
-        let mut value = tonic::metadata::MetadataValue::try_from(token).map_err(|_| {
-            Status::internal("shared secret is not a valid authorization header value")
-        })?;
-        value.set_sensitive(true);
-        request.metadata_mut().insert("authorization", value);
+        if let Some(role) = &self.role {
+            role.apply_metadata(request.metadata_mut())
+                .map_err(|_| Status::internal("RBAC principal headers could not be attached"))?;
+        }
         Ok(request)
     }
 }
@@ -555,6 +570,7 @@ pub struct PersistentMetaDbCluster {
     metrics_addr: OnceLock<String>,
     operability: Arc<operability::Operability>,
     transport_security: Arc<TransportSecurity>,
+    roles: Option<Arc<InstalledRoles>>,
 }
 
 async fn serve_global_directory(
@@ -562,6 +578,7 @@ async fn serve_global_directory(
     listener: TcpListener,
     bound_addr: String,
     transport_security: Arc<TransportSecurity>,
+    roles: Option<Arc<InstalledRoles>>,
 ) -> Result<(Arc<PersistentMetaDbCluster>, String)> {
     let clock = Arc::new(HybridLogicalClock::with_max_drift_ms(
         config.clock.max_clock_drift_ms,
@@ -589,7 +606,8 @@ async fn serve_global_directory(
     let tx_router = Arc::new(
         DistributedTxRouter::new(config.node.node_id, clock.clone(), global_manager.clone())
             .with_forward_secret(config.security.shared_secret.clone())
-            .with_transport_security(Arc::clone(&transport_security)),
+            .with_transport_security(Arc::clone(&transport_security))
+            .with_role_presentation(roles.as_ref().map(|roles| roles.local().clone())),
     );
     let proxy_router = Arc::new(StatelessProxyRouter::new(tx_router.clone()));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -609,6 +627,7 @@ async fn serve_global_directory(
         metrics_addr: OnceLock::new(),
         operability,
         transport_security: Arc::clone(&transport_security),
+        roles: roles.clone(),
     });
     let shared_secret = cluster.config.security.shared_secret.clone();
     let grpc_svc = MetaDbGrpcService::new(
@@ -618,6 +637,7 @@ async fn serve_global_directory(
     )
     .with_forward_secret(shared_secret.clone())
     .with_transport_security(Arc::clone(&transport_security))
+    .with_role_presentation(roles.as_ref().map(|roles| roles.local().clone()))
     .with_directory_only(true);
     let grpc_handle = spawn_grpc_server(
         listener,
@@ -626,6 +646,7 @@ async fn serve_global_directory(
         MultiRaftRouter::new(),
         shutdown_rx,
         Arc::clone(&transport_security),
+        roles,
     );
     cluster.task_handles.lock().await.push(grpc_handle);
     if let Err(error) = spawn_metrics_listener(&cluster).await {
@@ -676,6 +697,7 @@ async fn register_cell_with_global_manager(
         &endpoint,
         &cluster.config.security.shared_secret,
         &cluster.transport_security,
+        cluster.roles().map(|roles| roles.local()),
     )
     .await?;
     let response = client
@@ -773,9 +795,11 @@ impl PersistentMetaDbCluster {
                 .prepare_url(&config.cluster.global_manager)
                 .map_err(security_startup_error)?;
         }
-        // Certificate material is checked here, before a data directory or listener exists.
+        // TLS mode is rejected here, before a data directory or listener exists.
+        // Certificate files are not opened.
         let transport_security =
             Arc::new(TransportSecurity::load(&tls_spec).map_err(security_startup_error)?);
+        let roles = install_configured_roles(&config)?;
         std::fs::create_dir_all(&config.node.data_dir)?;
         if directory_only {
             let shard_tree = config.node.data_dir.join("be");
@@ -832,7 +856,8 @@ impl PersistentMetaDbCluster {
             .reject_listen_host(&bound_addr)
             .map_err(security_startup_error)?;
         if directory_only {
-            return serve_global_directory(config, listener, bound_addr, transport_security).await;
+            return serve_global_directory(config, listener, bound_addr, transport_security, roles)
+                .await;
         }
 
         let clock = Arc::new(HybridLogicalClock::with_max_drift_ms(
@@ -857,6 +882,7 @@ impl PersistentMetaDbCluster {
         backup::register_runtime(&config.node.data_dir)?;
         host.set_shared_secret(Some(config.security.shared_secret.clone()));
         host.set_transport_security((*transport_security).clone());
+        host.set_role_presentation(roles.as_ref().map(|roles| roles.local().clone()));
         let raft_router = host.router().clone();
         let directory_role = if cell_dir.join("CELL_MANAGER_STATE").exists() {
             DurableCellManager::inspect_directory(&cell_dir)?
@@ -932,7 +958,8 @@ impl PersistentMetaDbCluster {
         let tx_router = Arc::new(
             DistributedTxRouter::new(config.node.node_id, clock.clone(), global_manager.clone())
                 .with_forward_secret(config.security.shared_secret.clone())
-                .with_transport_security(Arc::clone(&transport_security)),
+                .with_transport_security(Arc::clone(&transport_security))
+                .with_role_presentation(roles.as_ref().map(|roles| roles.local().clone())),
         );
         let proxy_router = Arc::new(StatelessProxyRouter::new(tx_router.clone()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -952,6 +979,7 @@ impl PersistentMetaDbCluster {
             metrics_addr: OnceLock::new(),
             operability,
             transport_security: Arc::clone(&transport_security),
+            roles: roles.clone(),
         });
         let shared_secret = cluster.config.security.shared_secret.clone();
         if shared_secret.is_empty() {
@@ -975,6 +1003,7 @@ impl PersistentMetaDbCluster {
         )
         .with_forward_secret(cluster.config.security.shared_secret.clone())
         .with_transport_security(Arc::clone(&transport_security))
+        .with_role_presentation(roles.as_ref().map(|roles| roles.local().clone()))
         .with_remote_cell_registration(cluster.config.node.role != ServerRole::CellManager);
         let grpc_handle = spawn_grpc_server(
             listener,
@@ -983,6 +1012,7 @@ impl PersistentMetaDbCluster {
             raft_router,
             shutdown_rx,
             Arc::clone(&transport_security),
+            roles,
         );
         cluster.task_handles.lock().await.push(grpc_handle);
         // The probe listener is up before join so a scrape observes `starting`
@@ -1001,6 +1031,7 @@ impl PersistentMetaDbCluster {
                 cluster.cell_manager(),
                 &bound_addr,
                 &cluster.transport_security,
+                cluster.roles().map(|roles| roles.local()),
             )
             .await
             {
@@ -1259,6 +1290,7 @@ impl PersistentMetaDbCluster {
             &endpoint,
             &self.config.security.shared_secret,
             &self.transport_security,
+            self.roles().map(|roles| roles.local()),
         )
         .await?;
         let response = client
@@ -1353,6 +1385,11 @@ impl PersistentMetaDbCluster {
     /// TLS policy for outbound admin and control clients in this process.
     pub fn transport_security(&self) -> &TransportSecurity {
         &self.transport_security
+    }
+
+    /// Installed method grants. `None` means method RBAC is not installed.
+    pub fn roles(&self) -> Option<&InstalledRoles> {
+        self.roles.as_deref()
     }
 
     /// Stops gRPC and maintenance, drains auxiliary work, flushes memtables, and stops OpenRaft.
@@ -1581,10 +1618,12 @@ fn spawn_grpc_server(
     raft_router: MultiRaftRouter,
     mut shutdown_rx: watch::Receiver<bool>,
     security: Arc<TransportSecurity>,
+    roles: Option<Arc<InstalledRoles>>,
 ) -> tokio::task::JoinHandle<()> {
-    let auth = BearerAuth::new(shared_secret);
+    let auth = BearerAuth::new(shared_secret.clone());
     tokio::spawn(async move {
         let router = Server::builder()
+            .layer(rbac_layer::RbacLayer::new(shared_secret.clone(), roles))
             .add_service(MetadataServiceServer::with_interceptor(
                 grpc_svc.clone(),
                 auth.clone(),
@@ -1601,49 +1640,14 @@ fn spawn_grpc_server(
                 MultiRaftTransportServer::new(raft_router),
                 auth,
             ));
-        if security.is_plaintext() {
-            let _ = router
-                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                    let _ = shutdown_rx.changed().await;
-                })
-                .await;
+        if !security.is_plaintext() {
+            tracing::error!("refusing to serve: TLS termination is not available");
             return;
         }
-        let mut accept_shutdown = shutdown_rx.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel::<
-            std::result::Result<metadb_security::TlsServerIo, std::io::Error>,
-        >(32);
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = accept_shutdown.changed() => break,
-                    accepted = listener.accept() => {
-                        let Ok((tcp, _)) = accepted else { break; };
-                        let security = Arc::clone(&security);
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            match security.accept_grpc(tcp).await {
-                                Ok(io) => {
-                                    if tx.send(Ok(io)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                                Err(error) => {
-                                    tracing::warn!(%error, "tls handshake refused");
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-        });
         let _ = router
-            .serve_with_incoming_shutdown(
-                tokio_stream::wrappers::ReceiverStream::new(rx),
-                async move {
-                    let _ = shutdown_rx.changed().await;
-                },
-            )
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _ = shutdown_rx.changed().await;
+            })
             .await;
     })
 }
@@ -1682,6 +1686,7 @@ pub(crate) async fn control_plane_client(
     addr: &str,
     secret: &str,
     security: &TransportSecurity,
+    role: Option<&RolePresentation>,
 ) -> Result<
     ControlPlaneServiceClient<
         tonic::service::interceptor::InterceptedService<
@@ -1700,10 +1705,33 @@ pub(crate) async fn control_plane_client(
     let channel = security.connect(endpoint).await.map_err(|e| {
         MetaDbError::ConsensusError(format!("connect to raft leader {addr} failed: {e}"))
     })?;
-    Ok(ControlPlaneServiceClient::with_interceptor(
-        channel,
-        BearerAuthClient::new(secret),
-    ))
+    let mut auth = BearerAuthClient::new(secret);
+    if let Some(role) = role {
+        auth = auth.with_role(role.clone());
+    }
+    Ok(ControlPlaneServiceClient::with_interceptor(channel, auth))
+}
+
+fn install_configured_roles(config: &ServerTomlConfig) -> Result<Option<Arc<InstalledRoles>>> {
+    let Some(rbac) = &config.security.rbac else {
+        return Ok(None);
+    };
+    let grants = rbac
+        .grants
+        .iter()
+        .map(|grant| RoleGrantSpec {
+            principal: grant.principal.clone(),
+            credential: grant.credential.clone(),
+            allow: grant.allow.clone(),
+        })
+        .collect::<Vec<_>>();
+    InstalledRoles::install(
+        &rbac.local_principal,
+        &grants,
+        &config.security.shared_secret,
+    )
+    .map(|roles| Some(Arc::new(roles)))
+    .map_err(security_startup_error)
 }
 
 fn listen_port_is_ephemeral(addr: &str) -> bool {
@@ -1723,12 +1751,14 @@ async fn join_existing_raft_group(
     cell_manager: &DurableCellManager,
     bound_addr: &str,
     security: &TransportSecurity,
+    role: Option<&RolePresentation>,
 ) -> Result<()> {
     let budget = config.join_timeout.unwrap_or(Duration::from_secs(45));
     let deadline = tokio::time::Instant::now() + budget;
     let mut last_error = None;
     while tokio::time::Instant::now() < deadline {
-        match join_existing_raft_group_once(config, cell_manager, bound_addr, security).await {
+        match join_existing_raft_group_once(config, cell_manager, bound_addr, security, role).await
+        {
             Ok(()) => return Ok(()),
             Err(error) if join_failure_is_permanent(&error) => return Err(error),
             Err(error) => {
@@ -1748,6 +1778,7 @@ async fn join_existing_raft_group_once(
     cell_manager: &DurableCellManager,
     bound_addr: &str,
     security: &TransportSecurity,
+    role: Option<&RolePresentation>,
 ) -> Result<()> {
     let seed = security
         .prepare_url(&config.cluster.join)
@@ -1757,7 +1788,8 @@ async fn join_existing_raft_group_once(
                 config.cluster.join
             ))
         })?;
-    let mut client = control_plane_client(&seed, &config.security.shared_secret, security).await?;
+    let mut client =
+        control_plane_client(&seed, &config.security.shared_secret, security, role).await?;
     let listed = client
         .get_routes(GetRoutesRequest {
             cell_id: config.node.cell_id,

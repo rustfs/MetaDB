@@ -27,6 +27,14 @@ struct Cli {
     #[arg(long, env = "METADB_AUTH_TOKEN", default_value = "")]
     auth_token: String,
 
+    /// Installed RBAC principal. Not a substitute for `--auth-token`.
+    #[arg(long, env = "METADB_RBAC_PRINCIPAL")]
+    rbac_principal: Option<String>,
+
+    /// Credential for `--rbac-principal`. This is not the shared bearer.
+    #[arg(long, env = "METADB_RBAC_CREDENTIAL")]
+    rbac_credential: Option<String>,
+
     /// `tls` or `mtls`. Omit every TLS flag for a plaintext server.
     /// There is no flag that skips certificate or hostname checks.
     #[arg(long)]
@@ -191,10 +199,30 @@ enum CellCmd {
     },
 }
 
+fn bearer_client(cli: &Cli) -> Result<metadb_server::BearerAuthClient, String> {
+    let mut client = metadb_server::BearerAuthClient::new(&cli.auth_token);
+    match (&cli.rbac_principal, &cli.rbac_credential) {
+        (None, None) => {}
+        (Some(principal), Some(credential)) => {
+            client = client.with_role(metadb_security::RolePresentation::from_parts(
+                principal.clone(),
+                credential.clone(),
+            ));
+        }
+        _ => {
+            return Err(
+                "refusing to dial: --rbac-principal and --rbac-credential must be set together"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(client)
+}
+
 async fn open_cp(
     security: &metadb_security::TransportSecurity,
     url: &str,
-    token: &str,
+    auth: metadb_server::BearerAuthClient,
 ) -> Result<
     ControlPlaneServiceClient<
         tonic::service::interceptor::InterceptedService<
@@ -206,16 +234,13 @@ async fn open_cp(
 > {
     let endpoint = tonic::transport::Endpoint::from_shared(url.to_string())?;
     let channel = security.connect(endpoint).await?;
-    Ok(ControlPlaneServiceClient::with_interceptor(
-        channel,
-        metadb_server::BearerAuthClient::new(token),
-    ))
+    Ok(ControlPlaneServiceClient::with_interceptor(channel, auth))
 }
 
 async fn open_meta(
     security: &metadb_security::TransportSecurity,
     url: &str,
-    token: &str,
+    auth: metadb_server::BearerAuthClient,
 ) -> Result<
     MetadataServiceClient<
         tonic::service::interceptor::InterceptedService<
@@ -227,10 +252,7 @@ async fn open_meta(
 > {
     let endpoint = tonic::transport::Endpoint::from_shared(url.to_string())?;
     let channel = security.connect(endpoint).await?;
-    Ok(MetadataServiceClient::with_interceptor(
-        channel,
-        metadb_server::BearerAuthClient::new(token),
-    ))
+    Ok(MetadataServiceClient::with_interceptor(channel, auth))
 }
 
 fn client_security(cli: &Cli) -> Result<metadb_security::TransportSecurity, String> {
@@ -473,13 +495,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
     let security = client_security(&cli)?;
     let url = security.prepare_url(&cli.endpoint)?;
-    let token = cli.auth_token.clone();
+    let auth = bearer_client(&cli)?;
 
     match cli.command {
         Command::Cluster {
             sub: ClusterCmd::Status,
         } => {
-            let mut cp = open_cp(&security, &url, &token).await?;
+            let mut cp = open_cp(&security, &url, auth.clone()).await?;
             let resp = cp
                 .get_routes(GetRoutesRequest { cell_id: 0 })
                 .await?
@@ -502,7 +524,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
         Command::Shard { sub } => {
-            let mut cp = open_cp(&security, &url, &token).await?;
+            let mut cp = open_cp(&security, &url, auth.clone()).await?;
             match sub {
                 ShardCmd::List { cell_id } => {
                     let resp = cp
@@ -557,7 +579,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     target_voters,
                 },
         } => {
-            let mut cp = open_cp(&security, &url, &token).await?;
+            let mut cp = open_cp(&security, &url, auth.clone()).await?;
             let resp = cp
                 .scale_shard_replicas(ScaleShardReplicasRequest {
                     cell_id,
@@ -584,7 +606,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     end_key,
                 },
         } => {
-            let mut cp = open_cp(&security, &url, &token).await?;
+            let mut cp = open_cp(&security, &url, auth.clone()).await?;
             let eps: Vec<String> = endpoints.split(',').map(|s| s.trim().to_string()).collect();
             let (start_key, end_key) = match (start_key, end_key) {
                 (None, None) => (vec![0x01], vec![0x04]),
@@ -613,7 +635,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("Registered Cell {}", cell_id);
         }
         Command::Sql { query } => {
-            let mut meta = open_meta(&security, &url, &token).await?;
+            let mut meta = open_meta(&security, &url, auth.clone()).await?;
             let resp = meta
                 .execute_sql(ExecuteSqlRequest {
                     sql: query,
@@ -641,7 +663,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 run_benchmark(
                     &security,
                     &url,
-                    &token,
+                    auth,
                     &workload,
                     concurrency.unwrap_or(16),
                     ops,
@@ -764,7 +786,7 @@ impl BenchStats {
 async fn run_benchmark(
     security: &metadb_security::TransportSecurity,
     url: &str,
-    token: &str,
+    auth: metadb_server::BearerAuthClient,
     workload: &str,
     concurrency: usize,
     ops: usize,
@@ -779,8 +801,8 @@ async fn run_benchmark(
     if concurrency == 0 {
         return Err("--concurrency must be greater than zero".into());
     }
-    let mut meta = open_meta(security, url, token).await?;
-    let mut cp = open_cp(security, url, token).await?;
+    let mut meta = open_meta(security, url, auth.clone()).await?;
+    let mut cp = open_cp(security, url, auth).await?;
     let mut grants = Vec::new();
     for (kind, count) in [(2, 1), (1, ops as u64), (3, ops as u64)] {
         if count == 0 {

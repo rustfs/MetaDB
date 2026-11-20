@@ -138,6 +138,7 @@ pub struct MetaDbGrpcService {
     /// Outbound control probes use this policy. Plaintext is the only mode that loads.
     /// A certificate principal is not a role; method RBAC is not installed.
     transport_security: std::sync::Arc<metadb_security::TransportSecurity>,
+    role: Option<metadb_security::RolePresentation>,
     /// `global-manager` publishes routes and does not mint ids or rename leases.
     directory_only: bool,
     /// `cell-manager` keeps its own cell and refuses to store a remote cell.
@@ -156,6 +157,7 @@ impl MetaDbGrpcService {
             proxy_router,
             forward_secret: String::new(),
             transport_security: std::sync::Arc::new(metadb_security::TransportSecurity::plaintext()),
+            role: None,
             directory_only: false,
             accepts_remote_cells: true,
         }
@@ -171,6 +173,14 @@ impl MetaDbGrpcService {
         security: std::sync::Arc<metadb_security::TransportSecurity>,
     ) -> Self {
         self.transport_security = security;
+        self
+    }
+
+    pub fn with_role_presentation(
+        mut self,
+        role: Option<metadb_security::RolePresentation>,
+    ) -> Self {
+        self.role = role;
         self
     }
 
@@ -1493,14 +1503,18 @@ impl MetaDbGrpcService {
                     "RegisterCell endpoint is not usable with the configured TLS mode: {error}"
                 ))
             })?;
-        let mut client =
-            crate::control_plane_client(&endpoint, &self.forward_secret, &self.transport_security)
-                .await
-                .map_err(|error| {
-                    MetaDbError::ShardRoutingError(format!(
-                        "cell {cell_id} manager at {endpoint} is not reachable: {error}"
-                    ))
-                })?;
+        let mut client = crate::control_plane_client(
+            &endpoint,
+            &self.forward_secret,
+            &self.transport_security,
+            self.role.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            MetaDbError::ShardRoutingError(format!(
+                "cell {cell_id} manager at {endpoint} is not reachable: {error}"
+            ))
+        })?;
         let listed = client
             .get_routes(GetRoutesRequest { cell_id })
             .await

@@ -20,7 +20,7 @@ The metrics listener uses `classify_secret`, the same classification as gRPC. Th
 - `WhitespaceOnly`: the secret is spaces or other whitespace and contains no other character. `/metrics`, `/livez`, `/readyz`, and `/healthz` return HTTP 401. That includes a request whose `Authorization` value is exactly `Bearer` plus the same whitespace. Startup rejects this secret even when `allow_unauthenticated` is set. The probe does not compare it as a configured bearer.
 - `Configured`: the secret contains a non-whitespace character. `Authorization` must equal `Bearer <shared_secret>` exactly. A missing, empty, or different value is HTTP 401.
 
-`allow_unauthenticated` still refuses a wildcard or any other non-loopback address. When `[security.tls].mode` is `off`, listeners and outbound calls are plaintext and `https` is refused. `tls` and `mtls` terminate TLS 1.3 with rustls and the ring provider, verify the configured CA, hostname, and extended key usage, and refuse `http`. A wildcard listen address is refused. TLS does not replace the bearer. There is no CRL or OCSP check and no certificate reload. This is not a production security acceptance. See `docs/designs/transport_security.md`.
+`allow_unauthenticated` still refuses a wildcard or any other non-loopback address. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
 
 Only `GET` is accepted. Any other method is HTTP 405. The route is the URI path, so a query string does not select another check and cannot ask for a dump. `GET /readyz?verbose=1` is the same probe as `GET /readyz`. There is no POST, no reload, and no shutdown URL. The probes are not a management API.
 

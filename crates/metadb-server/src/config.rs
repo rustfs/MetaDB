@@ -126,7 +126,56 @@ pub struct SecuritySection {
     /// other non-loopback address. It cannot be combined with a usable secret.
     pub allow_unauthenticated: bool,
     /// TLS 1.3 material. Omitted or `mode = "off"` keeps plaintext.
+    /// `tls` and `mtls` are refused before a listener exists.
     pub tls: TlsSection,
+    /// Installed method grants. Absent means method RBAC is not installed.
+    /// Present means every gRPC method and probe is denied unless a grant lists it.
+    pub rbac: Option<RbacSection>,
+}
+
+/// `[security.rbac]`. The shared bearer is not one of these credentials.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RbacSection {
+    /// Principal this process presents on outbound RPCs.
+    pub local_principal: String,
+    pub grants: Vec<RbacGrantConfig>,
+}
+
+impl Default for RbacSection {
+    fn default() -> Self {
+        Self {
+            local_principal: String::new(),
+            grants: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for RbacSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RbacSection")
+            .field("local_principal", &self.local_principal)
+            .field("grants", &self.grants)
+            .finish()
+    }
+}
+
+/// One principal. Debug output does not include `credential`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RbacGrantConfig {
+    pub principal: String,
+    pub credential: String,
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+impl std::fmt::Debug for RbacGrantConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RbacGrantConfig")
+            .field("principal", &self.principal)
+            .field("allow", &self.allow)
+            .finish()
+    }
 }
 
 /// `[security.tls]`. Only these five keys are accepted.
@@ -576,6 +625,10 @@ fn reject_unsupported_security_keys(value: &toml::Value) -> Result<()> {
                 reject_tls_table(child)?;
                 continue;
             }
+            if key == "rbac" {
+                reject_rbac_table(child)?;
+                continue;
+            }
             if key != "shared_secret" && key != "allow_unauthenticated" {
                 return Err(security_key_error(key));
             }
@@ -596,6 +649,88 @@ fn reject_unsupported_security_keys(value: &toml::Value) -> Result<()> {
 }
 
 const TLS_TABLE_KEYS: &[&str] = &["mode", "cert_file", "key_file", "ca_file", "server_name"];
+
+fn reject_rbac_table(value: &toml::Value) -> Result<()> {
+    let Some(table) = value.as_table() else {
+        return Err(MetaDbError::CodecError(
+            "refusing to start: [security.rbac] must be a table".to_string(),
+        ));
+    };
+    for (key, child) in table {
+        match key.as_str() {
+            "local_principal" => {
+                if !child.is_str() {
+                    return Err(MetaDbError::CodecError(
+                        "refusing to start: [security.rbac].local_principal must be a string"
+                            .to_string(),
+                    ));
+                }
+            }
+            "grants" => reject_rbac_grants(child)?,
+            _ => {
+                return Err(MetaDbError::CodecError(format!(
+                    "refusing to start: unrecognized [security.rbac] key `{key}`. The accepted keys are local_principal and grants"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_rbac_grants(value: &toml::Value) -> Result<()> {
+    let Some(items) = value.as_array() else {
+        return Err(MetaDbError::CodecError(
+            "refusing to start: [security.rbac].grants must be an array of tables".to_string(),
+        ));
+    };
+    for item in items {
+        let Some(table) = item.as_table() else {
+            return Err(MetaDbError::CodecError(
+                "refusing to start: each [[security.rbac.grants]] entry must be a table"
+                    .to_string(),
+            ));
+        };
+        for (key, child) in table {
+            match key.as_str() {
+                "principal" => {
+                    if !child.is_str() {
+                        return Err(MetaDbError::CodecError(
+                            "refusing to start: [security.rbac.grants].principal must be a string"
+                                .to_string(),
+                        ));
+                    }
+                }
+                "credential" => {
+                    if !child.is_str() {
+                        return Err(MetaDbError::CodecError(
+                            "refusing to start: [security.rbac.grants].credential must be a string"
+                                .to_string(),
+                        ));
+                    }
+                }
+                "allow" => {
+                    let Some(entries) = child.as_array() else {
+                        return Err(MetaDbError::CodecError(
+                            "refusing to start: [security.rbac.grants].allow must be an array of strings".to_string(),
+                        ));
+                    };
+                    if entries.iter().any(|entry| !entry.is_str()) {
+                        return Err(MetaDbError::CodecError(
+                            "refusing to start: [security.rbac.grants].allow entries must be strings"
+                                .to_string(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(MetaDbError::CodecError(format!(
+                        "refusing to start: unrecognized RBAC grant key `{key}`"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 fn reject_tls_table(value: &toml::Value) -> Result<()> {
     let Some(table) = value.as_table() else {

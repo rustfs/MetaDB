@@ -99,6 +99,7 @@ pub struct ChannelPool {
     channels: Arc<AsyncMutex<HashMap<String, Channel>>>,
     shared_secret: Arc<RwLock<Option<String>>>,
     security: Arc<RwLock<TransportSecurity>>,
+    role: Arc<RwLock<Option<metadb_security::RolePresentation>>>,
 }
 
 impl ChannelPool {
@@ -114,6 +115,11 @@ impl ChannelPool {
         *self.security.write().unwrap() = security;
     }
 
+    /// Presents the process RBAC principal on Raft RPCs. `None` sends no role headers.
+    pub fn set_role_presentation(&self, role: Option<metadb_security::RolePresentation>) {
+        *self.role.write().unwrap() = role;
+    }
+
     fn authenticate<T>(&self, mut request: Request<T>) -> Result<Request<T>, io::Error> {
         if let Some(secret) = self.shared_secret.read().unwrap().as_ref() {
             let value = format!("Bearer {secret}").parse().map_err(|_| {
@@ -123,6 +129,10 @@ impl ChannelPool {
                 )
             })?;
             request.metadata_mut().insert("authorization", value);
+        }
+        if let Some(role) = self.role.read().unwrap().as_ref() {
+            role.apply_metadata(request.metadata_mut())
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         }
         Ok(request)
     }

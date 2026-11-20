@@ -454,6 +454,7 @@ pub struct DistributedTxRouter {
     /// Hard cap past `start_hlc`. Defaults to [`MAX_2PC_LEASE_LIFETIME_MS`].
     max_lease_lifetime_ms: u64,
     forward_secret: String,
+    role: Option<metadb_security::RolePresentation>,
     transport_security: std::sync::Arc<metadb_security::TransportSecurity>,
     pre_prepare_hold: Duration,
     post_prepare_gate: Option<Arc<TwoPcPrepareGate>>,
@@ -475,6 +476,7 @@ impl DistributedTxRouter {
             ttl_ms: DEFAULT_2PC_TTL_MS,
             max_lease_lifetime_ms: MAX_2PC_LEASE_LIFETIME_MS,
             forward_secret: String::new(),
+            role: None,
             transport_security: std::sync::Arc::new(metadb_security::TransportSecurity::plaintext()),
             pre_prepare_hold: Duration::ZERO,
             post_prepare_gate: None,
@@ -528,6 +530,15 @@ impl DistributedTxRouter {
 
     pub fn with_forward_secret(mut self, secret: impl Into<String>) -> Self {
         self.forward_secret = secret.into();
+        self
+    }
+
+    /// Outbound leader forwarding presents this principal when RBAC is installed.
+    pub fn with_role_presentation(
+        mut self,
+        role: Option<metadb_security::RolePresentation>,
+    ) -> Self {
+        self.role = role;
         self
     }
 
@@ -1950,6 +1961,7 @@ impl DistributedTxRouter {
                 op,
                 deadline,
                 &self.transport_security,
+                self.role.as_ref(),
             )
             .await
             {

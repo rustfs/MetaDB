@@ -116,10 +116,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         let endpoint = tonic::transport::Endpoint::from_shared(cm_url.clone())?;
         let channel = security.connect(endpoint).await?;
-        let mut cp = ControlPlaneServiceClient::with_interceptor(
-            channel,
-            metadb_server::BearerAuthClient::new(shared_secret),
-        );
+        let mut auth = metadb_server::BearerAuthClient::new(shared_secret);
+        if let Some(roles) = cluster.roles() {
+            auth = auth.with_role(roles.local().clone());
+        }
+        let mut cp = ControlPlaneServiceClient::with_interceptor(channel, auth);
         let reg_resp = cp
             .register_node(RegisterNodeRequest {
                 cell_id,

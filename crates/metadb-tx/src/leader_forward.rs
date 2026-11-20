@@ -139,6 +139,7 @@ pub enum ForwardedRouterOut {
 #[derive(Clone)]
 struct ForwardAuth {
     secret: String,
+    role: Option<metadb_security::RolePresentation>,
 }
 
 impl Interceptor for ForwardAuth {
@@ -151,6 +152,10 @@ impl Interceptor for ForwardAuth {
             })?;
             value.set_sensitive(true);
             request.metadata_mut().insert("authorization", value);
+        }
+        if let Some(role) = &self.role {
+            role.apply_metadata(request.metadata_mut())
+                .map_err(|_| Status::internal("RBAC principal headers could not be attached"))?;
         }
         request.metadata_mut().insert(
             "x-metadb-forwarded",
@@ -173,6 +178,7 @@ pub async fn forward_op(
     op: &ForwardedRouterOp,
     deadline: tokio::time::Instant,
     security: &TransportSecurity,
+    role: Option<&metadb_security::RolePresentation>,
 ) -> Result<ForwardedRouterOut> {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
@@ -201,6 +207,7 @@ pub async fn forward_op(
         channel,
         ForwardAuth {
             secret: secret.to_string(),
+            role: role.cloned(),
         },
     );
     let payload =

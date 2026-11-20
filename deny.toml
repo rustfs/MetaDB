@@ -26,18 +26,9 @@ allow = [
     "Unicode-3.0",
     "Zlib",
 ]
-# Owner decision 2026-11-20 11:17 Asia/Shanghai: TLS uses rustls with the
-# maintained ring provider only. ring's bundled C and assembly are accepted
-# for that TLS stack and for no other crate or module. These are crate-scoped
-# exceptions, not a blanket ISC allow. aws-lc-rs and aws-lc-sys are not
-# allowed. Do not add another crate to this list without a new owner decision.
-# Resolved with this lockfile: ring 0.17.14 (Apache-2.0 AND ISC),
-# rustls-webpki 0.103.17 (ISC), untrusted 0.9.0 (ISC).
-exceptions = [
-    { allow = ["Apache-2.0", "ISC"], name = "ring" },
-    { allow = ["ISC"], name = "rustls-webpki" },
-    { allow = ["ISC"], name = "untrusted" },
-]
+# The 2026-11-20 11:17 Asia/Shanghai TLS-only ring exception was revoked.
+# This project stays pure Rust. Do not add ISC exceptions, ring, rustls, or aws-lc.
+exceptions = []
 
 [bans]
 multiple-versions = "warn"
