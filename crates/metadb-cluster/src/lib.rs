@@ -14,6 +14,7 @@ pub mod global_manager;
 pub mod id_allocator;
 pub mod identity;
 pub mod jumbo;
+pub mod jumbo_files;
 pub mod jumbo_placement;
 pub mod meta_cache;
 pub mod shard;

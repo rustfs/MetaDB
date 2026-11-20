@@ -689,6 +689,14 @@ impl PersistentMetaDbCluster {
                 id_allocator.clone(),
                 meta_cache.clone(),
                 owned_range,
+                {
+                    let text = config.sharding.jumbo_dedicated_root.trim();
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(std::path::PathBuf::from(text))
+                    }
+                },
             )
             .await?
         };
@@ -917,6 +925,7 @@ impl PersistentMetaDbCluster {
                     .maybe_split_or_isolate_shard(grp.shard_id(), false)
                     .await;
             }
+            let _ = cell.relocate_configured_jumbo_files().await;
         }
         // Snapshot + purge after auxiliary drain so `last_snapshot_index` advances and
         // `.raftlog` retention follows the 3-watermark gate in production (metadbd's loop).
