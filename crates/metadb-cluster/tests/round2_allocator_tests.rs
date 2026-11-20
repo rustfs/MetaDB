@@ -1,6 +1,6 @@
 use metadb_cluster::{AllocIdKind, DurableIdAllocator};
 use metadb_core::codec;
-use metadb_core::HlcTimestamp;
+use metadb_core::{HlcTimestamp, LeaseRenewReject, MetaDbError};
 
 #[test]
 fn independently_opened_allocators_must_not_grant_overlapping_ids() {
@@ -183,6 +183,39 @@ fn version_two_allocator_cannot_be_misread_as_legacy_counters() {
         allocator.allocate_block(0, AllocIdKind::FileId, 1).unwrap(),
         (129, 1)
     );
+}
+
+#[test]
+fn rename_lease_ttl_above_the_cap_is_rejected_and_does_not_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let allocator = DurableIdAllocator::open(dir.path()).unwrap();
+    let now = HlcTimestamp::new(1_000, 0);
+    let rejected = allocator.acquire_dir_rename_lease(now, 60_001, 60_000);
+    assert!(
+        matches!(
+            rejected,
+            Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameTtlExceedsCap
+            ))
+        ),
+        "{rejected:?}"
+    );
+    let overflow =
+        allocator.acquire_dir_rename_lease(HlcTimestamp::new(u64::MAX, 0), u64::MAX, u64::MAX);
+    assert!(overflow.is_err(), "physical time plus TTL must not wrap");
+    let (token, expire) = allocator
+        .acquire_dir_rename_lease(now, 60_000, 60_000)
+        .unwrap();
+    assert_eq!(expire, HlcTimestamp::new(61_000, 0));
+    assert_eq!(token, 1, "rejected grants must not consume the fence token");
+    let minimum = {
+        let dir = tempfile::tempdir().unwrap();
+        let allocator = DurableIdAllocator::open(dir.path()).unwrap();
+        allocator
+            .acquire_dir_rename_lease(HlcTimestamp::new(5_000, 0), 1, 60_000)
+            .unwrap()
+    };
+    assert_eq!(minimum.1, HlcTimestamp::new(5_100, 0));
 }
 
 #[test]

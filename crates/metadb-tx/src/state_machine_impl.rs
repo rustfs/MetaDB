@@ -12,18 +12,20 @@ use serde::{Deserialize, Serialize};
 use metadb_core::codec;
 use metadb_core::schema::validate_user_entry_name;
 use metadb_core::{
-    negate_accounted_size, saturating_add_i64, validate_dir_inode_id, validate_file_size,
-    AttrDeltaSpec, AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, CompositeKeyRange,
-    DirShardDeltaKey, DirShardDeltaRecord, EntryType, FileId, HlcTimestamp, InodeAttr, InodeId,
-    IntentOp, LeaseRenewReject, MetaDbError, MetaEntry, MetaKey, QuotaKey, QuotaRecord, Result,
+    decode_lease_preimage, lease_preimage_prefix, lease_preimage_prefix_end, lease_window_is_legal,
+    negate_accounted_size, saturating_add_i64, trusted_lease_observation, validate_dir_inode_id,
+    validate_file_size, AttrDeltaSpec, AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload,
+    CompositeKeyRange, DirShardDeltaKey, DirShardDeltaRecord, EntryType, FenceHolder, FileId,
+    HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId, IntentOp, LeasePreimageValue,
+    LeaseRenewReject, MetaDbError, MetaEntry, MetaKey, QuotaKey, QuotaRecord, Result,
     SecondaryIndexKey, SecondaryIndexRecord, ShardEpoch, ShardId, TxnId, TxnRecordKey, TxnState,
     TxnStatusRecord, UserId, WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME,
-    PROPOSAL_ENVELOPE_MAGIC,
+    PROPOSAL_ENVELOPE_MAGIC, SYSTEM_PREFIX_LEASE_PREIMAGE,
 };
 use metadb_raft::{MetaDbRaftRequest, ShardApplyHandler, ShardWatermarkTracker};
 use metadb_storage::{
-    DurableShardCheckpoint, LifecycleStorageEngine, MvccValue, PreFlushHook, ScanControl,
-    ViewAtRaftIndex,
+    DurableShardCheckpoint, LifecycleStorageEngine, MvccValue, PersistentEntry, PreFlushHook,
+    ScanControl, ViewAtRaftIndex, VisibleAt,
 };
 
 use crate::aux_outbox::{ReplicatedAttrAggregator, ShardAuxOutbox, DEFAULT_OUTBOX_SPILL_THRESHOLD};
@@ -587,7 +589,7 @@ impl TxStateMachineHandler {
         let intent_key = WriteIntentKey::new(user_key.to_vec()).encode();
         if let Some(raw) = Self::read_latest_in_apply(engine, &intent_key)? {
             let rec = WriteIntentRecord::decode(&raw)?;
-            if allow_shared_dir_fence && matches!(rec.op, IntentOp::DirExistsFenceSet { .. }) {
+            if allow_shared_dir_fence && rec.op.is_dir_exists_fence() {
                 return Ok(());
             }
             return Err(MetaDbError::WriteIntentConflict {
@@ -678,7 +680,7 @@ impl TxStateMachineHandler {
             | IntentOp::Insert { attr_deltas, .. }
             | IntentOp::Delete { attr_deltas, .. }
             | IntentOp::DeletingDir { attr_deltas, .. } => attr_deltas,
-            IntentOp::DirExistsFenceSet { .. } => &[],
+            IntentOp::DirExistsFenceSet { .. } | IntentOp::DirExistsFenceV2 { .. } => &[],
         }
     }
 
@@ -1795,9 +1797,14 @@ impl TxStateMachineHandler {
                 rename_fence_token,
                 intents,
             } => {
-                if commit_hlc > expire_hlc {
+                if !lease_window_is_legal(
+                    start_hlc,
+                    expire_hlc,
+                    commit_hlc,
+                    MAX_2PC_LEASE_LIFETIME_MS,
+                ) {
                     return Err(MetaDbError::TransactionAborted(
-                        "2PC lease already expired before Prepare".to_string(),
+                        "2PC lease deadline is outside the provable window".to_string(),
                     ));
                 }
 
@@ -1826,9 +1833,9 @@ impl TxStateMachineHandler {
                             }
                             let mut holders = match existing_intent {
                                 None => std::collections::BTreeMap::new(),
-                                Some(ex) => match ex.op {
-                                    IntentOp::DirExistsFenceSet { holders } => holders,
-                                    _ => {
+                                Some(ex) => match ex.resolved_fence_holders() {
+                                    Some(holders) => holders,
+                                    None => {
                                         return Err(MetaDbError::WriteIntentConflict {
                                             conflicting_txn_id: ex.txn_id,
                                             primary_key: ex.primary_key,
@@ -1837,7 +1844,23 @@ impl TxStateMachineHandler {
                                     }
                                 },
                             };
-                            holders.insert(txn_id, (primary_key.clone(), expire_hlc));
+                            if let Some(previous) = holders.get(&txn_id) {
+                                if previous.start_hlc != Some(start_hlc) {
+                                    return Err(MetaDbError::WriteIntentConflict {
+                                        conflicting_txn_id: txn_id,
+                                        primary_key: primary_key.clone(),
+                                        expire_hlc: previous.expire_hlc.0,
+                                    });
+                                }
+                            }
+                            holders.insert(
+                                txn_id,
+                                FenceHolder {
+                                    primary_key: primary_key.clone(),
+                                    expire_hlc,
+                                    start_hlc: Some(start_hlc),
+                                },
+                            );
                             let rec = WriteIntentRecord {
                                 txn_id,
                                 primary_shard_hint: self.shard_id,
@@ -1845,7 +1868,7 @@ impl TxStateMachineHandler {
                                 start_hlc,
                                 expire_hlc,
                                 rename_fence_token,
-                                op: IntentOp::DirExistsFenceSet { holders },
+                                op: IntentOp::DirExistsFenceV2 { holders },
                             };
                             encoded_writes.push((intent_raw_key, rec.encode()));
                         }
@@ -1997,7 +2020,7 @@ impl TxStateMachineHandler {
                 self.outbox
                     .record_entry_specs(raft_index, commit_hlc, vec![]);
                 self.install_lease_hold(
-                    engine, txn_id, start_hlc, expire_hlc, commit_hlc, &hold_keys,
+                    engine, txn_id, start_hlc, expire_hlc, commit_hlc, &hold_keys, true,
                 );
                 Ok(TxRaftOutput::Prepared {
                     prepared_hlc: commit_hlc,
@@ -2039,7 +2062,7 @@ impl TxStateMachineHandler {
                 {
                     txn_rec.state = TxnState::Aborted;
                     engine.apply_committed_put(tk, txn_rec.encode(), commit_hlc, raft_index);
-                    self.release_lease_hold(engine, txn_id);
+                    self.release_lease_hold(engine, txn_id, raft_index, commit_hlc);
                     return Err(MetaDbError::TransactionAborted(
                         "DirRenameLease expired or fence token mismatch at commit".to_string(),
                     ));
@@ -2077,7 +2100,7 @@ impl TxStateMachineHandler {
 
                 self.outbox
                     .record_entry_specs(raft_index, final_commit_hlc, aux_specs);
-                self.release_lease_hold(engine, txn_id);
+                self.release_lease_hold(engine, txn_id, raft_index, final_commit_hlc);
                 Ok(TxRaftOutput::Committed {
                     commit_hlc: final_commit_hlc,
                     already_applied: false,
@@ -2107,6 +2130,9 @@ impl TxStateMachineHandler {
                 }
                 self.outbox
                     .record_entry_specs(raft_index, tx_commit_hlc, aux_specs);
+                if !self.shard_still_has_txn_intent(engine, txn_id)? {
+                    self.release_lease_hold(engine, txn_id, raft_index, commit_hlc);
+                }
                 Ok(TxRaftOutput::Committed {
                     commit_hlc: tx_commit_hlc,
                     already_applied: !any_applied,
@@ -2139,7 +2165,7 @@ impl TxStateMachineHandler {
                         }
                     }
                 }
-                self.release_lease_hold(engine, txn_id);
+                self.release_lease_hold(engine, txn_id, raft_index, commit_hlc);
                 self.outbox
                     .record_entry_specs(raft_index, commit_hlc, vec![]);
                 Ok(TxRaftOutput::Unit)
@@ -2187,7 +2213,7 @@ impl TxStateMachineHandler {
                     } else {
                         engine.apply_committed_put(tk, txn_rec.encode(), commit_hlc, raft_index);
                     }
-                    self.release_lease_hold(engine, txn_id);
+                    self.release_lease_hold(engine, txn_id, raft_index, commit_hlc);
                 }
                 self.outbox
                     .record_entry_specs(raft_index, commit_hlc, vec![]);
@@ -2222,9 +2248,17 @@ impl TxStateMachineHandler {
             } => {
                 // This check shares Raft's serialized apply boundary with the
                 // fence. Prepare cannot race between the worker's scan and fence.
-                if !Self::scan_latest_in_apply(engine, &[0x05], &[0x07])?.is_empty() {
+                if !Self::scan_latest_in_apply(engine, &[0x05], &[0x07])?.is_empty()
+                    || !Self::scan_latest_in_apply(
+                        engine,
+                        &[SYSTEM_PREFIX_LEASE_PREIMAGE],
+                        &[SYSTEM_PREFIX_LEASE_PREIMAGE.saturating_add(1)],
+                    )?
+                    .is_empty()
+                {
                     return Err(MetaDbError::SplitDeferred(
-                        "all intents and decisions must be drained before fencing".into(),
+                        "all intents, decisions, and lease pre-images must be drained before fencing"
+                            .into(),
                     ));
                 }
                 {
@@ -2395,37 +2429,107 @@ impl TxStateMachineHandler {
         Ok((children, bytes, mtime))
     }
 
-    fn lease_cap_ms(start_hlc: HlcTimestamp) -> Result<u64> {
-        start_hlc
-            .physical_ms()
-            .checked_add(MAX_2PC_LEASE_LIFETIME_MS)
-            .ok_or(MetaDbError::LeaseRenewRejected(
-                LeaseRenewReject::LifetimeCap,
-            ))
-    }
-
+    /// Installs or refreshes the in-memory hold. `capture` reads the value visible
+    /// at `start_hlc` once. A later call does not replace that capture.
+    ///
+    /// `observed` is the replicated apply timestamp or a trusted wall observation.
+    /// A failed clock read is not passed here. An illegal window installs nothing,
+    /// so a rolled-back timestamp cannot stretch the hold out to the cap.
     fn install_lease_hold(
         &self,
         engine: &LifecycleStorageEngine,
         txn_id: TxnId,
         start_hlc: HlcTimestamp,
         expire_hlc: HlcTimestamp,
-        commit_hlc: HlcTimestamp,
+        observed: HlcTimestamp,
         keys: &[Vec<u8>],
+        capture: bool,
     ) {
+        if !lease_window_is_legal(start_hlc, expire_hlc, observed, MAX_2PC_LEASE_LIFETIME_MS) {
+            return;
+        }
         let remain_ms = expire_hlc
             .physical_ms()
-            .saturating_sub(commit_hlc.physical_ms())
-            .max(1);
+            .saturating_sub(observed.physical_ms())
+            .clamp(1, MAX_2PC_LEASE_LIFETIME_MS);
+        let mut pins = Vec::new();
+        if capture {
+            let range = self.key_range();
+            for key in keys {
+                if !range.contains_key(key) {
+                    continue;
+                }
+                if let Some(value) = Self::capture_preimage(engine, key, start_hlc) {
+                    pins.push((key.clone(), start_hlc, value));
+                }
+            }
+        }
         engine.mvcc().snapshot_registry().renew_lease_hold(
             txn_id,
             start_hlc,
             std::time::Instant::now() + std::time::Duration::from_millis(remain_ms),
             keys,
+            &pins,
         );
     }
 
-    fn release_lease_hold(&self, engine: &LifecycleStorageEngine, txn_id: TxnId) {
+    /// Value visible at `start_hlc`, or `None` when a collapsed SSTable might be newer.
+    fn capture_preimage(
+        engine: &LifecycleStorageEngine,
+        key: &[u8],
+        start_hlc: HlcTimestamp,
+    ) -> Option<MvccValue> {
+        match engine.mvcc().classify_visible(key, start_hlc) {
+            VisibleAt::Memory(value) => Some(value),
+            VisibleAt::Unprovable => None,
+            VisibleAt::DiskSafe => {
+                let version = engine.backend().current_version();
+                match engine.backend().get_in_version(&version, key) {
+                    Ok(Some(PersistentEntry::Value(bytes))) => Some(MvccValue::Value(bytes)),
+                    Ok(Some(PersistentEntry::PhysicalTombstone) | None) => {
+                        Some(MvccValue::Tombstone)
+                    }
+                    Err(_) => None,
+                }
+            }
+        }
+    }
+
+    fn shard_still_has_txn_intent(
+        &self,
+        engine: &LifecycleStorageEngine,
+        txn_id: TxnId,
+    ) -> Result<bool> {
+        let rows = Self::scan_latest_in_apply(engine, &[0x05], &[0x06])?;
+        for (_, raw) in rows {
+            let Ok(intent) = WriteIntentRecord::decode(&raw) else {
+                continue;
+            };
+            if let Some(holders) = intent.resolved_fence_holders() {
+                if holders.contains_key(&txn_id) {
+                    return Ok(true);
+                }
+            } else if intent.txn_id == txn_id {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn release_lease_hold(
+        &self,
+        engine: &LifecycleStorageEngine,
+        txn_id: TxnId,
+        raft_index: u64,
+        hlc: HlcTimestamp,
+    ) {
+        let start = lease_preimage_prefix(txn_id);
+        let end = lease_preimage_prefix_end(txn_id);
+        if let Ok(rows) = Self::scan_latest_in_apply(engine, &start, &end) {
+            for (key, _) in rows {
+                engine.apply_committed_delete(key, hlc, raft_index);
+            }
+        }
         engine.mvcc().snapshot_registry().release_lease_hold(txn_id);
     }
 
@@ -2480,8 +2584,12 @@ impl TxStateMachineHandler {
                             LeaseRenewReject::AfterExpiry,
                         ));
                     }
-                    let cap = Self::lease_cap_ms(rec.start_hlc)?;
-                    if expire_hlc.physical_ms() > cap {
+                    if !lease_window_is_legal(
+                        rec.start_hlc,
+                        expire_hlc,
+                        commit_hlc,
+                        MAX_2PC_LEASE_LIFETIME_MS,
+                    ) {
                         return Err(MetaDbError::LeaseRenewRejected(
                             LeaseRenewReject::LifetimeCap,
                         ));
@@ -2505,24 +2613,40 @@ impl TxStateMachineHandler {
             };
             let mut intent = WriteIntentRecord::decode(&raw)?;
             let mut write_intent = false;
-            if let IntentOp::DirExistsFenceSet { holders } = &mut intent.op {
-                let Some((primary_key, holder_expire)) = holders.get(&txn_id).cloned() else {
+            if let Some(mut holders) = intent.resolved_fence_holders() {
+                let Some(holder) = holders.get(&txn_id).cloned() else {
                     continue;
                 };
-                if commit_hlc > holder_expire {
+                if holder.start_hlc != Some(start_hlc) {
+                    return Err(MetaDbError::LeaseRenewRejected(
+                        LeaseRenewReject::FenceMismatch,
+                    ));
+                }
+                if commit_hlc > holder.expire_hlc {
                     return Err(MetaDbError::LeaseRenewRejected(
                         LeaseRenewReject::AfterExpiry,
                     ));
                 }
-                let cap = Self::lease_cap_ms(start_hlc)?;
-                if expire_hlc.physical_ms() > cap {
+                if !lease_window_is_legal(
+                    start_hlc,
+                    expire_hlc,
+                    commit_hlc,
+                    MAX_2PC_LEASE_LIFETIME_MS,
+                ) {
                     return Err(MetaDbError::LeaseRenewRejected(
                         LeaseRenewReject::LifetimeCap,
                     ));
                 }
                 saw_participant = true;
-                if expire_hlc > holder_expire {
-                    holders.insert(txn_id, (primary_key, expire_hlc));
+                if expire_hlc > holder.expire_hlc {
+                    holders.insert(
+                        txn_id,
+                        FenceHolder {
+                            expire_hlc,
+                            ..holder
+                        },
+                    );
+                    intent.op = IntentOp::DirExistsFenceV2 { holders };
                     write_intent = true;
                 }
             } else if intent.txn_id == txn_id {
@@ -2537,8 +2661,12 @@ impl TxStateMachineHandler {
                         LeaseRenewReject::AfterExpiry,
                     ));
                 }
-                let cap = Self::lease_cap_ms(intent.start_hlc)?;
-                if expire_hlc.physical_ms() > cap {
+                if !lease_window_is_legal(
+                    intent.start_hlc,
+                    expire_hlc,
+                    commit_hlc,
+                    MAX_2PC_LEASE_LIFETIME_MS,
+                ) {
                     return Err(MetaDbError::LeaseRenewRejected(
                         LeaseRenewReject::LifetimeCap,
                     ));
@@ -2576,6 +2704,7 @@ impl TxStateMachineHandler {
             expire_hlc,
             commit_hlc,
             target_user_keys,
+            true,
         );
         Ok(())
     }
@@ -2597,13 +2726,14 @@ impl TxStateMachineHandler {
         let rec = WriteIntentRecord::decode(&raw)?;
         let create_only = matches!(rec.op, IntentOp::Insert { .. });
         match rec.op {
-            IntentOp::DirExistsFenceSet { mut holders } => {
+            IntentOp::DirExistsFenceSet { .. } | IntentOp::DirExistsFenceV2 { .. } => {
+                let mut holders = rec.resolved_fence_holders().unwrap_or_default();
                 let existed = holders.remove(&txn_id).is_some();
                 if holders.is_empty() {
                     engine.apply_committed_delete(ik, commit_hlc, raft_index);
                 } else {
                     let updated = WriteIntentRecord {
-                        op: IntentOp::DirExistsFenceSet { holders },
+                        op: IntentOp::DirExistsFenceV2 { holders },
                         ..rec
                     };
                     engine.apply_committed_put(ik, updated.encode(), commit_hlc, raft_index);
@@ -2693,13 +2823,14 @@ impl TxStateMachineHandler {
         };
         let rec = WriteIntentRecord::decode(&raw)?;
         match rec.op {
-            IntentOp::DirExistsFenceSet { mut holders } => {
+            IntentOp::DirExistsFenceSet { .. } | IntentOp::DirExistsFenceV2 { .. } => {
+                let mut holders = rec.resolved_fence_holders().unwrap_or_default();
                 holders.remove(&txn_id);
                 if holders.is_empty() {
                     engine.apply_committed_delete(ik, hlc, raft_index);
                 } else {
                     let updated = WriteIntentRecord {
-                        op: IntentOp::DirExistsFenceSet { holders },
+                        op: IntentOp::DirExistsFenceV2 { holders },
                         ..rec
                     };
                     engine.apply_committed_put(ik, updated.encode(), hlc, raft_index);
@@ -2739,26 +2870,56 @@ impl TxStateMachineHandler {
     /// After log purge, replay will not see the original Prepare. Pending leases
     /// still live in the snapshot, so rebuild MVCC holds from that state.
     /// Participant shards have `WriteIntent`s and no `TxnRecord`.
+    ///
+    /// A failed, overflowed, or rolled-back wall clock installs nothing. The
+    /// snapshot HLC is not treated as "still inside the lease". A fence holder
+    /// without a stored start is not given one.
     fn rehydrate_lease_holds(&self, engine: &LifecycleStorageEngine) {
-        let latest = engine.mvcc().latest_watermarks().1;
+        let last_applied = engine.mvcc().latest_watermarks().1;
+        let Some(now) =
+            trusted_lease_observation(last_applied, HybridLogicalClock::try_wall_clock_ms())
+        else {
+            return;
+        };
+        if let Ok(rows) = Self::scan_latest_in_apply(
+            engine,
+            &[SYSTEM_PREFIX_LEASE_PREIMAGE],
+            &[SYSTEM_PREFIX_LEASE_PREIMAGE.saturating_add(1)],
+        ) {
+            for (key, raw) in rows {
+                let Some((txn_id, user_key, hlc, value)) = decode_lease_preimage(&key, &raw) else {
+                    continue;
+                };
+                let stored = match value {
+                    LeasePreimageValue::Tombstone => MvccValue::Tombstone,
+                    LeasePreimageValue::Value(bytes) => MvccValue::Value(bytes),
+                };
+                engine
+                    .mvcc()
+                    .snapshot_registry()
+                    .ingest_persisted_preimage(txn_id, user_key, hlc, stored);
+            }
+        }
         if let Ok(rows) = Self::scan_latest_in_apply(engine, &[0x06], &[0x07]) {
             for (_, raw) in rows {
                 let Ok(rec) = TxnStatusRecord::decode(&raw) else {
                     continue;
                 };
-                if matches!(rec.state, TxnState::Pending) && latest <= rec.expire_hlc {
+                if matches!(rec.state, TxnState::Pending) {
                     self.install_lease_hold(
                         engine,
                         rec.txn_id,
                         rec.start_hlc,
                         rec.expire_hlc,
-                        latest,
+                        now,
                         &rec.participant_keys,
+                        true,
                     );
                 }
             }
         }
         let Ok(rows) = Self::scan_latest_in_apply(engine, &[0x05], &[0x06]) else {
+            engine.mvcc().snapshot_registry().drop_pins_without_hold();
             return;
         };
         for (key_bytes, raw) in rows {
@@ -2769,43 +2930,39 @@ impl TxStateMachineHandler {
             else {
                 continue;
             };
-            match intent.op {
-                IntentOp::DirExistsFenceSet { holders } => {
-                    for (txn_id, (_, expire_hlc)) in holders {
-                        if latest > expire_hlc {
-                            continue;
-                        }
-                        let start_hlc = if txn_id == intent.txn_id {
-                            intent.start_hlc
-                        } else {
-                            HlcTimestamp::new(
-                                expire_hlc
-                                    .physical_ms()
-                                    .saturating_sub(MAX_2PC_LEASE_LIFETIME_MS),
-                                0,
-                            )
-                        };
-                        self.install_lease_hold(
-                            engine,
-                            txn_id,
-                            start_hlc,
-                            expire_hlc,
-                            latest,
-                            std::slice::from_ref(&user_key),
-                        );
-                    }
+            if let Some(holders) = intent.resolved_fence_holders() {
+                for (txn_id, holder) in holders {
+                    let Some(start_hlc) = holder.start_hlc else {
+                        continue;
+                    };
+                    self.install_lease_hold(
+                        engine,
+                        txn_id,
+                        start_hlc,
+                        holder.expire_hlc,
+                        now,
+                        std::slice::from_ref(&user_key),
+                        true,
+                    );
                 }
-                _ if latest <= intent.expire_hlc => self.install_lease_hold(
+            } else if lease_window_is_legal(
+                intent.start_hlc,
+                intent.expire_hlc,
+                now,
+                MAX_2PC_LEASE_LIFETIME_MS,
+            ) {
+                self.install_lease_hold(
                     engine,
                     intent.txn_id,
                     intent.start_hlc,
                     intent.expire_hlc,
-                    latest,
+                    now,
                     std::slice::from_ref(&user_key),
-                ),
-                _ => {}
+                    true,
+                );
             }
         }
+        engine.mvcc().snapshot_registry().drop_pins_without_hold();
     }
 }
 

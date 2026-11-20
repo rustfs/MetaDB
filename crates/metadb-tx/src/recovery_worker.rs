@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use metadb_core::codec;
 use metadb_core::{
-    AuxOutboxEntry, AuxTaskPayload, HybridLogicalClock, IntentOp, QuotaKey, Result,
-    SecondaryIndexKey, ShardEpoch, ShardId, TxnId, TxnRecordKey, TxnState, TxnStatusRecord,
-    WriteIntentKey, WriteIntentRecord, SYSTEM_PREFIX_TXN_RECORD, SYSTEM_PREFIX_WRITE_INTENT,
+    lease_window_is_legal, trusted_lease_observation, AuxOutboxEntry, AuxTaskPayload, HlcTimestamp,
+    HybridLogicalClock, QuotaKey, Result, SecondaryIndexKey, ShardEpoch, ShardId, TxnId,
+    TxnRecordKey, TxnState, TxnStatusRecord, WriteIntentKey, WriteIntentRecord,
+    SYSTEM_PREFIX_TXN_RECORD, SYSTEM_PREFIX_WRITE_INTENT,
 };
 use metadb_raft::ShardRaftGroup;
 
@@ -131,7 +132,18 @@ impl TxnRecoveryWorker {
         directory: &dyn ShardDirectory,
         clock: &HybridLogicalClock,
     ) -> Result<usize> {
-        let now = clock.now();
+        let last_applied = group.engine().mvcc().latest_watermarks().1;
+        let Some(now) =
+            trusted_lease_observation(last_applied, HybridLogicalClock::try_wall_clock_ms())
+        else {
+            // Do not use the 1 ms wall-clock fallback as "not yet expired".
+            // Replicated records are left unchanged and are not extended.
+            return Err(metadb_core::MetaDbError::ClockSkewExceeded {
+                remote_ms: last_applied.physical_ms(),
+                local_ms: 0,
+                max_drift_ms: metadb_core::DEFAULT_MAX_CLOCK_DRIFT_MS,
+            });
+        };
         let ep = group.current_epoch();
         let (_, snap) = group.linearizable_read(ep).await?;
         let eng = group.engine();
@@ -155,6 +167,23 @@ impl TxnRecoveryWorker {
 
         for (_, v) in txn_rows {
             let rec = TxnStatusRecord::decode(&v)?;
+            let over_cap = matches!(rec.state, TxnState::Pending)
+                && !lease_window_is_legal(
+                    rec.start_hlc,
+                    rec.expire_hlc,
+                    rec.expire_hlc,
+                    crate::MAX_2PC_LEASE_LIFETIME_MS,
+                );
+            if over_cap {
+                let check_cmd = TxRaftCmd::CheckAndAbortExpiredTxn {
+                    txn_id: rec.txn_id,
+                    caller_hlc: HlcTimestamp::new(HlcTimestamp::MAX_PHYSICAL_MS, u16::MAX),
+                };
+                let bytes = crate::command_payload(&check_cmd)?;
+                let _ = group.propose(ep, now, bytes).await;
+                recovered_count += 1;
+                continue;
+            }
             match rec.state {
                 TxnState::Pending if now > rec.expire_hlc => {
                     let _ =
@@ -176,56 +205,68 @@ impl TxnRecoveryWorker {
         for (ik_bytes, iv_bytes) in intent_rows {
             let uk = WriteIntentKey::decode(&ik_bytes)?.target_user_key;
             let irec = WriteIntentRecord::decode(&iv_bytes)?;
-            match irec.op {
-                IntentOp::DirExistsFenceSet { holders } => {
-                    for (tid, (pkey, exp)) in holders {
-                        if now > exp {
-                            let st = Self::resolve_single_txn(directory, clock, tid, &pkey).await?;
-                            if matches!(st, TxnState::Aborted) {
-                                let abort_cmd = TxRaftCmd::Abort2pc {
-                                    txn_id: tid,
-                                    target_user_keys: vec![uk.clone()],
-                                };
-                                let bytes = crate::command_payload(&abort_cmd).unwrap();
-                                let _ = group
-                                    .propose(group.current_epoch(), clock.now(), bytes)
-                                    .await;
-                            }
-                            recovered_count += 1;
-                        }
-                    }
-                }
-                _ if now > irec.expire_hlc => {
-                    let st =
-                        Self::resolve_single_txn(directory, clock, irec.txn_id, &irec.primary_key)
-                            .await?;
-                    match st {
-                        TxnState::Aborted => {
+            if let Some(holders) = irec.resolved_fence_holders() {
+                for (tid, holder) in holders {
+                    let over_cap = holder.start_hlc.is_some_and(|start| {
+                        !lease_window_is_legal(
+                            start,
+                            holder.expire_hlc,
+                            holder.expire_hlc,
+                            crate::MAX_2PC_LEASE_LIFETIME_MS,
+                        )
+                    });
+                    if now > holder.expire_hlc || over_cap {
+                        let st =
+                            Self::resolve_single_txn(directory, clock, tid, &holder.primary_key)
+                                .await?;
+                        if matches!(st, TxnState::Aborted) {
                             let abort_cmd = TxRaftCmd::Abort2pc {
-                                txn_id: irec.txn_id,
-                                target_user_keys: vec![uk],
+                                txn_id: tid,
+                                target_user_keys: vec![uk.clone()],
                             };
                             let bytes = crate::command_payload(&abort_cmd).unwrap();
                             let _ = group
                                 .propose(group.current_epoch(), clock.now(), bytes)
                                 .await;
                         }
-                        TxnState::Committed { commit_hlc } => {
-                            let sec_cmd = TxRaftCmd::CommitSecondary2pc {
-                                txn_id: irec.txn_id,
-                                commit_hlc,
-                                target_user_keys: vec![uk],
-                            };
-                            let bytes = crate::command_payload(&sec_cmd).unwrap();
-                            let _ = group
-                                .propose(group.current_epoch(), commit_hlc, bytes)
-                                .await;
-                        }
-                        TxnState::Pending => {}
+                        recovered_count += 1;
                     }
-                    recovered_count += 1;
                 }
-                _ => {}
+            } else if now > irec.expire_hlc
+                || !lease_window_is_legal(
+                    irec.start_hlc,
+                    irec.expire_hlc,
+                    irec.expire_hlc,
+                    crate::MAX_2PC_LEASE_LIFETIME_MS,
+                )
+            {
+                let st = Self::resolve_single_txn(directory, clock, irec.txn_id, &irec.primary_key)
+                    .await?;
+                match st {
+                    TxnState::Aborted => {
+                        let abort_cmd = TxRaftCmd::Abort2pc {
+                            txn_id: irec.txn_id,
+                            target_user_keys: vec![uk],
+                        };
+                        let bytes = crate::command_payload(&abort_cmd).unwrap();
+                        let _ = group
+                            .propose(group.current_epoch(), clock.now(), bytes)
+                            .await;
+                    }
+                    TxnState::Committed { commit_hlc } => {
+                        let sec_cmd = TxRaftCmd::CommitSecondary2pc {
+                            txn_id: irec.txn_id,
+                            commit_hlc,
+                            target_user_keys: vec![uk],
+                        };
+                        let bytes = crate::command_payload(&sec_cmd).unwrap();
+                        let _ = group
+                            .propose(group.current_epoch(), commit_hlc, bytes)
+                            .await;
+                    }
+                    TxnState::Pending => {}
+                }
+                recovered_count += 1;
             }
         }
 

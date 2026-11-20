@@ -150,6 +150,10 @@ pub enum LeaseRenewReject {
     RenameLeaseExpired,
     /// The directory-rename lease is already at its lifetime cap.
     RenameLeaseCap,
+    /// The caller asked for a directory-rename TTL longer than the lifetime cap.
+    ///
+    /// Appended so earlier `LeaseRenewReject` tags stay stable. No lease is granted.
+    RenameTtlExceedsCap,
 }
 
 /// Why a consensus operation can be proposed again without hiding a durable loss.

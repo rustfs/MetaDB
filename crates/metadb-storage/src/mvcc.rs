@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use metadb_core::{HlcTimestamp, MetaDbError, Result};
+use metadb_core::{
+    encode_lease_preimage, lease_preimage_key, HlcTimestamp, LeasePreimageValue, MetaDbError,
+    Result,
+};
 
 use crate::backend::{PersistentEntry, StorageBackend};
 use crate::manifest::DurableShardCheckpoint;
@@ -173,13 +176,23 @@ struct LeaseHold {
     keys: Vec<Vec<u8>>,
 }
 
+/// Value proven visible at this transaction's `start_hlc`.
+/// A later renew must not replace it with a value written after that HLC.
+struct PinnedPreimage {
+    hlc: HlcTimestamp,
+    value: MvccValue,
+    persisted: bool,
+}
+
 pub struct ActiveSnapshotRegistry {
     next_id: AtomicU64,
     retention: Duration,
     slots: Mutex<BTreeMap<u64, Arc<SnapshotSlot>>>,
-    /// In-flight 2PC leases. While one is active, flush and the retention window
-    /// keep versions back to `retain_not_before` even after the default 5s window.
+    /// In-flight 2PC leases. A point read of a named key can return the value
+    /// captured at that lease's start. Flush still persists the user key's latest value.
     lease_holds: Mutex<BTreeMap<u128, LeaseHold>>,
+    /// `(txn_id, user_key)`. One transaction does not keep another's capture.
+    preimages: Mutex<BTreeMap<(u128, Vec<u8>), PinnedPreimage>>,
     flush_mu: Mutex<()>,
     flush_cv: Condvar,
 }
@@ -191,21 +204,23 @@ impl ActiveSnapshotRegistry {
             retention: Duration::from_millis(retention_ms.max(1)),
             slots: Mutex::new(BTreeMap::new()),
             lease_holds: Mutex::new(BTreeMap::new()),
+            preimages: Mutex::new(BTreeMap::new()),
             flush_mu: Mutex::new(()),
             flush_cv: Condvar::new(),
         }
     }
 
-    /// Keeps the pre-image of `keys` readable back to `retain_not_before` until `until`.
-    /// A later renewal may only move the floor earlier and the deadline later.
-    /// This does not block memtable flush: the latest value is still written to
-    /// the LSM so a restarted process can read it after log purge.
+    /// Keeps this transaction's capture of `keys` readable back to `retain_not_before`
+    /// until `until`. A later renewal may only move the floor earlier and the deadline later.
+    /// The first capture for a `(txn_id, key)` is kept. Flush still writes the latest
+    /// user-key value; the capture is a separate `0x0D` row in that same batch.
     pub fn renew_lease_hold(
         &self,
         txn_id: u128,
         retain_not_before: HlcTimestamp,
         until: Instant,
         keys: &[Vec<u8>],
+        pins: &[(Vec<u8>, HlcTimestamp, MvccValue)],
     ) {
         let mut holds = self.lease_holds.lock().unwrap();
         holds
@@ -228,11 +243,130 @@ impl ActiveSnapshotRegistry {
                 until,
                 keys: keys.to_vec(),
             });
+        drop(holds);
+        let mut preimages = self.preimages.lock().unwrap();
+        for (key, hlc, value) in pins {
+            preimages
+                .entry((txn_id, key.clone()))
+                .or_insert(PinnedPreimage {
+                    hlc: *hlc,
+                    value: value.clone(),
+                    persisted: false,
+                });
+        }
     }
 
-    /// Drops the hold for `txn_id` after commit or abort.
+    /// Pre-image captured for a live hold of `key` whose start is at or before `read_hlc`.
+    /// The capture with the greatest HLC still visible at `read_hlc` wins.
+    pub fn preimage_at(&self, key: &[u8], read_hlc: HlcTimestamp) -> Option<MvccValue> {
+        let now = Instant::now();
+        let holds = self.lease_holds.lock().unwrap();
+        let preimages = self.preimages.lock().unwrap();
+        let mut best_hlc: Option<HlcTimestamp> = None;
+        let mut best_value: Option<MvccValue> = None;
+        for (txn_id, hold) in holds.iter() {
+            if now >= hold.until || hold.retain_not_before > read_hlc {
+                continue;
+            }
+            if !hold.keys.iter().any(|held| held == key) {
+                continue;
+            }
+            let Some(pin) = preimages.get(&(*txn_id, key.to_vec())) else {
+                continue;
+            };
+            if pin.hlc > read_hlc {
+                continue;
+            }
+            if best_hlc.map(|hlc| pin.hlc > hlc).unwrap_or(true) {
+                best_hlc = Some(pin.hlc);
+                best_value = Some(pin.value.clone());
+            }
+        }
+        best_value
+    }
+
+    /// Pre-images that still belong to a live hold and have not been written yet.
+    pub fn unpersisted_preimages(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let now = Instant::now();
+        let holds = self.lease_holds.lock().unwrap();
+        let preimages = self.preimages.lock().unwrap();
+        let mut out = Vec::new();
+        for ((txn_id, user_key), pin) in preimages.iter() {
+            if pin.persisted {
+                continue;
+            }
+            let Some(hold) = holds.get(txn_id) else {
+                continue;
+            };
+            if now >= hold.until || !hold.keys.iter().any(|held| held == user_key) {
+                continue;
+            }
+            let stored = match &pin.value {
+                MvccValue::Tombstone => LeasePreimageValue::Tombstone,
+                MvccValue::Value(bytes) => LeasePreimageValue::Value(bytes.clone()),
+            };
+            out.push((
+                lease_preimage_key(*txn_id, user_key),
+                encode_lease_preimage(pin.hlc, &stored),
+            ));
+        }
+        out
+    }
+
+    pub fn mark_preimages_persisted(&self, storage_keys: &[Vec<u8>]) {
+        let mut preimages = self.preimages.lock().unwrap();
+        for storage_key in storage_keys {
+            if storage_key.len() < 17 {
+                continue;
+            }
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&storage_key[1..17]);
+            let txn_id = u128::from_be_bytes(id);
+            let user_key = storage_key[17..].to_vec();
+            if let Some(pin) = preimages.get_mut(&(txn_id, user_key)) {
+                pin.persisted = true;
+            }
+        }
+    }
+
+    /// Loads a pre-image that a previous flush already wrote. Does not replace a capture
+    /// this process already proved.
+    pub fn ingest_persisted_preimage(
+        &self,
+        txn_id: u128,
+        user_key: Vec<u8>,
+        hlc: HlcTimestamp,
+        value: MvccValue,
+    ) {
+        self.preimages
+            .lock()
+            .unwrap()
+            .entry((txn_id, user_key))
+            .or_insert(PinnedPreimage {
+                hlc,
+                value,
+                persisted: true,
+            });
+    }
+
+    /// Drops captures whose transaction no longer has a hold.
+    pub fn drop_pins_without_hold(&self) {
+        let holds = self.lease_holds.lock().unwrap();
+        let live: Vec<u128> = holds.keys().copied().collect();
+        drop(holds);
+        self.preimages
+            .lock()
+            .unwrap()
+            .retain(|(txn_id, _), _| live.contains(txn_id));
+    }
+
+    /// Drops the hold and its captures after commit or abort.
     pub fn release_lease_hold(&self, txn_id: u128) {
         self.lease_holds.lock().unwrap().remove(&txn_id);
+        self.preimages
+            .lock()
+            .unwrap()
+            .retain(|(id, _), _| *id != txn_id);
         self.notify_flush_waiters();
     }
 
@@ -253,12 +387,6 @@ impl ActiveSnapshotRegistry {
                 && read_hlc.physical_ms() >= hold.retain_not_before.physical_ms()
                 && hold.keys.iter().any(|held| held == key)
         })
-    }
-
-    /// Some open lease still needs reads at `read_hlc` (used by range scans).
-    pub fn lease_covers_read(&self, read_hlc: HlcTimestamp) -> bool {
-        self.lease_retain_floor()
-            .is_some_and(|floor| read_hlc.physical_ms() >= floor.physical_ms())
     }
 
     pub fn register(
@@ -417,6 +545,47 @@ struct MemMvccInner {
     total_mvcc_writes: u64,
     total_pruned_versions: u64,
     active_bytes: usize,
+}
+
+/// Result of looking for the value of a key at `read_hlc` without trusting a
+/// collapsed SSTable that may be newer than that timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VisibleAt {
+    /// A memory version with `hlc <= read_hlc` is still present.
+    Memory(MvccValue),
+    /// No memory version is visible, and the flush watermark is not ahead of `read_hlc`.
+    DiskSafe,
+    /// No memory version is visible, and the flush watermark is ahead of `read_hlc`.
+    Unprovable,
+}
+
+fn memory_value_leq(guard: &MemMvccInner, key: &[u8], read_hlc: HlcTimestamp) -> Option<MvccValue> {
+    let mut best: Option<(HlcTimestamp, MvccValue)> = None;
+    let consider = |chain: &[MvccVersion], best: &mut Option<(HlcTimestamp, MvccValue)>| {
+        for version in chain {
+            if version.hlc <= read_hlc
+                && best
+                    .as_ref()
+                    .map(|(hlc, _)| version.hlc > *hlc)
+                    .unwrap_or(true)
+            {
+                *best = Some((version.hlc, version.value.clone()));
+            }
+        }
+    };
+    {
+        let active = guard.active_versions.read().unwrap();
+        if let Some(chain) = active.get(key) {
+            let owned: Vec<MvccVersion> = chain.iter().cloned().collect();
+            consider(&owned, &mut best);
+        }
+    }
+    for imm in &guard.imm_queue {
+        if let Some(chain) = imm.entries.get(key) {
+            consider(chain, &mut best);
+        }
+    }
+    best.map(|(_, value)| value)
 }
 
 /// In-Memory MVCC store coordinating active version chains, `ImmMemTable` queue,
@@ -698,34 +867,42 @@ impl MemMvccStore {
     }
 
     pub fn get_at(&self, key: &[u8], read_hlc: HlcTimestamp) -> Result<Option<MvccValue>> {
-        let guard = self.inner.read().unwrap();
-        self.check_retention_window(&guard, read_hlc)?;
-        let covered = self.registry.lease_covers_key(key, read_hlc);
-        if read_hlc < guard.disk_flushed_max_hlc && !covered {
+        let (memory, behind, disk_hlc) = {
+            let guard = self.inner.read().unwrap();
+            self.check_retention_window(&guard, read_hlc)?;
+            let behind = read_hlc < guard.disk_flushed_max_hlc;
+            let memory = memory_value_leq(&guard, key, read_hlc);
+            (memory, behind, guard.disk_flushed_max_hlc)
+        };
+        if let Some(value) = memory {
+            return Ok(Some(value));
+        }
+        if behind {
+            // The collapsed disk value may be a write newer than `read_hlc`.
+            // Only a pre-image captured at a live lease's start is safe to return.
+            if let Some(value) = self.registry.preimage_at(key, read_hlc) {
+                return Ok(Some(value));
+            }
             return Err(MetaDbError::TransactionTimeout {
                 snapshot_hlc: read_hlc.as_u64(),
-                oldest_retained_hlc: guard.disk_flushed_max_hlc.as_u64(),
+                oldest_retained_hlc: disk_hlc.as_u64(),
             });
         }
-
-        let active_map = guard.active_versions.read().unwrap();
-        if let Some(chain) = active_map.get(key) {
-            for v in chain.iter().rev() {
-                if v.hlc <= read_hlc {
-                    return Ok(Some(v.value.clone()));
-                }
-            }
-        }
-        for imm in guard.imm_queue.iter().rev() {
-            if let Some(chain) = imm.entries.get(key) {
-                for v in chain.iter().rev() {
-                    if v.hlc <= read_hlc {
-                        return Ok(Some(v.value.clone()));
-                    }
-                }
-            }
-        }
         Ok(None)
+    }
+
+    /// Whether the value visible at `read_hlc` is still in memory, must be read from
+    /// disk because every flushed version is `<= read_hlc`, or cannot be proved.
+    pub fn classify_visible(&self, key: &[u8], read_hlc: HlcTimestamp) -> VisibleAt {
+        let guard = self.inner.read().unwrap();
+        if let Some(value) = memory_value_leq(&guard, key, read_hlc) {
+            return VisibleAt::Memory(value);
+        }
+        if read_hlc < guard.disk_flushed_max_hlc {
+            VisibleAt::Unprovable
+        } else {
+            VisibleAt::DiskSafe
+        }
     }
 
     pub fn range_at(
@@ -736,7 +913,10 @@ impl MemMvccStore {
     ) -> Result<BTreeMap<Vec<u8>, MvccValue>> {
         let guard = self.inner.read().unwrap();
         self.check_retention_window(&guard, read_hlc)?;
-        if read_hlc < guard.disk_flushed_max_hlc && !self.registry.lease_covers_read(read_hlc) {
+        // An unversioned SST cannot prove which keys in the range were absent,
+        // deleted, or written after `read_hlc`. A lease pin for one key does not
+        // make the rest of the range provable, so the scan fails closed.
+        if read_hlc < guard.disk_flushed_max_hlc {
             return Err(MetaDbError::TransactionTimeout {
                 snapshot_hlc: read_hlc.as_u64(),
                 oldest_retained_hlc: guard.disk_flushed_max_hlc.as_u64(),
@@ -907,7 +1087,21 @@ impl MemMvccStore {
                 });
             }
 
+            let preimage_rows = self.registry.unpersisted_preimages();
+            let mut merged: BTreeMap<Vec<u8>, PersistentEntry> =
+                batch_to_persist.into_iter().collect();
+            let mut persisted_preimage_keys = Vec::new();
+            for (key, bytes) in preimage_rows {
+                if let std::collections::btree_map::Entry::Vacant(slot) = merged.entry(key.clone())
+                {
+                    slot.insert(PersistentEntry::Value(bytes));
+                    persisted_preimage_keys.push(key);
+                }
+            }
+            let batch_to_persist: Vec<(Vec<u8>, PersistentEntry)> = merged.into_iter().collect();
             backend.flush_l0_batch(&batch_to_persist, candidate.checkpoint.clone())?;
+            self.registry
+                .mark_preimages_persisted(&persisted_preimage_keys);
 
             {
                 let mut guard = self.inner.write().unwrap();

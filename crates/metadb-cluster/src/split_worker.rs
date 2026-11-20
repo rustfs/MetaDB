@@ -6,10 +6,11 @@ use std::fs;
 use std::sync::Arc;
 
 use metadb_core::{
-    affinity_key_for_raw_entry, saturating_add_i64, CompositeKeyRange, DirShardDeltaKey,
-    DirShardDeltaRecord, EntryType, HlcTimestamp, InodeAttr, InodeId, MetaDbError, MetaKey, Result,
-    ShardEpoch, ShardId, TxnRecordKey, TxnStatusRecord, WriteIntentKey, WriteIntentRecord,
-    ATTR_ENTRY_NAME, TABLE_PREFIX_META,
+    affinity_key_for_raw_entry, lease_preimage_blocks_split, saturating_add_i64, CompositeKeyRange,
+    DirShardDeltaKey, DirShardDeltaRecord, EntryType, HlcTimestamp, InodeAttr, InodeId,
+    MetaDbError, MetaKey, Result, ShardEpoch, ShardId, TxnRecordKey, TxnStatusRecord,
+    WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME, SYSTEM_PREFIX_LEASE_PREIMAGE,
+    TABLE_PREFIX_META,
 };
 use metadb_raft::{
     RaftNodeOptions, RegistryShardState, ShardGroupHost, ShardRaftGroup, ShardWatermarkTracker,
@@ -235,6 +236,13 @@ impl RaftShardSplitWorker {
                 return Err(MetaDbError::SplitDeferred(
                     "transaction decisions must be acknowledged before fencing".into(),
                 ));
+            }
+            for (key, value) in eng.scan_with_snapshot(
+                &[SYSTEM_PREFIX_LEASE_PREIMAGE],
+                &[SYSTEM_PREFIX_LEASE_PREIMAGE.saturating_add(1)],
+                &snap,
+            )? {
+                lease_preimage_blocks_split(&key, &value)?;
             }
             if let Some(dpid) = dual_mode_pid {
                 let dk = DirShardDeltaKey { pid: dpid }.encode();
