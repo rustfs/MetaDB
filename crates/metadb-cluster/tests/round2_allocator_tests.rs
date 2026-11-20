@@ -260,3 +260,53 @@ fn rename_lease_renewal_is_capped_and_survives_reopen() {
         .extend_dir_rename_lease(token, HlcTimestamp::new(15_001, 0), 1_000)
         .is_err());
 }
+
+#[test]
+fn skewed_clock_cannot_extend_a_rename_lease_or_replace_its_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let allocator = DurableIdAllocator::open(dir.path()).unwrap();
+    let (token, expire) = allocator
+        .acquire_dir_rename_lease(HlcTimestamp::new(80_000, 0), 1_000, 5_000)
+        .unwrap();
+    assert_eq!(expire, HlcTimestamp::new(81_000, 0));
+    let fallback = allocator.acquire_dir_rename_lease(HlcTimestamp::new(1, 0), 1_000, 5_000);
+    assert!(
+        matches!(
+            fallback,
+            Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::UntrustedClock
+            ))
+        ),
+        "{fallback:?}"
+    );
+    let behind = allocator.extend_dir_rename_lease(token, HlcTimestamp::new(1_000, 0), 1_000);
+    assert!(
+        matches!(
+            behind,
+            Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::UntrustedClock
+            ))
+        ),
+        "{behind:?}"
+    );
+    let (next, next_expire) = allocator
+        .acquire_dir_rename_lease(HlcTimestamp::new(81_001, 0), 1_000, 5_000)
+        .unwrap();
+    assert_ne!(next, token);
+    let previous = allocator.extend_dir_rename_lease(token, HlcTimestamp::new(81_100, 0), 1_000);
+    assert!(
+        matches!(
+            previous,
+            Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameLeaseTokenMismatch
+            ))
+        ),
+        "{previous:?}"
+    );
+    let current = allocator
+        .extend_dir_rename_lease(next, HlcTimestamp::new(81_100, 0), 1_000)
+        .unwrap();
+    assert_eq!(current, HlcTimestamp::new(82_100, 0));
+    assert_eq!(next_expire, HlcTimestamp::new(82_001, 0));
+    let _ = current;
+}

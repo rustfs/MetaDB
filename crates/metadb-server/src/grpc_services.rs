@@ -1844,16 +1844,16 @@ impl TransactionService for MetaDbGrpcService {
                 }))
             }
         };
+        let server_hlc = self.tx_router.clock().now();
         let cmd = TxRaftCmd::CheckAndAbortExpiredTxn {
             txn_id: decode_req_txn_id(&req.txn_id_be)?,
-            caller_hlc: HlcTimestamp(req.caller_hlc),
+            // The client clock is not a lease observation. Apply ignores this
+            // field and uses the replicated proposal timestamp.
+            caller_hlc: server_hlc,
         };
         let payload =
             metadb_tx::command_payload(&cmd).map_err(|e| Status::internal(e.to_string()))?;
-        match grp
-            .propose(grp.current_epoch(), HlcTimestamp(req.caller_hlc), payload)
-            .await
-        {
+        match grp.propose(grp.current_epoch(), server_hlc, payload).await {
             Ok(resp) => {
                 let out: TxRaftOutput = codec::deserialize(&resp.result.unwrap_or_default())
                     .unwrap_or(TxRaftOutput::TxnStatus(Some(TxnState::Aborted)));

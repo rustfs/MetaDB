@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use metadb_core::codec;
 use metadb_core::{
-    append_crc32c_le, make_file_inode_id, verify_crc32c_le, FileId, HlcTimestamp, InodeId,
-    LeaseRenewReject, MetaDbError, Result, ShardId,
+    append_crc32c_le, lease_clock_can_extend, make_file_inode_id, verify_crc32c_le, FileId,
+    HlcTimestamp, InodeId, LeaseRenewReject, MetaDbError, Result, ShardId,
+    DEFAULT_MAX_CLOCK_DRIFT_MS,
 };
 use metadb_storage::sstable::sync_dir;
 
@@ -434,6 +435,18 @@ impl DurableIdAllocator {
     ) -> Result<(u64, HlcTimestamp)> {
         let mut guard = self.state.lock().unwrap();
         if let Some(active) = &guard.active_rename_lease {
+            // A clock behind the grant window must not be told the old lease is
+            // still valid, and it must not be allowed to mint a replacement.
+            let earliest = active.expire_hlc.physical_ms().saturating_sub(
+                max_lifetime_ms
+                    .max(100)
+                    .saturating_add(DEFAULT_MAX_CLOCK_DRIFT_MS),
+            );
+            if now_hlc.physical_ms() <= 1 || now_hlc.physical_ms() < earliest {
+                return Err(MetaDbError::LeaseRenewRejected(
+                    LeaseRenewReject::UntrustedClock,
+                ));
+            }
             if now_hlc <= active.expire_hlc {
                 return Err(MetaDbError::TransactionAborted(
                     "another cross-directory directory rename lease is currently active"
@@ -495,6 +508,11 @@ impl DurableIdAllocator {
         if now_hlc > active.expire_hlc {
             return Err(MetaDbError::LeaseRenewRejected(
                 LeaseRenewReject::RenameLeaseExpired,
+            ));
+        }
+        if !lease_clock_can_extend(now_hlc, active.expire_hlc, ttl_ms.max(100)) {
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::UntrustedClock,
             ));
         }
         let deadline_ms = active.deadline_hlc.physical_ms();

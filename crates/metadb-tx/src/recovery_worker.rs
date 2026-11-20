@@ -4,17 +4,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use metadb_core::codec;
 use metadb_core::{
-    lease_preimage_is_orphan, lease_window_is_legal, trusted_lease_observation, AuxOutboxEntry,
-    AuxTaskPayload, HlcTimestamp, HybridLogicalClock, QuotaKey, Result, SecondaryIndexKey,
-    ShardEpoch, ShardId, TxnId, TxnRecordKey, TxnState, TxnStatusRecord, WriteIntentKey,
-    WriteIntentRecord, SYSTEM_PREFIX_LEASE_PREIMAGE, SYSTEM_PREFIX_TXN_RECORD,
+    lease_exceeds_lifetime, lease_expiry_is_proved, lease_preimage_is_orphan, lease_wall_ms,
+    AuxOutboxEntry, AuxTaskPayload, HlcTimestamp, HybridLogicalClock, QuotaKey, Result,
+    SecondaryIndexKey, ShardEpoch, ShardId, TxnId, TxnRecordKey, TxnState, TxnStatusRecord,
+    WriteIntentKey, WriteIntentRecord, SYSTEM_PREFIX_LEASE_PREIMAGE, SYSTEM_PREFIX_TXN_RECORD,
     SYSTEM_PREFIX_WRITE_INTENT,
 };
 use metadb_raft::ShardRaftGroup;
 
-use crate::state_machine_impl::{TxRaftCmd, TxRaftOutput, TxStateMachineHandler};
+use crate::state_machine_impl::{TxRaftCmd, TxStateMachineHandler};
 use crate::two_pc::ShardDirectory;
 
 /// Drains un-acknowledged `ShardAuxOutbox` entries in strict FIFO `(origin_raft_index, task_ordinal)`
@@ -87,42 +86,83 @@ impl AuxDispatcher {
 pub struct TxnRecoveryWorker;
 
 impl TxnRecoveryWorker {
-    /// Resolves a single `txn_id` anchored at `primary_key` (`Resolution B12` / `consensus_and_transactions.md` §8.4).
+    /// Resolves a single `txn_id` anchored at `primary_key`.
+    ///
+    /// A committed or aborted record is driven immediately. A pending record is
+    /// aborted only when the replicated HLC is already past `expire_hlc`, the
+    /// stored window exceeds the lifetime cap, or [`lease_wall_ms`] proves
+    /// expiry. An untrusted wall clock does not abort it and does not count as
+    /// "still inside the lease".
     pub async fn resolve_single_txn(
         directory: &dyn ShardDirectory,
         clock: &HybridLogicalClock,
         txn_id: TxnId,
         primary_key: &[u8],
     ) -> Result<TxnState> {
-        let now = clock.now();
         let (p_epoch, p_group, p_handler) = directory.route_user_key(primary_key)?;
-
-        // Read or expire `TxnRecord` on Primary Shard.
-        let check_cmd = TxRaftCmd::CheckAndAbortExpiredTxn {
-            txn_id,
-            caller_hlc: now,
-        };
-        let check_bytes = crate::command_payload(&check_cmd)?;
-        let resp = p_group.propose(p_epoch, now, check_bytes).await?;
-        let out: TxRaftOutput = codec::deserialize(&resp.result?)
-            .map_err(|e| metadb_core::MetaDbError::CodecError(e.to_string()))?;
-
-        let state = match out {
-            TxRaftOutput::TxnStatus(Some(st)) => st,
-            _ => TxnState::Aborted,
-        };
-
-        // Load participant keys if `[0x06][txn_id]` still exists on `p_group`.
         let tk = TxnRecordKey { txn_id }.encode();
-        let (_, snap) = p_group.linearizable_read(p_group.current_epoch()).await?;
-        if let Some(raw_rec) = p_group.engine().get_with_snapshot(&tk, &snap)? {
-            drop(snap);
-            let rec = TxnStatusRecord::decode(&raw_rec)?;
-            Self::drive_participants(directory, clock, &p_group, p_handler.as_ref(), &rec, state)
+        let (_, snap) = p_group.linearizable_read(p_epoch).await?;
+        let raw = p_group.engine().get_with_snapshot(&tk, &snap)?;
+        drop(snap);
+        let Some(raw_rec) = raw else {
+            return Ok(TxnState::Aborted);
+        };
+        let rec = TxnStatusRecord::decode(&raw_rec)?;
+        match rec.state {
+            TxnState::Committed { .. } | TxnState::Aborted => {
+                Self::drive_participants(
+                    directory,
+                    clock,
+                    &p_group,
+                    p_handler.as_ref(),
+                    &rec,
+                    rec.state,
+                )
                 .await?;
+                Ok(rec.state)
+            }
+            TxnState::Pending => {
+                let last_applied = p_group.engine().mvcc().latest_watermarks().1;
+                let wall = lease_wall_ms();
+                let proved = lease_exceeds_lifetime(
+                    rec.start_hlc,
+                    rec.expire_hlc,
+                    crate::MAX_2PC_LEASE_LIFETIME_MS,
+                ) || lease_expiry_is_proved(last_applied, rec.expire_hlc, wall);
+                if !proved {
+                    return Ok(TxnState::Pending);
+                }
+                let proposal = wall
+                    .filter(|ms| *ms > 1)
+                    .map(|ms| HlcTimestamp::new(ms, 0))
+                    .filter(|observed| *observed > last_applied)
+                    .unwrap_or(last_applied);
+                let check_cmd = TxRaftCmd::CheckAndAbortExpiredTxn {
+                    txn_id,
+                    caller_hlc: proposal,
+                };
+                let check_bytes = crate::command_payload(&check_cmd)?;
+                let _ = p_group.propose(p_epoch, proposal, check_bytes).await?;
+                let (_, snap) = p_group.linearizable_read(p_group.current_epoch()).await?;
+                if let Some(raw_rec) = p_group.engine().get_with_snapshot(&tk, &snap)? {
+                    drop(snap);
+                    let rec = TxnStatusRecord::decode(&raw_rec)?;
+                    let state = rec.state;
+                    Self::drive_participants(
+                        directory,
+                        clock,
+                        &p_group,
+                        p_handler.as_ref(),
+                        &rec,
+                        state,
+                    )
+                    .await?;
+                    Ok(state)
+                } else {
+                    Ok(TxnState::Aborted)
+                }
+            }
         }
-
-        Ok(state)
     }
 
     /// Scans `[0x06]` (`TxnRecord`) and `[0x05]` (`WriteIntent`) on `group` and resolves any
@@ -134,15 +174,15 @@ impl TxnRecoveryWorker {
         clock: &HybridLogicalClock,
     ) -> Result<usize> {
         let last_applied = group.engine().mvcc().latest_watermarks().1;
-        // Wall time is optional. Expiry can also be proved from the last
-        // replicated HLC. A missing wall clock must not block roll-forward or
-        // orphan cleanup, and it must not be treated as "not yet expired".
-        let trusted =
-            trusted_lease_observation(last_applied, HybridLogicalClock::try_wall_clock_ms());
-        let expired = |deadline: HlcTimestamp| {
-            last_applied > deadline || trusted.is_some_and(|now| now > deadline)
-        };
-        let propose_hlc = trusted.unwrap_or(last_applied);
+        // Wall time is optional. A missing, fallback, or skewed reading must
+        // not block roll-forward or orphan cleanup, and it must not be treated
+        // as "not yet expired" or as proof that a lease is still valid.
+        let wall = lease_wall_ms();
+        let expired = |deadline: HlcTimestamp| lease_expiry_is_proved(last_applied, deadline, wall);
+        let propose_hlc = wall
+            .filter(|ms| *ms > 1)
+            .map(|ms| HlcTimestamp::new(ms, 0))
+            .unwrap_or(last_applied);
         let ep = group.current_epoch();
         let (_, snap) = group.linearizable_read(ep).await?;
         let eng = group.engine();
@@ -172,16 +212,15 @@ impl TxnRecoveryWorker {
         for (_, v) in &txn_rows {
             let rec = TxnStatusRecord::decode(v)?;
             let over_cap = matches!(rec.state, TxnState::Pending)
-                && !lease_window_is_legal(
+                && lease_exceeds_lifetime(
                     rec.start_hlc,
-                    rec.expire_hlc,
                     rec.expire_hlc,
                     crate::MAX_2PC_LEASE_LIFETIME_MS,
                 );
             if over_cap {
                 let check_cmd = TxRaftCmd::CheckAndAbortExpiredTxn {
                     txn_id: rec.txn_id,
-                    caller_hlc: HlcTimestamp::new(HlcTimestamp::MAX_PHYSICAL_MS, u16::MAX),
+                    caller_hlc: propose_hlc,
                 };
                 let bytes = crate::command_payload(&check_cmd)?;
                 let _ = group.propose(ep, propose_hlc, bytes).await;
@@ -212,9 +251,8 @@ impl TxnRecoveryWorker {
             if let Some(holders) = irec.resolved_fence_holders() {
                 for (tid, holder) in holders {
                     let over_cap = holder.start_hlc.is_some_and(|start| {
-                        !lease_window_is_legal(
+                        lease_exceeds_lifetime(
                             start,
-                            holder.expire_hlc,
                             holder.expire_hlc,
                             crate::MAX_2PC_LEASE_LIFETIME_MS,
                         )
@@ -237,9 +275,8 @@ impl TxnRecoveryWorker {
                     }
                 }
             } else if expired(irec.expire_hlc)
-                || !lease_window_is_legal(
+                || lease_exceeds_lifetime(
                     irec.start_hlc,
-                    irec.expire_hlc,
                     irec.expire_hlc,
                     crate::MAX_2PC_LEASE_LIFETIME_MS,
                 )
