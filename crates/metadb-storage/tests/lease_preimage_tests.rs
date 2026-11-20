@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use metadb_core::{
-    decode_lease_preimage, lease_preimage_key, HlcTimestamp, LeasePreimageValue, MetaDbError,
-    MetaKey, SYSTEM_PREFIX_LEASE_PREIMAGE,
+    decode_lease_preimage, encode_lease_preimage, lease_preimage_key, HlcTimestamp,
+    LeasePreimageValue, MetaDbError, MetaKey, SYSTEM_PREFIX_LEASE_PREIMAGE,
 };
 use metadb_storage::{
     DurableShardCheckpoint, LifecycleStorageEngine, LsmEngineConfig, MvccValue, ShardedBlockCache,
@@ -337,4 +337,147 @@ fn releasing_the_hold_stops_serving_the_capture() {
         engine.get(&key, start).unwrap_err(),
         MetaDbError::TransactionTimeout { .. }
     ));
+}
+
+#[test]
+fn flush_keeps_the_start_capture_when_the_same_prefix_has_a_newer_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(dir.path());
+    let key = MetaKey::child(7, "capture.txt").encode();
+    let start = HlcTimestamp::new(1_000, 0);
+    let later = HlcTimestamp::new(3_000, 0);
+    engine.apply_committed_put(key.clone(), b"v0".to_vec(), start, 1);
+    engine.mvcc().snapshot_registry().renew_lease_hold(
+        11,
+        start,
+        Instant::now() + Duration::from_secs(30),
+        &[key.clone()],
+        &[(key.clone(), start, MvccValue::Value(b"v0".to_vec()))],
+    );
+    let storage_key = lease_preimage_key(11, &key);
+    engine.apply_committed_put(
+        storage_key.clone(),
+        encode_lease_preimage(later, &LeasePreimageValue::Value(b"newer".to_vec())),
+        later,
+        2,
+    );
+    engine.apply_committed_put(key.clone(), b"v1".to_vec(), later, 3);
+    flush(&engine, 3, later);
+    let raw = engine
+        .get(&storage_key, HlcTimestamp::new(u64::MAX, 0))
+        .unwrap()
+        .expect("0x0D capture");
+    assert_eq!(
+        decode_lease_preimage(&storage_key, &raw).unwrap().3,
+        LeasePreimageValue::Value(b"v0".to_vec()),
+        "collapse must not replace the start capture with a newer 0x0D body"
+    );
+    assert_eq!(
+        engine.get(&key, start).unwrap().as_deref(),
+        Some(b"v0".as_slice())
+    );
+    assert_eq!(
+        engine
+            .get(&key, HlcTimestamp::new(u64::MAX, 0))
+            .unwrap()
+            .as_deref(),
+        Some(b"v1".as_slice())
+    );
+}
+
+#[test]
+fn pinned_generation_compaction_keeps_the_cut_and_the_open_lease_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(dir.path());
+    let key = MetaKey::child(4, "gen.txt").encode();
+    let start = HlcTimestamp::new(1_000, 0);
+    let flushed = HlcTimestamp::new(2_000, 0);
+    engine.apply_committed_put(key.clone(), b"v0".to_vec(), start, 1);
+    engine.mvcc().snapshot_registry().renew_lease_hold(
+        12,
+        start,
+        Instant::now() + Duration::from_secs(30),
+        &[key.clone()],
+        &[(key.clone(), start, MvccValue::Value(b"v0".to_vec()))],
+    );
+    flush(&engine, 1, flushed);
+    let snap = engine.acquire_linearizable_snapshot(1).unwrap();
+    let pinned_ids: Vec<u64> = engine
+        .backend()
+        .current_version()
+        .levels
+        .iter()
+        .flatten()
+        .map(|sst| sst.meta().file_id)
+        .collect();
+    assert!(
+        !pinned_ids.is_empty(),
+        "the first flush must publish a generation"
+    );
+    engine.apply_committed_put(key.clone(), b"v1".to_vec(), HlcTimestamp::new(3_000, 0), 2);
+    flush(&engine, 2, HlcTimestamp::new(3_000, 0));
+    let version = engine.backend().current_version();
+    let mut min_key = None;
+    let mut max_key = None;
+    for level in &version.levels {
+        for sst in level {
+            let meta = sst.meta();
+            min_key = Some(match min_key {
+                Some(current) => std::cmp::min(current, meta.min_key.clone()),
+                None => meta.min_key.clone(),
+            });
+            max_key = Some(match max_key {
+                Some(current) => std::cmp::max(current, meta.max_key.clone()),
+                None => meta.max_key.clone(),
+            });
+        }
+    }
+    let mut end = max_key.expect("flushed files");
+    end.push(0);
+    engine.compact_range(&min_key.expect("flushed files"), &end);
+    let live_ids: Vec<u64> = engine
+        .backend()
+        .current_version()
+        .levels
+        .iter()
+        .flatten()
+        .map(|sst| sst.meta().file_id)
+        .collect();
+    assert!(
+        pinned_ids.iter().any(|id| !live_ids.contains(id)),
+        "compaction must replace the pinned generation; pinned={pinned_ids:?} live={live_ids:?}"
+    );
+    let listed = engine
+        .scan_with_snapshot(
+            &MetaKey::encode_pid_prefix_start(4),
+            &MetaKey::encode_pid_prefix_end(4),
+            &snap,
+        )
+        .unwrap();
+    let pinned_value = listed
+        .iter()
+        .find(|(found, _)| found == &key)
+        .map(|(_, raw)| raw.clone());
+    assert_eq!(pinned_value.as_deref(), Some(b"v0".as_slice()));
+    assert_eq!(
+        engine.get(&key, start).unwrap().as_deref(),
+        Some(b"v0".as_slice()),
+        "an open lease must not observe the compacted newer value"
+    );
+    let storage_key = lease_preimage_key(12, &key);
+    let raw = engine
+        .get(&storage_key, HlcTimestamp::new(u64::MAX, 0))
+        .unwrap()
+        .expect("0x0D row survives compaction");
+    assert_eq!(
+        decode_lease_preimage(&storage_key, &raw).unwrap().3,
+        LeasePreimageValue::Value(b"v0".to_vec())
+    );
+    assert_eq!(
+        engine
+            .get(&key, HlcTimestamp::new(u64::MAX, 0))
+            .unwrap()
+            .as_deref(),
+        Some(b"v1".as_slice())
+    );
 }

@@ -121,16 +121,20 @@ impl HybridLogicalClock {
     }
 
     /// Generates a strictly monotonic timestamp for a local event.
+    ///
+    /// The physical time comes from [`lease_wall_ms`]. An untracked wall is not
+    /// adopted, so a forward jump cannot become a later proposal or `commit_hlc`.
     pub fn now(&self) -> HlcTimestamp {
-        let wall_ms = Self::wall_clock_ms();
+        let current = HlcTimestamp(self.state.load(Ordering::Acquire));
+        let wall_ms = proposal_physical_ms(current.physical_ms(), lease_wall_ms());
         self.now_with_wall_ms(wall_ms)
     }
 
     /// Generates a timestamp strictly greater than both the current clock state and `floor`.
     pub fn now_strictly_after(&self, floor: HlcTimestamp) -> HlcTimestamp {
-        let wall_ms = Self::wall_clock_ms();
         loop {
             let current = HlcTimestamp(self.state.load(Ordering::Acquire));
+            let wall_ms = proposal_physical_ms(current.physical_ms(), lease_wall_ms());
             let base = current.max(floor);
             let wall_ts = HlcTimestamp::new(wall_ms, 0);
             let next = if wall_ts > base {
@@ -180,7 +184,8 @@ impl HybridLogicalClock {
     /// Updates the local HLC upon receiving a remote `HlcTimestamp` after enforcing
     /// `max_drift_ms` skew protection.
     pub fn update_checked(&self, remote: HlcTimestamp) -> Result<HlcTimestamp> {
-        let wall_ms = Self::wall_clock_ms();
+        let current = HlcTimestamp(self.state.load(Ordering::Acquire));
+        let wall_ms = proposal_physical_ms(current.physical_ms(), lease_wall_ms()).max(1);
         self.update_checked_with_wall_ms(remote, wall_ms)
     }
 
@@ -237,7 +242,8 @@ impl HybridLogicalClock {
     /// Updates the local HLC upon receiving a message with a remote `HlcTimestamp`
     /// and returns a new timestamp strictly greater than both local and remote states.
     pub fn update(&self, remote: HlcTimestamp) -> HlcTimestamp {
-        let wall_ms = Self::wall_clock_ms();
+        let current = HlcTimestamp(self.state.load(Ordering::Acquire));
+        let wall_ms = proposal_physical_ms(current.physical_ms(), lease_wall_ms());
         self.update_with_wall_ms(remote, wall_ms)
     }
 
@@ -337,6 +343,151 @@ pub fn lease_window_is_legal(
     expire.physical_ms() <= from_start && expire.physical_ms() <= from_observed
 }
 
+/// The stored window is longer than `max_lifetime_ms`, or `expire` is before `start`.
+///
+/// This does not read a clock. A missing or skewed wall clock cannot make an
+/// over-cap record legal, and it cannot make a legal record look over-cap.
+pub fn lease_exceeds_lifetime(
+    start: HlcTimestamp,
+    expire: HlcTimestamp,
+    max_lifetime_ms: u64,
+) -> bool {
+    if expire < start {
+        return true;
+    }
+    match start.physical_ms().checked_add(max_lifetime_ms) {
+        Some(cap) => expire.physical_ms() > cap,
+        None => true,
+    }
+}
+
+/// `now` is inside the published lease and could still be the clock that holds it.
+///
+/// `ttl_ms` is the TTL that last published `expire`. A directory-rename renew uses
+/// that same TTL, so an observation more than `ttl + drift` before `expire` did
+/// not publish this deadline. A physical time of `0` or `1` is the unread-clock
+/// fallback. Either case must not extend the lease.
+pub fn lease_clock_can_extend(now: HlcTimestamp, expire: HlcTimestamp, ttl_ms: u64) -> bool {
+    if now.physical_ms() <= 1 || now > expire {
+        return false;
+    }
+    let slack = ttl_ms.saturating_add(DEFAULT_MAX_CLOCK_DRIFT_MS);
+    now.physical_ms() >= expire.physical_ms().saturating_sub(slack)
+}
+
+/// `now` can extend a 2PC lease that started at `start` and ends at `expire`.
+///
+/// The deadline may already be many TTLs ahead: one renew can move it up to the
+/// lifetime cap. The observation still has to be after `start` (within drift)
+/// and not after `expire`. The 1 ms fallback is not inside the window.
+pub fn lease_observation_inside_window(
+    now: HlcTimestamp,
+    start: HlcTimestamp,
+    expire: HlcTimestamp,
+) -> bool {
+    if now.physical_ms() <= 1 || now > expire || expire < start {
+        return false;
+    }
+    now.physical_ms().saturating_add(DEFAULT_MAX_CLOCK_DRIFT_MS) >= start.physical_ms()
+}
+
+/// Expiry proved without treating an untrusted or rolled-back wall as "not yet".
+///
+/// `last_applied > expire` is enough. A wall reading proves expiry only when
+/// [`trusted_lease_observation`] accepts it and that observation is past `expire`.
+/// `None` does not prove the lease is still inside the window; callers that
+/// cannot prove expiry must leave the durable lock in place.
+pub fn lease_expiry_is_proved(
+    last_applied: HlcTimestamp,
+    expire: HlcTimestamp,
+    wall_ms: Option<u64>,
+) -> bool {
+    if last_applied > expire {
+        return true;
+    }
+    let Some(wall) = wall_ms else {
+        return false;
+    };
+    if wall <= 1 {
+        return false;
+    }
+    trusted_lease_observation(last_applied, Some(wall)).is_some_and(|observed| observed > expire)
+}
+
+/// `wall` still moves with a monotonic anchor captured at `origin_wall`.
+///
+/// `elapsed_ms` is monotonic time since that anchor. A step larger than the
+/// drift bound, or a wall that moved backwards past the bound, is skewed.
+/// The historical `1` ms fallback is not an observation.
+pub fn wall_tracks_monotonic(elapsed_ms: u128, origin_wall: u64, wall: u64) -> Option<u64> {
+    if wall <= 1 || origin_wall <= 1 {
+        return None;
+    }
+    if wall.saturating_add(DEFAULT_MAX_CLOCK_DRIFT_MS) < origin_wall {
+        return None;
+    }
+    let elapsed = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
+    let moved = wall.saturating_sub(origin_wall);
+    if moved.abs_diff(elapsed) > DEFAULT_MAX_CLOCK_DRIFT_MS {
+        None
+    } else {
+        Some(wall)
+    }
+}
+
+/// Physical time that a proposal HLC may adopt.
+///
+/// `tracked_ms` is [`lease_wall_ms`]. `None` means the process wall is missing
+/// or has stepped away from monotonic time. The raw wall is not used. The
+/// clock keeps `last_physical_ms`, so a jump is not written as `commit_hlc`
+/// and cannot prove that a lease expired. A tracked reading of `0` or `1` is
+/// the historical fallback and is not adopted either.
+pub fn proposal_physical_ms(last_physical_ms: u64, tracked_ms: Option<u64>) -> u64 {
+    match tracked_ms {
+        Some(ms) if ms > 1 => ms,
+        _ => last_physical_ms,
+    }
+}
+
+/// `now_ms` is this process's wall clock, and that wall does not track monotonic time.
+///
+/// A timestamp more than the drift bound away from the process wall is a
+/// caller-supplied clock, such as a test HLC, and is not this check. A true
+/// result must not acquire, extend, replace, or abort a lease.
+pub fn lease_live_wall_is_untracked(
+    now_ms: u64,
+    raw_wall_ms: Option<u64>,
+    tracked_ms: Option<u64>,
+) -> bool {
+    let Some(raw) = raw_wall_ms else {
+        return false;
+    };
+    if now_ms.abs_diff(raw) > DEFAULT_MAX_CLOCK_DRIFT_MS {
+        return false;
+    }
+    tracked_ms.is_none()
+}
+
+/// Wall time for a lease decision, or `None` when it cannot be trusted.
+///
+/// The first accepted reading is the monotonic anchor. A later reading that
+/// does not track that anchor is skewed and must not extend a lease or prove
+/// that the lease is still inside its deadline. A clock that was already wrong
+/// when the anchor was taken, and that then moves with monotonic time, is not
+/// detected here.
+pub fn lease_wall_ms() -> Option<u64> {
+    let wall = HybridLogicalClock::try_wall_clock_ms()?;
+    if wall <= 1 {
+        return None;
+    }
+    static ANCHOR: std::sync::Mutex<Option<(std::time::Instant, u64)>> =
+        std::sync::Mutex::new(None);
+    let mut guard = ANCHOR.lock().unwrap_or_else(|poison| poison.into_inner());
+    let (origin, origin_wall) = *guard.get_or_insert_with(|| (std::time::Instant::now(), wall));
+    drop(guard);
+    wall_tracks_monotonic(origin.elapsed().as_millis(), origin_wall, wall)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +541,98 @@ mod tests {
             observed,
             u64::MAX
         ));
+
+        let expire = HlcTimestamp::new(11_000, 0);
+        assert!(lease_clock_can_extend(
+            HlcTimestamp::new(10_500, 0),
+            expire,
+            1_000
+        ));
+        assert!(
+            !lease_clock_can_extend(HlcTimestamp::new(1, 0), expire, 1_000),
+            "the 1 ms fallback must not look inside a real lease"
+        );
+        assert!(
+            !lease_clock_can_extend(HlcTimestamp::new(1_000, 0), expire, 1_000),
+            "a clock behind the published window must not extend"
+        );
+        let lease_start = HlcTimestamp::new(10_000, 0);
+        assert!(lease_observation_inside_window(
+            HlcTimestamp::new(15_000, 0),
+            lease_start,
+            HlcTimestamp::new(30_000, 0)
+        ));
+        assert!(!lease_observation_inside_window(
+            HlcTimestamp::new(1, 0),
+            lease_start,
+            HlcTimestamp::new(30_000, 0)
+        ));
+        assert!(
+            !lease_observation_inside_window(
+                HlcTimestamp::new(1_000, 0),
+                lease_start,
+                HlcTimestamp::new(30_000, 0)
+            ),
+            "a clock before the transaction start must not extend"
+        );
+        assert!(!lease_exceeds_lifetime(
+            HlcTimestamp::new(1_000, 0),
+            HlcTimestamp::new(61_000, 0),
+            60_000
+        ));
+        assert!(lease_exceeds_lifetime(
+            HlcTimestamp::new(1_000, 0),
+            HlcTimestamp::new(61_001, 0),
+            60_000
+        ));
+
+        let applied = HlcTimestamp::new(20_000, 0);
+        let deadline = HlcTimestamp::new(21_000, 0);
+        assert!(!lease_expiry_is_proved(applied, deadline, None));
+        assert!(!lease_expiry_is_proved(applied, deadline, Some(1)));
+        assert!(!lease_expiry_is_proved(
+            applied,
+            deadline,
+            Some(applied.physical_ms() - 10_000)
+        ));
+        assert!(lease_expiry_is_proved(
+            applied,
+            deadline,
+            Some(deadline.physical_ms() + 1)
+        ));
+        assert!(lease_expiry_is_proved(
+            HlcTimestamp::new(deadline.physical_ms() + 1, 0),
+            deadline,
+            None
+        ));
+        assert_eq!(wall_tracks_monotonic(1_000, 50_000, 51_000), Some(51_000));
+        assert!(wall_tracks_monotonic(1_000, 50_000, 51_000 + 501).is_none());
+        assert!(wall_tracks_monotonic(1_000, 50_000, 50_000).is_none());
+        assert!(wall_tracks_monotonic(0, 50_000, 1).is_none());
+        assert!(lease_live_wall_is_untracked(90_000, Some(90_100), None));
+        assert!(!lease_live_wall_is_untracked(
+            90_000,
+            Some(90_100),
+            Some(90_100)
+        ));
+        assert!(
+            !lease_live_wall_is_untracked(1_000, Some(1_700_000_000_000), None),
+            "a synthetic timestamp is not the process wall"
+        );
+        assert_eq!(proposal_physical_ms(50_000, None), 50_000);
+        assert_eq!(proposal_physical_ms(50_000, Some(1)), 50_000);
+        assert_eq!(proposal_physical_ms(50_000, Some(53_000)), 53_000);
+        let clock = HybridLogicalClock::with_max_drift_ms(500);
+        let held = clock.now_with_wall_ms(50_000);
+        let rejected = clock.update_checked_with_wall_ms(HlcTimestamp::new(80_000, 0), 50_000);
+        assert!(matches!(
+            rejected,
+            Err(MetaDbError::ClockSkewExceeded { .. })
+        ));
+        assert_eq!(
+            clock.now_with_wall_ms(50_000).physical_ms(),
+            held.physical_ms()
+        );
     }
 
     #[test]

@@ -1091,12 +1091,12 @@ impl MemMvccStore {
             let mut merged: BTreeMap<Vec<u8>, PersistentEntry> =
                 batch_to_persist.into_iter().collect();
             let mut persisted_preimage_keys = Vec::new();
+            // The capture is the value at `start_hlc`. A later put or tombstone of
+            // the same `0x0D` key in this memtable is a collapsed newer body and
+            // must not replace the capture or leave it unpersisted.
             for (key, bytes) in preimage_rows {
-                if let std::collections::btree_map::Entry::Vacant(slot) = merged.entry(key.clone())
-                {
-                    slot.insert(PersistentEntry::Value(bytes));
-                    persisted_preimage_keys.push(key);
-                }
+                merged.insert(key.clone(), PersistentEntry::Value(bytes));
+                persisted_preimage_keys.push(key);
             }
             let batch_to_persist: Vec<(Vec<u8>, PersistentEntry)> = merged.into_iter().collect();
             backend.flush_l0_batch(&batch_to_persist, candidate.checkpoint.clone())?;

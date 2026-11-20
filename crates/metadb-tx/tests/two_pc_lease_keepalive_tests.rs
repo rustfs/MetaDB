@@ -11,8 +11,9 @@ use std::time::Duration;
 use metadb_core::{
     encode_lease_preimage, lease_preimage_key, CompositeKeyRange, HlcTimestamp, HybridLogicalClock,
     InodeId, IntentOp, LeasePreimageValue, LeaseRenewReject, MetaDbError, MetaKey, Result,
-    ShardEpoch, TxnState, TxnStatusRecord, WriteIntentKey, WriteIntentRecord, ROOT_INODE_ID,
-    SYSTEM_PREFIX_LEASE_PREIMAGE, SYSTEM_PREFIX_TXN_RECORD, SYSTEM_PREFIX_WRITE_INTENT,
+    ShardEpoch, TxnRecordKey, TxnState, TxnStatusRecord, WriteIntentKey, WriteIntentRecord,
+    ROOT_INODE_ID, SYSTEM_PREFIX_LEASE_PREIMAGE, SYSTEM_PREFIX_TXN_RECORD,
+    SYSTEM_PREFIX_WRITE_INTENT,
 };
 use metadb_raft::{
     ChannelPool, MultiRaftRouter, RaftNodeOptions, ShardRaftGroup, ShardWatermarkTracker,
@@ -1541,4 +1542,186 @@ async fn legacy_holder_without_a_start_can_keep_its_deadline_but_not_grow_it() {
         .unwrap();
     assert_eq!(holder.expire_hlc, stored_expire);
     assert_eq!(holder.start_hlc, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn skewed_caller_clock_does_not_abort_a_live_lease() {
+    let dir = tempdir().unwrap();
+    let cluster = boot_cluster(dir.path()).await;
+    let gate = Arc::new(TwoPcPrepareGate::new());
+    let tx = DistributedTxRouter::new(1, cluster.clock.clone(), cluster.directory.clone());
+    seed_dirs(&tx).await;
+    tx.create_file(100, "clock.txt", 1016, 8016, 10, 0o644, 4)
+        .await
+        .unwrap();
+    let rename = {
+        let tx = DistributedTxRouter::new(1, cluster.clock.clone(), cluster.directory.clone())
+            .with_post_prepare_gate(gate.clone());
+        tokio::spawn(async move {
+            tx.rename(100, "clock.txt", 600, "clock-dst.txt", false)
+                .await
+        })
+    };
+    gate.wait_prepared().await;
+    let pending = txn_records(&cluster.shard1).await.remove(0);
+    let expire = pending.expire_hlc;
+    propose_cmd(
+        &cluster.shard1,
+        &cluster.clock,
+        &TxRaftCmd::CheckAndAbortExpiredTxn {
+            txn_id: pending.txn_id,
+            caller_hlc: HlcTimestamp::new(u64::MAX, 0),
+        },
+    )
+    .await
+    .unwrap();
+    let still = txn_records(&cluster.shard1).await.remove(0);
+    assert!(matches!(still.state, TxnState::Pending), "{still:?}");
+    assert_eq!(still.expire_hlc, expire);
+    assert!(cluster.clock.now() < expire);
+    gate.release();
+    rename.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn previous_holder_cannot_extend_after_a_new_holder_exists() {
+    let dir = tempdir().unwrap();
+    let cluster = boot_cluster(dir.path()).await;
+    let previous = (1u128 << 64) | 21;
+    let current = (1u128 << 64) | 22;
+    let key = MetaKey::child(100, "held.txt").encode();
+    let start = HlcTimestamp::new(cluster.clock.now().physical_ms(), 0);
+    let expire = HlcTimestamp::new(start.physical_ms() + 20_000, 0);
+    let intent = WriteIntentRecord {
+        txn_id: current,
+        primary_shard_hint: 1,
+        primary_key: key.clone(),
+        start_hlc: start,
+        expire_hlc: expire,
+        rename_fence_token: None,
+        op: IntentOp::Put {
+            value: b"current-holder".to_vec(),
+            attr_deltas: vec![],
+            aux_specs: vec![],
+        },
+    };
+    let record = TxnStatusRecord {
+        txn_id: previous,
+        primary_key: key.clone(),
+        participant_keys: vec![key.clone()],
+        pending_ack_keys: std::collections::BTreeSet::new(),
+        start_hlc: start,
+        expire_hlc: expire,
+        rename_fence_token: None,
+        state: TxnState::Pending,
+    };
+    let now = cluster.clock.now();
+    cluster.shard1.engine().apply_committed_put(
+        WriteIntentKey::new(key.clone()).encode(),
+        intent.encode(),
+        now,
+        8,
+    );
+    cluster.shard1.engine().apply_committed_put(
+        TxnRecordKey { txn_id: previous }.encode().to_vec(),
+        record.encode(),
+        now,
+        9,
+    );
+    let rejected = propose_extend(
+        &cluster.shard1,
+        &cluster.clock,
+        previous,
+        1,
+        start,
+        HlcTimestamp::new(expire.physical_ms() + 5_000, 0),
+        None,
+        vec![key],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            rejected,
+            MetaDbError::LeaseRenewRejected(LeaseRenewReject::NotHolder)
+        ),
+        "{rejected}"
+    );
+    let intents = intent_records(&cluster.shard1).await;
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].txn_id, current);
+    assert_eq!(intents[0].expire_hlc, expire);
+    let records = txn_records(&cluster.shard1).await;
+    assert_eq!(records[0].txn_id, previous);
+    assert_eq!(records[0].expire_hlc, expire);
+    assert!(matches!(records[0].state, TxnState::Pending));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn untrusted_wall_does_not_extend_or_drop_a_live_lease() {
+    let dir = tempdir().unwrap();
+    let cluster = boot_cluster(dir.path()).await;
+    let gate = Arc::new(TwoPcPrepareGate::new());
+    let wall = Arc::new(Mutex::new(None));
+    let tx = DistributedTxRouter::new(1, cluster.clock.clone(), cluster.directory.clone());
+    seed_dirs(&tx).await;
+    tx.create_file(100, "wall.txt", 1017, 8017, 10, 0o644, 4)
+        .await
+        .unwrap();
+    let rename = {
+        let tx = DistributedTxRouter::new(1, cluster.clock.clone(), cluster.directory.clone())
+            .with_ttl_ms(5_000)
+            .with_post_prepare_gate(gate.clone())
+            .with_lease_wall_override(wall);
+        tokio::spawn(async move { tx.rename(100, "wall.txt", 600, "wall-dst.txt", false).await })
+    };
+    gate.wait_prepared().await;
+    let prepared = txn_records(&cluster.shard1).await.remove(0);
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    let still = txn_records(&cluster.shard1).await.remove(0);
+    assert!(matches!(still.state, TxnState::Pending), "{still:?}");
+    assert_eq!(
+        still.expire_hlc, prepared.expire_hlc,
+        "an untrusted wall must not publish a later deadline"
+    );
+    assert!(cluster.clock.now() < still.expire_hlc);
+    gate.release();
+    rename.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_intent_is_finalized_before_expiry_without_a_recovery_tick() {
+    let dir = tempdir().unwrap();
+    let cluster = boot_cluster(dir.path()).await;
+    let tx = DistributedTxRouter::new(1, cluster.clock.clone(), cluster.directory.clone())
+        .with_ttl_ms(10_000);
+    seed_dirs(&tx).await;
+    tx.create_file(100, "soon.txt", 1018, 8018, 10, 0o644, 4)
+        .await
+        .unwrap();
+    let error = tx
+        .rename_with_fault_injection(
+            100,
+            "soon.txt",
+            600,
+            "soon-dst.txt",
+            false,
+            TwoPcCrashStage::StopAfterPrimaryCommitBeforeSecondary,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaDbError::RpcError(_)));
+    let committed = txn_records(&cluster.shard1).await.remove(0);
+    assert!(matches!(committed.state, TxnState::Committed { .. }));
+    assert!(cluster.clock.now() < committed.expire_hlc);
+    let conflict = tx
+        .create_file(600, "soon-dst.txt", 1019, 8019, 10, 0o644, 1)
+        .await;
+    assert!(conflict.is_err(), "{conflict:?}");
+    let landed = tx.lookup(600, "soon-dst.txt").await.unwrap().unwrap();
+    assert_eq!(landed.attr.inode_id, 1018);
+    assert!(
+        cluster.clock.now() < committed.expire_hlc,
+        "roll-forward must not wait until the lease expires"
+    );
 }

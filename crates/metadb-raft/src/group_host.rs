@@ -828,6 +828,8 @@ impl ShardRaftGroup {
             });
         }
 
+        // `now` and `update_checked` refuse an untracked wall. A forward jump
+        // stays out of `proposal_hlc`, so Apply does not see it as `commit_hlc`.
         let proposal_hlc = if caller_hlc == HlcTimestamp::ZERO {
             self.clock.now()
         } else {

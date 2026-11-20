@@ -16,8 +16,9 @@ use metadb_cluster::{
 };
 use metadb_core::codec;
 use metadb_core::{
-    AuxOutboxEntry, CompositeKeyRange, HlcTimestamp, MetaDbError, MetaKey, QuotaKey,
-    SecondaryIndexKey, ShardEpoch, TxnState, WriteIntentKey, WriteIntentRecord,
+    lease_exceeds_lifetime, lease_expiry_is_proved, lease_wall_ms, AuxOutboxEntry,
+    CompositeKeyRange, HlcTimestamp, MetaDbError, MetaKey, QuotaKey, SecondaryIndexKey, ShardEpoch,
+    TxnRecordKey, TxnState, TxnStatusRecord, WriteIntentKey, WriteIntentRecord,
     TABLE_PREFIX_SECONDARY_INDEX,
 };
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
@@ -31,7 +32,10 @@ use metadb_proto::*;
 use metadb_proxy::{
     MetadataSqlCommand, ProxySqlResult, SqlParam, SqlTemplateParser, StatelessProxyRouter,
 };
-use metadb_tx::{DistributedTxRouter, SetAttrPatch, ShardDirectory, TxRaftCmd, TxRaftOutput};
+use metadb_tx::{
+    DistributedTxRouter, SetAttrPatch, ShardDirectory, TxRaftCmd, TxRaftOutput,
+    MAX_2PC_LEASE_LIFETIME_MS,
+};
 
 mod route_conv {
     use super::*;
@@ -2195,16 +2199,83 @@ impl TransactionService for MetaDbGrpcService {
                 }))
             }
         };
+        let txn_id = decode_req_txn_id(&req.txn_id_be)?;
+        let epoch = grp.current_epoch();
+        let (_, snap) = match grp.linearizable_read(epoch).await {
+            Ok(read) => read,
+            Err(error) => {
+                return Ok(Response::new(CheckTxnStatusResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                    txn_state: 0,
+                    commit_hlc: 0,
+                }))
+            }
+        };
+        let last_applied = grp.engine().mvcc().latest_watermarks().1;
+        let raw = match grp
+            .engine()
+            .get_with_snapshot(&TxnRecordKey { txn_id }.encode(), &snap)
+        {
+            Ok(raw) => raw,
+            Err(error) => {
+                return Ok(Response::new(CheckTxnStatusResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                    txn_state: 0,
+                    commit_hlc: 0,
+                }))
+            }
+        };
+        drop(snap);
+        let Some(raw) = raw else {
+            // Nothing to abort. Do not propose a wall timestamp.
+            return Ok(Response::new(CheckTxnStatusResponse {
+                error: None,
+                txn_state: 0,
+                commit_hlc: 0,
+            }));
+        };
+        let rec = match TxnStatusRecord::decode(&raw) {
+            Ok(rec) => rec,
+            Err(error) => {
+                return Ok(Response::new(CheckTxnStatusResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                    txn_state: 0,
+                    commit_hlc: 0,
+                }))
+            }
+        };
+        let (code, chlc) = match rec.state {
+            TxnState::Pending => (1u32, 0u64),
+            TxnState::Committed { commit_hlc } => (2u32, commit_hlc.0),
+            TxnState::Aborted => (0, 0),
+        };
+        let wall = lease_wall_ms();
+        let proved = matches!(rec.state, TxnState::Pending)
+            && (lease_exceeds_lifetime(rec.start_hlc, rec.expire_hlc, MAX_2PC_LEASE_LIFETIME_MS)
+                || lease_expiry_is_proved(last_applied, rec.expire_hlc, wall));
+        if !proved {
+            // A raw or jumped wall must not become the proposal HLC. Apply
+            // aborts a pending lease when that committed HLC passes expire.
+            return Ok(Response::new(CheckTxnStatusResponse {
+                error: None,
+                txn_state: code,
+                commit_hlc: chlc,
+            }));
+        }
+        let proposal = wall
+            .map(|ms| HlcTimestamp::new(ms, 0))
+            .filter(|observed| *observed > last_applied)
+            .unwrap_or(last_applied);
         let cmd = TxRaftCmd::CheckAndAbortExpiredTxn {
-            txn_id: decode_req_txn_id(&req.txn_id_be)?,
-            caller_hlc: HlcTimestamp(req.caller_hlc),
+            txn_id,
+            // Kept so older logs decode. Apply does not let this field outrank
+            // the replicated proposal timestamp, and this proposal is only sent
+            // when expiry is already proved without a raw wall jump.
+            caller_hlc: proposal,
         };
         let payload =
             metadb_tx::command_payload(&cmd).map_err(|e| Status::internal(e.to_string()))?;
-        match grp
-            .propose(grp.current_epoch(), HlcTimestamp(req.caller_hlc), payload)
-            .await
-        {
+        match grp.propose(epoch, proposal, payload).await {
             Ok(resp) => {
                 let out: TxRaftOutput = codec::deserialize(&resp.result.unwrap_or_default())
                     .unwrap_or(TxRaftOutput::TxnStatus(Some(TxnState::Aborted)));

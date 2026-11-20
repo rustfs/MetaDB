@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use metadb_core::codec;
 use metadb_core::{
-    append_crc32c_le, make_file_inode_id, verify_crc32c_le, FileId, HlcTimestamp, InodeId,
-    LeaseRenewReject, MetaDbError, Result, ShardId,
+    append_crc32c_le, lease_clock_can_extend, lease_live_wall_is_untracked, lease_wall_ms,
+    make_file_inode_id, verify_crc32c_le, FileId, HlcTimestamp, HybridLogicalClock, InodeId,
+    LeaseRenewReject, MetaDbError, Result, ShardId, DEFAULT_MAX_CLOCK_DRIFT_MS,
 };
 use metadb_storage::sstable::sync_dir;
 
@@ -232,6 +233,22 @@ fn allocator_is_pristine(state: &PersistedAllocatorState) -> bool {
         && state.next_client_seq == fresh.next_client_seq
 }
 
+/// Reject a timestamp that is this process's wall clock when that wall has
+/// stepped away from monotonic time. A far-away synthetic timestamp is kept,
+/// so tests can move a lease without reading the host clock.
+fn refuse_untracked_live_wall(now: HlcTimestamp) -> Result<()> {
+    if lease_live_wall_is_untracked(
+        now.physical_ms(),
+        HybridLogicalClock::try_wall_clock_ms(),
+        lease_wall_ms(),
+    ) {
+        return Err(MetaDbError::LeaseRenewRejected(
+            LeaseRenewReject::UntrustedClock,
+        ));
+    }
+    Ok(())
+}
+
 /// Crash-safe persistent ID & lease allocator enforcing **Write-Before-Grant** (`Resolution B18`).
 pub struct DurableIdAllocator {
     state_dir: PathBuf,
@@ -432,8 +449,21 @@ impl DurableIdAllocator {
         ttl_ms: u64,
         max_lifetime_ms: u64,
     ) -> Result<(u64, HlcTimestamp)> {
+        refuse_untracked_live_wall(now_hlc)?;
         let mut guard = self.state.lock().unwrap();
         if let Some(active) = &guard.active_rename_lease {
+            // A clock behind the grant window must not be told the old lease is
+            // still valid, and it must not be allowed to mint a replacement.
+            let earliest = active.expire_hlc.physical_ms().saturating_sub(
+                max_lifetime_ms
+                    .max(100)
+                    .saturating_add(DEFAULT_MAX_CLOCK_DRIFT_MS),
+            );
+            if now_hlc.physical_ms() <= 1 || now_hlc.physical_ms() < earliest {
+                return Err(MetaDbError::LeaseRenewRejected(
+                    LeaseRenewReject::UntrustedClock,
+                ));
+            }
             if now_hlc <= active.expire_hlc {
                 return Err(MetaDbError::TransactionAborted(
                     "another cross-directory directory rename lease is currently active"
@@ -492,9 +522,17 @@ impl DurableIdAllocator {
                 LeaseRenewReject::RenameLeaseTokenMismatch,
             ));
         }
+        // A jumped process wall past `expire_hlc` is not proof the published
+        // window ended, and it must not be reported as `RenameLeaseExpired`.
+        refuse_untracked_live_wall(now_hlc)?;
         if now_hlc > active.expire_hlc {
             return Err(MetaDbError::LeaseRenewRejected(
                 LeaseRenewReject::RenameLeaseExpired,
+            ));
+        }
+        if !lease_clock_can_extend(now_hlc, active.expire_hlc, ttl_ms.max(100)) {
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::UntrustedClock,
             ));
         }
         let deadline_ms = active.deadline_hlc.physical_ms();
