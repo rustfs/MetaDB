@@ -52,10 +52,10 @@ use crate::jumbo_placement::{
     AUTOMATIC_TRANSFER_DISABLED_REASON,
 };
 use crate::jumbo_remote::{
-    append_handoff, append_spare_drain, destination_has_live_cut, drain_record_for,
+    append_handoff, append_spare_drain, destination_live_cut, drain_record_for,
     handoff_blocks_local_open, load_handoffs, load_spare_drains, outcome_from_drain,
-    push_jumbo_shard, refuse_non_loopback, PushResult, RemoteHandoffRecord, RemoteMoveOutcome,
-    SpareDrainRecord,
+    push_jumbo_shard, refuse_non_loopback, DestinationCut, PushResult, RemoteHandoffRecord,
+    RemoteMoveOutcome, SpareDrainRecord,
 };
 use crate::meta_cache::{CompositeMetaCache, CompositeShardRoute};
 use crate::replicated_control::validate_replicated_record;
@@ -1169,16 +1169,8 @@ impl DurableCellManager {
                     existing.dest_node
                 )));
             }
-            let live =
-                destination_has_live_cut(shard_id, self.host.node_id(), dest_node, dest_addr)
-                    .await?;
-            if !live {
-                return Err(MetaDbError::StorageIoError(format!(
-                    "handoff for shard {shard_id} is recorded but the destination has no MOVE_LIVE; the source directory was not deleted and transfer_leader was not called"
-                )));
-            }
             return self
-                .finish_remote_after_live(shard_id, dest_node, &plan)
+                .finish_if_live_dirsync_succeeded(shard_id, dest_node, dest_addr, &plan)
                 .await;
         }
 
@@ -1221,18 +1213,12 @@ impl DurableCellManager {
             )));
         }
         if self.host.get_group(shard_id).is_none() {
-            let live =
-                destination_has_live_cut(shard_id, self.host.node_id(), dest_node, dest_addr)
-                    .await?;
-            if live {
-                return self
-                    .finish_remote_after_live(shard_id, dest_node, &plan)
-                    .await;
-            }
-            return Err(MetaDbError::ShardRoutingError(format!(
-                "shard {shard_id} is not running and the destination has no MOVE_LIVE; files were not moved"
-            )));
+            return self
+                .finish_if_live_dirsync_succeeded(shard_id, dest_node, dest_addr, &plan)
+                .await;
         }
+        self.preserve_control_snapshot_before_handoff(shard_id)
+            .await?;
         let group = self.host.get_group(shard_id).ok_or_else(|| {
             MetaDbError::ShardRoutingError(format!(
                 "shard {shard_id} is not running; files were not moved"
@@ -1310,6 +1296,44 @@ impl DurableCellManager {
         }))
     }
 
+    async fn finish_if_live_dirsync_succeeded(
+        &self,
+        shard_id: ShardId,
+        dest_node: NodeId,
+        dest_addr: SocketAddr,
+        plan: &SpareDrainPlan,
+    ) -> Result<RemoteMoveOutcome> {
+        match destination_live_cut(shard_id, self.host.node_id(), dest_node, dest_addr).await? {
+            DestinationCut::Durable => {
+                self.finish_remote_after_live(shard_id, dest_node, plan)
+                    .await
+            }
+            DestinationCut::VisibleNotDurable => {
+                match push_jumbo_shard(
+                    &self.host.shard_dir(shard_id),
+                    shard_id,
+                    self.host.node_id(),
+                    dest_node,
+                    dest_addr,
+                )
+                .await
+                {
+                    Ok(PushResult::LiveCut) => {
+                        self.finish_remote_after_live(shard_id, dest_node, plan)
+                            .await
+                    }
+                    Err(failure) => Err(MetaDbError::StorageIoError(format!(
+                        "{}; the source directory was not deleted; the spare voter was not replaced; transfer_leader was not called",
+                        failure.message
+                    ))),
+                }
+            }
+            DestinationCut::Absent => Err(MetaDbError::ShardRoutingError(format!(
+                "shard {shard_id} is not running and the destination directory fsync has not succeeded; files were not moved and the source was not deleted"
+            ))),
+        }
+    }
+
     async fn finish_remote_after_live(
         &self,
         shard_id: ShardId,
@@ -1356,9 +1380,10 @@ impl DurableCellManager {
         Ok(outcome_from_drain(&record))
     }
 
-    /// Applies the spare replacement on a local Raft group only when this process
-    /// is the leader and the live voter set is the planned set. Otherwise the
-    /// protocol record is the commit, and `raft_membership_changed` stays false.
+    /// Changes Raft only when this process is already the leader and the live
+    /// voter set equals `voters_before`. A closed shard, a different live set,
+    /// or a set that already equals `voters_after` does not set
+    /// `raft_membership_changed`.
     async fn try_raft_spare_drain(&self, plan: &SpareDrainPlan) -> Result<bool> {
         let Some(group) = self.host.get_group(plan.shard_id) else {
             return Ok(false);
@@ -1367,9 +1392,6 @@ impl DurableCellManager {
             return Ok(false);
         }
         let live: BTreeSet<NodeId> = group.uniform_voter_addrs()?.into_keys().collect();
-        if live == plan.voters_after {
-            return Ok(true);
-        }
         if live != plan.voters_before {
             return Ok(false);
         }
@@ -2572,35 +2594,228 @@ impl DurableCellManager {
     }
 
     fn control_group(&self) -> Result<std::sync::Arc<metadb_raft::ShardRaftGroup>> {
-        let mut shard_ids: Vec<ShardId> = {
-            let state = self.state.lock().unwrap();
-            state.routes.keys().copied().collect()
+        let running = self.running_shard_ids();
+        let Some(lowest_running) = running.first().copied() else {
+            let lowest = self.route_shard_ids().first().copied();
+            return Err(match lowest {
+                Some(shard_id) => MetaDbError::ShardRoutingError(format!(
+                    "shard {shard_id} is not running; the replicated directory was not published"
+                )),
+                None => MetaDbError::ShardRoutingError(
+                    "cell has no shard that can store the replicated directory".to_string(),
+                ),
+            });
         };
-        shard_ids.sort_unstable();
-        let Some(lowest) = shard_ids.first().copied() else {
+        if let Some(shard_id) = self.running_carrier_with_record()? {
+            return self.host.get_group(shard_id).ok_or_else(|| {
+                MetaDbError::ShardRoutingError(format!(
+                    "shard {shard_id} dropped its control snapshot while it was being read"
+                ))
+            });
+        }
+        if self.committed_snapshot_unreadable_after_handoff()? {
             return Err(MetaDbError::ShardRoutingError(
-                "cell has no shard that can store the replicated directory".to_string(),
+                "committed cell directory is not readable after jumbo handoff; refusing to publish an empty directory on another shard"
+                    .to_string(),
             ));
-        };
-        // The carrier is the lowest local shard while that group is open. A jumbo
-        // handoff leaves that shard without a Raft group, so the next open group
-        // holds the snapshot. A hint does not choose this shard.
-        for shard_id in shard_ids {
-            if let Some(group) = self.host.get_group(shard_id) {
-                return Ok(group);
+        }
+        self.host.get_group(lowest_running).ok_or_else(|| {
+            MetaDbError::ShardRoutingError(format!(
+                "shard {lowest_running} is not running; the replicated directory was not published"
+            ))
+        })
+    }
+
+    fn route_shard_ids(&self) -> Vec<ShardId> {
+        let mut ids: Vec<ShardId> = self.state.lock().unwrap().routes.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn running_shard_ids(&self) -> Vec<ShardId> {
+        self.route_shard_ids()
+            .into_iter()
+            .filter(|shard_id| self.host.get_group(*shard_id).is_some())
+            .collect()
+    }
+
+    /// Lowest running shard that holds the highest committed control sequence.
+    fn running_carrier_with_record(&self) -> Result<Option<ShardId>> {
+        let mut best: Option<(ShardId, u64)> = None;
+        for shard_id in self.running_shard_ids() {
+            let Some(group) = self.host.get_group(shard_id) else {
+                continue;
+            };
+            let Some(record) = metadb_tx::read_replicated_control_record(group.engine().as_ref())?
+            else {
+                continue;
+            };
+            let replace = match best {
+                None => true,
+                Some((_, sequence)) if record.sequence > sequence => true,
+                Some((id, sequence)) if record.sequence == sequence && shard_id < id => true,
+                _ => false,
+            };
+            if replace {
+                best = Some((shard_id, record.sequence));
             }
         }
-        Err(MetaDbError::ShardRoutingError(format!(
-            "shard {lowest} is not running; the replicated directory was not published"
-        )))
+        Ok(best.map(|(shard_id, _)| shard_id))
+    }
+
+    fn committed_snapshot_unreadable_after_handoff(&self) -> Result<bool> {
+        if self.running_carrier_with_record()?.is_some() {
+            return Ok(false);
+        }
+        if self.read_handed_off_control_record()?.is_some() {
+            return Ok(false);
+        }
+        let running = self.running_shard_ids();
+        let Some(lowest_running) = running.first().copied() else {
+            return Ok(false);
+        };
+        Ok(load_handoffs(&self.state_dir)?
+            .iter()
+            .any(|record| record.shard_id < lowest_running))
+    }
+
+    fn record_outside_group(
+        &self,
+        except: ShardId,
+    ) -> Result<Option<metadb_tx::ReplicatedControlRecord>> {
+        let mut best: Option<metadb_tx::ReplicatedControlRecord> = None;
+        for shard_id in self.running_shard_ids() {
+            if shard_id == except {
+                continue;
+            }
+            let Some(group) = self.host.get_group(shard_id) else {
+                continue;
+            };
+            let Some(record) = metadb_tx::read_replicated_control_record(group.engine().as_ref())?
+            else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|current| record.sequence >= current.sequence)
+            {
+                best = Some(record);
+            }
+        }
+        if let Some(record) = self.read_handed_off_control_record()? {
+            if best
+                .as_ref()
+                .is_none_or(|current| record.sequence >= current.sequence)
+            {
+                best = Some(record);
+            }
+        }
+        Ok(best)
+    }
+
+    fn read_handed_off_control_record(&self) -> Result<Option<metadb_tx::ReplicatedControlRecord>> {
+        let mut best: Option<metadb_tx::ReplicatedControlRecord> = None;
+        for handoff in load_handoffs(&self.state_dir)? {
+            if self.host.get_group(handoff.shard_id).is_some() {
+                continue;
+            }
+            let lsm = self.host.shard_dir(handoff.shard_id).join("lsm");
+            if !lsm.exists() {
+                continue;
+            }
+            let engine = metadb_storage::LifecycleStorageEngine::open_lsm_existing(
+                handoff.shard_id,
+                &lsm,
+                self.host.block_cache().clone(),
+                self.lsm_config.clone(),
+            )?;
+            let Some(record) = metadb_tx::read_replicated_control_record(&engine)? else {
+                continue;
+            };
+            let replace = match &best {
+                None => true,
+                Some(current) if record.sequence > current.sequence => true,
+                _ => false,
+            };
+            if replace {
+                best = Some(record);
+            }
+        }
+        Ok(best)
+    }
+
+    /// Copies a committed directory off `leaving` before that shard's log is closed.
+    ///
+    /// The next open shard receives the same cell ids. An empty directory is not
+    /// proposed. If no other group is open, the handoff is refused.
+    async fn preserve_control_snapshot_before_handoff(&self, leaving: ShardId) -> Result<()> {
+        let Some(group) = self.host.get_group(leaving) else {
+            return Ok(());
+        };
+        let Some(record) = metadb_tx::read_replicated_control_record(group.engine().as_ref())?
+        else {
+            return Ok(());
+        };
+        let next_id = self
+            .running_shard_ids()
+            .into_iter()
+            .find(|shard_id| *shard_id != leaving);
+        let Some(next_id) = next_id else {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "shard {leaving} holds the committed cell directory and no other shard group is open; refusing to hand it off or publish an empty directory"
+            )));
+        };
+        let Some(next) = self.host.get_group(next_id) else {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "shard {next_id} stopped before the committed directory could be copied"
+            )));
+        };
+        self.propose_control_on_group(
+            next.as_ref(),
+            record.directory_cell_ids.clone(),
+            record.directory_body.clone(),
+            record.manager_body.clone(),
+            Some(record.sequence),
+        )
+        .await?;
+        let copied = metadb_tx::read_replicated_control_record(next.engine().as_ref())?
+            .ok_or_else(|| {
+                MetaDbError::ShardRoutingError(format!(
+                    "shard {next_id} did not store the committed cell directory; the old log was kept"
+                ))
+            })?;
+        if copied.directory_cell_ids != record.directory_cell_ids
+            || copied.directory_body != record.directory_body
+        {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "shard {next_id} stored a different cell directory; refusing to drop the committed snapshot"
+            )));
+        }
+        Ok(())
     }
 
     /// Snapshot committed on this cell's existing shard Raft group, if any.
     ///
     /// A value that does not decode fails closed. This does not create cells.
     pub fn replicated_control(&self) -> Result<Option<metadb_tx::ReplicatedControlRecord>> {
-        let group = self.control_group()?;
-        metadb_tx::read_replicated_control_record(group.engine().as_ref())
+        if let Some(shard_id) = self.running_carrier_with_record()? {
+            let group = self.host.get_group(shard_id).ok_or_else(|| {
+                MetaDbError::ShardRoutingError(format!(
+                    "shard {shard_id} dropped its control snapshot while it was being read"
+                ))
+            })?;
+            return metadb_tx::read_replicated_control_record(group.engine().as_ref());
+        }
+        if let Some(record) = self.read_handed_off_control_record()? {
+            return Ok(Some(record));
+        }
+        if self.committed_snapshot_unreadable_after_handoff()? {
+            return Err(MetaDbError::ShardRoutingError(
+                "committed cell directory is not readable after jumbo handoff; refusing to publish an empty directory"
+                    .to_string(),
+            ));
+        }
+        Ok(None)
     }
 
     /// Fail closed when the replicated manager snapshot does not decode.
@@ -2635,7 +2850,8 @@ impl DurableCellManager {
             codec::serialize(&*state)
                 .map_err(|error| MetaDbError::CodecError(format!("CELL_MANAGER_STATE: {error}")))?
         };
-        self.propose_control_plane(directory_cell_ids, directory_body, manager_body)
+        let floor = self.replicated_control()?.map(|record| record.sequence);
+        self.propose_control_plane(directory_cell_ids, directory_body, manager_body, floor)
             .await
     }
 
@@ -2651,11 +2867,23 @@ impl DurableCellManager {
             codec::serialize(&*state)
                 .map_err(|error| MetaDbError::CodecError(format!("CELL_MANAGER_STATE: {error}")))?
         };
-        let (directory_cell_ids, directory_body) = match self.replicated_control()? {
-            Some(current) => (current.directory_cell_ids, current.directory_body),
-            None => (Vec::new(), encode_directory_body(&BTreeMap::new())?),
+        let (directory_cell_ids, directory_body, floor) = match self.replicated_control()? {
+            Some(current) => (
+                current.directory_cell_ids,
+                current.directory_body,
+                Some(current.sequence),
+            ),
+            None => {
+                if self.committed_snapshot_unreadable_after_handoff()? {
+                    return Err(MetaDbError::ShardRoutingError(
+                        "committed cell directory is not readable after jumbo handoff; refusing to publish an empty directory"
+                            .to_string(),
+                    ));
+                }
+                (Vec::new(), encode_directory_body(&BTreeMap::new())?, None)
+            }
         };
-        self.propose_control_plane(directory_cell_ids, directory_body, manager_body)
+        self.propose_control_plane(directory_cell_ids, directory_body, manager_body, floor)
             .await?;
         Ok(())
     }
@@ -2665,13 +2893,39 @@ impl DurableCellManager {
         directory_cell_ids: Vec<CellId>,
         directory_body: Vec<u8>,
         manager_body: Vec<u8>,
+        floor_sequence: Option<u64>,
     ) -> Result<bool> {
         let group = self.control_group()?;
+        self.propose_control_on_group(
+            group.as_ref(),
+            directory_cell_ids,
+            directory_body,
+            manager_body,
+            floor_sequence,
+        )
+        .await
+    }
+
+    async fn propose_control_on_group(
+        &self,
+        group: &metadb_raft::ShardRaftGroup,
+        directory_cell_ids: Vec<CellId>,
+        directory_body: Vec<u8>,
+        manager_body: Vec<u8>,
+        floor_sequence: Option<u64>,
+    ) -> Result<bool> {
         let leader = group.wait_for_leader(Duration::from_secs(15)).await?;
         if leader != self.host.node_id() {
             return Ok(false);
         }
         if let Some(current) = metadb_tx::read_replicated_control_record(group.engine().as_ref())? {
+            for cell_id in &current.directory_cell_ids {
+                if !directory_cell_ids.contains(cell_id) {
+                    return Err(MetaDbError::ShardRoutingError(format!(
+                        "refusing to drop replicated cell {cell_id}"
+                    )));
+                }
+            }
             if current.directory_cell_ids == directory_cell_ids
                 && current.directory_body == directory_body
                 && current.manager_body == manager_body
@@ -2679,9 +2933,37 @@ impl DurableCellManager {
                 return Ok(true);
             }
         }
+        let outside = self.record_outside_group(group.shard_id())?;
+        if let Some(prior) = &outside {
+            for cell_id in &prior.directory_cell_ids {
+                if !directory_cell_ids.contains(cell_id) {
+                    return Err(MetaDbError::ShardRoutingError(format!(
+                        "refusing to drop replicated cell {cell_id} while moving the committed directory"
+                    )));
+                }
+            }
+        }
         let sequence = match metadb_tx::read_replicated_control_record(group.engine().as_ref())? {
             Some(current) => current.sequence.saturating_add(1),
-            None => 1,
+            None => {
+                let floor = outside
+                    .as_ref()
+                    .map(|record| record.sequence)
+                    .or(floor_sequence)
+                    .unwrap_or(1);
+                let same = outside.as_ref().is_some_and(|record| {
+                    record.directory_cell_ids == directory_cell_ids
+                        && record.directory_body == directory_body
+                        && record.manager_body == manager_body
+                });
+                if same {
+                    floor
+                } else if outside.is_some() {
+                    floor.saturating_add(1)
+                } else {
+                    floor
+                }
+            }
         };
         if sequence == 0 {
             return Err(MetaDbError::CodecError(

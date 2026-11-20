@@ -107,7 +107,7 @@ There is no `metadb_raft_watermark_lag_entries` series and no per-shard placemen
 
 - シャードを増やす。`shard_split_threshold_bytes` を超える成長、または `metadb-ctl shard split` は、同じ `be/shards` ディレクトリの下にシャードグループを追加できます。親は左側のキー範囲を保持し、子はこのノード上の別の 1 投票者グループとして起動します。再起動は両方を開き直します。
 - デュアルモードフラグ。`shard enable-dual-mode` は 1 つの親 ID を印します。そのシャードの後の分割は `(pid, name)` で切ることがあります。
-- ジャンボフラグ。1 つの親がシャード上の `MetaTable` バイトの 85% を超えるとき、またはシャードの親が 1 つのとき、ルートは `JumboIsolated` になります。専用ノード ID は、このセルにすでに登録されたノードから選ばれます。ノードが 1 つのとき、フラグはこのプロセスを指します。ファイルは別ホストへ移動しません。
+- ジャンボフラグ。1 つの親がシャード上の `MetaTable` バイトの 85% を超えるとき、またはシャードの親が 1 つのとき、ルートは `JumboIsolated` になります。専用ノード ID は、このセルにすでに登録されたノードから選ばれます。ノードが 1 つのとき、フラグはこのプロセスを指します。フラグ自体はファイルを別ホストへ移しません。ループバックの `MOVE_STAGED` / `MOVE_LIVE` は `127.0.0.1` のリスナーへディレクトリを置けます。`metadbd` はそのリスナーを起動せず、Raft を開かず、`transfer_leader` を呼ばず、本番のホスト間コピーではありません。`docs/en/scale-control-plane-status.md` を参照。
 - プロセス内の投票者。`DurableCellManager::scale_out_replicas` は、それらのノード ID が登録されており、**かつ** 各アドレスがそのシャードのグループに対してすでに `RaftTransportService` を提供しているときに、learner を追加して昇格できます。`crates/metadb-raft/tests/multi_raft_failover_tests.rs` は、1 つのテストプロセス内の 3 つのリスナーと基本的な KV ステートマシンでこれを行います。メタデータのステートマシンではなく、`metadbd` を 3 プロセス起動するのでもありません。
 
 運用手順として動かないもの:
@@ -158,7 +158,7 @@ There is no `metadb_raft_watermark_lag_entries` series and no per-shard placemen
 
 1. `be`、`proxy`、`cell-manager`、`global-manager` の複数プロセス配置。
 2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
-3. ジャンボシャードを専用マシンに置き、他のシャードをそのマシンから移すこと。
+3. ジャンボシャードを専用マシンに置き、他のシャードをそのマシンから移すこと。ループバックのリスナーは `MOVE_STAGED` / `MOVE_LIVE` でジャンボディレクトリを受け取れます。それは `metadbd` ではなく、認証もなく、Raft を開かず、`transfer_leader` を呼ばず、別ホストへの本番コピーではありません。
 4. プロセス内の TLS。このプロセスは TLS を終端しない。TLS や証明書を求める設定キーは、平文で提供する代わりに拒否される。終端は外部プロキシに置く。シークレットがあるとき、Raft とメトリクスは他のサービスと同じベアラを使う。これは相互 TLS ではない。ハートビート駆動の制御ループは未実装である。
 5. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. A leader election makes `/readyz` and `/healthz` return 503 on replicas that do not know a leader. `[raft]` is loaded and is not `#[serde(skip)]`. Its values apply when a group starts and are not reloaded. See [Operability](../en/operability.md).
 6. A checked-in service-level result for `metadb-ctl bench`. The command prints numbers for the machine you run it on. This repository does not record one. See [Tests and benches](./testing.md).

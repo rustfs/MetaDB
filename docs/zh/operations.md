@@ -107,7 +107,7 @@ There is no `metadb_raft_watermark_lag_entries` series and no per-shard placemen
 
 - 更多分片。增长超过 `shard_split_threshold_bytes`，或 `metadb-ctl shard split`，可以在同一 `be/shards` 目录下增加分片组。父分片保留左侧键范围，子分片在本节点上作为另一个 1 投票者组启动。重启会重新打开两者。
 - 双模式标志。`shard enable-dual-mode` 标记一个父标识。该分片之后的分裂可以按 `(pid, name)` 切开。
-- 巨型标志。当一个父项超过该分片上 `MetaTable` 字节的 85%，或分片只有一个父项时，路由变为 `JumboIsolated`。专用节点标识从本单元已注册的节点中选出。只有一个节点时，标志指向本进程。没有文件被搬到另一台主机。
+- 巨型标志。当一个父项超过该分片上 `MetaTable` 字节的 85%，或分片只有一个父项时，路由变为 `JumboIsolated`。专用节点标识从本单元已注册的节点中选出。只有一个节点时，标志指向本进程。标志本身不会把文件搬到另一台主机。回环上的 `MOVE_STAGED` / `MOVE_LIVE` 可以把目录放到 `127.0.0.1` 监听器。`metadbd` 不启动该监听器，不打开 Raft，不调用 `transfer_leader`，也不是跨主机的生产拷贝。见 `docs/en/scale-control-plane-status.md`。
 - 进程内投票者。当这些节点标识已经注册，**并且** 每个地址已经为该分片的组提供 `RaftTransportService` 时，`DurableCellManager::scale_out_replicas` 可以添加 learner 并提升它们。`crates/metadb-raft/tests/multi_raft_failover_tests.rs` 用一个测试进程里的三个监听器和基本 KV 状态机做这件事，不是元数据状态机，也不是三个 `metadbd` 进程。
 
 不能当作运维步骤的做法：
@@ -158,7 +158,7 @@ There is no `metadb_raft_watermark_lag_entries` series and no per-shard placemen
 
 1. `be`、`proxy`、`cell-manager` 和 `global-manager` 的多进程布局。
 2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
-3. 把巨型分片放到独立机器上，并把其他分片从那台机器移走。
+3. 把巨型分片放到独立机器上，并把其他分片从那台机器移走。回环监听器可以用 `MOVE_STAGED` / `MOVE_LIVE` 接收一个巨型目录。它不是 `metadbd`，没有鉴权，不打开 Raft，不调用 `transfer_leader`，也不是搬到另一台主机的生产拷贝。
 4. 本进程内的 TLS。进程不终结 TLS。要求 TLS 或证书的配置键会被拒绝，而不是以明文提供服务。请在外部代理终结 TLS。密钥非空时，Raft 和指标与其他服务使用同一个持有者令牌；这不是双向 TLS。由心跳驱动的控制循环没有实现。
 5. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. A leader election makes `/readyz` and `/healthz` return 503 on replicas that do not know a leader. `[raft]` is loaded and is not `#[serde(skip)]`. Its values apply when a group starts and are not reloaded. See [Operability](../en/operability.md).
 6. A checked-in service-level result for `metadb-ctl bench`. The command prints numbers for the machine you run it on. This repository does not record one. See [Tests and benches](./testing.md).

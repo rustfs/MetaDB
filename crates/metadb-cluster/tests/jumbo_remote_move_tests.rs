@@ -41,8 +41,10 @@ async fn open_cell(dir: &Path) -> (Arc<ShardGroupHost>, Arc<DurableCellManager>)
 }
 
 fn drain_request() -> SpareDrainRequest {
+    // Shard 2 stays open. Its live voters are {1}, not this planned set, so
+    // the spare replacement must not change Raft.
     SpareDrainRequest {
-        shard_id: 1,
+        shard_id: 2,
         voters: BTreeSet::from([1, 2, 3]),
         remove: 3,
         add: 4,
@@ -80,6 +82,10 @@ async fn remote_live_cut_then_spare_drain_keeps_the_placement_row() {
     assert!(early.to_string().contains("not serving"), "{early}");
 
     cell.testing_mark_jumbo(1, 2, 9).unwrap();
+    let committed = cell
+        .replicated_control()
+        .unwrap()
+        .expect("open publishes the cell directory onto the lowest shard");
     let blocked = cell.reconcile_jumbo_placement(1, 9, 2).await.unwrap();
     assert_eq!(blocked.phase, PlacementPhase::Blocked);
     assert!(blocked.committed_moves.is_empty(), "{blocked:?}");
@@ -92,6 +98,11 @@ async fn remote_live_cut_then_spare_drain_keeps_the_placement_row() {
     assert_eq!(outcome.removed, 3);
     assert_eq!(outcome.added, 4);
     assert!(!outcome.raft_membership_changed);
+    assert_eq!(
+        cell.raft_voter_ids(2).unwrap(),
+        BTreeSet::from([1]),
+        "shard 2 is open and its live voters are not the planned set"
+    );
     assert!(!outcome.destination_raft_opened);
     assert!(!outcome.transfer_leader_called);
     assert!(!automatic_leadership_transfer_allowed());
@@ -142,6 +153,16 @@ async fn remote_live_cut_then_spare_drain_keeps_the_placement_row() {
     );
     assert!(!host.shard_dir(1).exists());
     assert!(cell.lookup_local_handle(2).is_ok());
+    let restored = cell
+        .replicated_control()
+        .unwrap()
+        .expect("handoff must not replace the committed directory with an empty snapshot");
+    assert_eq!(
+        restored.directory_cell_ids, committed.directory_cell_ids,
+        "cell ids must survive the carrier move"
+    );
+    assert_eq!(restored.directory_body, committed.directory_body);
+    assert!(restored.sequence >= committed.sequence);
     assert_eq!(cell.stored_remote_handoffs().unwrap().len(), 1);
     assert!(cell.stored_placement(1).is_some());
     host.shutdown_all().await.unwrap();
@@ -258,14 +279,41 @@ async fn live_dirsync_failure_does_not_delete_the_only_copy_or_drain() {
     assert!(source.exists());
     assert!(cell.lookup_local_handle(1).is_err());
     assert!(!disk.is_serving(1));
+    let published = disk
+        .dedicated_root()
+        .join("shards")
+        .join(format!("{:020}", 1u64));
     assert!(
         metadb_cluster::jumbo_files::load_live_dir(disk.dedicated_root(), 1)
             .unwrap()
             .is_some(),
         "MOVE_LIVE stays visible"
     );
+    assert!(!metadb_cluster::jumbo_files::live_dirsync_is_durable(&published).unwrap());
     assert!(cell.stored_spare_drains().unwrap().is_empty());
     assert!(cell.stored_remote_handoffs().unwrap().is_empty());
+    disk.testing_report_visible_dirsync_failure();
+    let retried = cell
+        .relocate_jumbo_shard_to_remote(1, 2, disk.local_addr(), &drain_request())
+        .await
+        .unwrap_err();
+    let retry_text = retried.to_string();
+    assert!(
+        retry_text.contains("directory fsync failed"),
+        "{retry_text}"
+    );
+    assert!(retry_text.contains("not deleted"), "{retry_text}");
+    assert!(
+        retry_text.contains("spare voter was not replaced"),
+        "{retry_text}"
+    );
+    assert!(
+        source.exists(),
+        "HELLO_ALREADY_LIVE alone must not delete the source"
+    );
+    assert!(cell.stored_spare_drains().unwrap().is_empty());
+    assert!(cell.stored_remote_handoffs().unwrap().is_empty());
+    assert!(!disk.is_serving(1));
     assert_eq!(cell.raft_voter_ids(2).unwrap(), BTreeSet::from([1]));
     host.shutdown_all().await.unwrap();
     stop_listener(task).await;

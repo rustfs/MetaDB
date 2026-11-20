@@ -32,8 +32,9 @@ use metadb_storage::sstable::sync_dir;
 
 use crate::identity::node_id_in_ha_range;
 use crate::jumbo_files::{
-    load_live_dir, refuse_dedicated_root, remove_tree, shard_move_dir, write_move_phase,
-    MovePhaseError, MovedFile, JUMBO_MOVE_FILE, MOVE_LIVE, MOVE_STAGED,
+    live_dirsync_is_durable, load_live_dir, refuse_dedicated_root, remove_tree, seal_live_dirsync,
+    shard_move_dir, testing_fail_live_dirsync_at, write_move_phase, MovePhaseError, MovedFile,
+    JUMBO_LIVE_DURABLE_FILE, JUMBO_MOVE_FILE, MOVE_LIVE, MOVE_STAGED,
 };
 use crate::jumbo_placement::SpareDrainPlan;
 
@@ -60,6 +61,8 @@ const KIND_LIVE_DIRSYNC: u32 = 11;
 
 const HELLO_ACCEPT: u32 = 1;
 const HELLO_ALREADY_LIVE: u32 = 2;
+/// `MOVE_LIVE` is visible. The destination directory fsync has not finished.
+const HELLO_LIVE_NOT_DURABLE: u32 = 3;
 
 /// One spare replacement committed only after a remote `MOVE_LIVE` cut.
 #[derive(
@@ -116,6 +119,7 @@ impl std::fmt::Display for PushFailure {
 }
 
 pub enum PushResult {
+    /// Directory fsync of `MOVE_LIVE` finished. The source may be removed.
     LiveCut,
 }
 
@@ -127,8 +131,7 @@ pub struct RemoteJumboDisk {
     local_addr: SocketAddr,
     serving: Mutex<BTreeSet<ShardId>>,
     fail_before_live: AtomicBool,
-    /// Report `MOVE_LIVE` as visible while refusing to serve. The rename has
-    /// already been published by `write_move_phase`.
+    /// The next `MOVE_LIVE` directory fsync on this disk fails after the rename.
     fail_visible_dirsync: AtomicBool,
 }
 
@@ -250,14 +253,25 @@ impl RemoteJumboDisk {
                     if load_live_dir(&self.dedicated_root, shard_id)?.is_some() {
                         session.shard_id = Some(shard_id);
                         session.keep_tree = true;
-                        self.mark_serving(shard_id);
+                        if live_dirsync_is_durable(&dest)? {
+                            self.mark_serving(shard_id);
+                            write_frame(
+                                &mut stream,
+                                KIND_HELLO_OK,
+                                &HELLO_ALREADY_LIVE.to_le_bytes(),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        // The rename is visible. The directory fsync is not.
+                        // Do not serve and do not let the source delete its copy.
                         write_frame(
                             &mut stream,
                             KIND_HELLO_OK,
-                            &HELLO_ALREADY_LIVE.to_le_bytes(),
+                            &HELLO_LIVE_NOT_DURABLE.to_le_bytes(),
                         )
                         .await?;
-                        return Ok(());
+                        continue;
                     }
                     if dest.exists() {
                         remove_tree(&dest)?;
@@ -334,22 +348,46 @@ impl RemoteJumboDisk {
                         )
                     })?;
                     let dest = shard_move_dir(&self.dedicated_root, shard_id);
+                    if load_live_dir(&self.dedicated_root, shard_id)?.is_some() {
+                        if self.fail_visible_dirsync.swap(false, Ordering::Relaxed) {
+                            testing_fail_live_dirsync_at(&dest, 2);
+                        }
+                        match seal_live_dirsync(&dest, shard_id) {
+                            Ok(()) => {
+                                session.keep_tree = true;
+                                self.mark_serving(shard_id);
+                                write_frame(&mut stream, KIND_LIVE_OK, &[]).await?;
+                                return Ok(());
+                            }
+                            Err(MovePhaseError::LiveVisibleDirSyncFailed(error)) => {
+                                session.keep_tree = true;
+                                let message = format!(
+                                    "MOVE_LIVE is visible on {} but the directory fsync failed; the destination copy was not deleted and it is not serving: {error}",
+                                    dest.display()
+                                );
+                                write_frame(&mut stream, KIND_LIVE_DIRSYNC, message.as_bytes())
+                                    .await?;
+                                return Err(MetaDbError::StorageIoError(message));
+                            }
+                            Err(MovePhaseError::NotPublished(error)) => {
+                                let message = format!(
+                                    "failed before the live cut; MOVE_LIVE was not published: {error}"
+                                );
+                                write_err(&mut stream, &message).await?;
+                                return Err(MetaDbError::StorageIoError(message));
+                            }
+                        }
+                    }
                     if self.fail_before_live.swap(false, Ordering::Relaxed) {
                         session.cleanup();
                         let message = "failed before the live cut; MOVE_LIVE was not published";
                         write_err(&mut stream, message).await?;
                         return Err(MetaDbError::StorageIoError(message.to_string()));
                     }
+                    if self.fail_visible_dirsync.swap(false, Ordering::Relaxed) {
+                        testing_fail_live_dirsync_at(&dest, 2);
+                    }
                     match write_move_phase(&dest, shard_id, MOVE_LIVE, &received) {
-                        Ok(()) if self.fail_visible_dirsync.swap(false, Ordering::Relaxed) => {
-                            session.keep_tree = true;
-                            let message = format!(
-                                "MOVE_LIVE is visible on {} but the directory fsync failed; the destination copy was not deleted and it is not serving",
-                                dest.display()
-                            );
-                            write_frame(&mut stream, KIND_LIVE_DIRSYNC, message.as_bytes()).await?;
-                            return Err(MetaDbError::StorageIoError(message));
-                        }
                         Ok(()) => {
                             session.keep_tree = true;
                             self.mark_serving(shard_id);
@@ -483,6 +521,9 @@ pub async fn push_jumbo_shard(
     if status == HELLO_ALREADY_LIVE {
         return Ok(PushResult::LiveCut);
     }
+    if status == HELLO_LIVE_NOT_DURABLE {
+        return seal_from_open_session(&mut stream).await;
+    }
     if status != HELLO_ACCEPT {
         return Err(before_live(format!(
             "jumbo remote destination refused the hello with status {status}"
@@ -556,14 +597,22 @@ pub async fn push_jumbo_shard(
     }
 }
 
-/// HELLO only. Used when a handoff record already exists and the source must
-/// see `MOVE_LIVE` again before it deletes a leftover directory.
-pub async fn destination_has_live_cut(
+/// What the destination has published. `Durable` is the only state that may
+/// delete the source. A visible rename without a directory fsync is not enough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestinationCut {
+    Absent,
+    VisibleNotDurable,
+    Durable,
+}
+
+/// HELLO only. Does not delete a visible `MOVE_LIVE` tree.
+pub async fn destination_live_cut(
     shard_id: ShardId,
     source_node: NodeId,
     dest_node: NodeId,
     dest_addr: SocketAddr,
-) -> Result<bool> {
+) -> Result<DestinationCut> {
     refuse_non_loopback(dest_addr)?;
     let mut stream = TcpStream::connect(dest_addr)
         .await
@@ -584,11 +633,57 @@ pub async fn destination_has_live_cut(
         ));
     }
     let status = u32::from_le_bytes(frame.payload.as_slice().try_into().unwrap());
-    if status == HELLO_ALREADY_LIVE {
-        return Ok(true);
+    let cut = match status {
+        HELLO_ALREADY_LIVE => DestinationCut::Durable,
+        HELLO_LIVE_NOT_DURABLE => DestinationCut::VisibleNotDurable,
+        HELLO_ACCEPT => DestinationCut::Absent,
+        other => {
+            return Err(MetaDbError::StorageIoError(format!(
+                "jumbo remote hello status {other} is not a live cut"
+            )))
+        }
+    };
+    if cut == DestinationCut::Absent {
+        abort_best_effort(&mut stream).await;
     }
-    abort_best_effort(&mut stream).await;
-    Ok(false)
+    Ok(cut)
+}
+
+async fn seal_from_open_session(
+    stream: &mut TcpStream,
+) -> std::result::Result<PushResult, PushFailure> {
+    if let Err(error) = write_frame(stream, KIND_LIVE, &[]).await {
+        return Err(PushFailure {
+            live_visible: true,
+            message: error.to_string(),
+        });
+    }
+    let live = match read_frame(stream).await {
+        Ok(frame) => frame,
+        Err(error) => {
+            return Err(PushFailure {
+                live_visible: true,
+                message: error.to_string(),
+            })
+        }
+    };
+    match live.kind {
+        KIND_LIVE_OK => Ok(PushResult::LiveCut),
+        KIND_LIVE_DIRSYNC => Err(PushFailure {
+            live_visible: true,
+            message: message_of(&live.payload),
+        }),
+        KIND_ERR => Err(PushFailure {
+            live_visible: true,
+            message: message_of(&live.payload),
+        }),
+        other => Err(PushFailure {
+            live_visible: true,
+            message: format!(
+                "jumbo remote live cut returned frame {other}; the directory fsync was not confirmed"
+            ),
+        }),
+    }
 }
 
 pub fn load_spare_drains(dir: &Path) -> Result<Vec<SpareDrainRecord>> {
@@ -995,7 +1090,12 @@ fn collect_files(source: &Path, prefix: &str, files: &mut Vec<(String, PathBuf)>
             ))
         })?;
         let move_tmp = format!("{JUMBO_MOVE_FILE}.tmp");
-        if name == JUMBO_MOVE_FILE || name == move_tmp {
+        let durable_tmp = format!("{JUMBO_LIVE_DURABLE_FILE}.tmp");
+        if name == JUMBO_MOVE_FILE
+            || name == move_tmp
+            || name == JUMBO_LIVE_DURABLE_FILE
+            || name == durable_tmp
+        {
             continue;
         }
         if name.is_empty()
@@ -1077,7 +1177,8 @@ fn scan_serving(root: &Path) -> Result<BTreeSet<ShardId>> {
         let Ok(shard_id) = text.parse::<ShardId>() else {
             continue;
         };
-        if load_live_dir(root, shard_id)?.is_some() {
+        let dest = shard_move_dir(root, shard_id);
+        if load_live_dir(root, shard_id)?.is_some() && live_dirsync_is_durable(&dest)? {
             serving.insert(shard_id);
         }
     }

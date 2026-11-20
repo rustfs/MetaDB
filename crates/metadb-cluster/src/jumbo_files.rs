@@ -20,16 +20,31 @@ use metadb_core::{append_crc32c_le, verify_crc32c_le, MetaDbError, Result, Shard
 use metadb_storage::sstable::sync_dir;
 
 pub const JUMBO_MOVE_FILE: &str = "JUMBO_FILE_MOVE";
+/// Written only after the `MOVE_LIVE` directory fsync succeeds.
+pub const JUMBO_LIVE_DURABLE_FILE: &str = "JUMBO_LIVE_DURABLE";
 const MOVE_VERSION: u32 = 1;
 pub const MOVE_STAGED: u32 = 1;
 pub const MOVE_LIVE: u32 = 2;
 
 static FAIL_LIVE_DIRSYNC: AtomicU32 = AtomicU32::new(0);
+static FAIL_LIVE_DIRSYNC_AT: std::sync::Mutex<Vec<(std::path::PathBuf, u32)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// The next `n` directory fsyncs after a successful `MOVE_LIVE` rename fail.
 /// The renamed file stays visible.
 pub fn testing_fail_next_live_dirsync(n: u32) {
     FAIL_LIVE_DIRSYNC.store(n, Ordering::Relaxed);
+}
+
+/// The next `n` `MOVE_LIVE` directory fsyncs for this destination fail.
+/// The renamed `MOVE_LIVE` file stays visible. Other directories are not affected.
+pub fn testing_fail_live_dirsync_at(dest: &Path, n: u32) {
+    let mut pending = FAIL_LIVE_DIRSYNC_AT.lock().unwrap();
+    if let Some((_, left)) = pending.iter_mut().find(|(path, _)| path == dest) {
+        *left = n;
+    } else {
+        pending.push((dest.to_path_buf(), n));
+    }
 }
 
 /// Why [`write_move_phase`] failed.
@@ -122,6 +137,30 @@ pub fn load_live_dir(dedicated_root: &Path, shard_id: ShardId) -> Result<Option<
     // the LSM append. A later open only rejects a missing file or a symlink.
     ensure_live_files_present(&dest, &record.files)?;
     Ok(Some(dest))
+}
+
+/// `MOVE_LIVE` is visible and the destination directory fsync finished.
+///
+/// A visible rename without this marker is not a completed live cut.
+pub fn live_dirsync_is_durable(dest: &Path) -> Result<bool> {
+    let path = dest.join(JUMBO_LIVE_DURABLE_FILE);
+    if !path.exists() {
+        return Ok(false);
+    }
+    refuse_symlink(&path)?;
+    let mut raw = Vec::new();
+    File::open(&path)?.read_to_end(&mut raw)?;
+    let body = verify_crc32c_le(&raw, JUMBO_LIVE_DURABLE_FILE)?;
+    if body.len() != 8 {
+        return Err(MetaDbError::CodecError(format!(
+            "{JUMBO_LIVE_DURABLE_FILE} is the wrong length"
+        )));
+    }
+    let recorded = ShardId::from_le_bytes(body.try_into().unwrap());
+    let Some(record) = read_record(dest)? else {
+        return Ok(false);
+    };
+    Ok(record.phase == MOVE_LIVE && record.shard_id == recorded)
 }
 
 fn ensure_live_files_present(dest: &Path, files: &[MovedFile]) -> Result<()> {
@@ -247,14 +286,86 @@ pub fn write_move_phase(
             "{JUMBO_MOVE_FILE} rename failed and the phase is not visible: {error}"
         ))
     })?;
-    // The new name is visible. A directory fsync failure must not hide that.
+    // The new name is visible. A directory fsync failure must not hide that,
+    // and it must not mark the live cut durable.
     if let Err(error) = sync_published_dir(dest, phase) {
         if phase == MOVE_LIVE {
             return Err(MovePhaseError::LiveVisibleDirSyncFailed(error));
         }
         return Err(MovePhaseError::NotPublished(error));
     }
+    if phase == MOVE_LIVE {
+        if let Err(error) = mark_live_dirsync_durable(dest, shard_id) {
+            return Err(MovePhaseError::LiveVisibleDirSyncFailed(format!(
+                "{JUMBO_MOVE_FILE} is visible but the durable directory marker was not written: {error}"
+            )));
+        }
+    }
     Ok(())
+}
+
+/// Retries the directory fsync for a `MOVE_LIVE` file that is already visible.
+///
+/// Success writes [`JUMBO_LIVE_DURABLE_FILE`]. Failure leaves the rename in place
+/// and does not create that marker.
+pub fn seal_live_dirsync(
+    dest: &Path,
+    shard_id: ShardId,
+) -> std::result::Result<(), MovePhaseError> {
+    let visible =
+        read_record(dest).map_err(|error| MovePhaseError::NotPublished(error.to_string()))?;
+    let Some(record) = visible else {
+        return Err(MovePhaseError::NotPublished(format!(
+            "{JUMBO_MOVE_FILE} is not visible; the live cut was not sealed"
+        )));
+    };
+    if record.phase != MOVE_LIVE || record.shard_id != shard_id {
+        return Err(MovePhaseError::NotPublished(format!(
+            "{JUMBO_MOVE_FILE} is not a live record for shard {shard_id}"
+        )));
+    }
+    if let Err(error) = sync_published_dir(dest, MOVE_LIVE) {
+        return Err(MovePhaseError::LiveVisibleDirSyncFailed(error));
+    }
+    mark_live_dirsync_durable(dest, shard_id).map_err(|error| {
+        MovePhaseError::LiveVisibleDirSyncFailed(format!(
+            "{JUMBO_MOVE_FILE} is visible but the durable directory marker was not written: {error}"
+        ))
+    })
+}
+
+fn mark_live_dirsync_durable(dest: &Path, shard_id: ShardId) -> Result<()> {
+    let mut raw = shard_id.to_le_bytes().to_vec();
+    append_crc32c_le(&mut raw);
+    let path = dest.join(JUMBO_LIVE_DURABLE_FILE);
+    refuse_symlink_allow_missing(&path)?;
+    let tmp = dest.join(format!("{JUMBO_LIVE_DURABLE_FILE}.tmp"));
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(&raw)?;
+        file.sync_data()?;
+    }
+    fs::rename(&tmp, &path)?;
+    sync_dir(dest)?;
+    Ok(())
+}
+
+fn consume_path_dirsync_failure(dest: &Path) -> bool {
+    let mut pending = FAIL_LIVE_DIRSYNC_AT.lock().unwrap();
+    let Some(index) = pending.iter().position(|(path, _)| path == dest) else {
+        return false;
+    };
+    let left = pending[index].1;
+    if left <= 1 {
+        pending.remove(index);
+    } else {
+        pending[index].1 = left - 1;
+    }
+    true
 }
 
 fn sync_published_dir(dest: &Path, phase: u32) -> std::result::Result<(), String> {
@@ -263,6 +374,10 @@ fn sync_published_dir(dest: &Path, phase: u32) -> std::result::Result<(), String
     for _ in 0..attempts {
         if phase == MOVE_LIVE && FAIL_LIVE_DIRSYNC.load(Ordering::Relaxed) > 0 {
             FAIL_LIVE_DIRSYNC.fetch_sub(1, Ordering::Relaxed);
+            last = format!("{JUMBO_MOVE_FILE} is visible but the directory fsync failed");
+            continue;
+        }
+        if phase == MOVE_LIVE && consume_path_dirsync_failure(dest) {
             last = format!("{JUMBO_MOVE_FILE} is visible but the directory fsync failed");
             continue;
         }
