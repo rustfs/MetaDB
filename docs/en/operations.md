@@ -123,7 +123,7 @@ What does not work as an operator procedure:
 3. `metadb-ctl cell register` records a second cell only after that cell's manager is reachable and its routes cover the requested range. The registrar does not serve or forward those keys. `open_and_serve` still starts one all-in-one cell per process.
 4. The in-memory `MetaDbEngine::new_single_node` path used by tests `T1`–`T6` can bump an in-memory voter count to 3. That object has no disk and no Raft. It is not a scale-out of `metadbd`.
 
-`topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. Disaggregated roles and a second Cell are still not live deployments. Jumbo dedicated-node isolation remains a route flag, not a move of shards onto another machine.
+`topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. Disaggregated roles are still not a live deployment. A second cell can be recorded in this process's `GLOBAL_CELL_DIRECTORY` after its routes cover the requested range. That registration is not a production multi-cell deployment: forwarding, a replicated directory, role split, Jumbo file moves, and automatic leadership transfer are not delivered. Jumbo dedicated-node isolation remains a route flag, not a move of shards onto another machine.
 
 ## Errors you can hit
 

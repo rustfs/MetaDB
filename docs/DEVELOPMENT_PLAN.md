@@ -59,6 +59,8 @@ flowchart TD
     Proxy --> Server
 ```
 
+`metadb-transport` is not one of those eight data-path crates. It is a later policy crate. The only carried transport remains tonic gRPC over TCP. RDMA is recognized and rejected. See [`designs/rdma_transport.md`](./designs/rdma_transport.md).
+
 ### 1.3 Workspace Engineering Rules (Enforced Across All Phases)
 1. **100% Rust & 100% English**: Zero `unsafe` C/C++ bindings (`rocksdb` / `leveldb` FFI forbidden). All code, Rustdoc comments, error messages, commit messages, and technical specs must be written in English.
 2. **Documentation Synchronization**: At the end of every phase, update the implementation status matrix in `Architecture.md`, `README.md`, and the five multilingual usage guide suites (`docs/guides/{en,ja,fr,zh,de}/`) to reflect newly landed capabilities accurately.
