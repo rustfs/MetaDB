@@ -9,9 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use metadb_core::{
-    CompositeKeyRange, HlcTimestamp, HybridLogicalClock, InodeId, LeaseRenewReject, MetaDbError,
-    MetaKey, Result, ShardEpoch, TxnState, TxnStatusRecord, WriteIntentRecord, ROOT_INODE_ID,
-    SYSTEM_PREFIX_TXN_RECORD, SYSTEM_PREFIX_WRITE_INTENT,
+    encode_lease_preimage, lease_preimage_key, CompositeKeyRange, HlcTimestamp, HybridLogicalClock,
+    InodeId, IntentOp, LeasePreimageValue, LeaseRenewReject, MetaDbError, MetaKey, Result,
+    ShardEpoch, TxnState, TxnStatusRecord, WriteIntentKey, WriteIntentRecord, ROOT_INODE_ID,
+    SYSTEM_PREFIX_LEASE_PREIMAGE, SYSTEM_PREFIX_TXN_RECORD, SYSTEM_PREFIX_WRITE_INTENT,
 };
 use metadb_raft::{
     ChannelPool, MultiRaftRouter, RaftNodeOptions, ShardRaftGroup, ShardWatermarkTracker,
@@ -1393,4 +1394,151 @@ async fn corrupt_preimage_record_does_not_block_restart() {
     let tx = DistributedTxRouter::new(1, restarted.clock.clone(), restarted.directory.clone());
     let kept = tx.lookup(100, "legacy.txt").await.unwrap().unwrap();
     assert_eq!(kept.attr.inode_id, 1013);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sweep_deletes_orphan_preimages_without_removing_a_live_capture() {
+    let dir = tempdir().unwrap();
+    let cluster = boot_cluster(dir.path()).await;
+    let tx = DistributedTxRouter::new(1, cluster.clock.clone(), cluster.directory.clone());
+    seed_dirs(&tx).await;
+    tx.create_file(100, "pinned.txt", 1014, 8014, 10, 0o644, 4)
+        .await
+        .unwrap();
+    let error = tx
+        .rename_with_fault_injection(
+            100,
+            "pinned.txt",
+            600,
+            "pinned-dst.txt",
+            false,
+            TwoPcCrashStage::StopAfterPrepareBeforePrimaryCommit,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MetaDbError::RpcError(_)));
+    cluster.shard1.flush_snapshot_and_purge().await.unwrap();
+    let pending = txn_records(&cluster.shard1).await.remove(0);
+    let user_key = MetaKey::child(100, "pinned.txt").encode();
+    let orphan_txn = 99u128;
+    let orphan_key = lease_preimage_key(orphan_txn, &user_key);
+    let orphan_body = encode_lease_preimage(
+        pending.start_hlc,
+        &LeasePreimageValue::Value(b"orphan".to_vec()),
+    );
+    let mut corrupt_key = vec![SYSTEM_PREFIX_LEASE_PREIMAGE];
+    corrupt_key.extend_from_slice(&98u128.to_be_bytes());
+    corrupt_key.extend_from_slice(b"corrupt");
+    let now = cluster.clock.now();
+    cluster
+        .shard1
+        .engine()
+        .apply_committed_put(orphan_key.clone(), orphan_body, now, 50);
+    cluster
+        .shard1
+        .engine()
+        .apply_committed_put(corrupt_key.clone(), b"garbage".to_vec(), now, 51);
+    propose_cmd(
+        &cluster.shard1,
+        &cluster.clock,
+        &TxRaftCmd::SweepOrphanLeasePreimages,
+    )
+    .await
+    .unwrap();
+    let rows = {
+        let (_, snap) = cluster
+            .shard1
+            .linearizable_read(cluster.shard1.current_epoch())
+            .await
+            .unwrap();
+        cluster
+            .shard1
+            .engine()
+            .scan_with_snapshot(
+                &[SYSTEM_PREFIX_LEASE_PREIMAGE],
+                &[SYSTEM_PREFIX_LEASE_PREIMAGE.saturating_add(1)],
+                &snap,
+            )
+            .unwrap()
+    };
+    assert!(rows
+        .iter()
+        .all(|(key, _)| key != &orphan_key && key != &corrupt_key));
+    assert!(
+        rows.iter().any(|(key, _)| key
+            .windows(16)
+            .any(|window| { window == pending.txn_id.to_be_bytes() })),
+        "the prepared transaction's capture must stay until the lease ends"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_holder_without_a_start_can_keep_its_deadline_but_not_grow_it() {
+    let dir = tempdir().unwrap();
+    let cluster = boot_cluster(dir.path()).await;
+    let owner = (1u128 << 64) | 7;
+    let other = (1u128 << 64) | 8;
+    let stored_expire = HlcTimestamp::new(cluster.clock.now().physical_ms() + 30_000, 0);
+    let fence_key = MetaKey::dir_attr(100).encode();
+    let intent = WriteIntentRecord {
+        txn_id: owner,
+        primary_shard_hint: 1,
+        primary_key: fence_key.clone(),
+        start_hlc: HlcTimestamp::new(stored_expire.physical_ms() - 3_000, 0),
+        expire_hlc: stored_expire,
+        rename_fence_token: None,
+        op: IntentOp::DirExistsFenceSet {
+            holders: std::collections::BTreeMap::from([
+                (owner, (fence_key.clone(), stored_expire)),
+                (other, (fence_key.clone(), stored_expire)),
+            ]),
+        },
+    };
+    let intent_key = WriteIntentKey::new(fence_key).encode();
+    cluster.shard1.engine().apply_committed_put(
+        intent_key,
+        intent.encode(),
+        cluster.clock.now(),
+        3,
+    );
+    let same = propose_extend(
+        &cluster.shard1,
+        &cluster.clock,
+        other,
+        1,
+        HlcTimestamp::new(stored_expire.physical_ms() - 3_000, 0),
+        stored_expire,
+        None,
+        vec![MetaKey::dir_attr(100).encode()],
+    )
+    .await;
+    assert!(same.is_ok(), "{same:?}");
+    let longer = propose_extend(
+        &cluster.shard1,
+        &cluster.clock,
+        other,
+        1,
+        HlcTimestamp::new(stored_expire.physical_ms() - 3_000, 0),
+        HlcTimestamp::new(stored_expire.physical_ms() + 1_000, 0),
+        None,
+        vec![MetaKey::dir_attr(100).encode()],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(longer, MetaDbError::TransactionAborted(_)),
+        "{longer}"
+    );
+    assert!(!matches!(
+        longer,
+        MetaDbError::LeaseRenewRejected(LeaseRenewReject::FenceMismatch)
+    ));
+    let records = intent_records(&cluster.shard1).await;
+    let holder = records[0]
+        .resolved_fence_holders()
+        .unwrap()
+        .remove(&other)
+        .unwrap();
+    assert_eq!(holder.expire_hlc, stored_expire);
+    assert_eq!(holder.start_hlc, None);
 }

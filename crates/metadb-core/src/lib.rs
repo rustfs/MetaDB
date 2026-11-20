@@ -36,8 +36,9 @@ pub use schema::{
 pub use system_keys::{
     affinity_key_for_raw_entry, decode_lease_preimage, decode_origin_quota_cursor,
     encode_lease_preimage, encode_origin_quota_cursor, lease_preimage_blocks_split,
-    lease_preimage_key, lease_preimage_prefix, lease_preimage_prefix_end, AttrDeltaSpec,
-    AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, DirShardDeltaKey, DirShardDeltaRecord,
-    FenceHolder, IntentOp, LeasePreimageValue, OriginQuotaCursorKey, SpilledAuxOutboxKey,
-    TxnRecordKey, TxnState, TxnStatusRecord, WriteIntentKey, WriteIntentRecord,
+    lease_preimage_is_orphan, lease_preimage_key, lease_preimage_prefix, lease_preimage_prefix_end,
+    AttrDeltaSpec, AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, DirShardDeltaKey,
+    DirShardDeltaRecord, FenceHolder, IntentOp, LeasePreimageValue, OriginQuotaCursorKey,
+    SpilledAuxOutboxKey, TxnRecordKey, TxnState, TxnStatusRecord, WriteIntentKey,
+    WriteIntentRecord,
 };

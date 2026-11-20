@@ -318,6 +318,12 @@ impl LifecycleStorageEngine {
     pub fn get_with_snapshot(&self, key: &[u8], snap: &SnapshotGuard) -> Result<Option<Vec<u8>>> {
         let cut = snap.cut();
         snap.with_step_lease(|pinned| {
+            if pinned.version.checkpoint.flushed_max_hlc > cut.max_hlc {
+                return Err(MetaDbError::TransactionTimeout {
+                    snapshot_hlc: cut.max_hlc.as_u64(),
+                    oldest_retained_hlc: pinned.version.checkpoint.flushed_max_hlc.as_u64(),
+                });
+            }
             if let Some(mvcc_val) = self.mvcc.get_with_pinned(key, cut, pinned) {
                 return Ok(match mvcc_val {
                     MvccValue::Value(v) => Some(v),
@@ -345,6 +351,17 @@ impl LifecycleStorageEngine {
         }
 
         let cut = snap.cut();
+        let pinned_disk_hlc =
+            snap.with_step_lease(|pinned| Ok(pinned.version.checkpoint.flushed_max_hlc))?;
+        // The pinned SST is unversioned. It is safe only when every flushed value
+        // is at or before the cut. A newer checkpoint fails closed instead of
+        // returning folded values for keys the cut no longer covers.
+        if pinned_disk_hlc > cut.max_hlc {
+            return Err(MetaDbError::TransactionTimeout {
+                snapshot_hlc: cut.max_hlc.as_u64(),
+                oldest_retained_hlc: pinned_disk_hlc.as_u64(),
+            });
+        }
         let mut cursor = start_key.to_vec();
         let mut out = Vec::new();
 

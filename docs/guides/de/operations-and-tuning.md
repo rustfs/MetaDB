@@ -6,7 +6,7 @@
 
 ## 1. Administrations-CLI `metadb-ctl` `[Implementiert]`
 
-`[Implementiert]` means the `metadb-ctl` binary exists and talks to an all-in-one process. `cell register` does not create a cell. `metadbd --role be` is not a supported deployment. Output from a bench command is for the machine that ran it, not a checked-in result.
+`[Implementiert]` means the `metadb-ctl` binary exists and talks to an all-in-one process. `cell register` does not create a cell. `metadbd --role be` hosts local Raft replicas and does not mint id blocks. Output from a bench command is for the machine that ran it, not a checked-in result.
 
 ```bash
 # Cluster-, Cell-, BE-Knoten- und Raft-Watermark-Status prüfen

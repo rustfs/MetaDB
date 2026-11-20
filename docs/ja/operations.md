@@ -112,7 +112,7 @@ There is no `metadb_raft_watermark_lag_entries` series and no per-shard placemen
 
 運用手順として動かないもの:
 
-1. `metadbd --role be` and `--role proxy` still exit in `open_and_serve`. `--role global-manager` serves `GLOBAL_CELL_DIRECTORY` only and does not open Raft groups. `--role cell-manager` hosts one local cell and its Raft groups, and publishes that cell when `[cluster] global_manager` is set. The directory file is not a Raft group, and the global process does not forward keys.
+1. `metadbd --role be` hosts local Raft replicas and serves their metadata. It does not publish a cell or mint ids. `metadbd --role proxy` forwards metadata and transactions to one `[cluster] upstream` and does not host Raft. `--role global-manager` serves `GLOBAL_CELL_DIRECTORY` only and does not open Raft groups. `--role cell-manager` hosts one local cell and its Raft groups, and publishes that cell when `[cluster] global_manager` is set. The directory file is not a Raft group, and the global process does not forward keys.
 2. 2 つ目の `metadbd --role all-in-one` は、データディレクトリが空で `--join` または `--cell-manager` が現在のリーダーを指すとき、既存の Raft グループに参加します。リーダーは空エントリを追記してスナップショットを取り、参加者を learner から voter へ昇格します。`--join` はそのリーダーに届く必要があります。すでに Raft 状態があるディレクトリはそれを開き直し、新しい join アドレスを無視します。ノード ID 2 から 32767 の新しいアロケータは、そのノード自身の inode、file id、shard id 名前空間から始まるため、ノード 1 が既に発行した ID を再発行しません。既に低い ID を発行したアロケータファイルは移し替えません。リーダーが分かっている follower への `Lookup`、ディレクトリ一覧、ディレクトリ統計、`GetDirPartitionStat`、クォータ読み取り、セカンダリインデックス読み取りは、そのリーダーへ転送します。リーダーが不明な follower は引き続き `NotLeader` を返します。メンバーシップが joint の間、`GetRoutes` は適用済みの全投票者、現在のリーダー、適用済み epoch を報告します。均一構成がコミットされた後、それらの投票者と `conf_ver` は Raft と一致します。参加は一時的なエラーを 45 秒間再試行し、その後リスナーとローカル Raft グループを止めてエラーを返します。`metadbd` が終わるのは、起動がそのエラーを返したためです。最初の失敗だけではプロセスを中断しません。
 3. `metadb-ctl cell register` records a second cell only after that cell's routes cover the requested range. This process does not forward those keys. `open_and_serve` still starts one local cell.
 4. テスト `T1`–`T6` が使うメモリ内の `MetaDbEngine::new_single_node` は、メモリ上の投票者数を 3 に増やせます。そのオブジェクトにはディスクも Raft もありません。`metadbd` のスケールアウトではありません。
@@ -143,7 +143,7 @@ There is no `metadb_raft_watermark_lag_entries` series and no per-shard placemen
 
 ## 既知の制限
 
-- `all-in-one`, `cell-manager`, and `global-manager` start. `be` and `proxy` are rejected before listen. `global-manager` has no local shards and does not forward. `cell-manager` still colocates its Raft groups.
+- `all-in-one`, `cell-manager`, `global-manager`, `be`, and `proxy` start on a valid config. `be` hosts local replicas and does not mint ids. `proxy` forwards to one upstream and does not host Raft. `global-manager` has no local shards and does not forward. `cell-manager` still colocates its Raft groups.
 - A second all-in-one process can join the same cell with `[cluster] join`. That does not create a second cell. `RegisterCell` records a different cell only after its routes cover the requested range, and this process does not forward keys.
 - 未知で非ゼロの `cell_id` に対する `GetRoutes` は失敗して閉じる。`StoreHeartbeat` はキャッシュ済みルートを置き換えない。
 - ジャンボ隔離はルートフラグと、ローカルノード表から選んだノード ID である。他のシャードをディスクから追い出すことはしない。

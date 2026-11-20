@@ -44,22 +44,30 @@ fn heartbeat_request(seq: u64, node_id: u64, disk_free_bytes: u64) -> StoreHeart
 }
 
 #[tokio::test]
-async fn disaggregated_roles_are_rejected_before_listen() {
-    for role in [ServerRole::Be, ServerRole::Proxy] {
-        let mut cfg = ServerTomlConfig::default();
-        cfg.node.role = role;
-        cfg.node.data_dir = tempdir().unwrap().path().to_path_buf();
-        cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
-        let err = match PersistentMetaDbCluster::open_and_serve(cfg).await {
-            Ok(_) => panic!("disaggregated role {role:?} must not start"),
-            Err(err) => err,
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("not implemented"),
-            "role {role:?} error was: {msg}"
-        );
-    }
+async fn proxy_without_upstream_and_unauthenticated_be_fail_before_listen() {
+    let proxy_dir = tempdir().unwrap();
+    let mut proxy = ServerTomlConfig::default();
+    proxy.node.role = ServerRole::Proxy;
+    proxy.node.data_dir = proxy_dir.path().join("missing");
+    proxy.node.grpc_listen_addr = "127.0.0.1:0".into();
+    let message = match PersistentMetaDbCluster::open_and_serve(proxy).await {
+        Ok(_) => panic!("proxy without an upstream must not start"),
+        Err(error) => error.to_string(),
+    };
+    assert!(message.contains("upstream"), "{message}");
+    assert!(!proxy_dir.path().join("missing").exists());
+
+    let be_dir = tempdir().unwrap();
+    let mut be = ServerTomlConfig::default();
+    be.node.role = ServerRole::Be;
+    be.node.data_dir = be_dir.path().to_path_buf();
+    be.node.grpc_listen_addr = "127.0.0.1:0".into();
+    let message = match PersistentMetaDbCluster::open_and_serve(be).await {
+        Ok(_) => panic!("be without credentials must not start"),
+        Err(error) => error.to_string(),
+    };
+    assert!(message.contains("allow_unauthenticated"), "{message}");
+    assert!(!be_dir.path().join("be").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
