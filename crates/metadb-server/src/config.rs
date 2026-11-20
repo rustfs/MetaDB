@@ -158,6 +158,9 @@ impl SecuritySection {
 pub struct ShardingSection {
     pub bootstrap_table_shards: bool,
     pub shard_split_threshold_bytes: usize,
+    /// Directory outside `node.data_dir` for this process's jumbo shard files.
+    /// Empty leaves those files in the shared `be/shards` tree.
+    pub jumbo_dedicated_root: String,
 }
 
 impl Default for ShardingSection {
@@ -165,6 +168,7 @@ impl Default for ShardingSection {
         Self {
             bootstrap_table_shards: true,
             shard_split_threshold_bytes: 4 * 1024 * 1024 * 1024,
+            jumbo_dedicated_root: String::new(),
         }
     }
 }

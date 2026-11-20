@@ -14,6 +14,7 @@ metadb-storage = { path = "../metadb-storage" }
 metadb-raft = { path = "../metadb-raft" }
 metadb-tx = { path = "../metadb-tx" }
 wincode = { workspace = true }
+crc-fast = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

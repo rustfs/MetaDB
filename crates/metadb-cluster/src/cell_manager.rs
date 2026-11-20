@@ -25,6 +25,7 @@ use metadb_raft::{
 use metadb_storage::sstable::sync_dir;
 use metadb_storage::LsmEngineConfig;
 use metadb_tx::{RoutedShardHandle, TxStateMachineHandler};
+use tracing;
 
 use crate::cell_directory::{shards_covering, union_route_range};
 use crate::control_plane_state::{
@@ -35,6 +36,10 @@ use crate::control_plane_state::{
 use crate::id_allocator::{AllocIdKind, DurableIdAllocator};
 use crate::identity::{node_id_in_ha_range, random_id, ClusterIdentity};
 use crate::jumbo::JumboIsolationPlanner;
+use crate::jumbo_files::{
+    copy_shard_tree, load_live_dir, refuse_dedicated_root, remove_tree, shard_move_dir,
+    write_move_phase, MOVE_LIVE, MOVE_STAGED,
+};
 use crate::jumbo_placement::{
     automatic_leadership_transfer_allowed, executable_placement_actions,
     jumbo_membership_change_allowed, plan_jumbo_placement, CommittedMove, PlacementAction,
@@ -153,6 +158,10 @@ pub struct DurableCellManager {
     fail_control_persists: AtomicU32,
     /// Test hook: the next `n` persists rename the file and then fail the directory sync.
     fail_control_dirsync: AtomicU32,
+    /// Separate disk for this process's jumbo shard files. Empty means the shared `be` tree.
+    jumbo_dedicated_root: Mutex<Option<PathBuf>>,
+    /// Shard ids whose file move already failed in this process. Not retried until restart.
+    jumbo_file_move_failed: Mutex<HashSet<ShardId>>,
 }
 
 impl DurableCellManager {
@@ -181,6 +190,7 @@ impl DurableCellManager {
             id_allocator,
             meta_cache,
             None,
+            None,
         )
         .await
     }
@@ -201,6 +211,7 @@ impl DurableCellManager {
         id_allocator: Arc<DurableIdAllocator>,
         meta_cache: Arc<CompositeMetaCache>,
         owned_range: Option<CompositeKeyRange>,
+        jumbo_dedicated_root: Option<PathBuf>,
     ) -> Result<Arc<Self>> {
         node_id_in_ha_range(host.node_id())?;
         let state_dir = state_dir.as_ref().to_path_buf();
@@ -296,6 +307,9 @@ impl DurableCellManager {
             is_existing,
         )?;
         let control_plane = Self::load_control_plane(&state_dir)?;
+        if let Some(root) = jumbo_dedicated_root.as_ref() {
+            refuse_dedicated_root(host.data_dir(), root)?;
+        }
 
         let mgr = Arc::new(Self {
             cell_id,
@@ -317,6 +331,8 @@ impl DurableCellManager {
             control: Mutex::new(control_plane),
             fail_control_persists: AtomicU32::new(0),
             fail_control_dirsync: AtomicU32::new(0),
+            jumbo_dedicated_root: Mutex::new(jumbo_dedicated_root),
+            jumbo_file_move_failed: Mutex::new(HashSet::new()),
         });
 
         if let Err(error) = mgr.boot_local_shards().await {
@@ -428,6 +444,8 @@ impl DurableCellManager {
             control: Mutex::new(control_plane),
             fail_control_persists: AtomicU32::new(0),
             fail_control_dirsync: AtomicU32::new(0),
+            jumbo_dedicated_root: Mutex::new(None),
+            jumbo_file_move_failed: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -761,7 +779,7 @@ impl DurableCellManager {
                     wm.clone(),
                 ));
                 handler.set_instance_bindings(self.instance_bindings.clone());
-                let sdir = self.host.shard_dir(route.shard_id);
+                let sdir = self.resolved_shard_dir(route.shard_id)?;
                 let group = ShardRaftGroup::start(
                     route.shard_id,
                     self.host.node_id(),
@@ -859,6 +877,226 @@ impl DurableCellManager {
 
     pub fn local_node_id(&self) -> NodeId {
         self.host.node_id()
+    }
+
+    fn resolved_shard_dir(&self, shard_id: ShardId) -> Result<PathBuf> {
+        let Some(root) = self.jumbo_dedicated_root.lock().unwrap().clone() else {
+            return Ok(self.host.shard_dir(shard_id));
+        };
+        let Some(dest) = load_live_dir(&root, shard_id)? else {
+            return Ok(self.host.shard_dir(shard_id));
+        };
+        let source = self.host.shard_dir(shard_id);
+        if source.exists() {
+            remove_tree(&source)?;
+        }
+        Ok(dest)
+    }
+
+    /// Copies this process's jumbo shard directory onto `dedicated_root` and
+    /// reopens it there. The source is removed only after the copy verifies and
+    /// the new Raft group is running. Another machine's disk is not written.
+    /// `transfer_leader` is not called.
+    pub async fn relocate_jumbo_shard_files(
+        &self,
+        shard_id: ShardId,
+        dedicated_root: &Path,
+    ) -> Result<PathBuf> {
+        let _lock = self.membership_lock.lock().await;
+        refuse_dedicated_root(self.host.data_dir(), dedicated_root)?;
+        if self
+            .jumbo_file_move_failed
+            .lock()
+            .unwrap()
+            .contains(&shard_id)
+        {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "jumbo shard {shard_id} file move already failed in this process; the source was left in place and transfer_leader was not called"
+            )));
+        }
+        let route = {
+            let state = self.state.lock().unwrap();
+            state.routes.get(&shard_id).cloned()
+        };
+        let Some(route) = route else {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "shard {shard_id} has no route; files were not moved"
+            )));
+        };
+        match route.health_state {
+            ShardHealthState::JumboIsolated { dedicated_node, .. }
+                if dedicated_node == self.host.node_id() => {}
+            ShardHealthState::JumboIsolated { dedicated_node, .. } => {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "dedicated node {dedicated_node} is not this process; shard files stay on this disk. Another machine was not written and transfer_leader was not called"
+                )));
+            }
+            ShardHealthState::Normal => {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "shard {shard_id} is not jumbo-isolated; a route flag was not treated as a file move"
+                )));
+            }
+        }
+        *self.jumbo_dedicated_root.lock().unwrap() = Some(dedicated_root.to_path_buf());
+        let dest = shard_move_dir(dedicated_root, shard_id);
+        if load_live_dir(dedicated_root, shard_id)?.is_some() {
+            if self.host.get_group(shard_id).is_some() {
+                return Ok(dest);
+            }
+            self.open_shard_group(&route, &dest).await?;
+            return Ok(dest);
+        }
+        let source = self.host.shard_dir(shard_id);
+        if dest.exists() {
+            remove_tree(&dest)?;
+        }
+        if !source.exists() {
+            return Err(MetaDbError::StorageIoError(format!(
+                "jumbo shard {shard_id} directory {} is missing; nothing was published on {}",
+                source.display(),
+                dest.display()
+            )));
+        }
+        let group = self.host.get_group(shard_id).ok_or_else(|| {
+            MetaDbError::ShardRoutingError(format!(
+                "shard {shard_id} is not running; files were not moved"
+            ))
+        })?;
+        group.state_machine().flush_to_lsm().map_err(|error| {
+            MetaDbError::StorageIoError(format!(
+                "jumbo shard {shard_id} flush failed before the file move: {error}"
+            ))
+        })?;
+        group.shutdown().await?;
+        self.host.take_running_group(shard_id);
+        drop(group);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let files = match copy_shard_tree(&source, &dest) {
+            Ok(files) => files,
+            Err(error) => {
+                let _ = remove_tree(&dest);
+                self.open_shard_group(&route, &source).await?;
+                self.jumbo_file_move_failed.lock().unwrap().insert(shard_id);
+                return Err(error);
+            }
+        };
+        if let Err(error) = write_move_phase(&dest, shard_id, MOVE_STAGED, &files) {
+            let _ = remove_tree(&dest);
+            self.open_shard_group(&route, &source).await?;
+            self.jumbo_file_move_failed.lock().unwrap().insert(shard_id);
+            return Err(error);
+        }
+        if let Err(error) = self.open_shard_group(&route, &dest).await {
+            let _ = remove_tree(&dest);
+            let _ = self.open_shard_group(&route, &source).await;
+            self.jumbo_file_move_failed.lock().unwrap().insert(shard_id);
+            return Err(error);
+        }
+        if let Err(error) = write_move_phase(&dest, shard_id, MOVE_LIVE, &files) {
+            self.jumbo_file_move_failed.lock().unwrap().insert(shard_id);
+            return Err(error);
+        }
+        if let Err(error) = remove_tree(&source) {
+            return Err(MetaDbError::StorageIoError(format!(
+                "jumbo shard {shard_id} is open on {} but the old directory could not be removed: {error}",
+                dest.display()
+            )));
+        }
+        Ok(dest)
+    }
+
+    /// Moves every local jumbo shard whose dedicated node is this process.
+    /// No dedicated root means this returns without copying. A failed shard is
+    /// not retried until the process restarts. `transfer_leader` is not called.
+    pub async fn relocate_configured_jumbo_files(&self) -> Result<()> {
+        let Some(root) = self.jumbo_dedicated_root.lock().unwrap().clone() else {
+            return Ok(());
+        };
+        let shard_ids: Vec<ShardId> = {
+            let state = self.state.lock().unwrap();
+            state
+                .routes
+                .values()
+                .filter_map(|route| match route.health_state {
+                    ShardHealthState::JumboIsolated { dedicated_node, .. }
+                        if dedicated_node == self.host.node_id() =>
+                    {
+                        Some(route.shard_id)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        for shard_id in shard_ids {
+            if self
+                .jumbo_file_move_failed
+                .lock()
+                .unwrap()
+                .contains(&shard_id)
+            {
+                continue;
+            }
+            if let Err(error) = self.relocate_jumbo_shard_files(shard_id, &root).await {
+                tracing::warn!(%error, shard_id, "jumbo shard files were not moved");
+            }
+        }
+        Ok(())
+    }
+
+    async fn open_shard_group(&self, route: &CompositeShardRoute, dir: &Path) -> Result<()> {
+        let wm = Arc::new(ShardWatermarkTracker::default());
+        let handler = Arc::new(TxStateMachineHandler::new(
+            route.shard_id,
+            route.epoch,
+            route.range.clone(),
+            wm.clone(),
+        ));
+        handler.set_instance_bindings(self.instance_bindings.clone());
+        let voters: BTreeMap<NodeId, String> = route
+            .peers
+            .iter()
+            .filter(|(_, (_, voter))| *voter)
+            .map(|(&id, (addr, _))| (id, addr.clone()))
+            .collect();
+        let group = ShardRaftGroup::start(
+            route.shard_id,
+            self.host.node_id(),
+            dir,
+            self.host.block_cache().clone(),
+            self.lsm_config.clone(),
+            self.raft_opts.clone(),
+            handler.clone(),
+            wm,
+            self.host.clock().clone(),
+            self.host.router(),
+            self.host.channel_pool().clone(),
+        )
+        .await?;
+        group.initialize_if_needed(voters).await?;
+        self.host.register_running_group(group);
+        self.handlers
+            .write()
+            .unwrap()
+            .insert(route.shard_id, handler);
+        Ok(())
+    }
+
+    /// Test hook. Persists the jumbo route flag without moving files.
+    pub fn testing_mark_local_jumbo(&self, shard_id: ShardId, dominant_pid: InodeId) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let mut next = state.clone();
+        let route = next.routes.get_mut(&shard_id).ok_or_else(|| {
+            MetaDbError::ShardRoutingError(format!("shard {shard_id} has no route"))
+        })?;
+        route.health_state = ShardHealthState::JumboIsolated {
+            dedicated_node: self.host.node_id(),
+            dominant_pid,
+        };
+        let updated = route.clone();
+        self.persist_sync(&next)?;
+        *state = next;
+        self.meta_cache.upsert_route(updated);
+        Ok(())
     }
 
     pub fn host(&self) -> &Arc<ShardGroupHost> {

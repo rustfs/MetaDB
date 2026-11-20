@@ -1122,6 +1122,10 @@ impl ShardGroupHost {
         self.groups.write().unwrap().insert(group.shard_id(), group);
     }
 
+    pub fn take_running_group(&self, shard_id: ShardId) -> Option<Arc<ShardRaftGroup>> {
+        self.groups.write().unwrap().remove(&shard_id)
+    }
+
     pub fn get_group(&self, shard_id: ShardId) -> Option<Arc<ShardRaftGroup>> {
         self.groups.read().unwrap().get(&shard_id).cloned()
     }

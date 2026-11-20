@@ -24,6 +24,7 @@
 | `storage.locality_tombstone_ratio` | `0.50` | Yes. Multiplied by 1000, clamped to 1..=1000, stored as `tombstone_min_ratio_permille` |
 | `sharding.bootstrap_table_shards` | `true` | Yes. `true` creates shards 1, 2, and 3. `false` creates shard 1 over `[0x01, 0x04)` |
 | `sharding.shard_split_threshold_bytes` | `4294967296` (4 GiB) | Yes. Split check uses approximate shard size |
+| `sharding.jumbo_dedicated_root` | empty | Yes. A real directory outside the data directory. Empty does not move files. A symlink, or a path inside the data directory, refuses startup. The copy stays on this machine |
 | `security.shared_secret` | `""` | Yes. Empty does not start a listener. A value with a non-whitespace character requires the same bearer on gRPC and the metrics listener. Whitespace-only is rejected |
 | `security.allow_unauthenticated` | `false` | Yes. Explicit loopback-only development opt-in. It does not allow a non-loopback bind, and it cannot be combined with a usable secret |
 | `raft.heartbeat_interval_ms` | `150` | Yes, when each local Raft group starts. Not reloaded while the process runs |
