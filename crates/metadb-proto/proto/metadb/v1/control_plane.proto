@@ -54,11 +54,45 @@ message GetRoutesRequest {
   uint64 cell_id = 1;
 }
 
+// One move stored on a local placement row. Not a route and not a shard epoch.
+message PlacementMoveProto {
+  // 1 = leadership_transferred, 2 = voter_replaced. Zero is not a stored move.
+  uint32 kind = 1;
+  uint64 shard_id = 2;
+  // Leadership target, or the voter that was added.
+  uint64 node_id = 3;
+  // Set for voter_replaced. Zero for a leadership move.
+  uint64 removed_node = 4;
+}
+
+// One `CELL_CONTROL_PLANE` placement row hosted by this process.
+// It is not installed as a route. A remote cell does not contribute a row.
+message PlacementRecordProto {
+  uint64 cell_id = 1;
+  uint64 shard_id = 2;
+  uint64 dominant_pid = 3;
+  uint64 dedicated_node = 4;
+  // 1 recorded, 2 leader_on_dedicated, 3 dedicated_not_shared, 4 blocked.
+  // Zero is not a stored phase.
+  uint32 phase = 5;
+  string phase_name = 6;
+  string blocked_reason = 7;
+  repeated PlacementMoveProto committed_moves = 8;
+  uint64 last_transfer_attempt_unix_ms = 9;
+  uint64 last_replace_attempt_unix_ms = 10;
+  uint64 updated_unix_ms = 11;
+}
+
 message GetRoutesResponse {
   ErrorDetailProto error = 1;
   repeated ShardDescriptorProto shards = 2;
   // 16-byte big-endian cluster id. Empty means this process has not adopted one.
   bytes cluster_id = 3;
+  // Local placement rows only. Empty for a remote cell. Not a route list.
+  repeated PlacementRecordProto placements = 4;
+  // This process's build flag. False means maintenance does not call transfer_leader.
+  // It is not a measurement of a remote cell.
+  bool automatic_leadership_transfer_enabled = 5;
 }
 
 message AllocateIdBlockRequest {
@@ -126,6 +160,11 @@ message TriggerShardSplitResponse {
   ErrorDetailProto error = 1;
   bool split_executed = 2;
   uint64 child_shard_id = 3;
+  // Local placement row for this shard after the call, when one exists.
+  // A jumbo candidate can set this while split_executed stays false.
+  PlacementRecordProto placement = 4;
+  // This process's build flag. A placement row is not a leadership transfer.
+  bool automatic_leadership_transfer_enabled = 5;
 }
 
 message EnableDualModeSplitRequest {

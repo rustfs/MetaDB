@@ -8,8 +8,9 @@ use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::metadata_service_client::MetadataServiceClient;
 use metadb_proto::{
     AllocateIdBlockRequest, CreateFileRequest, EnableDualModeSplitRequest, ErrorDetailProto,
-    ExecuteSqlRequest, GetRoutesRequest, ListDirRequest, MkdirRequest, RegisterCellRequest,
-    ScaleShardReplicasRequest, TriggerShardSplitRequest, UnlinkRequest,
+    ExecuteSqlRequest, GetRoutesRequest, GetRoutesResponse, ListDirRequest, MkdirRequest,
+    PlacementMoveProto, PlacementRecordProto, RegisterCellRequest, ScaleShardReplicasRequest,
+    TriggerShardSplitRequest, TriggerShardSplitResponse, UnlinkRequest,
 };
 
 #[derive(Debug, Parser)]
@@ -403,6 +404,79 @@ fn print_hold(label: &str, record: &metadb_raft::backup::BackupHoldRecord) {
     }
 }
 
+fn print_placements(resp: &GetRoutesResponse) {
+    println!(
+        "placement_automatic_transfer_enabled={}",
+        resp.automatic_leadership_transfer_enabled
+    );
+    println!("Placements: {}", resp.placements.len());
+    for placement in &resp.placements {
+        println!("  {}", format_placement(placement));
+    }
+}
+
+fn print_split(resp: &TriggerShardSplitResponse) {
+    let (phase, code, shard, dedicated, pid, moves) = match &resp.placement {
+        Some(placement) => (
+            placement.phase_name.as_str(),
+            placement.phase,
+            placement.shard_id,
+            placement.dedicated_node,
+            placement.dominant_pid,
+            placement.committed_moves.len(),
+        ),
+        None => ("", 0, 0, 0, 0, 0),
+    };
+    println!(
+        "split_executed={} child_shard_id={} placement_phase={} placement_phase_code={} placement_shard={} dedicated_node={} dominant_pid={} move_count={} placement_automatic_transfer_enabled={}",
+        resp.split_executed,
+        resp.child_shard_id,
+        phase,
+        code,
+        shard,
+        dedicated,
+        pid,
+        moves,
+        resp.automatic_leadership_transfer_enabled
+    );
+}
+
+fn format_placement(placement: &PlacementRecordProto) -> String {
+    format!(
+        "placement cell={} shard={} phase={} phase_code={} dedicated_node={} dominant_pid={} move_count={} moves={} transfer_attempt_unix_ms={} replace_attempt_unix_ms={} updated_unix_ms={} reason={}",
+        placement.cell_id,
+        placement.shard_id,
+        placement.phase_name,
+        placement.phase,
+        placement.dedicated_node,
+        placement.dominant_pid,
+        placement.committed_moves.len(),
+        format_moves(&placement.committed_moves),
+        placement.last_transfer_attempt_unix_ms,
+        placement.last_replace_attempt_unix_ms,
+        placement.updated_unix_ms,
+        placement.blocked_reason
+    )
+}
+
+fn format_moves(moves: &[PlacementMoveProto]) -> String {
+    moves
+        .iter()
+        .map(|movement| match movement.kind {
+            1 => format!(
+                "leadership_transferred:shard={},to={}",
+                movement.shard_id, movement.node_id
+            ),
+            2 => format!(
+                "voter_replaced:shard={},removed={},added={}",
+                movement.shard_id, movement.removed_node, movement.node_id
+            ),
+            other => format!("unknown:kind={other},shard={}", movement.shard_id),
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 fn normalize_url(ep: &str) -> String {
     if ep.starts_with("http://") || ep.starts_with("https://") {
         ep.to_string()
@@ -447,7 +521,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .into_inner();
             check_error("get_routes", resp.error.as_ref())?;
             println!("Active Shards: {}", resp.shards.len());
-            for s in resp.shards {
+            for s in &resp.shards {
                 let ep = s.epoch.unwrap_or_default();
                 println!(
                     "  shard={} cell={} leader={} voters={} epoch=(conf_ver={}, ver={}) dual_mode={} jumbo={}",
@@ -461,6 +535,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     s.jumbo_isolated
                 );
             }
+            print_placements(&resp);
         }
         Command::Shard { sub } => {
             let mut cp = open_cp(&url, &token).await?;
@@ -471,13 +546,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .await?
                         .into_inner();
                     check_error("get_routes", resp.error.as_ref())?;
-                    for s in resp.shards {
+                    for s in &resp.shards {
                         let ep = s.epoch.unwrap_or_default();
                         println!(
                             "shard={} cell={} range=({:?}..{:?}) epoch=({}, {})",
                             s.shard_id, s.cell_id, s.start_key, s.end_key, ep.conf_ver, ep.version
                         );
                     }
+                    print_placements(&resp);
                 }
                 ShardCmd::Split { shard_id } => {
                     let resp = cp
@@ -487,10 +563,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     if let Some(err) = resp.error {
                         return Err(application_error("split", &err));
                     }
-                    println!(
-                        "split_executed={} child_shard_id={}",
-                        resp.split_executed, resp.child_shard_id
-                    );
+                    print_split(&resp);
                 }
                 ShardCmd::EnableDualMode { shard_id, pid } => {
                     let resp = cp

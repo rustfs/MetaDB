@@ -3,7 +3,9 @@
 //! Operability series are unlabeled gauges. Shard ids, peer addresses, and
 //! paths are not labels and are not values.
 
-use metadb_cluster::DurableGlobalManager;
+use metadb_cluster::{
+    automatic_leadership_transfer_allowed, CommittedMove, DurableGlobalManager, PlacementPhase,
+};
 use metadb_raft::RaftNodeOptions;
 
 use crate::operability::{ReadinessReport, ShardGate};
@@ -36,6 +38,20 @@ pub struct ClusterMetricsSnapshot {
     pub raft_election_timeout_max_ms: u64,
     pub raft_max_in_snapshot_log_to_keep: u64,
     pub raft_max_segment_bytes: u64,
+    /// Local `CELL_CONTROL_PLANE` placement rows. Not a route count.
+    pub placement_records: u64,
+    pub placement_phase_recorded: u64,
+    pub placement_phase_leader_on_dedicated: u64,
+    pub placement_phase_dedicated_not_shared: u64,
+    pub placement_phase_blocked: u64,
+    pub placement_moves_leadership: u64,
+    pub placement_moves_voter_replaced: u64,
+    /// Rows whose transfer-attempt timestamp is non-zero. The reconciler does not stamp it.
+    pub placement_rows_with_transfer_attempt: u64,
+    /// Rows whose replace-attempt timestamp is non-zero.
+    pub placement_rows_with_replace_attempt: u64,
+    /// 1 only when this build calls `transfer_leader`. This build reports 0.
+    pub placement_automatic_transfer_enabled: u64,
 }
 
 impl ClusterMetricsSnapshot {
@@ -90,8 +106,34 @@ pub fn collect_cluster_metrics(gm: &DurableGlobalManager) -> ClusterMetricsSnaps
             let p = grp.watermarks().safe_purge_index();
             min_purge = Some(min_purge.map_or(p, |cur| cur.min(p)));
         }
+        for placement in cell.stored_placements() {
+            snap.placement_records += 1;
+            match placement.phase {
+                PlacementPhase::Recorded => snap.placement_phase_recorded += 1,
+                PlacementPhase::LeaderOnDedicated => snap.placement_phase_leader_on_dedicated += 1,
+                PlacementPhase::DedicatedNodeNotShared => {
+                    snap.placement_phase_dedicated_not_shared += 1
+                }
+                PlacementPhase::Blocked => snap.placement_phase_blocked += 1,
+            }
+            for movement in &placement.committed_moves {
+                match movement {
+                    CommittedMove::LeadershipTransferred { .. } => {
+                        snap.placement_moves_leadership += 1
+                    }
+                    CommittedMove::VoterReplaced { .. } => snap.placement_moves_voter_replaced += 1,
+                }
+            }
+            if placement.last_transfer_attempt_unix_ms != 0 {
+                snap.placement_rows_with_transfer_attempt += 1;
+            }
+            if placement.last_replace_attempt_unix_ms != 0 {
+                snap.placement_rows_with_replace_attempt += 1;
+            }
+        }
     }
     snap.min_raft_safe_purge_index = min_purge.unwrap_or(0);
+    snap.placement_automatic_transfer_enabled = u64::from(automatic_leadership_transfer_allowed());
     snap
 }
 
@@ -148,6 +190,26 @@ pub fn render_prometheus_metrics(m: &ClusterMetricsSnapshot) -> String {
             "metadb_raft_max_in_snapshot_log_to_keep {}\n",
             "# TYPE metadb_raft_max_segment_bytes gauge\n",
             "metadb_raft_max_segment_bytes {}\n",
+            "# TYPE metadb_placement_records gauge\n",
+            "metadb_placement_records {}\n",
+            "# TYPE metadb_placement_phase_recorded gauge\n",
+            "metadb_placement_phase_recorded {}\n",
+            "# TYPE metadb_placement_phase_leader_on_dedicated gauge\n",
+            "metadb_placement_phase_leader_on_dedicated {}\n",
+            "# TYPE metadb_placement_phase_dedicated_not_shared gauge\n",
+            "metadb_placement_phase_dedicated_not_shared {}\n",
+            "# TYPE metadb_placement_phase_blocked gauge\n",
+            "metadb_placement_phase_blocked {}\n",
+            "# TYPE metadb_placement_moves_leadership gauge\n",
+            "metadb_placement_moves_leadership {}\n",
+            "# TYPE metadb_placement_moves_voter_replaced gauge\n",
+            "metadb_placement_moves_voter_replaced {}\n",
+            "# TYPE metadb_placement_rows_with_transfer_attempt gauge\n",
+            "metadb_placement_rows_with_transfer_attempt {}\n",
+            "# TYPE metadb_placement_rows_with_replace_attempt gauge\n",
+            "metadb_placement_rows_with_replace_attempt {}\n",
+            "# TYPE metadb_placement_automatic_transfer_enabled gauge\n",
+            "metadb_placement_automatic_transfer_enabled {}\n",
         ),
         m.cells_total,
         m.shards_total,
@@ -174,6 +236,16 @@ pub fn render_prometheus_metrics(m: &ClusterMetricsSnapshot) -> String {
         m.raft_election_timeout_max_ms,
         m.raft_max_in_snapshot_log_to_keep,
         m.raft_max_segment_bytes,
+        m.placement_records,
+        m.placement_phase_recorded,
+        m.placement_phase_leader_on_dedicated,
+        m.placement_phase_dedicated_not_shared,
+        m.placement_phase_blocked,
+        m.placement_moves_leadership,
+        m.placement_moves_voter_replaced,
+        m.placement_rows_with_transfer_attempt,
+        m.placement_rows_with_replace_attempt,
+        m.placement_automatic_transfer_enabled,
     )
 }
 
@@ -206,5 +278,55 @@ mod tests {
         assert!(text.contains("metadb_ready 0\n"), "{text}");
         assert!(text.contains("metadb_process_phase 0\n"), "{text}");
         assert!(text.contains("metadb_shards_leader_known 1\n"), "{text}");
+    }
+
+    #[test]
+    fn placement_series_are_unlabeled_counts() {
+        let text = render_prometheus_metrics(&ClusterMetricsSnapshot::default());
+        for series in [
+            "metadb_placement_records 0\n",
+            "metadb_placement_phase_recorded 0\n",
+            "metadb_placement_phase_leader_on_dedicated 0\n",
+            "metadb_placement_phase_dedicated_not_shared 0\n",
+            "metadb_placement_phase_blocked 0\n",
+            "metadb_placement_moves_leadership 0\n",
+            "metadb_placement_moves_voter_replaced 0\n",
+            "metadb_placement_rows_with_transfer_attempt 0\n",
+            "metadb_placement_rows_with_replace_attempt 0\n",
+            "metadb_placement_automatic_transfer_enabled 0\n",
+        ] {
+            assert!(text.contains(series), "{text}");
+        }
+        assert!(!text.contains('{'), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+
+        let snap = ClusterMetricsSnapshot {
+            placement_records: 4,
+            placement_phase_recorded: 1,
+            placement_phase_leader_on_dedicated: 1,
+            placement_phase_dedicated_not_shared: 1,
+            placement_phase_blocked: 1,
+            placement_moves_leadership: 2,
+            placement_moves_voter_replaced: 3,
+            placement_rows_with_transfer_attempt: 0,
+            placement_rows_with_replace_attempt: 1,
+            placement_automatic_transfer_enabled: 0,
+            ..ClusterMetricsSnapshot::default()
+        };
+        let text = render_prometheus_metrics(&snap);
+        assert!(text.contains("metadb_placement_records 4\n"), "{text}");
+        assert!(
+            text.contains("metadb_placement_phase_recorded 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("metadb_placement_moves_voter_replaced 3\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("metadb_placement_rows_with_transfer_attempt 0\n"),
+            "{text}"
+        );
+        assert!(!text.contains('{'), "{text}");
     }
 }

@@ -11,10 +11,10 @@
 `metadb-ctl` connects to gRPC services to inspect local cluster state, manage shards, execute SQL templates, and run synthetic benchmarks. SQL results are complete JSON responses; command failures exit nonzero. Benchmark JSONL reports an allocated `bench_pid`, exact attempts, successes, failures, and latency statistics. See [upgrade and compatibility notes](../../designs/correctness_hardening.md).
 
 ```bash
-# Inspect Cells, BE node health, shard counts, and 3-watermark Raft log lag
+# Local routes, then local CELL_CONTROL_PLANE placement rows. Not disk free, QPS, or Raft watermarks.
 metadb-ctl --endpoint 127.0.0.1:7800 cluster status
 
-# List shards with key ranges, ShardEpoch, Raft roles, and Jumbo isolation state
+# Routes for one cell, then that cell's local placement rows. A remote cell has routes and no placement rows.
 metadb-ctl --endpoint 127.0.0.1:7800 shard list --cell-id 1
 
 # Manually trigger a PID-boundary split check on shard 12

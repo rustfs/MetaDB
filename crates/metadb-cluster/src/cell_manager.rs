@@ -2281,6 +2281,17 @@ impl DurableCellManager {
             .cloned()
     }
 
+    /// Local placement rows in shard-id order. This is not a route table.
+    pub fn stored_placements(&self) -> Vec<StoredPlacement> {
+        self.control
+            .lock()
+            .unwrap()
+            .placements
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub fn local_heartbeat_is_fresh(&self, now_ms: u64, interval_ms: u64) -> bool {
         self.control
             .lock()

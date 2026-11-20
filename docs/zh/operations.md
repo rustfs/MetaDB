@@ -34,15 +34,15 @@
 
 ### `cluster status`
 
-以 `cell_id = 0` 调用 `GetRoutes`。对每个分片打印 `shard`、`cell`、`leader`、投票者数量、`epoch=(conf_ver, ver)`、`dual_mode` 和 `jumbo`。它不打印空闲磁盘、QPS 或 Raft 水位。
+以 `cell_id = 0` 调用 `GetRoutes`。对每个分片打印 `shard`、`cell`、`leader`、投票者数量、`epoch=(conf_ver, ver)`、`dual_mode` 和 `jumbo`。It then prints local `CELL_CONTROL_PLANE` placement rows (`phase`, `phase_code`, `dedicated_node`, `dominant_pid`, `moves`, attempt timestamps, `reason`) and `placement_automatic_transfer_enabled=false`. Those rows are not routes. A remote cell contributes no placement rows. It does not print disk free space, QPS, Raft watermarks, or `MOVE_STAGED` / `MOVE_LIVE`. The reconciler does not publish phase `recorded` and does not stamp `transfer_attempt_unix_ms`.
 
 ### `shard list --cell-id <u64>`
 
-为该单元调用 `GetRoutes`（`0` 表示每条缓存路由）。打印 `shard`、`cell`、原始起止键字节，以及纪元 `(conf_ver, version)`。
+为该单元调用 `GetRoutes`（`0` 表示每条缓存路由）。打印 `shard`、`cell`、原始起止键字节，以及纪元 `(conf_ver, version)`，然后打印同一进程上该单元的 placement 行。A remote cell prints `Placements: 0`.
 
 ### `shard split --shard-id <u64>`
 
-调用 `TriggerShardSplit`，即使分片低于 `shard_split_threshold_bytes` 也强制做分裂检查。打印 `split_executed` 和 `child_shard_id`。`split_executed=false` 表示工作者没有找到边界（例如存活键少于两个，或巨型候选只翻转路由标志）。
+调用 `TriggerShardSplit`，即使分片低于 `shard_split_threshold_bytes` 也强制做分裂检查。打印 `split_executed`、`child_shard_id`，以及本进程已有 placement 行时的 phase。`split_executed=false` 表示没有创建子分片（存活键少于两个，或巨型候选写入 placement 行后仍保持 `split_executed=false`）。
 
 ### `shard enable-dual-mode --shard-id <u64> --pid <u64>`
 
@@ -88,8 +88,18 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 | `metadb_tombstones_traversed_on_scans_total` | counter |
 | `metadb_locality_compactions_total` | counter |
 | `metadb_min_raft_safe_purge_index` | gauge |
+| `metadb_placement_records` | gauge, local placement rows |
+| `metadb_placement_phase_recorded` | gauge; the reconciler does not publish this phase |
+| `metadb_placement_phase_leader_on_dedicated` | gauge |
+| `metadb_placement_phase_dedicated_not_shared` | gauge |
+| `metadb_placement_phase_blocked` | gauge |
+| `metadb_placement_moves_leadership` | gauge |
+| `metadb_placement_moves_voter_replaced` | gauge |
+| `metadb_placement_rows_with_transfer_attempt` | gauge; the reconciler does not stamp this timestamp |
+| `metadb_placement_rows_with_replace_attempt` | gauge |
+| `metadb_placement_automatic_transfer_enabled` | gauge, 0 in this build |
 
-There is no `metadb_raft_watermark_lag_entries` series. `metadb_cells_total` counts rows in this process's `GLOBAL_CELL_DIRECTORY`, including a remote cell after `RegisterCell`. `metadb_shards_total` counts only local shards. A fresh process has one cell.
+There is no `metadb_raft_watermark_lag_entries` series and no per-shard placement label. There is no `MOVE_STAGED` or `MOVE_LIVE` series. `metadb_cells_total` counts rows in this process's `GLOBAL_CELL_DIRECTORY`, including a remote cell after `RegisterCell`. `metadb_shards_total` counts only local shards. A fresh process has one cell. The English operability page lists the readiness gauges that this table does not repeat.
 
 ## 扩容
 
