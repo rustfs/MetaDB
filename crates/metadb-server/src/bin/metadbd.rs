@@ -110,18 +110,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(grpc_addr = %bound_addr, "metadbd online and serving requests");
 
     if let Some(cm_ep) = cell_manager_ep {
-        let cm_url = if cm_ep.starts_with("http://") || cm_ep.starts_with("https://") {
-            cm_ep
-        } else {
-            format!("http://{}", cm_ep)
-        };
-        let channel = tonic::transport::Endpoint::from_shared(cm_url.clone())?
-            .connect()
-            .await?;
-        let mut cp = ControlPlaneServiceClient::with_interceptor(
-            channel,
-            metadb_server::BearerAuthClient::new(shared_secret),
-        );
+        let security = cluster.transport_security();
+        let cm_url = security.prepare_url(&cm_ep).map_err(|error| {
+            format!("cell-manager address is not usable with the configured TLS mode: {error}")
+        })?;
+        let endpoint = tonic::transport::Endpoint::from_shared(cm_url.clone())?;
+        let channel = security.connect(endpoint).await?;
+        let mut auth = metadb_server::BearerAuthClient::new(shared_secret);
+        if let Some(roles) = cluster.roles() {
+            auth = auth.with_role(roles.local().clone());
+        }
+        let mut cp = ControlPlaneServiceClient::with_interceptor(channel, auth);
         let reg_resp = cp
             .register_node(RegisterNodeRequest {
                 cell_id,

@@ -10,6 +10,7 @@ members = [
     "crates/metadb-proxy",
     "crates/metadb-server",
     "crates/metadb-transport",
+    "crates/metadb-security",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ metadb-cluster = { path = "crates/metadb-cluster", version = "0.1.0" }
 metadb-proxy = { path = "crates/metadb-proxy", version = "0.1.0" }
 metadb-server = { path = "crates/metadb-server", version = "0.1.0" }
 metadb-transport = { path = "crates/metadb-transport", version = "0.1.0" }
+metadb-security = { path = "crates/metadb-security", version = "0.1.0" }
 bytes = "1.12.1"
 crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
 prost = "0.14.6"

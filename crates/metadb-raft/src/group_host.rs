@@ -1093,6 +1093,14 @@ impl ShardGroupHost {
         self.channel_pool.set_shared_secret(secret);
     }
 
+    pub fn set_role_presentation(&self, role: Option<metadb_security::RolePresentation>) {
+        self.channel_pool.set_role_presentation(role);
+    }
+
+    pub fn set_transport_security(&self, security: metadb_security::TransportSecurity) {
+        self.channel_pool.set_transport_security(security);
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }

@@ -15,7 +15,7 @@
 5. 在 `<data_dir>/cell_<cell_id>` 打开或引导 `DurableCellManager`。
 6. 把这一个单元以键范围 `[0x01, 0x04)` 注册到 `DurableGlobalManager`。
 7. 保证根 inode `1`（`ROOT_INODE_ID`）有属性记录。
-8. Serves four gRPC services on one listener. All four use the same bearer interceptor. When `metrics_listen_addr` is set, `GET /metrics` on that address requires the same secret. A non-empty secret rejects a missing or wrong bearer. An empty secret does not listen unless `allow_unauthenticated = true`, and that flag is loopback-only. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. This process does not terminate TLS.
+8. Serves four gRPC services on one listener. All four use the same bearer interceptor. When `metrics_listen_addr` is set, `GET /metrics` on that address requires the same secret. A non-empty secret rejects a missing or wrong bearer. An empty secret does not listen unless `allow_unauthenticated = true`, and that flag is loopback-only. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
 9. 启动间隔 250 ms 的维护任务。
 
 `metadbd` 是薄封装：加载 TOML，应用命令行覆盖，调用 `open_and_serve`，可选地对 `--cell-manager` 调用 `RegisterNode`，并在 Ctrl-C 时调用 `shutdown`。配置了指标时，由 `open_and_serve` 提供。

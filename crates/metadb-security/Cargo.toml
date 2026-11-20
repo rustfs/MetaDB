@@ -1,0 +1,11 @@
+[package]
+name = "metadb-security"
+description = "Transport policy and optional method grants. TLS termination is refused."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tonic = { workspace = true }

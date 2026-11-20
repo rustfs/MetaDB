@@ -26,6 +26,8 @@ allow = [
     "Unicode-3.0",
     "Zlib",
 ]
+# The 2026-11-20 11:17 Asia/Shanghai TLS-only ring exception was revoked.
+# This project stays pure Rust. Do not add ISC exceptions, ring, rustls, or aws-lc.
 exceptions = []
 
 [bans]

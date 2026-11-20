@@ -207,3 +207,7 @@ flowchart TD
   * `cargo test --workspace`
 * **Acceptance Criteria**:
   * `e2e_cluster_evolution_tests.rs` boots one persistent all-in-one `PersistentMetaDbCluster`, restarts it from the same directory, calls `TriggerShardSplit`, and runs a cross-shard `Rename` plus bulk deletion on that one process. It does not start `metadbd --role be`, does not join two extra BE processes, and does not register a second Cell. A second all-in-one join is `join_existing_group`, not that end-to-end test. In-process 1-voter to 3-voter coverage is `multi_raft_failover_tests`, not a three-VM rehearsal.
+
+## 3. Security workstream (not a phase completion)
+
+`metadb-security` is the single outbound transport policy, described in [`designs/transport_security.md`](./designs/transport_security.md). The default mode is plaintext. `tls` and `mtls` are refused before listen. The 2026-11-20 ring exception was revoked, so no TLS provider is linked and `deny.toml` has no ISC exceptions. `[security.rbac]`, when present, installs method grants and fail-closes on deny. The shared bearer is still required and is not a role. The scale stream owns process role separation. The transaction stream owns 2PC leases. This workstream is not a first-launch pass, not encryption, and not a trillion-scale acceptance.
