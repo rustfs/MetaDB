@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use metadb_core::{CellId, MetaDbError, NodeId, Result, DEFAULT_MAX_CLOCK_DRIFT_MS};
+use metadb_core::{
+    CellId, CompositeKeyRange, MetaDbError, NodeId, Result, DEFAULT_MAX_CLOCK_DRIFT_MS,
+};
 use metadb_raft::RaftNodeOptions;
 use metadb_storage::{LsmEngineConfig, DEFAULT_MVCC_RETENTION_MS};
 use metadb_transport::{
@@ -178,6 +180,11 @@ impl Default for ShardingSection {
 pub struct ClusterSection {
     /// `host:port` (or `http://host:port`) of a cell member that can propose membership.
     pub join: String,
+    /// Hex cell start, without a `0x` prefix. Empty with `cell_end_key` means the
+    /// whole user key space. A second cell sets a contiguous union of table roots.
+    pub cell_start_key: String,
+    /// Hex cell end, exclusive. See `cell_start_key`.
+    pub cell_end_key: String,
 }
 
 /// Top-level TOML configuration matching `docs/guides/{en,ja,fr,zh,de}/deployment.md`.
@@ -273,6 +280,70 @@ impl ServerTomlConfig {
         .map_err(transport_config_error)?;
         policy.resolve_startup().map_err(transport_config_error)
     }
+
+    /// `None` is the historical whole user key space.
+    ///
+    /// Join and a configured range together are refused: join adds a voter to
+    /// an existing cell and does not publish a second cell.
+    pub fn configured_cell_range(&self) -> Result<Option<CompositeKeyRange>> {
+        let start = self.cluster.cell_start_key.trim();
+        let end = self.cluster.cell_end_key.trim();
+        if start.is_empty() && end.is_empty() {
+            return Ok(None);
+        }
+        if start.is_empty() || end.is_empty() {
+            return Err(MetaDbError::CodecError(
+                "cell_start_key and cell_end_key must both be set or both be empty".to_string(),
+            ));
+        }
+        if !self.cluster.join.trim().is_empty() {
+            return Err(MetaDbError::CodecError(
+                "join adds a voter to an existing cell; it does not publish a second cell. Leave cell_start_key and cell_end_key empty"
+                    .to_string(),
+            ));
+        }
+        let range = CompositeKeyRange::new(decode_hex_key(start)?, decode_hex_key(end)?)?;
+        metadb_cluster::shards_covering(Some(&range), true)?;
+        Ok(Some(range))
+    }
+}
+
+/// Decodes an even-length hex key. An optional `0x` prefix is accepted.
+pub fn decode_hex_key(text: &str) -> Result<Vec<u8>> {
+    let text = text.trim();
+    let text = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+    if text.is_empty()
+        || !text.len().is_multiple_of(2)
+        || !text.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(MetaDbError::CodecError(format!(
+            "cell key '{text}' is not even-length hex"
+        )));
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let pair = std::str::from_utf8(&bytes[index..index + 2]).unwrap();
+        out.push(u8::from_str_radix(pair, 16).map_err(|error| {
+            MetaDbError::CodecError(format!("cell key '{text}' is not hex: {error}"))
+        })?);
+        index += 2;
+    }
+    Ok(out)
+}
+
+/// Literal loopback after an optional `http://` prefix. Hostnames are not loopback.
+pub fn is_literal_loopback_addr(addr: &str) -> bool {
+    let addr = addr.trim();
+    let addr = addr.strip_prefix("http://").unwrap_or(addr);
+    if addr.starts_with("https://") {
+        return false;
+    }
+    is_loopback_bind(addr)
 }
 
 /// Operator transport policy. This is not an RDMA implementation.

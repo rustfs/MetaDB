@@ -112,7 +112,7 @@ Resource keys are ceilings for a backend this repository does not have. Setting 
 
 - Per-role subsystem trimming. The role field is an allow/deny switch, not a feature set.
 - A voter list in TOML. The first process bootstraps alone. A later all-in-one process joins with `[cluster] join = "host:port"` (or `--join` / `--cell-manager`) pointing at the current leader, and only when its data directory does not already own a cell. The leader must be reached directly; a follower does not forward the membership change. That join is the same cell, not a second cell. See [Operations](./operations.md).
-- A second cell's key range. `RegisterCell` returns an error and stores nothing.
+- An arbitrary key slice as a cell range. `[cluster] cell_start_key` and `cell_end_key` are even-length hex and must be a contiguous union of the meta (`01`..`02`), quota (`02`..`03`), and secondary-index (`03`..`04`) tables. Empty means the whole user key space, which is the historical default. Join cannot be combined with those keys. The other process is not started by this file.
 - Locality-compaction on/off. `to_lsm_config` always enables it. Raft timers are the `[raft]` table; see [Operability](./operability.md).
 - Native TLS certificates. A TLS key in this file is rejected. Termination belongs in an external proxy.
 - A working RDMA device, provider library, or unauthenticated bypass listener. `mode = "rdma"` refuses to start. `prefer-rdma` keeps TCP/gRPC after an explicit rejection.

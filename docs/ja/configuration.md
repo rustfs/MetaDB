@@ -83,6 +83,6 @@ An empty secret does not start the process. Loopback is not an implicit exceptio
 
 - ロールごとのサブシステム切り出し。ロール項目は許可と拒否のスイッチであり、機能セットではありません。
 - ピア一覧、投票者集合、参加トークン。メンバーシップはこのプロセス 1 つから始まります。追加のピアは `RegisterNode` と `ScaleShardReplicas` のあとでのみ現れ、そのピアは同じシャードログに対してすでに `RaftTransportService` を話す Raft メンバーでなければなりません。2 つ目の all-in-one プロセスはそれをしません。 [運用](./operations.md) を参照してください。
-- 2 つ目のセルのキー範囲。`RegisterCell` はエラーを返し、何も保存しません。空ディレクトリの 2 つ目の all-in-one は `[cluster] join` で現在のリーダーに参加します。これは同じセルです。
+- An arbitrary key slice as a cell range. `cell_start_key` and `cell_end_key` must be a contiguous union of whole tables. `RegisterCell` stores a remote cell only after its routes cover that range. Join still joins the same cell and does not create a second one.
 - Locality-compaction on/off. `to_lsm_config` always enables it. Raft timers are the `[raft]` table; see [Operability](../en/operability.md).
 - このプロセス内の TLS 証明書。設定中の TLS キーは拒否される。終端は外部プロキシで行う。

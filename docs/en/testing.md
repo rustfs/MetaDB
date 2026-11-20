@@ -248,6 +248,6 @@ These commands are in this tree. CI runs them with `cargo test --workspace --loc
 - `cargo test -p metadb-server --test topology_distributed` uses one process and `DurableCellManager::scale_out_replicas` for three localhost voters, including leader loss under create load.
 - `cargo test -p metadb-server --test stress_crash_restart` stops without flushing the memtable while a create is inside `propose`, then reopens the same `data_dir`.
 - `cargo test -p metadb-server --test join_existing_group` covers two different joins. `metadbd_processes_join_existing_group_and_fail_over` starts real `metadbd` processes, joins the first process's Raft group, and fails over. `join_sends_the_shared_secret` opens two `PersistentMetaDbCluster` servers inside the test process and checks that the shared secret is sent on that join. That case does not start two `metadbd` OS processes.
-- `open_and_serve` still rejects every role except `all-in-one`. A second Cell stays unimplemented. `RegisterCell` returns an error.
+- `open_and_serve` still rejects every role except `all-in-one`. A second cell is registered only when its routes cover the requested range. `RegisterCell` does not forward keys.
 
 The smoke profile and the ignored local profile are the [in-process stress harness](#in-process-stress-harness). `topology_distributed` is still one OS process with three localhost Raft voters, not three `metadbd` processes. Disaggregated roles and a second Cell are still not live deployments.

@@ -52,9 +52,9 @@ Calls `EnableDualModeSplit`. The CLI sends an empty `split_name`. The server sto
 
 Calls `ScaleShardReplicas`. The server requires `target_voters` entries already present in that cell's node map. A fresh all-in-one cell has one node, so `--target-voters 3` returns a consensus error of the form `need 3 registered nodes in cell <id>, have 1`. On success it prints how many local shards were passed to the membership change.
 
-### `cell register --cell-id <u64> --endpoints <a,b,c>`
+### `cell register --cell-id <u64> --endpoints <a,b,c> [--start-key <hex> --end-key <hex>]`
 
-Calls `RegisterCell`. The server returns an application error and does not add a cell. `metadb-ctl` exits non-zero and does not print `Registered Cell`. Do not use this as a federation step.
+Calls `RegisterCell` on this process's cell directory. The server probes the first endpoint's `GetRoutes` for that cell and fsyncs `GLOBAL_CELL_DIRECTORY` only when those routes tile `[start-key, end-key)` exactly. A gap, an overlap with a cell already in the directory, an `https://` endpoint, or an unreachable manager on the first attempt returns an error and writes nothing. Omitting both keys sends `[01, 04)`, which overlaps a default cell and is rejected. An empty secret still requires `allow_unauthenticated` and a literal loopback endpoint. The stored routes are the probed snapshot. An identical retry keeps that snapshot when the peer is down and does not refresh it. This process does not forward keys to the other cell. Heartbeats do not update the snapshot. See [Scale control plane](./scale-control-plane-status.md).
 
 ### `sql <statement>`
 
@@ -105,7 +105,7 @@ Gauges and counters from `render_prometheus_metrics`:
 | `metadb_raft_max_in_snapshot_log_to_keep` | gauge, configured value |
 | `metadb_raft_max_segment_bytes` | gauge, configured value |
 
-There is no `metadb_raft_watermark_lag_entries` series and no per-shard label. `metadb_cells_total` counts cells registered inside this process, which `open_and_serve` sets to one. `metadb_process_phase 1` does not by itself mean `metadb_ready 1`.
+There is no `metadb_raft_watermark_lag_entries` series and no per-shard label. `metadb_cells_total` counts rows in this process's `GLOBAL_CELL_DIRECTORY`, including a remote cell after `RegisterCell`. `metadb_shards_total` still counts only local shards. A fresh process has one cell. `metadb_process_phase 1` does not by itself mean `metadb_ready 1`.
 
 ## Scale-out
 
@@ -120,10 +120,10 @@ What does not work as an operator procedure:
 
 1. `metadbd --role be`, `--role proxy`, `--role cell-manager`, and `--role global-manager` exit in `open_and_serve`. The subsystems are not trimmed by role, and the process refuses to start them under those names.
 2. A second `metadbd --role all-in-one` joins an existing group when `--join` or `--cell-manager` names the current leader and the data directory is fresh. The leader appends a blank entry, snapshots, and promotes the joiner from learner to voter on the shards it already hosts. `--join` must reach that leader. A directory that already has Raft state reopens it and ignores a new join address. A fresh allocator for node ids 2 through 32767 starts in that node's inode, file-id, and shard-id namespace, so it does not reissue ids node 1 has already granted. An allocator file that has already granted low ids is not relocated. `Lookup`, directory listing, directory stat, `GetDirPartitionStat`, quota reads, and secondary-index reads that reach a follower with a known leader are forwarded to that leader. A follower that does not know a leader still returns `NotLeader`. While membership is joint, `GetRoutes` reports every applied voter, the current leader, and the applied epoch. After the uniform config commits, those voters and `conf_ver` match Raft. A join that cannot finish retries transient errors for 45 seconds, then shuts the listeners and local Raft groups down and returns the error. `metadbd` ends because startup returned that error. The first failed attempt does not abort the process by itself.
-3. `metadb-ctl cell register` does not create a second cell. `RegisterCell` fails closed. `open_and_serve` registers only the local cell on the global manager.
+3. `metadb-ctl cell register` records a second cell only after that cell's manager is reachable and its routes cover the requested range. The registrar does not serve or forward those keys. `open_and_serve` still starts one all-in-one cell per process.
 4. The in-memory `MetaDbEngine::new_single_node` path used by tests `T1`–`T6` can bump an in-memory voter count to 3. That object has no disk and no Raft. It is not a scale-out of `metadbd`.
 
-`topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. Disaggregated roles and a second Cell are still not live deployments. Jumbo dedicated-node isolation remains a route flag, not a move of shards onto another machine.
+`topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. Disaggregated roles are still not a live deployment. A second cell can be recorded in this process's `GLOBAL_CELL_DIRECTORY` after its routes cover the requested range. That registration is not a production multi-cell deployment: forwarding, a replicated directory, role split, Jumbo file moves, and automatic leadership transfer are not delivered. Jumbo dedicated-node isolation remains a route flag, not a move of shards onto another machine.
 
 ## Errors you can hit
 
@@ -150,7 +150,7 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 ## Known limitations
 
 - Role `all-in-one` only. `be`, `proxy`, `cell-manager`, and `global-manager` are rejected before listen.
-- A second all-in-one process can join the same cell with `[cluster] join`. It does not create a second cell. `RegisterCell` returns an error.
+- A second all-in-one process can join the same cell with `[cluster] join`. That join does not create a second cell. A second cell is a different `cell_id`, a disjoint node id, and a `[cluster] cell_start_key` / `cell_end_key` pair of whole tables. `RegisterCell` records it on the process you call. It does not forward requests, and it does not replicate the directory to the other process.
 - `GetRoutes` fails closed for an unknown non-zero `cell_id`. `StoreHeartbeat` does not replace cached routes. A registered node's heartbeat is fsynced in `CELL_CONTROL_PLANE`. Shard ids inside that RPC stay annotations.
 - User names `.`, `..`, `/`, `\`, `_attr_`, empty, and NUL are rejected. A negative file size is rejected. A directory rename into its own descendant fails closed, including chains deeper than 1024.
 - The HLC saturates at the 48-bit physical ceiling instead of wrapping the logical counter. `Prepare2pc` follows `header.shard_id`, not the primary-key shard.
@@ -218,7 +218,7 @@ After restore, open the new directory with the same node id and cell id. Look up
 These items are missing from the product, so this guide cannot describe a procedure for them:
 
 1. A multi-process layout for `be`, `proxy`, `cell-manager`, and `global-manager`.
-2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
+2. A replicated global cell map, request forwarding between cells, and a follower that forwards `RegisterCell` or join. The directory is one process's file. Join still has to reach the current leader.
 3. Placing a jumbo shard on its own machine and moving other shard files off that disk. Automatic leadership transfer is disabled because OpenRaft drops the leader lease before peers answer, and older peers do not implement `TransferLeader`. A same-size voter replacement keeps fault tolerance and only adds a node that is already a voter. A node that has not joined a shard is not added.
 4. Native TLS. This process does not terminate TLS. Config keys that ask for TLS or a certificate are rejected instead of serving plaintext. Put termination in an external proxy. Raft and metrics use the same bearer as the other services when a secret is set; that bearer is not mutual TLS. The 3-second heartbeat records liveness. It does not drive splits, cell federation, or disk drain.
 5. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. A leader election makes `/readyz` and `/healthz` return 503 on replicas that do not know a leader. `[raft]` is loaded and is not `#[serde(skip)]`. Its values apply when a group starts and are not reloaded. See [Operability](./operability.md).

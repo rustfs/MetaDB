@@ -26,6 +26,7 @@ use metadb_storage::sstable::sync_dir;
 use metadb_storage::LsmEngineConfig;
 use metadb_tx::{RoutedShardHandle, TxStateMachineHandler};
 
+use crate::cell_directory::{shards_covering, union_route_range};
 use crate::control_plane_state::{
     decide_heartbeat, decode_control_plane, normalize_ids, remote_state_change_is_too_soon,
     unix_ms, HeartbeatDecision, HeartbeatWrite, PersistedControlPlane, StoredHeartbeat,
@@ -168,6 +169,39 @@ impl DurableCellManager {
         id_allocator: Arc<DurableIdAllocator>,
         meta_cache: Arc<CompositeMetaCache>,
     ) -> Result<Arc<Self>> {
+        Self::open_or_bootstrap_in_range(
+            cell_id,
+            state_dir,
+            host,
+            local_addr,
+            bootstrap_table_shards,
+            split_threshold_bytes,
+            lsm_config,
+            raft_opts,
+            id_allocator,
+            meta_cache,
+            None,
+        )
+        .await
+    }
+
+    /// `owned_range` `None` keeps the historical whole user key space.
+    /// A configured range must already be the durable route union when the
+    /// cell directory exists.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_or_bootstrap_in_range(
+        cell_id: CellId,
+        state_dir: impl AsRef<Path>,
+        host: Arc<ShardGroupHost>,
+        local_addr: String,
+        bootstrap_table_shards: bool,
+        split_threshold_bytes: usize,
+        lsm_config: LsmEngineConfig,
+        raft_opts: RaftNodeOptions,
+        id_allocator: Arc<DurableIdAllocator>,
+        meta_cache: Arc<CompositeMetaCache>,
+        owned_range: Option<CompositeKeyRange>,
+    ) -> Result<Arc<Self>> {
         node_id_in_ha_range(host.node_id())?;
         let state_dir = state_dir.as_ref().to_path_buf();
         fs::create_dir_all(&state_dir)?;
@@ -226,37 +260,16 @@ impl DurableCellManager {
             let mut init_peers = BTreeMap::new();
             init_peers.insert(host.node_id(), (local_addr.clone(), true));
 
-            if bootstrap_table_shards {
-                for (sid, range) in [
-                    (1u64, CompositeKeyRange::meta_table_root()),
-                    (2u64, CompositeKeyRange::quota_table_root()),
-                    (3u64, CompositeKeyRange::secondary_index_table_root()),
-                ] {
-                    init.routes.insert(
-                        sid,
-                        CompositeShardRoute {
-                            cell_id,
-                            shard_id: sid,
-                            range,
-                            epoch: ShardEpoch::initial(),
-                            leader_node: host.node_id(),
-                            peers: init_peers.clone(),
-                            split_mode: ShardSplitMode::DirectoryColocated,
-                            health_state: ShardHealthState::Normal,
-                            dual_mode_pid: None,
-                        },
-                    );
-                }
-            } else {
+            for (sid, range) in shards_covering(owned_range.as_ref(), bootstrap_table_shards)? {
                 init.routes.insert(
-                    1,
+                    sid,
                     CompositeShardRoute {
                         cell_id,
-                        shard_id: 1,
-                        range: CompositeKeyRange::all_user_tables(),
+                        shard_id: sid,
+                        range,
                         epoch: ShardEpoch::initial(),
                         leader_node: host.node_id(),
-                        peers: init_peers,
+                        peers: init_peers.clone(),
                         split_mode: ShardSplitMode::DirectoryColocated,
                         health_state: ShardHealthState::Normal,
                         dual_mode_pid: None,
@@ -266,6 +279,14 @@ impl DurableCellManager {
             Self::write_state_file(&state_dir, &init)?;
             init
         };
+        if let Some(expected) = &owned_range {
+            let actual = union_route_range(persisted.routes.values().map(|route| &route.range))?;
+            if &actual != expected {
+                return Err(MetaDbError::ShardRoutingError(
+                    "configured cell range does not match the durable routes".to_string(),
+                ));
+            }
+        }
 
         Self::verify_or_initialize_owner(
             &state_dir,
@@ -834,6 +855,10 @@ impl DurableCellManager {
 
     pub fn cell_id(&self) -> CellId {
         self.cell_id
+    }
+
+    pub fn local_node_id(&self) -> NodeId {
+        self.host.node_id()
     }
 
     pub fn host(&self) -> &Arc<ShardGroupHost> {

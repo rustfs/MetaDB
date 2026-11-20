@@ -83,6 +83,6 @@ An empty secret does not start the process. Loopback is not an implicit exceptio
 
 - Le découpage des sous-systèmes par rôle. Le champ de rôle est un interrupteur autoriser/refuser, pas un ensemble de fonctions.
 - Les listes de pairs, les ensembles de votants ou un jeton de jonction. L'appartenance commence par ce seul processus. Des pairs supplémentaires n'apparaissent qu'après `RegisterNode` plus `ScaleShardReplicas`, et ces pairs doivent déjà être des membres Raft qui parlent `RaftTransportService` pour les mêmes journaux de shard. Un second processus all-in-one ne le fait pas. Voir [Exploitation](./operations.md).
-- L'intervalle de clés d'une seconde cellule. `RegisterCell` renvoie une erreur et ne stocke rien. Un second all-in-one au répertoire vide rejoint le leader courant avec `[cluster] join` ; c'est toujours la même cellule.
+- An arbitrary key slice as a cell range. `cell_start_key` and `cell_end_key` must be a contiguous union of whole tables. `RegisterCell` stores a remote cell only after its routes cover that range. Join still joins the same cell and does not create a second one.
 - Locality-compaction on/off. `to_lsm_config` always enables it. Raft timers are the `[raft]` table; see [Operability](../en/operability.md).
 - Les certificats TLS natifs. Une clé TLS dans ce fichier est rejetée. La terminaison appartient à un proxy externe.

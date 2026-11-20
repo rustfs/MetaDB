@@ -143,4 +143,4 @@ Split plans are stored in `CELL_MANAGER_STATE`. Crash points covered by `split_c
 | `TriggerShardSplit` | Forces `maybe_split_or_isolate_shard` on a local shard |
 | `EnableDualModeSplit` | Sets the local route flag. `split_name` in the request is ignored |
 | `ScaleShardReplicas` | Calls `scale_out_replicas` if this cell exists and enough nodes are registered |
-| `RegisterCell` | Returns an application error. This process still hosts one cell and does not store the requested cell |
+| `RegisterCell` | Stores a remote cell after its routes cover the requested range. This process does not forward those keys |

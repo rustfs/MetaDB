@@ -83,6 +83,6 @@ An empty secret does not start the process. Loopback is not an implicit exceptio
 
 - 按角色裁剪子系统。角色字段是允许或拒绝的开关，不是功能集合。
 - 对等体列表、投票者集合或加入令牌。成员关系从这一个进程开始。额外对等体只在 `RegisterNode` 加上 `ScaleShardReplicas` 之后出现，而且这些对等体必须已经是同一分片日志上会说 `RaftTransportService` 的 Raft 成员。第二个 all-in-one 进程不会这样做。见 [运维](./operations.md)。
-- 第二个单元的键范围。`RegisterCell` 返回错误并且什么都不保存。空数据目录上的第二个 all-in-one 进程用 `[cluster] join` 加入当前 leader，这仍是同一个单元。
+- An arbitrary key slice as a cell range. `cell_start_key` and `cell_end_key` must be a contiguous union of whole tables. `RegisterCell` stores a remote cell only after its routes cover that range. Join still joins the same cell and does not create a second one.
 - Locality-compaction on/off. `to_lsm_config` always enables it. Raft timers are the `[raft]` table; see [Operability](../en/operability.md).
 - 本进程内的 TLS 证书。配置中的 TLS 键会被拒绝。终结应放在外部代理。
