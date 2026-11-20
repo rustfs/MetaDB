@@ -135,6 +135,10 @@ pub struct MetaDbGrpcService {
     /// Bearer sent when this process probes another cell. Empty means the
     /// process was allowed to start without a secret, so probes stay on loopback.
     forward_secret: String,
+    /// `global-manager` publishes routes and does not mint ids or rename leases.
+    directory_only: bool,
+    /// `cell-manager` keeps its own cell and refuses to store a remote cell.
+    accepts_remote_cells: bool,
 }
 
 impl MetaDbGrpcService {
@@ -148,12 +152,30 @@ impl MetaDbGrpcService {
             tx_router,
             proxy_router,
             forward_secret: String::new(),
+            directory_only: false,
+            accepts_remote_cells: true,
         }
     }
 
     pub fn with_forward_secret(mut self, secret: String) -> Self {
         self.forward_secret = secret;
         self
+    }
+
+    pub fn with_directory_only(mut self, directory_only: bool) -> Self {
+        self.directory_only = directory_only;
+        self
+    }
+
+    pub fn with_remote_cell_registration(mut self, accepts_remote_cells: bool) -> Self {
+        self.accepts_remote_cells = accepts_remote_cells;
+        self
+    }
+
+    fn directory_only_error() -> MetaDbError {
+        MetaDbError::ShardRoutingError(
+            "global-manager does not allocate ids or rename leases".to_string(),
+        )
     }
 
     fn server_hlc(&self) -> u64 {
@@ -1122,6 +1144,14 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<AllocateIdBlockRequest>,
     ) -> Result<Response<AllocateIdBlockResponse>, Status> {
+        if self.directory_only {
+            let error = Self::directory_only_error();
+            return Ok(Response::new(AllocateIdBlockResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+                start_id: 0,
+                count: 0,
+            }));
+        }
         let req = request.into_inner();
         let kind = match req.id_kind {
             1 => AllocIdKind::FileInode,
@@ -1212,6 +1242,14 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<AcquireDirRenameLeaseRequest>,
     ) -> Result<Response<AcquireDirRenameLeaseResponse>, Status> {
+        if self.directory_only {
+            let error = Self::directory_only_error();
+            return Ok(Response::new(AcquireDirRenameLeaseResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+                rename_fence_token: 0,
+                expire_hlc: 0,
+            }));
+        }
         let req = request.into_inner();
         match self
             .global_manager
@@ -1235,6 +1273,12 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<ReleaseDirRenameLeaseRequest>,
     ) -> Result<Response<ReleaseDirRenameLeaseResponse>, Status> {
+        if self.directory_only {
+            let error = Self::directory_only_error();
+            return Ok(Response::new(ReleaseDirRenameLeaseResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+            }));
+        }
         let req = request.into_inner();
         match self
             .global_manager
@@ -1343,6 +1387,15 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<RegisterCellRequest>,
     ) -> Result<Response<RegisterCellResponse>, Status> {
+        if !self.accepts_remote_cells {
+            let error = MetaDbError::ShardRoutingError(
+                "cell-manager does not store a remote cell; register it with the global-manager"
+                    .to_string(),
+            );
+            return Ok(Response::new(RegisterCellResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+            }));
+        }
         let req = request.into_inner();
         let range = match CompositeKeyRange::new(req.start_key, req.end_key) {
             Ok(range) => range,

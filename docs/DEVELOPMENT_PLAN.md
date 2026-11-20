@@ -199,7 +199,7 @@ flowchart TD
   * `crates/metadb-server/tests/{integration_tests.rs, e2e_cluster_evolution_tests.rs}`
   * Documentation status updates across `Architecture.md`, `README.md`, and `docs/guides/{en,ja,fr,zh,de}/`
 * **Key Invariants**:
-  * **Single runnable role**: `metadbd --role all-in-one` runs `GlobalManager`, `CellLocalManager`, `MetaCache`, `Proxy`, and a `1-Voter` OpenRaft group in one process. `open_and_serve` rejects `global-manager`, `cell-manager`, `be`, and `proxy`. Those names are not a disaggregated deployment.
+  * **Runnable roles**: `all-in-one` still hosts the directory, one cell, and local Raft groups. `global-manager` hosts only `GLOBAL_CELL_DIRECTORY` and does not open Raft groups or mint ids. `cell-manager` hosts one cell and its local Raft groups and can `RegisterCell` itself with `cluster.global_manager`. `be` and `proxy` are still rejected. The directory file is not a Raft group, and the global process does not forward keys.
   * **Clean Lifecycle**: Graceful SIGINT/SIGTERM drain flushes active MemTables, persists `MANIFEST` and Raft state, and closes network listeners cleanly.
 * **Verification Commands**:
   * `cargo fmt --all -- --check`

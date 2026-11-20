@@ -45,12 +45,7 @@ fn heartbeat_request(seq: u64, node_id: u64, disk_free_bytes: u64) -> StoreHeart
 
 #[tokio::test]
 async fn disaggregated_roles_are_rejected_before_listen() {
-    for role in [
-        ServerRole::Be,
-        ServerRole::Proxy,
-        ServerRole::CellManager,
-        ServerRole::GlobalManager,
-    ] {
+    for role in [ServerRole::Be, ServerRole::Proxy] {
         let mut cfg = ServerTomlConfig::default();
         cfg.node.role = role;
         cfg.node.data_dir = tempdir().unwrap().path().to_path_buf();
