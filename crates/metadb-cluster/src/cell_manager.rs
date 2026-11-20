@@ -190,6 +190,9 @@ pub struct DurableCellManager {
     /// Test hook: return after `MOVE_LIVE` and the dest group are durable, before
     /// the old directory is removed.
     stop_before_source_removal: AtomicBool,
+    /// Test hook: the next control-plane propose reports that this process is
+    /// not the leader and writes nothing.
+    control_propose_not_leader: AtomicBool,
 }
 
 impl DurableCellManager {
@@ -363,6 +366,7 @@ impl DurableCellManager {
             jumbo_dedicated_root: Mutex::new(jumbo_dedicated_root),
             jumbo_file_move_failed: Mutex::new(HashSet::new()),
             stop_before_source_removal: AtomicBool::new(false),
+            control_propose_not_leader: AtomicBool::new(false),
         });
 
         if let Err(error) = mgr.boot_local_shards().await {
@@ -381,6 +385,10 @@ impl DurableCellManager {
             return Err(error);
         }
         if let Err(error) = mgr.ingest_engine_bindings() {
+            let _ = mgr.host.shutdown_all().await;
+            return Err(error);
+        }
+        if let Err(error) = mgr.adopt_instance_binding_from_snapshot() {
             let _ = mgr.host.shutdown_all().await;
             return Err(error);
         }
@@ -482,6 +490,7 @@ impl DurableCellManager {
             jumbo_dedicated_root: Mutex::new(None),
             jumbo_file_move_failed: Mutex::new(HashSet::new()),
             stop_before_source_removal: AtomicBool::new(false),
+            control_propose_not_leader: AtomicBool::new(false),
         }))
     }
 
@@ -585,6 +594,41 @@ impl DurableCellManager {
         self.local_shard_handles()
             .iter()
             .any(|(_, group, _)| group.voter_count() > 1)
+    }
+
+    /// Keeps a committed manager snapshot when its instance binding was not on
+    /// this shard's log.
+    ///
+    /// A jumbo handoff copies `CELL_MANAGER_STATE` onto another shard. That
+    /// copy does not include the `0x09` binding row. Republishing the local
+    /// file would replace the committed manager body. The snapshot's instance
+    /// is enough to skip that publish.
+    fn adopt_instance_binding_from_snapshot(&self) -> Result<()> {
+        let Some(identity) = *self.identity.lock().unwrap() else {
+            return Ok(());
+        };
+        if self.bound_instance(identity.node_id) == Some(identity.node_instance_id) {
+            return Ok(());
+        }
+        let Some(record) = self.replicated_control()? else {
+            return Ok(());
+        };
+        let Ok(state) = decode_cell_state(&record.manager_body) else {
+            return Ok(());
+        };
+        if state.node_instances.get(&identity.node_id) != Some(&identity.node_instance_id) {
+            return Ok(());
+        }
+        let address = state
+            .nodes
+            .get(&identity.node_id)
+            .cloned()
+            .unwrap_or_default();
+        self.instance_bindings
+            .lock()
+            .unwrap()
+            .insert(identity.node_id, (identity.node_instance_id, address));
+        Ok(())
     }
 
     async fn bind_local_instance(&self) -> Result<()> {
@@ -1340,6 +1384,11 @@ impl DurableCellManager {
         dest_node: NodeId,
         plan: &SpareDrainPlan,
     ) -> Result<RemoteMoveOutcome> {
+        // The source group may already be closed. Copy both snapshots before
+        // the directory is removed. A non-leader target or a different manager
+        // body leaves the source in place.
+        self.preserve_control_snapshot_before_handoff(shard_id)
+            .await?;
         let raft_membership_changed = self.try_raft_spare_drain(plan).await?;
         append_spare_drain(
             &self.state_dir,
@@ -2744,54 +2793,193 @@ impl DurableCellManager {
         Ok(best)
     }
 
-    /// Copies a committed directory off `leaving` before that shard's log is closed.
+    /// Copies both committed snapshots off `leaving` before that directory is removed.
     ///
-    /// The next open shard receives the same cell ids. An empty directory is not
-    /// proposed. If no other group is open, the handoff is refused.
+    /// `Ok(false)` from a target that is not led by this process is a failure.
+    /// The open shard must then contain the same directory and the same
+    /// `CELL_MANAGER_STATE` body. A closed source log is read from disk. If it
+    /// cannot be moved, the source directory stays.
     async fn preserve_control_snapshot_before_handoff(&self, leaving: ShardId) -> Result<()> {
-        let Some(group) = self.host.get_group(leaving) else {
+        let Some(record) = self.committed_record_for_shard(leaving)? else {
             return Ok(());
         };
-        let Some(record) = metadb_tx::read_replicated_control_record(group.engine().as_ref())?
-        else {
+        if self.open_shard_has_exact_snapshot(leaving, &record)? {
             return Ok(());
-        };
+        }
         let next_id = self
             .running_shard_ids()
             .into_iter()
             .find(|shard_id| *shard_id != leaving);
         let Some(next_id) = next_id else {
             return Err(MetaDbError::ShardRoutingError(format!(
-                "shard {leaving} holds the committed cell directory and no other shard group is open; refusing to hand it off or publish an empty directory"
+                "shard {leaving} holds the committed cell directory and CELL_MANAGER_STATE and no other shard group is open; refusing to hand it off or publish an empty directory"
             )));
         };
         let Some(next) = self.host.get_group(next_id) else {
             return Err(MetaDbError::ShardRoutingError(format!(
-                "shard {next_id} stopped before the committed directory could be copied"
+                "shard {next_id} stopped before the committed directory and CELL_MANAGER_STATE could be copied; the source directory was not deleted"
             )));
         };
-        self.propose_control_on_group(
-            next.as_ref(),
-            record.directory_cell_ids.clone(),
-            record.directory_body.clone(),
-            record.manager_body.clone(),
-            Some(record.sequence),
-        )
-        .await?;
+        let proposed = self
+            .propose_control_on_group(
+                next.as_ref(),
+                record.directory_cell_ids.clone(),
+                record.directory_body.clone(),
+                record.manager_body.clone(),
+                Some(record.sequence),
+            )
+            .await?;
+        if !proposed {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "shard {next_id} is not led by this process; the committed directory and CELL_MANAGER_STATE were not proposed and the source directory was not deleted"
+            )));
+        }
         let copied = metadb_tx::read_replicated_control_record(next.engine().as_ref())?
             .ok_or_else(|| {
                 MetaDbError::ShardRoutingError(format!(
-                    "shard {next_id} did not store the committed cell directory; the old log was kept"
+                    "shard {next_id} did not store the committed directory and CELL_MANAGER_STATE; the source directory was not deleted"
                 ))
             })?;
-        if copied.directory_cell_ids != record.directory_cell_ids
-            || copied.directory_body != record.directory_body
-        {
+        if !control_snapshots_match(&copied, &record) {
             return Err(MetaDbError::ShardRoutingError(format!(
-                "shard {next_id} stored a different cell directory; refusing to drop the committed snapshot"
+                "shard {next_id} stored a different directory or CELL_MANAGER_STATE; refusing to drop the committed snapshot and the source directory was not deleted"
             )));
         }
         Ok(())
+    }
+
+    fn committed_record_for_shard(
+        &self,
+        shard_id: ShardId,
+    ) -> Result<Option<metadb_tx::ReplicatedControlRecord>> {
+        if let Some(group) = self.host.get_group(shard_id) {
+            return metadb_tx::read_replicated_control_record(group.engine().as_ref());
+        }
+        self.read_stopped_shard_control_record(shard_id)
+    }
+
+    fn open_shard_has_exact_snapshot(
+        &self,
+        leaving: ShardId,
+        record: &metadb_tx::ReplicatedControlRecord,
+    ) -> Result<bool> {
+        for shard_id in self.running_shard_ids() {
+            if shard_id == leaving {
+                continue;
+            }
+            let Some(group) = self.host.get_group(shard_id) else {
+                continue;
+            };
+            let Some(existing) =
+                metadb_tx::read_replicated_control_record(group.engine().as_ref())?
+            else {
+                continue;
+            };
+            if control_snapshots_match(&existing, record) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn read_stopped_shard_control_record(
+        &self,
+        shard_id: ShardId,
+    ) -> Result<Option<metadb_tx::ReplicatedControlRecord>> {
+        if self.host.get_group(shard_id).is_some() {
+            return Ok(None);
+        }
+        let lsm = self.host.shard_dir(shard_id).join("lsm");
+        if !lsm.exists() {
+            return Ok(None);
+        }
+        let engine = metadb_storage::LifecycleStorageEngine::open_lsm_existing(
+            shard_id,
+            &lsm,
+            self.host.block_cache().clone(),
+            self.lsm_config.clone(),
+        )?;
+        metadb_tx::read_replicated_control_record(&engine)
+    }
+
+    /// The next control-plane propose reports that this process is not the leader.
+    pub fn testing_next_control_propose_not_leader(&self) {
+        self.control_propose_not_leader
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Writes `manager_body` onto `shard_id` with the current committed directory.
+    ///
+    /// The directory bytes stay the same. The manager body is what differs.
+    pub async fn testing_publish_manager_body_on_shard(
+        &self,
+        shard_id: ShardId,
+        manager_body: Vec<u8>,
+    ) -> Result<()> {
+        let record = self.replicated_control()?.ok_or_else(|| {
+            MetaDbError::ShardRoutingError("no committed control snapshot to diverge".to_string())
+        })?;
+        let Some(group) = self.host.get_group(shard_id) else {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "shard {shard_id} is not running"
+            )));
+        };
+        let proposed = self
+            .propose_control_on_group(
+                group.as_ref(),
+                record.directory_cell_ids,
+                record.directory_body,
+                manager_body,
+                Some(record.sequence),
+            )
+            .await?;
+        if !proposed {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "shard {shard_id} did not accept the divergent CELL_MANAGER_STATE"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn testing_control_record_on_shard(
+        &self,
+        shard_id: ShardId,
+    ) -> Result<Option<metadb_tx::ReplicatedControlRecord>> {
+        self.committed_record_for_shard(shard_id)
+    }
+
+    /// Publishes the committed directory with a different, still-valid manager body.
+    ///
+    /// The address of this process gains a suffix. Nodes, voters, and addresses
+    /// stay non-empty, so the record still decodes.
+    pub async fn testing_diverge_manager_on_shard(&self, shard_id: ShardId) -> Result<Vec<u8>> {
+        let record = self.replicated_control()?.ok_or_else(|| {
+            MetaDbError::ShardRoutingError("no committed control snapshot to diverge".to_string())
+        })?;
+        let mut state: PersistedCellState =
+            codec::deserialize(&record.manager_body).map_err(|error| {
+                MetaDbError::CodecError(format!(
+                    "CELL_MANAGER_STATE could not be diverged: {error}"
+                ))
+            })?;
+        let node = self.host.node_id();
+        let address = state.nodes.get_mut(&node).ok_or_else(|| {
+            MetaDbError::ShardRoutingError(format!(
+                "CELL_MANAGER_STATE has no address for node {node}"
+            ))
+        })?;
+        address.push_str("-diverged");
+        for route in state.routes.values_mut() {
+            if let Some((peer, _)) = route.peers.get_mut(&node) {
+                peer.push_str("-diverged");
+            }
+        }
+        let body = codec::serialize(&state).map_err(|error| {
+            MetaDbError::CodecError(format!("CELL_MANAGER_STATE could not be diverged: {error}"))
+        })?;
+        self.testing_publish_manager_body_on_shard(shard_id, body.clone())
+            .await?;
+        Ok(body)
     }
 
     /// Snapshot committed on this cell's existing shard Raft group, if any.
@@ -2914,6 +3102,12 @@ impl DurableCellManager {
         manager_body: Vec<u8>,
         floor_sequence: Option<u64>,
     ) -> Result<bool> {
+        if self
+            .control_propose_not_leader
+            .swap(false, Ordering::Relaxed)
+        {
+            return Ok(false);
+        }
         let leader = group.wait_for_leader(Duration::from_secs(15)).await?;
         if leader != self.host.node_id() {
             return Ok(false);
@@ -3991,6 +4185,15 @@ struct LegacyPersistedCellState {
     nodes: BTreeMap<NodeId, String>,
     routes: BTreeMap<ShardId, CompositeShardRoute>,
     split_plans: BTreeMap<u128, LegacySplitPlanRecord>,
+}
+
+fn control_snapshots_match(
+    copied: &metadb_tx::ReplicatedControlRecord,
+    record: &metadb_tx::ReplicatedControlRecord,
+) -> bool {
+    copied.directory_cell_ids == record.directory_cell_ids
+        && copied.directory_body == record.directory_body
+        && copied.manager_body == record.manager_body
 }
 
 pub fn manager_voters_from_body(

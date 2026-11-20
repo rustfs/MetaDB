@@ -162,6 +162,12 @@ async fn remote_live_cut_then_spare_drain_keeps_the_placement_row() {
         "cell ids must survive the carrier move"
     );
     assert_eq!(restored.directory_body, committed.directory_body);
+    assert_eq!(
+        restored.manager_body, committed.manager_body,
+        "restart must restore CELL_MANAGER_STATE, not only directory fields"
+    );
+    let nodes = metadb_cluster::manager_nodes_from_body(&restored.manager_body).unwrap();
+    assert_eq!(nodes.get(&1).map(String::as_str), Some("127.0.0.1:1"));
     assert!(restored.sequence >= committed.sequence);
     assert_eq!(cell.stored_remote_handoffs().unwrap().len(), 1);
     assert!(cell.stored_placement(1).is_some());
@@ -317,4 +323,118 @@ async fn live_dirsync_failure_does_not_delete_the_only_copy_or_drain() {
     assert_eq!(cell.raft_voter_ids(2).unwrap(), BTreeSet::from([1]));
     host.shutdown_all().await.unwrap();
     stop_listener(task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_directory_different_manager_does_not_delete_the_source() {
+    let dir = tempdir().unwrap();
+    let remote = tempdir().unwrap();
+    let (host, cell) = open_cell(dir.path()).await;
+    let (disk, task) = listen(remote.path()).await;
+    let source = host.shard_dir(1);
+    cell.testing_mark_jumbo(1, 2, 9).unwrap();
+    let committed = cell
+        .replicated_control()
+        .unwrap()
+        .expect("the source shard holds both snapshots");
+    let divergent = cell.testing_diverge_manager_on_shard(2).await.unwrap();
+    let on_two = cell.testing_control_record_on_shard(2).unwrap().unwrap();
+    assert_eq!(on_two.directory_body, committed.directory_body);
+    assert_eq!(on_two.directory_cell_ids, committed.directory_cell_ids);
+    assert_ne!(on_two.manager_body, committed.manager_body);
+    assert_eq!(on_two.manager_body, divergent);
+    cell.testing_next_control_propose_not_leader();
+    let failed = cell
+        .relocate_jumbo_shard_to_remote(1, 2, disk.local_addr(), &drain_request())
+        .await
+        .unwrap_err();
+    let text = failed.to_string();
+    assert!(text.contains("not led by this process"), "{text}");
+    assert!(text.contains("source directory was not deleted"), "{text}");
+    assert!(source.exists());
+    assert!(cell.lookup_local_handle(1).is_ok());
+    assert!(cell.stored_spare_drains().unwrap().is_empty());
+    assert!(cell.stored_remote_handoffs().unwrap().is_empty());
+    assert!(!disk.is_serving(1));
+    let kept = cell.testing_control_record_on_shard(1).unwrap().unwrap();
+    assert_eq!(kept.manager_body, committed.manager_body);
+    assert_eq!(kept.directory_body, committed.directory_body);
+    let still_divergent = cell.testing_control_record_on_shard(2).unwrap().unwrap();
+    assert_eq!(still_divergent.directory_body, committed.directory_body);
+    assert_eq!(still_divergent.manager_body, divergent);
+
+    host.shutdown_all().await.unwrap();
+    drop(cell);
+    drop(host);
+    stop_listener(task).await;
+
+    let (host, cell) = open_cell(dir.path()).await;
+    assert!(host.shard_dir(1).exists());
+    assert!(cell.lookup_local_handle(1).is_ok());
+    let restored = cell.testing_control_record_on_shard(1).unwrap().unwrap();
+    assert_eq!(restored.directory_body, committed.directory_body);
+    assert_eq!(restored.manager_body, committed.manager_body);
+    let nodes = metadb_cluster::manager_nodes_from_body(&restored.manager_body).unwrap();
+    assert_eq!(nodes.get(&1).map(String::as_str), Some("127.0.0.1:1"));
+    let other = cell.testing_control_record_on_shard(2).unwrap().unwrap();
+    assert_eq!(other.manager_body, divergent);
+    assert!(cell.stored_remote_handoffs().unwrap().is_empty());
+    host.shutdown_all().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_source_with_a_different_manager_does_not_delete_the_directory() {
+    let dir = tempdir().unwrap();
+    let remote = tempdir().unwrap();
+    let (host, cell) = open_cell(dir.path()).await;
+    let (disk, task) = listen(remote.path()).await;
+    let source = host.shard_dir(1);
+    cell.testing_mark_jumbo(1, 2, 9).unwrap();
+    let committed = cell.replicated_control().unwrap().unwrap();
+    disk.testing_report_visible_dirsync_failure();
+    let closed = cell
+        .relocate_jumbo_shard_to_remote(1, 2, disk.local_addr(), &drain_request())
+        .await
+        .unwrap_err();
+    assert!(
+        closed.to_string().contains("directory fsync failed"),
+        "{closed}"
+    );
+    assert!(source.exists());
+    assert!(cell.lookup_local_handle(1).is_err());
+    assert!(cell.stored_remote_handoffs().unwrap().is_empty());
+    let divergent = cell.testing_diverge_manager_on_shard(2).await.unwrap();
+    assert_ne!(divergent, committed.manager_body);
+    cell.testing_next_control_propose_not_leader();
+    let failed = cell
+        .relocate_jumbo_shard_to_remote(1, 2, disk.local_addr(), &drain_request())
+        .await
+        .unwrap_err();
+    let text = failed.to_string();
+    assert!(text.contains("not led by this process"), "{text}");
+    assert!(text.contains("source directory was not deleted"), "{text}");
+    assert!(source.exists(), "a closed source is not deleted");
+    assert!(cell.stored_spare_drains().unwrap().is_empty());
+    assert!(cell.stored_remote_handoffs().unwrap().is_empty());
+    let kept = cell.testing_control_record_on_shard(1).unwrap().unwrap();
+    assert_eq!(kept.directory_body, committed.directory_body);
+    assert_eq!(kept.manager_body, committed.manager_body);
+    let other = cell.testing_control_record_on_shard(2).unwrap().unwrap();
+    assert_eq!(other.directory_body, committed.directory_body);
+    assert_eq!(other.manager_body, divergent);
+    assert_eq!(cell.raft_voter_ids(2).unwrap(), BTreeSet::from([1]));
+    host.shutdown_all().await.unwrap();
+    drop(cell);
+    drop(host);
+    stop_listener(task).await;
+
+    let (host, cell) = open_cell(dir.path()).await;
+    assert!(host.shard_dir(1).exists());
+    let restored = cell.testing_control_record_on_shard(1).unwrap().unwrap();
+    assert_eq!(restored.directory_cell_ids, committed.directory_cell_ids);
+    assert_eq!(restored.directory_body, committed.directory_body);
+    assert_eq!(restored.manager_body, committed.manager_body);
+    let nodes = metadb_cluster::manager_nodes_from_body(&restored.manager_body).unwrap();
+    assert_eq!(nodes.get(&1).map(String::as_str), Some("127.0.0.1:1"));
+    host.shutdown_all().await.unwrap();
 }
