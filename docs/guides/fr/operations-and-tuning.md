@@ -6,7 +6,7 @@
 
 ## 1. Utilitaire d'Administration `metadb-ctl` `[Implémenté]`
 
-`[Implémenté]` means the `metadb-ctl` binary exists and talks to an all-in-one process. `cell register` does not create a cell. `metadbd --role be` is not a supported deployment. Output from a bench command is for the machine that ran it, not a checked-in result.
+`[Implémenté]` means the `metadb-ctl` binary exists and talks to an all-in-one process. `cell register` does not create a cell. `metadbd --role be` hosts local Raft replicas and does not mint id blocks. Output from a bench command is for the machine that ran it, not a checked-in result.
 
 ```bash
 # État global des cellules, nœuds BE et filigranes Raft

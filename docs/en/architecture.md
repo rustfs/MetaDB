@@ -2,13 +2,13 @@
 
 [Overview](./README.md) · [Français](../fr/architecture.md) · [Deutsch](../de/architecture.md) · [日本語](../ja/architecture.md) · [简体中文](../zh/architecture.md)
 
-This page follows the code in `crates/`. A `global-manager` process and a `cell-manager` process can run separately. The directory is still one local file, this process does not forward keys, and `be` / `proxy` do not start. See [Operations](./operations.md#known-limitations).
+This page follows the code in `crates/`. `global-manager`, `cell-manager`, `be`, and `proxy` can run as separate processes. The directory is still one local file. The proxy forwards to one upstream and does not choose a cell. See [Operations](./operations.md#known-limitations).
 
 ## Process shape
 
 `PersistentMetaDbCluster::open_and_serve` (`crates/metadb-server/src/lib.rs`):
 
-1. Rejects `be` and `proxy` before listen. `global-manager` refuses a join address, a cell range, a jumbo root, or a data directory that already has `be/` or `CELL_MANAGER_STATE`. `all-in-one` refuses `cluster.global_manager`.
+1. `be` hosts local Raft replicas and refuses `cluster.global_manager` or `cluster.upstream`. `proxy` requires one `cluster.upstream`, refuses join, a cell range, a jumbo root, and https, and does not open Raft. `global-manager` refuses a join address, a cell range, a jumbo root, an upstream, or a data directory that already has `be/` or `CELL_MANAGER_STATE`. `all-in-one` refuses `cluster.global_manager` and `cluster.upstream`. Invalid combinations return before the process binds.
 2. An empty `shared_secret` listens only when `allow_unauthenticated` is explicitly set, and only when every listener address is a literal loopback IP (`127.0.0.0/8` or `::1`). The hostname `localhost` is not accepted and is not resolved. A whitespace-only secret is rejected even when that flag is set. The flag does not permit a wildcard or any other address. The process then binds that same literal address (`grpc_listen_addr` defaults to `127.0.0.1:7800`; port `0` asks the OS for a port). After the socket is bound, the bound IP is checked again.
 3. `global-manager` stops after loading `GLOBAL_CELL_DIRECTORY`. It does not open `ShardGroupHost`, does not bootstrap a cell, and does not run the 250 ms maintenance loop. `AllocateIdBlock` and the rename-lease RPCs return an application error. A key owned by a published cell returns `does not forward`. Readiness is `directory_only` when the process is serving and has no local shards. An empty shard list is still `no_local_shards` for every other role.
 4. `all-in-one` and `cell-manager` open `DurableIdAllocator` at `<data_dir>/global_allocator`, `ShardGroupHost` at `<data_dir>/be`, and `DurableCellManager` at `<data_dir>/cell_<cell_id>`.

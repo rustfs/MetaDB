@@ -6,7 +6,7 @@
 
 ## 1. `metadb-ctl` 运维命令行工具 `[已实现]`
 
-`[已实现]` means the `metadb-ctl` binary exists and talks to an all-in-one process. `cell register` does not create a cell. `metadbd --role be` is not a supported deployment. Output from a bench command is for the machine that ran it, not a checked-in result.
+`[已实现]` means the `metadb-ctl` binary exists and talks to an all-in-one process. `cell register` does not create a cell. `metadbd --role be` hosts local Raft replicas and does not mint id blocks. Output from a bench command is for the machine that ran it, not a checked-in result.
 
 ```bash
 # 查看各 Cell、BE 节点健康状态、分片分布与 Raft 三水位延迟
