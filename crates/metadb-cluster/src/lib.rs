@@ -16,6 +16,7 @@ pub mod identity;
 pub mod jumbo;
 pub mod jumbo_files;
 pub mod jumbo_placement;
+pub mod jumbo_remote;
 pub mod meta_cache;
 pub mod shard;
 pub mod split_worker;
@@ -42,9 +43,11 @@ pub use jumbo::JumboIsolationPlanner;
 pub use jumbo_placement::{
     automatic_leadership_transfer_allowed, executable_placement_actions, fault_tolerance,
     jumbo_membership_change_allowed, leadership_move_recorded, plan_jumbo_placement,
-    transfer_poll_covers_election, CommittedMove, MembershipRefusal, PlacementAction,
-    PlacementDecision, PlacementObservation, PlacementPhase, ShardVoters,
+    plan_spare_voter_drain, transfer_poll_covers_election, CommittedMove, MembershipRefusal,
+    PlacementAction, PlacementDecision, PlacementObservation, PlacementPhase, ShardVoters,
+    SpareDrainPlan, SpareDrainRequest,
 };
+pub use jumbo_remote::{RemoteHandoffRecord, RemoteJumboDisk, RemoteMoveOutcome, SpareDrainRecord};
 pub use meta_cache::{CompositeMetaCache, CompositeShardRoute};
 pub use shard::{
     PolicyShardSplitter, RaftMemberRole, RaftMembership, ShardDescriptor, ShardHealthState,

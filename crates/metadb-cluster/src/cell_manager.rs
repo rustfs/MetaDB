@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -43,7 +44,14 @@ use crate::jumbo_files::{
 use crate::jumbo_placement::{
     automatic_leadership_transfer_allowed, executable_placement_actions,
     jumbo_membership_change_allowed, plan_jumbo_placement, CommittedMove, PlacementAction,
-    PlacementObservation, PlacementPhase, ShardVoters, AUTOMATIC_TRANSFER_DISABLED_REASON,
+    PlacementObservation, PlacementPhase, ShardVoters, SpareDrainPlan, SpareDrainRequest,
+    AUTOMATIC_TRANSFER_DISABLED_REASON,
+};
+use crate::jumbo_remote::{
+    append_handoff, append_spare_drain, destination_has_live_cut, drain_record_for,
+    handoff_blocks_local_open, load_handoffs, load_spare_drains, outcome_from_drain,
+    push_jumbo_shard, refuse_non_loopback, PushResult, RemoteHandoffRecord, RemoteMoveOutcome,
+    SpareDrainRecord,
 };
 use crate::meta_cache::{CompositeMetaCache, CompositeShardRoute};
 use crate::shard::{ShardHealthState, ShardSplitMode};
@@ -783,6 +791,13 @@ impl DurableCellManager {
                     route.range.clone(),
                     wm.clone(),
                 ));
+                if handoff_blocks_local_open(&self.state_dir, route.shard_id)? {
+                    // The directory was handed to another listener after MOVE_LIVE.
+                    // Do not create an empty Raft group in its place. The route row
+                    // stays as it was. This process does not forward the shard.
+                    self.meta_cache.upsert_route(route);
+                    continue;
+                }
                 handler.set_instance_bindings(self.instance_bindings.clone());
                 let sdir = self.resolved_shard_dir(route.shard_id)?;
                 let group = ShardRaftGroup::start(
@@ -1090,6 +1105,275 @@ impl DurableCellManager {
         Ok(())
     }
 
+    /// Places this process's jumbo shard directory on a loopback listener.
+    ///
+    /// `MOVE_STAGED` then `MOVE_LIVE` run on the destination disk. The destination
+    /// does not serve placed-file reads until the live directory fsync succeeds.
+    /// The source directory is removed only after that cut, the spare-drain record,
+    /// and the handoff record are durable. A failure before `MOVE_LIVE` is visible
+    /// reopens the source and does not record the spare drain. `transfer_leader`
+    /// is not called. Raft is not opened on the destination. `CELL_CONTROL_PLANE`
+    /// rows are not deleted. The maintenance loop does not call this method.
+    pub async fn relocate_jumbo_shard_to_remote(
+        &self,
+        shard_id: ShardId,
+        dest_node: NodeId,
+        dest_addr: SocketAddr,
+        drain: &SpareDrainRequest,
+    ) -> Result<RemoteMoveOutcome> {
+        let _lock = self.membership_lock.lock().await;
+        refuse_non_loopback(dest_addr)?;
+        node_id_in_ha_range(dest_node)?;
+        if drain.dedicated_node != dest_node {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "spare drain names dedicated node {} but the destination is {dest_node}; no files were copied and transfer_leader was not called",
+                drain.dedicated_node
+            )));
+        }
+        let plan = drain.plan().map_err(|error| {
+            MetaDbError::ConsensusError(format!("{error}; no files were copied"))
+        })?;
+        if let Some(existing) = load_handoffs(&self.state_dir)?
+            .into_iter()
+            .find(|record| record.shard_id == shard_id)
+        {
+            if existing.dest_node != dest_node {
+                return Err(MetaDbError::StorageIoError(format!(
+                    "jumbo shard {shard_id} is already handed off to node {}; the source was not sent to {dest_node}",
+                    existing.dest_node
+                )));
+            }
+            let live =
+                destination_has_live_cut(shard_id, self.host.node_id(), dest_node, dest_addr)
+                    .await?;
+            if !live {
+                return Err(MetaDbError::StorageIoError(format!(
+                    "handoff for shard {shard_id} is recorded but the destination has no MOVE_LIVE; the source directory was not deleted and transfer_leader was not called"
+                )));
+            }
+            return self
+                .finish_remote_after_live(shard_id, dest_node, &plan)
+                .await;
+        }
+
+        let route = {
+            let state = self.state.lock().unwrap();
+            state.routes.get(&shard_id).cloned()
+        };
+        let Some(route) = route else {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "shard {shard_id} has no route; files were not moved"
+            )));
+        };
+        match route.health_state {
+            ShardHealthState::JumboIsolated { dedicated_node, .. }
+                if dedicated_node == dest_node && dedicated_node != self.host.node_id() => {}
+            ShardHealthState::JumboIsolated { dedicated_node, .. }
+                if dedicated_node == self.host.node_id() =>
+            {
+                return Err(MetaDbError::ShardRoutingError(
+                    "dedicated node is this process; the local dedicated-disk move was not replaced and transfer_leader was not called"
+                        .to_string(),
+                ));
+            }
+            ShardHealthState::JumboIsolated { dedicated_node, .. } => {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "dedicated node {dedicated_node} is not destination {dest_node}; files were not moved and transfer_leader was not called"
+                )));
+            }
+            ShardHealthState::Normal => {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "shard {shard_id} is not jumbo-isolated; a route flag was not treated as a remote file move"
+                )));
+            }
+        }
+        let source = self.host.shard_dir(shard_id);
+        if !source.exists() {
+            return Err(MetaDbError::StorageIoError(format!(
+                "jumbo shard {shard_id} directory {} is missing; nothing was published",
+                source.display()
+            )));
+        }
+        if self.host.get_group(shard_id).is_none() {
+            let live =
+                destination_has_live_cut(shard_id, self.host.node_id(), dest_node, dest_addr)
+                    .await?;
+            if live {
+                return self
+                    .finish_remote_after_live(shard_id, dest_node, &plan)
+                    .await;
+            }
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "shard {shard_id} is not running and the destination has no MOVE_LIVE; files were not moved"
+            )));
+        }
+        let group = self.host.get_group(shard_id).ok_or_else(|| {
+            MetaDbError::ShardRoutingError(format!(
+                "shard {shard_id} is not running; files were not moved"
+            ))
+        })?;
+        group.state_machine().flush_to_lsm().map_err(|error| {
+            MetaDbError::StorageIoError(format!(
+                "jumbo shard {shard_id} flush failed before the remote move: {error}"
+            ))
+        })?;
+        let shutdown_result = group.shutdown().await;
+        drop(group);
+        self.release_stopped_shard(shard_id);
+        if let Err(error) = shutdown_result {
+            let _ = self.reopen_source_group(&route, &source).await;
+            return Err(error);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match push_jumbo_shard(
+            &source,
+            shard_id,
+            self.host.node_id(),
+            dest_node,
+            dest_addr,
+        )
+        .await
+        {
+            Ok(PushResult::LiveCut) => {
+                self.finish_remote_after_live(shard_id, dest_node, &plan)
+                    .await
+            }
+            Err(failure) if failure.live_visible => Err(MetaDbError::StorageIoError(format!(
+                "{}; the source directory was not reopened and was not deleted; the spare voter was not replaced; transfer_leader was not called",
+                failure.message
+            ))),
+            Err(failure) => {
+                if let Err(reopen) = self.reopen_source_group(&route, &source).await {
+                    return Err(MetaDbError::StorageIoError(format!(
+                        "{}; the source copy is still at {} but reopening it failed: {reopen}; the spare voter was not replaced; transfer_leader was not called",
+                        failure.message,
+                        source.display()
+                    )));
+                }
+                Err(MetaDbError::StorageIoError(format!(
+                    "{}; the source copy was reopened; the spare voter was not replaced; transfer_leader was not called",
+                    failure.message
+                )))
+            }
+        }
+    }
+
+    fn release_stopped_shard(&self, shard_id: ShardId) {
+        drop(self.host.take_running_group(shard_id));
+        self.host.router().remove_group(shard_id);
+        self.host.router().remove_local_proposer(shard_id);
+    }
+
+    async fn reopen_source_group(&self, route: &CompositeShardRoute, source: &Path) -> Result<()> {
+        let mut last = None;
+        for _ in 0..20 {
+            match self.open_shard_group(route, source).await {
+                Ok(()) => return Ok(()),
+                Err(error) if error.to_string().contains("would block") => {
+                    last = Some(error);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            MetaDbError::StorageIoError(
+                "reopening the jumbo source did not finish; the directory was not deleted"
+                    .to_string(),
+            )
+        }))
+    }
+
+    async fn finish_remote_after_live(
+        &self,
+        shard_id: ShardId,
+        dest_node: NodeId,
+        plan: &SpareDrainPlan,
+    ) -> Result<RemoteMoveOutcome> {
+        let raft_membership_changed = self.try_raft_spare_drain(plan).await?;
+        append_spare_drain(
+            &self.state_dir,
+            drain_record_for(shard_id, plan, raft_membership_changed),
+        )?;
+        append_handoff(
+            &self.state_dir,
+            RemoteHandoffRecord {
+                shard_id,
+                dest_node,
+                destination_raft_opened: false,
+                transfer_leader_called: false,
+            },
+        )?;
+        let source = self.host.shard_dir(shard_id);
+        if source.exists() {
+            remove_tree(&source).map_err(|error| {
+                MetaDbError::StorageIoError(format!(
+                    "jumbo shard {shard_id} is published on the destination but the old directory could not be removed: {error}; it will not be opened on restart"
+                ))
+            })?;
+        }
+        let stored = load_spare_drains(&self.state_dir)?;
+        let record = stored
+            .iter()
+            .find(|stored| {
+                stored.jumbo_shard_id == shard_id
+                    && stored.drain_shard_id == plan.shard_id
+                    && stored.removed == plan.remove
+                    && stored.added == plan.add
+            })
+            .cloned()
+            .ok_or_else(|| {
+                MetaDbError::StorageIoError(
+                    "spare drain record was not readable after it was written".to_string(),
+                )
+            })?;
+        Ok(outcome_from_drain(&record))
+    }
+
+    /// Applies the spare replacement on a local Raft group only when this process
+    /// is the leader and the live voter set is the planned set. Otherwise the
+    /// protocol record is the commit, and `raft_membership_changed` stays false.
+    async fn try_raft_spare_drain(&self, plan: &SpareDrainPlan) -> Result<bool> {
+        let Some(group) = self.host.get_group(plan.shard_id) else {
+            return Ok(false);
+        };
+        if group.current_leader() != Some(self.host.node_id()) {
+            return Ok(false);
+        }
+        let live: BTreeSet<NodeId> = group.uniform_voter_addrs()?.into_keys().collect();
+        if live == plan.voters_after {
+            return Ok(true);
+        }
+        if live != plan.voters_before {
+            return Ok(false);
+        }
+        match self
+            .replace_dedicated_voter(plan.shard_id, plan.remove, plan.add)
+            .await
+        {
+            ReplaceOutcome::Committed {
+                route_persist_error: None,
+            } => Ok(true),
+            ReplaceOutcome::Committed {
+                route_persist_error: Some(error),
+            } => Err(MetaDbError::StorageIoError(format!(
+                "spare replacement reached the planned voter set but the route record failed: {error}; the source copy was kept; transfer_leader was not called"
+            ))),
+            ReplaceOutcome::NotProposed => Ok(false),
+            ReplaceOutcome::Rejected(error) => Err(MetaDbError::ConsensusError(format!(
+                "spare voter replacement was not committed: {error}; the source copy was kept; transfer_leader was not called"
+            ))),
+        }
+    }
+
+    pub fn stored_spare_drains(&self) -> Result<Vec<SpareDrainRecord>> {
+        load_spare_drains(&self.state_dir)
+    }
+
+    pub fn stored_remote_handoffs(&self) -> Result<Vec<RemoteHandoffRecord>> {
+        load_handoffs(&self.state_dir)
+    }
+
     async fn open_shard_group(&self, route: &CompositeShardRoute, dir: &Path) -> Result<()> {
         let wm = Arc::new(ShardWatermarkTracker::default());
         let handler = Arc::new(TxStateMachineHandler::new(
@@ -1137,13 +1421,24 @@ impl DurableCellManager {
 
     /// Test hook. Persists the jumbo route flag without moving files.
     pub fn testing_mark_local_jumbo(&self, shard_id: ShardId, dominant_pid: InodeId) -> Result<()> {
+        self.testing_mark_jumbo(shard_id, self.host.node_id(), dominant_pid)
+    }
+
+    /// Test hook. Persists `JumboIsolated` for `dedicated_node` without moving files.
+    pub fn testing_mark_jumbo(
+        &self,
+        shard_id: ShardId,
+        dedicated_node: NodeId,
+        dominant_pid: InodeId,
+    ) -> Result<()> {
+        node_id_in_ha_range(dedicated_node)?;
         let mut state = self.state.lock().unwrap();
         let mut next = state.clone();
         let route = next.routes.get_mut(&shard_id).ok_or_else(|| {
             MetaDbError::ShardRoutingError(format!("shard {shard_id} has no route"))
         })?;
         route.health_state = ShardHealthState::JumboIsolated {
-            dedicated_node: self.host.node_id(),
+            dedicated_node,
             dominant_pid,
         };
         let updated = route.clone();

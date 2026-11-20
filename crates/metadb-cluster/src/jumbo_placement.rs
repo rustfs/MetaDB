@@ -335,6 +335,105 @@ fn replacement_spare(shard: &ShardVoters, obs: &PlacementObservation) -> Result<
     ))
 }
 
+/// Planned same-size replacement of a spare voter. Leadership is not part of the plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpareDrainPlan {
+    pub shard_id: ShardId,
+    pub remove: NodeId,
+    pub add: NodeId,
+    pub voters_before: BTreeSet<NodeId>,
+    pub voters_after: BTreeSet<NodeId>,
+}
+
+/// Inputs for [`plan_spare_voter_drain`]. The voter set is the caller's observed set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpareDrainRequest {
+    pub shard_id: ShardId,
+    pub voters: BTreeSet<NodeId>,
+    pub remove: NodeId,
+    pub add: NodeId,
+    pub leader: NodeId,
+    pub dedicated_node: NodeId,
+    pub proven_voters: BTreeSet<NodeId>,
+    pub reserved_dedicated_nodes: BTreeSet<NodeId>,
+}
+
+impl SpareDrainRequest {
+    pub fn plan(&self) -> Result<SpareDrainPlan, String> {
+        plan_spare_voter_drain(self)
+    }
+}
+
+/// Replace one spare voter with a proven voter that is not already in the set.
+///
+/// `remove` must not be the leader and must not be the dedicated node. This
+/// function does not emit [`PlacementAction::TransferLeadership`] and does not
+/// become legal by turning automatic transfer on. A node that is not in
+/// `proven_voters` is not added.
+pub fn plan_spare_voter_drain(request: &SpareDrainRequest) -> Result<SpareDrainPlan, String> {
+    let SpareDrainRequest {
+        shard_id,
+        voters,
+        remove,
+        add,
+        leader,
+        dedicated_node,
+        proven_voters,
+        reserved_dedicated_nodes,
+    } = request;
+    if !voters.contains(leader) {
+        return Err(
+            "spare drain requires a leader that is still a voter; transfer_leader was not called"
+                .to_string(),
+        );
+    }
+    if remove == leader {
+        return Err(format!(
+            "refusing to drain leader {leader} of shard {shard_id}; automatic leadership transfer is disabled and transfer_leader was not called"
+        ));
+    }
+    if remove == dedicated_node {
+        return Err(format!(
+            "refusing to drain dedicated node {dedicated_node} of shard {shard_id}; this path drains a spare voter and does not call transfer_leader"
+        ));
+    }
+    if !voters.contains(remove) {
+        return Err(format!(
+            "node {remove} is not a voter of shard {shard_id}; no spare was replaced"
+        ));
+    }
+    if add == remove || voters.contains(add) {
+        return Err(format!(
+            "node {add} is already a voter of shard {shard_id}; no spare was replaced"
+        ));
+    }
+    if !proven_voters.contains(add) {
+        return Err(format!(
+            "refusing to add node {add} on shard {shard_id}; it is not a proven voter and a node that has not joined is not added"
+        ));
+    }
+    if reserved_dedicated_nodes.contains(add) {
+        return Err(format!(
+            "refusing to add node {add}; it is another jumbo shard's dedicated node"
+        ));
+    }
+    let mut voters_after = voters.clone();
+    voters_after.remove(remove);
+    voters_after.insert(*add);
+    if let Err(refusal) = jumbo_membership_change_allowed(voters, &voters_after) {
+        return Err(format!(
+            "refusing spare drain on shard {shard_id}: {refusal:?}; transfer_leader was not called"
+        ));
+    }
+    Ok(SpareDrainPlan {
+        shard_id: *shard_id,
+        remove: *remove,
+        add: *add,
+        voters_before: voters.clone(),
+        voters_after,
+    })
+}
+
 fn blocked(reason: impl Into<String>) -> PlacementDecision {
     PlacementDecision {
         phase: PlacementPhase::Blocked,
@@ -552,5 +651,47 @@ mod tests {
             plan_jumbo_placement(&obs(1, vec![shard(1, &[1], Some(1))], &[1])).phase,
             PlacementPhase::Recorded
         );
+    }
+
+    fn spare_request(remove: u64, add: u64) -> SpareDrainRequest {
+        SpareDrainRequest {
+            shard_id: 1,
+            voters: voters(&[1, 2, 3]),
+            remove,
+            add,
+            leader: 1,
+            dedicated_node: 2,
+            proven_voters: voters(&[1, 2, 3, 4]),
+            reserved_dedicated_nodes: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn spare_drain_replaces_a_non_leader_and_does_not_plan_transfer() {
+        let plan = spare_request(3, 4).plan().unwrap();
+        assert_eq!(plan.voters_before, voters(&[1, 2, 3]));
+        assert_eq!(plan.voters_after, voters(&[1, 2, 4]));
+        assert_eq!(plan.remove, 3);
+        assert_eq!(plan.add, 4);
+        assert!(!automatic_leadership_transfer_allowed());
+        let forced = vec![PlacementAction::TransferLeadership { shard_id: 1, to: 4 }];
+        assert!(executable_placement_actions(&forced).is_empty());
+    }
+
+    #[test]
+    fn spare_drain_refuses_the_leader_the_dedicated_node_and_a_stranger() {
+        let leader = spare_request(1, 4).plan().unwrap_err();
+        assert!(
+            leader.contains("transfer_leader was not called"),
+            "{leader}"
+        );
+        let dedicated = spare_request(2, 4).plan().unwrap_err();
+        assert!(dedicated.contains("dedicated node"), "{dedicated}");
+        let stranger = spare_request(3, 9).plan().unwrap_err();
+        assert!(stranger.contains("not a proven voter"), "{stranger}");
+        let mut reserved = spare_request(3, 4);
+        reserved.reserved_dedicated_nodes.insert(4);
+        let held = reserved.plan().unwrap_err();
+        assert!(held.contains("another jumbo"), "{held}");
     }
 }

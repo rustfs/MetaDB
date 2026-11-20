@@ -1,8 +1,9 @@
 //! Move one local Jumbo shard directory onto a dedicated disk root.
 //!
-//! This is not a copy onto another machine and not a Raft membership change.
-//! The dedicated node must be this process. Peer replicas are left where they
-//! are. Automatic leadership transfer is not involved.
+//! This module does not open a socket. A loopback placement onto another
+//! listener's disk is [`crate::jumbo_remote`]. The dedicated node for this
+//! function must be this process. Peer replicas are left where they are.
+//! Automatic leadership transfer is not involved.
 //!
 //! A symlink anywhere in the source tree, the destination, or the dedicated
 //! root is refused. Linux is the supported platform.
