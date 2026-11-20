@@ -5,7 +5,10 @@
 
 use std::sync::Arc;
 
-use metadb_cluster::{CompositeMetaCache, DurableCellManager, DurableIdAllocator, PlacementPhase};
+use metadb_cluster::{
+    capture_mono_ns, liveness_effects, CompositeMetaCache, DurableCellManager, DurableIdAllocator,
+    LivenessDecision, LivenessRefusal, PlacementPhase, ScheduleNow, HEARTBEAT_FRESHNESS_MS,
+};
 use metadb_core::HybridLogicalClock;
 use metadb_raft::{RaftNodeOptions, ShardGroupHost};
 use metadb_storage::{LsmEngineConfig, ShardedBlockCache};
@@ -368,5 +371,116 @@ async fn receiver_file_loss_accepts_sender_sequence_above_64() {
         .unwrap();
     assert_eq!(cell.stored_heartbeat(1).unwrap().seq, seq);
     assert!(cell.stored_heartbeat(1).unwrap().seq > 64);
+    host.shutdown_all().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn measured_heartbeat_is_a_hint_and_an_untrusted_clock_refuses() {
+    let dir = tempdir().unwrap();
+    let (host, cell) = open_cell(dir.path()).await;
+    let published = cell.publish_local_heartbeat().unwrap();
+    let local = cell.liveness_decision(1);
+    assert_eq!(
+        local,
+        LivenessDecision::Refuse {
+            node_id: 1,
+            reason: LivenessRefusal::MissingHeartbeat,
+        },
+        "a local wall stamp is not a measured heartbeat"
+    );
+    assert!(!cell.local_heartbeat_is_fresh(0, 3_000));
+    assert!(!cell.local_heartbeat_is_fresh(1, 3_000));
+    assert!(cell.local_heartbeat_is_fresh(published.observed_unix_ms, 3_000));
+
+    let recv = capture_mono_ns();
+    let sent = recv.saturating_sub(1_000_000);
+    cell.record_acknowledged_round_trip(1, published.seq, sent, recv);
+    let live = cell.liveness_decision(1);
+    match &live {
+        LivenessDecision::HintLive {
+            node_id,
+            seq,
+            rtt_ns,
+            ..
+        } => {
+            assert_eq!(*node_id, 1);
+            assert_eq!(*seq, published.seq);
+            assert_eq!(*rtt_ns, Some(recv - sent));
+        }
+        LivenessDecision::Refuse { reason, .. } => panic!("round trip refused: {reason:?}"),
+    }
+    let effects = liveness_effects(&live);
+    assert!(!effects.transfer_leader);
+    assert!(!effects.jumbo_cross_machine);
+    assert!(!effects.membership_change);
+    assert!(!effects.directory_replication);
+    assert!(!metadb_cluster::heartbeat_is_scheduling_truth());
+    assert!(!metadb_cluster::automatic_leadership_transfer_allowed());
+
+    cell.register_node(4, "127.0.0.1:4".to_string()).unwrap();
+    cell.accept_remote_heartbeat(4, 2, None, vec![999], None, 11)
+        .unwrap();
+    assert!(cell.list_routes().iter().all(|route| route.shard_id != 999));
+    let peer = cell.liveness_decision(4);
+    assert!(
+        matches!(
+            peer,
+            LivenessDecision::HintLive {
+                node_id: 4,
+                rtt_ns: None,
+                ..
+            }
+        ),
+        "{peer:?}"
+    );
+    assert!(matches!(
+        cell.liveness_decision(8),
+        LivenessDecision::Refuse {
+            node_id: 8,
+            reason: LivenessRefusal::MissingHeartbeat,
+        }
+    ));
+
+    let old_recv = 1_000_000_000;
+    let old_wall = 1_700_000_000_000;
+    cell.testing_record_measured_recv(9, 1, old_recv, old_wall)
+        .unwrap();
+    let expired = cell.liveness_decision_at(
+        9,
+        ScheduleNow {
+            mono_ns: old_recv + HEARTBEAT_FRESHNESS_MS * 1_000_000,
+            wall_unix_ms: Some(old_wall + HEARTBEAT_FRESHNESS_MS),
+        },
+    );
+    assert_eq!(
+        expired,
+        LivenessDecision::Refuse {
+            node_id: 9,
+            reason: LivenessRefusal::ExpiredHeartbeat,
+        }
+    );
+    assert!(!liveness_effects(&expired).transfer_leader);
+
+    let now = capture_mono_ns();
+    cell.note_control_heartbeat_published(now);
+    assert!(!cell.control_heartbeat_publish_is_due(now));
+    assert!(cell.control_heartbeat_publish_is_due(now.saturating_sub(1)));
+
+    let before = cell.stored_heartbeat(1).unwrap().seq;
+    cell.testing_set_heartbeat_wall(Some(1));
+    let refused = cell.publish_local_heartbeat().unwrap_err();
+    assert!(refused.to_string().contains("untrusted"), "{refused}");
+    assert_eq!(cell.stored_heartbeat(1).unwrap().seq, before);
+    let closed = cell.liveness_decision(4);
+    assert_eq!(
+        closed,
+        LivenessDecision::Refuse {
+            node_id: 4,
+            reason: LivenessRefusal::UntrustedClock,
+        }
+    );
+    assert!(!liveness_effects(&closed).jumbo_cross_machine);
+    let voters: Vec<_> = cell.raft_voter_ids(1).unwrap().into_iter().collect();
+    assert_eq!(voters, vec![1]);
     host.shutdown_all().await.unwrap();
 }
