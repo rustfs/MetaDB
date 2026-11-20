@@ -11,12 +11,13 @@ use std::time::Duration;
 use metadb_core::codec;
 use metadb_core::schema::validate_user_entry_name;
 use metadb_core::{
-    negate_accounted_size, saturating_add_i64, validate_dir_inode_id, validate_file_size,
-    AttrDeltaSpec, AuxIntentSpec, DirShardDeltaKey, DirShardDeltaRecord, EntryType, FileId,
-    HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId, IntentOp, MetaDbError, MetaEntry,
-    MetaKey, QuotaKey, QuotaRecord, Result, SecondaryIndexKey, SecondaryIndexRecord, ShardEpoch,
-    ShardId, TxnId, TxnRecordKey, TxnState, TxnStatusRecord, UserId, WriteIntentKey,
-    WriteIntentRecord, ATTR_ENTRY_NAME, TABLE_PREFIX_QUOTA, TABLE_PREFIX_SECONDARY_INDEX,
+    lease_expiry_is_proved, lease_observation_inside_window, lease_wall_ms, negate_accounted_size,
+    saturating_add_i64, validate_dir_inode_id, validate_file_size, AttrDeltaSpec, AuxIntentSpec,
+    DirShardDeltaKey, DirShardDeltaRecord, EntryType, FileId, HlcTimestamp, HybridLogicalClock,
+    InodeAttr, InodeId, IntentOp, MetaDbError, MetaEntry, MetaKey, QuotaKey, QuotaRecord, Result,
+    SecondaryIndexKey, SecondaryIndexRecord, ShardEpoch, ShardId, TxnId, TxnRecordKey, TxnState,
+    TxnStatusRecord, UserId, WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME,
+    TABLE_PREFIX_QUOTA, TABLE_PREFIX_SECONDARY_INDEX,
 };
 use metadb_raft::ShardRaftGroup;
 use metadb_storage::{ScanControl, SnapshotGuard};
@@ -339,9 +340,16 @@ impl Drop for LeaseTask {
     }
 }
 
+/// Monotonic-tracking wall time. This does not read [`HybridLogicalClock::now`].
+///
+/// `None` means the wall stepped away from monotonic time or cannot be read.
+/// Callers must not abort prepared shards or publish a later `expire_hlc` from it.
+fn monotonic_lease_hlc() -> Option<HlcTimestamp> {
+    lease_wall_ms().map(|ms| HlcTimestamp::new(ms, 0))
+}
+
 async fn renew_open_lease(
     directory: &dyn ShardDirectory,
-    clock: &HybridLogicalClock,
     keeper: &LeaseKeeper,
     txn_id: TxnId,
     coord_node_id: u64,
@@ -349,11 +357,25 @@ async fn renew_open_lease(
     start_hlc: HlcTimestamp,
     rename_token: Option<u64>,
     ttl_ms: u64,
+    wall_ms: Option<u64>,
 ) -> bool {
     if keeper.cancel.load(Ordering::Acquire) {
         return true;
     }
-    let now = clock.now();
+    let last_applied = directory
+        .route_user_key(primary_key)
+        .map(|(_, group, _)| group.engine().mvcc().latest_watermarks().1)
+        .unwrap_or(HlcTimestamp::ZERO);
+    let lifetime_cap = HlcTimestamp::new(keeper.deadline_ms, 0);
+    if lease_expiry_is_proved(last_applied, lifetime_cap, wall_ms) {
+        return false;
+    }
+    let Some(wall_ms) = wall_ms else {
+        // Unreadable, fallback, or skewed. Do not extend and do not treat the
+        // missing reading as proof the lease is still inside its deadline.
+        return true;
+    };
+    let now = HlcTimestamp::new(wall_ms, 0);
     if now.physical_ms() >= keeper.deadline_ms {
         return false;
     }
@@ -373,14 +395,18 @@ async fn renew_open_lease(
             Err(_) => return true,
         }
     }
-    let proposed_ms = now.physical_ms().saturating_add(ttl_ms).min(cap_ms);
+    let proposed_ms = wall_ms.saturating_add(ttl_ms).min(cap_ms);
     let Some(published) = keeper.durable_floor_ms() else {
         // Nothing is prepared yet, so there is no durable deadline to move.
         return true;
     };
-    if now.physical_ms() >= published {
+    let published_hlc = HlcTimestamp::new(published, 0);
+    if lease_expiry_is_proved(last_applied, published_hlc, Some(wall_ms)) {
         // The durable expire has passed. A late Extend2pcLease cannot revive it.
         return false;
+    }
+    if !lease_observation_inside_window(now, start_hlc, published_hlc) {
+        return true;
     }
     if proposed_ms <= published {
         return true;
@@ -442,7 +468,11 @@ async fn renew_open_lease(
 /// A missing record (`TransactionAborted`) and transport or routing errors are
 /// retried and must not move the in-memory deadline.
 fn lease_renew_is_fatal(error: &MetaDbError) -> bool {
-    matches!(error, MetaDbError::LeaseRenewRejected(_))
+    matches!(
+        error,
+        MetaDbError::LeaseRenewRejected(reason)
+            if !matches!(reason, metadb_core::LeaseRenewReject::UntrustedClock)
+    )
 }
 
 /// Executes both `1-RTT` single-shard pushdown and Primary-Anchored `2PC` across `ShardRaftGroup`s.
@@ -461,6 +491,9 @@ pub struct DistributedTxRouter {
     abandon_after_prepare_gate: bool,
     lease_publish_probe: Option<Arc<AtomicU64>>,
     renew_transient_faults: Option<Arc<AtomicU32>>,
+    /// Test seam. `None` inside the mutex is an untrusted wall clock.
+    /// `None` for the option uses [`lease_wall_ms`].
+    lease_wall_override: Option<Arc<Mutex<Option<u64>>>>,
 }
 
 impl DistributedTxRouter {
@@ -483,7 +516,25 @@ impl DistributedTxRouter {
             abandon_after_prepare_gate: false,
             lease_publish_probe: None,
             renew_transient_faults: None,
+            lease_wall_override: None,
         }
+    }
+
+    /// Replaces the wall clock used for 2PC lease renewal.
+    ///
+    /// `Some(ms)` is that millisecond reading. `None` is an untrusted clock:
+    /// renewal must not extend the lease and must not drop it unless the
+    /// replicated HLC is already past the deadline.
+    pub fn with_lease_wall_override(mut self, wall_ms: Arc<Mutex<Option<u64>>>) -> Self {
+        self.lease_wall_override = Some(wall_ms);
+        self
+    }
+
+    fn lease_wall_reading(&self) -> Option<u64> {
+        if let Some(over) = &self.lease_wall_override {
+            return *over.lock().unwrap();
+        }
+        lease_wall_ms()
     }
 
     /// Records the minimum durable participant `expire_hlc` after Prepare and
@@ -740,16 +791,31 @@ impl DistributedTxRouter {
                 Err(MetaDbError::WriteIntentConflict {
                     conflicting_txn_id,
                     primary_key,
-                    expire_hlc,
+                    expire_hlc: _,
                 }) if attempt < 11 => {
-                    if self.clock.now().0 > expire_hlc {
-                        let _ = TxnRecoveryWorker::resolve_single_txn(
-                            self.directory.as_ref(),
-                            &self.clock,
-                            conflicting_txn_id,
-                            &primary_key,
-                        )
-                        .await;
+                    // A committed or already-aborted transaction can be finished
+                    // now. An expired pending transaction is aborted only when
+                    // expiry is proved. Neither waits for the next recovery tick,
+                    // and a skewed clock is not treated as "still valid".
+                    let state = TxnRecoveryWorker::resolve_single_txn(
+                        self.directory.as_ref(),
+                        &self.clock,
+                        conflicting_txn_id,
+                        &primary_key,
+                    )
+                    .await;
+                    if matches!(state, Ok(TxnState::Aborted)) {
+                        let abort = TxRaftCmd::Abort2pc {
+                            txn_id: conflicting_txn_id,
+                            target_user_keys: vec![user_key.to_vec()],
+                        };
+                        let _ = self
+                            .propose_participant_retry_epoch(
+                                user_key,
+                                &abort,
+                                monotonic_lease_hlc().unwrap_or(HlcTimestamp::new(2, 0)),
+                            )
+                            .await;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(5 * (attempt as u64 + 1)))
                         .await;
@@ -1446,9 +1512,9 @@ impl DistributedTxRouter {
     ) -> LeaseTask {
         let keeper_task = keeper.clone();
         let directory = self.directory.clone();
-        let clock = self.clock.clone();
         let ttl_ms = self.ttl_ms;
         let coord_node_id = self.coord_node_id;
+        let wall_override = self.lease_wall_override.clone();
         let handle = tokio::spawn(async move {
             let interval = Duration::from_millis((ttl_ms / 3).max(1));
             loop {
@@ -1456,9 +1522,12 @@ impl DistributedTxRouter {
                 if keeper_task.cancel.load(Ordering::Acquire) {
                     return;
                 }
+                let wall_ms = match &wall_override {
+                    Some(slot) => *slot.lock().unwrap(),
+                    None => lease_wall_ms(),
+                };
                 let renewed = renew_open_lease(
                     directory.as_ref(),
-                    clock.as_ref(),
                     keeper_task.as_ref(),
                     txn_id,
                     coord_node_id,
@@ -1466,6 +1535,7 @@ impl DistributedTxRouter {
                     start_hlc,
                     rename_token,
                     ttl_ms,
+                    wall_ms,
                 )
                 .await;
                 if !renewed {
@@ -1512,7 +1582,11 @@ impl DistributedTxRouter {
         // Waiting for split publication must not consume a transaction's lease
         // before its first prepare. A directory-rename lease is not renewed during
         // that wait; if it already expired, fail before writing intents.
-        let start_hlc = self.clock.now();
+        let Some(start_hlc) = monotonic_lease_hlc() else {
+            return Err(MetaDbError::TransactionAborted(
+                "2PC lease clock stepped away from monotonic time; refusing to open a lease".into(),
+            ));
+        };
         let rename_fence_token = lease_opt.map(|lease| lease.rename_fence_token);
         let rename_cap_ms = lease_opt
             .map(|lease| lease.expire_hlc.physical_ms())
@@ -1574,7 +1648,11 @@ impl DistributedTxRouter {
                 held_before_prepare = true;
                 tokio::time::sleep(self.pre_prepare_hold).await;
             }
-            let now = self.clock.now();
+            let Some(now) = monotonic_lease_hlc() else {
+                // A jumped wall is not expiry and must not move the deadline.
+                tokio::time::sleep(ROUTE_RETRY_INTERVAL).await;
+                continue;
+            };
             let expire_hlc = keeper.expire_for(now, self.ttl_ms);
             if expire_hlc <= now {
                 self.abort_prepared_shards(txn_id, &prepared_shards).await;
@@ -1618,6 +1696,7 @@ impl DistributedTxRouter {
             ordered_groups.sort_by_key(|(sid, _)| *sid == shard_id);
             let mut prepared_this_round: Vec<PreparedShardBatch> = Vec::new();
             let mut regroup = false;
+            let mut wait_clock = false;
             for (sid, (_epoch, _group, shard_intents)) in ordered_groups {
                 let shard_keys: Vec<Vec<u8>> =
                     shard_intents.iter().map(|(key, _)| key.clone()).collect();
@@ -1642,7 +1721,11 @@ impl DistributedTxRouter {
                     .unwrap_or_else(|| primary_key.to_vec());
                 // Recompute immediately before this proposal. A NotLeader retry
                 // longer than the remaining TTL must not reuse a stale expire.
-                let attempt_now = self.clock.now();
+                let Some(attempt_now) = monotonic_lease_hlc() else {
+                    // Do not abort shards prepared earlier in this round.
+                    wait_clock = true;
+                    break;
+                };
                 let attempt_expire = keeper.expire_for(attempt_now, self.ttl_ms);
                 if attempt_expire <= attempt_now {
                     self.abort_prepared_shards(txn_id, &prepared_shards).await;
@@ -1704,6 +1787,11 @@ impl DistributedTxRouter {
                     }
                 }
             }
+            if wait_clock {
+                keeper.clear();
+                tokio::time::sleep(ROUTE_RETRY_INTERVAL).await;
+                continue;
+            }
             if regroup {
                 keeper.clear();
                 self.abort_prepared_shards(txn_id, &prepared_this_round)
@@ -1738,7 +1826,13 @@ impl DistributedTxRouter {
                 ));
             }
         }
-        if keeper.failed() || self.clock.now() > keeper.published() {
+        let last_applied = prepared_shards
+            .first()
+            .map(|(_, group, _)| group.engine().mvcc().latest_watermarks().1)
+            .unwrap_or(HlcTimestamp::ZERO);
+        if keeper.failed()
+            || lease_expiry_is_proved(last_applied, keeper.published(), lease_wall_ms())
+        {
             self.abort_prepared_shards(txn_id, &prepared_shards).await;
             return Err(MetaDbError::TransactionAborted(
                 "2PC lease expired before commit".into(),
@@ -1746,7 +1840,19 @@ impl DistributedTxRouter {
         }
 
         // Phase 2a: Atomic Commit on Primary Shard (`[0x06] TxnRecord -> Committed`).
-        let commit_hlc = self.clock.update(max_prepared_hlc);
+        // Do not fold a raw wall jump into the commit timestamp. A monotonic
+        // reading may advance it; otherwise stay on the prepared HLC.
+        let commit_hlc = match monotonic_lease_hlc() {
+            Some(wall) if wall > max_prepared_hlc => wall,
+            _ => {
+                let next = max_prepared_hlc.next_strict();
+                if next > max_prepared_hlc {
+                    next
+                } else {
+                    max_prepared_hlc
+                }
+            }
+        };
         let commit_primary_cmd = TxRaftCmd::CommitPrimary2pc {
             txn_id,
             commit_hlc,
@@ -1847,10 +1953,22 @@ impl DistributedTxRouter {
             }
             TxnState::Pending => {}
         }
-        let now = self.clock.now();
-        if now > rec.expire_hlc {
+        let last_applied = group.engine().mvcc().latest_watermarks().1;
+        let wall_ms = self.lease_wall_reading();
+        if lease_expiry_is_proved(last_applied, rec.expire_hlc, wall_ms) {
             return Err(MetaDbError::TransactionAborted(
                 "2PC lease renewal rejected after expiry".into(),
+            ));
+        }
+        let Some(wall_ms) = wall_ms else {
+            return Err(MetaDbError::LeaseRenewRejected(
+                metadb_core::LeaseRenewReject::UntrustedClock,
+            ));
+        };
+        let now = HlcTimestamp::new(wall_ms, 0);
+        if !lease_observation_inside_window(now, rec.start_hlc, rec.expire_hlc) {
+            return Err(MetaDbError::LeaseRenewRejected(
+                metadb_core::LeaseRenewReject::UntrustedClock,
             ));
         }
         let cap = rec
@@ -1862,7 +1980,7 @@ impl DistributedTxRouter {
                 "2PC lease renewal exceeds lifetime cap".into(),
             ));
         }
-        let mut proposed = now.physical_ms().saturating_add(self.ttl_ms).min(cap);
+        let mut proposed = wall_ms.saturating_add(self.ttl_ms).min(cap);
         if let Some(token) = rec.rename_fence_token {
             match self
                 .directory
@@ -1907,7 +2025,7 @@ impl DistributedTxRouter {
     }
 
     async fn abort_prepared_shards(&self, txn_id: TxnId, prepared: &[PreparedShardBatch]) {
-        let now = self.clock.now();
+        let now = monotonic_lease_hlc().unwrap_or(HlcTimestamp::new(2, 0));
         for (_ep, _grp, keys) in prepared {
             let cmd = TxRaftCmd::Abort2pc {
                 txn_id,

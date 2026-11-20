@@ -154,6 +154,13 @@ pub enum LeaseRenewReject {
     ///
     /// Appended so earlier `LeaseRenewReject` tags stay stable. No lease is granted.
     RenameTtlExceedsCap,
+    /// The wall clock cannot be read, is the historical 1 ms fallback, or is too
+    /// far behind the published lease to be the clock that holds it.
+    ///
+    /// Appended so earlier `LeaseRenewReject` tags stay stable. The durable
+    /// deadline is not moved. Callers must not treat this as proof the lease
+    /// expired, and must not publish a later deadline.
+    UntrustedClock,
 }
 
 /// Why a consensus operation can be proposed again without hiding a durable loss.
