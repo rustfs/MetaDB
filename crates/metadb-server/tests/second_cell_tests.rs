@@ -1,6 +1,6 @@
 //! A second all-in-one cell can be registered after its routes cover the
-//! requested range. This test does not split roles, move shard files, or
-//! forward a key to the other process.
+//! requested range. The in-process router still refuses to apply a remote key
+//! on a local shard. gRPC forwarding is covered by `cell_forward_tests`.
 
 use std::sync::Arc;
 
@@ -129,13 +129,10 @@ async fn second_cell_is_durable_only_after_exact_route_coverage() {
         .route_user_key(&quota)
         .expect("cell 2 serves its quota range");
     let refused = match cell1.global_manager().route_user_key(&quota) {
-        Ok(_) => panic!("cell 1 must not forward a remote key"),
+        Ok(_) => panic!("cell 1 must not apply a remote key on a local shard"),
         Err(error) => error,
     };
-    assert!(
-        refused.to_string().contains("does not forward"),
-        "{refused}"
-    );
+    assert!(refused.to_string().contains("will not apply"), "{refused}");
     cell1
         .tx_router()
         .dirstat(ROOT_INODE_ID)
@@ -190,10 +187,10 @@ async fn second_cell_is_durable_only_after_exact_route_coverage() {
     assert_eq!(restored.shards.len(), 1);
     assert_eq!(cell1.metrics_snapshot().cells_total, 2);
     let still_refused = match cell1.global_manager().route_user_key(&quota) {
-        Ok(_) => panic!("restart must not start forwarding"),
+        Ok(_) => panic!("restart must not apply a remote key on a local shard"),
         Err(error) => error,
     };
-    assert!(still_refused.to_string().contains("does not forward"));
+    assert!(still_refused.to_string().contains("will not apply"));
     assert!(!metadb_cluster::automatic_leadership_transfer_allowed());
     assert!(!metadb_cluster::heartbeat_is_scheduling_truth());
     cell1.shutdown().await.unwrap();

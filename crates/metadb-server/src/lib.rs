@@ -158,7 +158,7 @@ impl Interceptor for BearerAuthClient {
 use metadb_cluster::{
     capture_mono_ns, CellDirectoryRole, CellId, CellLocalManager, CompositeMetaCache,
     DurableCellManager, DurableGlobalManager, DurableIdAllocator, GlobalManager, LocalIdBuffer,
-    MetaCache, ShardDescriptor,
+    MetaCache, ShardDescriptor, SharedIdAllocator,
 };
 use metadb_core::{
     EntryType, FileId, HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId, MetaDbError,
@@ -596,6 +596,9 @@ async fn serve_global_directory(
         config.node.node_id,
     ));
     let meta_cache = Arc::new(CompositeMetaCache::new());
+    let shared_ids = Arc::new(SharedIdAllocator::open(
+        config.node.data_dir.join("shared_id_allocator"),
+    )?);
     let global_manager = Arc::new(DurableGlobalManager::new(
         clock.clone(),
         id_allocator,
@@ -643,7 +646,8 @@ async fn serve_global_directory(
     .with_forward_secret(shared_secret.clone())
     .with_transport_security(Arc::clone(&transport_security))
     .with_role_presentation(roles.as_ref().map(|roles| roles.local().clone()))
-    .with_directory_only(true);
+    .with_directory_only(true)
+    .with_shared_allocator(shared_ids);
     let grpc_handle = spawn_grpc_server(
         listener,
         grpc_svc,
@@ -1175,7 +1179,7 @@ impl PersistentMetaDbCluster {
                 "tls transport enabled"
             );
         }
-        let grpc_svc = MetaDbGrpcService::new(
+        let mut grpc_svc = MetaDbGrpcService::new(
             cluster.global_manager.clone(),
             cluster.tx_router.clone(),
             cluster.proxy_router.clone(),
@@ -1188,6 +1192,14 @@ impl PersistentMetaDbCluster {
                 && cluster.config.node.role != ServerRole::Be,
         )
         .with_shard_host_only(cluster.config.node.role == ServerRole::Be);
+        if cluster.config.node.role == ServerRole::CellManager {
+            let global = cluster.config.cluster.global_manager.trim();
+            if !global.is_empty() {
+                grpc_svc = grpc_svc
+                    .with_id_authority(global.to_string())
+                    .with_local_cell_id(cluster.config.node.cell_id);
+            }
+        }
         let grpc_handle = spawn_grpc_server(
             listener,
             grpc_svc,
@@ -1354,6 +1366,12 @@ impl PersistentMetaDbCluster {
         mode: u32,
         size_bytes: i64,
     ) -> Result<MetaEntry> {
+        if self.directory_only {
+            return Err(MetaDbError::ShardRoutingError(
+                "global-manager does not mint inode ids from its local buffer; AllocateIdBlock uses the shared allocator"
+                    .to_string(),
+            ));
+        }
         let inode_id = self.id_buffer.next_file_inode_id()?;
         let fid = self.id_buffer.next_file_id()?;
         self.tx_router
@@ -1369,6 +1387,12 @@ impl PersistentMetaDbCluster {
         uid: UserId,
         mode: u32,
     ) -> Result<MetaEntry> {
+        if self.directory_only {
+            return Err(MetaDbError::ShardRoutingError(
+                "global-manager does not mint inode ids from its local buffer; AllocateIdBlock uses the shared allocator"
+                    .to_string(),
+            ));
+        }
         let dir_id = self.id_buffer.next_dir_inode_id()?;
         self.tx_router.mkdir(pid, name, dir_id, uid, mode).await
     }
