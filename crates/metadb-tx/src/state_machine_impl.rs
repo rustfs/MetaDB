@@ -12,15 +12,15 @@ use serde::{Deserialize, Serialize};
 use metadb_core::codec;
 use metadb_core::schema::validate_user_entry_name;
 use metadb_core::{
-    decode_lease_preimage, lease_preimage_prefix, lease_preimage_prefix_end, lease_window_is_legal,
-    negate_accounted_size, saturating_add_i64, trusted_lease_observation, validate_dir_inode_id,
-    validate_file_size, AttrDeltaSpec, AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload,
-    CompositeKeyRange, DirShardDeltaKey, DirShardDeltaRecord, EntryType, FenceHolder, FileId,
-    HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId, IntentOp, LeasePreimageValue,
-    LeaseRenewReject, MetaDbError, MetaEntry, MetaKey, QuotaKey, QuotaRecord, Result,
-    SecondaryIndexKey, SecondaryIndexRecord, ShardEpoch, ShardId, TxnId, TxnRecordKey, TxnState,
-    TxnStatusRecord, UserId, WriteIntentKey, WriteIntentRecord, ATTR_ENTRY_NAME,
-    PROPOSAL_ENVELOPE_MAGIC, SYSTEM_PREFIX_LEASE_PREIMAGE,
+    decode_lease_preimage, lease_preimage_is_orphan, lease_preimage_prefix,
+    lease_preimage_prefix_end, lease_window_is_legal, negate_accounted_size, saturating_add_i64,
+    trusted_lease_observation, validate_dir_inode_id, validate_file_size, AttrDeltaSpec,
+    AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, CompositeKeyRange, DirShardDeltaKey,
+    DirShardDeltaRecord, EntryType, FenceHolder, FileId, HlcTimestamp, HybridLogicalClock,
+    InodeAttr, InodeId, IntentOp, LeasePreimageValue, LeaseRenewReject, MetaDbError, MetaEntry,
+    MetaKey, QuotaKey, QuotaRecord, Result, SecondaryIndexKey, SecondaryIndexRecord, ShardEpoch,
+    ShardId, TxnId, TxnRecordKey, TxnState, TxnStatusRecord, UserId, WriteIntentKey,
+    WriteIntentRecord, ATTR_ENTRY_NAME, PROPOSAL_ENVELOPE_MAGIC, SYSTEM_PREFIX_LEASE_PREIMAGE,
 };
 use metadb_raft::{MetaDbRaftRequest, ShardApplyHandler, ShardWatermarkTracker};
 use metadb_storage::{
@@ -197,6 +197,10 @@ pub enum TxRaftCmd {
         rename_fence_token: Option<u64>,
         target_user_keys: Vec<Vec<u8>>,
     },
+    /// Delete `0x0D` rows whose transaction is no longer pending on this shard.
+    /// Appended after `Extend2pcLease` so that command's tag stays stable.
+    /// Apply rechecks liveness, so a prepare ordered first keeps its capture.
+    SweepOrphanLeasePreimages,
 }
 
 /// Longest a renewed cross-shard lease may reach past the transaction's `start_hlc`.
@@ -2219,6 +2223,12 @@ impl TxStateMachineHandler {
                     .record_entry_specs(raft_index, commit_hlc, vec![]);
                 Ok(TxRaftOutput::TxnStatus(Some(txn_rec.state)))
             }
+            TxRaftCmd::SweepOrphanLeasePreimages => {
+                self.sweep_orphan_lease_preimages(engine, raft_index, commit_hlc)?;
+                self.outbox
+                    .record_entry_specs(raft_index, commit_hlc, vec![]);
+                Ok(TxRaftOutput::Unit)
+            }
             TxRaftCmd::Extend2pcLease {
                 txn_id,
                 coord_node_id,
@@ -2516,6 +2526,51 @@ impl TxStateMachineHandler {
         Ok(false)
     }
 
+    fn live_lease_txn_ids(engine: &LifecycleStorageEngine) -> Result<BTreeSet<TxnId>> {
+        let mut live = BTreeSet::new();
+        if let Ok(rows) = Self::scan_latest_in_apply(engine, &[0x06], &[0x07]) {
+            for (_, raw) in rows {
+                let Ok(rec) = TxnStatusRecord::decode(&raw) else {
+                    continue;
+                };
+                if matches!(rec.state, TxnState::Pending) {
+                    live.insert(rec.txn_id);
+                }
+            }
+        }
+        for (_, raw) in Self::scan_latest_in_apply(engine, &[0x05], &[0x06])? {
+            let Ok(intent) = WriteIntentRecord::decode(&raw) else {
+                continue;
+            };
+            if let Some(holders) = intent.resolved_fence_holders() {
+                live.extend(holders.into_keys());
+            } else {
+                live.insert(intent.txn_id);
+            }
+        }
+        Ok(live)
+    }
+
+    fn sweep_orphan_lease_preimages(
+        &self,
+        engine: &LifecycleStorageEngine,
+        raft_index: u64,
+        commit_hlc: HlcTimestamp,
+    ) -> Result<()> {
+        let live = Self::live_lease_txn_ids(engine)?;
+        let rows = Self::scan_latest_in_apply(
+            engine,
+            &[SYSTEM_PREFIX_LEASE_PREIMAGE],
+            &[SYSTEM_PREFIX_LEASE_PREIMAGE.saturating_add(1)],
+        )?;
+        for (key, raw) in rows {
+            if lease_preimage_is_orphan(&key, &raw, &live) {
+                engine.apply_committed_delete(key, commit_hlc, raft_index);
+            }
+        }
+        Ok(())
+    }
+
     fn release_lease_hold(
         &self,
         engine: &LifecycleStorageEngine,
@@ -2617,6 +2672,23 @@ impl TxStateMachineHandler {
                 let Some(holder) = holders.get(&txn_id).cloned() else {
                     continue;
                 };
+                if holder.start_hlc.is_none() {
+                    if commit_hlc > holder.expire_hlc {
+                        return Err(MetaDbError::LeaseRenewRejected(
+                            LeaseRenewReject::AfterExpiry,
+                        ));
+                    }
+                    // The stored expire is the only proved deadline. Extending it
+                    // could pass the unknown start's 60s cap, so this is not fatal
+                    // and does not publish a longer lease.
+                    if expire_hlc > holder.expire_hlc {
+                        return Err(MetaDbError::TransactionAborted(
+                            "legacy fence holder has no start and cannot be extended".into(),
+                        ));
+                    }
+                    saw_participant = true;
+                    continue;
+                }
                 if holder.start_hlc != Some(start_hlc) {
                     return Err(MetaDbError::LeaseRenewRejected(
                         LeaseRenewReject::FenceMismatch,
