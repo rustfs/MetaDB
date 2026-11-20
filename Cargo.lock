@@ -1004,6 +1004,7 @@ dependencies = [
  "metadb-proxy",
  "metadb-raft",
  "metadb-storage",
+ "metadb-transport",
  "metadb-tx",
  "openraft",
  "serde",
@@ -1027,6 +1028,10 @@ dependencies = [
  "tempfile",
  "wincode",
 ]
+
+[[package]]
+name = "metadb-transport"
+version = "0.1.0"
 
 [[package]]
 name = "metadb-tx"

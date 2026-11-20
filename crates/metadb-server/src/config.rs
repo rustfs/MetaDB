@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 use metadb_core::{CellId, MetaDbError, NodeId, Result, DEFAULT_MAX_CLOCK_DRIFT_MS};
 use metadb_raft::RaftNodeOptions;
 use metadb_storage::{LsmEngineConfig, DEFAULT_MVCC_RETENTION_MS};
+use metadb_transport::{
+    check_transport_key, PolicyFields, StartupResolution, TransportPolicy,
+    DEFAULT_MAX_INFLIGHT_NEGOTIATIONS, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_QUEUE_PAIRS,
+    DEFAULT_MAX_REGISTERED_BYTES, DEFAULT_NEGOTIATION_TIMEOUT_MS,
+};
 
 /// Operational role of a `metadbd` process.
 ///
@@ -185,6 +190,11 @@ pub struct ServerTomlConfig {
     pub sharding: ShardingSection,
     pub security: SecuritySection,
     pub cluster: ClusterSection,
+    /// Optional transport policy. Omitted sections keep TCP/gRPC.
+    ///
+    /// `mode = "rdma"` fails closed in [`Self::resolve_transport`]. This section
+    /// does not open an RDMA device or a second listener.
+    pub transport: TransportSection,
     /// OpenRaft timers and the segmented-log size. The TOML table is `[raft]`.
     ///
     /// Field names are not secret or TLS keys, so the security-key walk in
@@ -202,10 +212,14 @@ impl ServerTomlConfig {
         let value: toml::Value = toml::from_str(s)
             .map_err(|e| MetaDbError::CodecError(format!("invalid TOML config: {e}")))?;
         reject_unsupported_security_keys(&value)?;
+        reject_transport_table(&value)?;
         let parsed = ServerTomlConfig::deserialize(value)
             .map_err(|e| MetaDbError::CodecError(format!("invalid TOML config: {e}")))?;
         // Timer checks only. This does not read or rewrite [security].
         parsed.raft_options.validate()?;
+        // Required RDMA fails here, before a listener exists. Prefer-RDMA resolves
+        // to an explicit TCP/gRPC fallback and is checked again at startup.
+        parsed.resolve_transport()?;
         Ok(parsed)
     }
 
@@ -240,6 +254,64 @@ impl ServerTomlConfig {
     /// actually be bound (a restarted process may reuse a saved advertise address).
     pub fn reject_unauthenticated_bind(&self, addr: &str) -> Result<()> {
         reject_unauthenticated_bind(addr, &self.security)
+    }
+
+    /// Resolves the carried transport for this process.
+    ///
+    /// The only successful selection is TCP/gRPC. `mode = "rdma"` returns an
+    /// error and must not bind. `mode = "prefer-rdma"` succeeds with an explicit
+    /// fallback record. No queue pairs or registered memory are allocated.
+    pub fn resolve_transport(&self) -> Result<StartupResolution> {
+        let policy = TransportPolicy::try_from_fields(PolicyFields {
+            mode: &self.transport.mode,
+            negotiation_timeout_ms: self.transport.negotiation_timeout_ms,
+            max_inflight_negotiations: self.transport.max_inflight_negotiations,
+            max_queue_pairs: self.transport.max_queue_pairs,
+            max_registered_bytes: self.transport.max_registered_bytes,
+            max_message_bytes: self.transport.max_message_bytes,
+        })
+        .map_err(transport_config_error)?;
+        policy.resolve_startup().map_err(transport_config_error)
+    }
+}
+
+/// Operator transport policy. This is not an RDMA implementation.
+///
+/// Unknown keys are rejected. The rest of the file still ignores unknown keys
+/// that do not name a secret or TLS setting; an ignored RDMA or bypass key
+/// would look like a configured fast path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransportSection {
+    /// `tcp-grpc` (default), `prefer-rdma`, or `rdma`.
+    ///
+    /// `rdma` and the synonyms `roce`, `rocev2`, `infiniband`, `ib`, `ibverbs`,
+    /// and `verbs` require an RDMA backend and refuse to start. `tcp` and
+    /// `grpc` are not accepted aliases.
+    pub mode: String,
+    /// Budget for one in-process negotiation, in milliseconds. Zero is rejected.
+    pub negotiation_timeout_ms: u64,
+    /// Ceiling on concurrent negotiation attempts. This process does not run
+    /// a network handshake, and the ceiling is still enforced by the contract.
+    pub max_inflight_negotiations: u32,
+    /// Future queue-pair ceiling. Nothing is allocated when this is set.
+    pub max_queue_pairs: u32,
+    /// Future registered-memory ceiling, in bytes. Nothing is registered.
+    pub max_registered_bytes: u64,
+    /// Future single-message ceiling, in bytes. No RDMA message is posted.
+    pub max_message_bytes: u64,
+}
+
+impl Default for TransportSection {
+    fn default() -> Self {
+        Self {
+            mode: "tcp-grpc".to_string(),
+            negotiation_timeout_ms: DEFAULT_NEGOTIATION_TIMEOUT_MS,
+            max_inflight_negotiations: DEFAULT_MAX_INFLIGHT_NEGOTIATIONS,
+            max_queue_pairs: DEFAULT_MAX_QUEUE_PAIRS,
+            max_registered_bytes: DEFAULT_MAX_REGISTERED_BYTES,
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+        }
     }
 }
 
@@ -281,6 +353,28 @@ fn bind_host(addr: &str) -> &str {
         }
         _ => addr,
     }
+}
+
+fn transport_config_error(error: metadb_transport::TransportError) -> MetaDbError {
+    MetaDbError::CodecError(error.to_string())
+}
+
+fn reject_transport_table(value: &toml::Value) -> Result<()> {
+    let Some(root) = value.as_table() else {
+        return Ok(());
+    };
+    let Some(transport) = root.get("transport") else {
+        return Ok(());
+    };
+    let Some(table) = transport.as_table() else {
+        return Err(MetaDbError::CodecError(
+            "[transport] must be a table. The only carried transport is tcp-grpc, and RDMA is not implemented".to_string(),
+        ));
+    };
+    for key in table.keys() {
+        check_transport_key(key).map_err(transport_config_error)?;
+    }
+    Ok(())
 }
 
 fn normalize_key(key: &str) -> String {
@@ -625,5 +719,152 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.node.node_id, 2);
         assert_eq!(cfg.security.shared_secret, "secret");
+    }
+
+    #[test]
+    fn omitted_transport_section_stays_on_tcp_grpc() {
+        let cfg = ServerTomlConfig::from_toml_str(
+            r#"
+            [node]
+            node_id = 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.transport.mode, "tcp-grpc");
+        let resolution = cfg.resolve_transport().unwrap();
+        assert_eq!(
+            resolution.selected().map(|transport| transport.to_string()),
+            Some("tcp-grpc".to_string())
+        );
+        assert!(!resolution.explicit_rdma_fallback());
+        assert!(resolution.outcome.allocation().is_empty());
+    }
+
+    #[test]
+    fn required_rdma_mode_fails_closed_before_a_listener() {
+        let err = ServerTomlConfig::from_toml_str(
+            r#"
+            [transport]
+            mode = "rdma"
+            "#,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("RDMA backend is not implemented"), "{text}");
+        assert!(text.contains("does not fall back"), "{text}");
+
+        let mut cfg = ServerTomlConfig::default();
+        cfg.transport.mode = "roce".to_string();
+        let programmatic = cfg.resolve_transport().unwrap_err().to_string();
+        assert!(
+            programmatic.contains("backend-not-implemented"),
+            "{programmatic}"
+        );
+    }
+
+    #[test]
+    fn prefer_rdma_records_tcp_fallback_and_does_not_allocate() {
+        let cfg = ServerTomlConfig::from_toml_str(
+            r#"
+            [transport]
+            mode = "prefer-rdma"
+            negotiation_timeout_ms = 250
+            max_inflight_negotiations = 4
+            max_queue_pairs = 8
+            max_registered_bytes = 1048576
+            max_message_bytes = 65536
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.transport.max_queue_pairs, 8);
+        let resolution = cfg.resolve_transport().unwrap();
+        assert!(resolution.explicit_rdma_fallback());
+        assert_eq!(
+            resolution
+                .selected()
+                .map(|transport| transport.to_string())
+                .as_deref(),
+            Some("tcp-grpc")
+        );
+        assert!(resolution.outcome.allocation().is_empty());
+        assert!(!metadb_transport::RDMA_BACKEND_IMPLEMENTED);
+    }
+
+    #[test]
+    fn transport_bypass_device_and_unbounded_keys_fail_closed() {
+        let insecure = ServerTomlConfig::from_toml_str(
+            r#"
+            [transport]
+            mode = "tcp-grpc"
+            insecure = true
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(insecure.contains("insecure"), "{insecure}");
+
+        let bypass = ServerTomlConfig::from_toml_str(
+            r#"
+            [transport]
+            mode = "tcp-grpc"
+            bypass = true
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(bypass.contains("not an authorization bypass"), "{bypass}");
+
+        let device = ServerTomlConfig::from_toml_str(
+            r#"
+            [transport]
+            device = "mlx5_0"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            device.contains("no RDMA backend is implemented"),
+            "{device}"
+        );
+
+        let unlimited = ServerTomlConfig::from_toml_str(
+            r#"
+            [transport]
+            max_registered_bytes = 0
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(unlimited.contains("max_registered_bytes"), "{unlimited}");
+        assert!(unlimited.contains("Zero is not unlimited"), "{unlimited}");
+
+        let not_a_table = ServerTomlConfig::from_toml_str(
+            r#"
+            transport = "rdma"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            not_a_table.contains("[transport] must be a table"),
+            "{not_a_table}"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_rdma_open_does_not_create_a_data_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let data = parent.path().join("not-created");
+        let mut cfg = ServerTomlConfig::default();
+        cfg.node.data_dir = data.clone();
+        cfg.node.grpc_listen_addr = "127.0.0.1:0".to_string();
+        cfg.transport.mode = "rdma".to_string();
+        let text = match crate::PersistentMetaDbCluster::open_and_serve(cfg).await {
+            Ok(_) => panic!("required RDMA must not start"),
+            Err(err) => err.to_string(),
+        };
+        assert!(text.contains("backend-not-implemented"), "{text}");
+        assert!(text.contains("does not fall back"), "{text}");
+        assert!(!data.exists(), "required RDMA must not create {data:?}");
     }
 }

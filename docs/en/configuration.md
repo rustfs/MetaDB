@@ -2,7 +2,7 @@
 
 [Overview](./README.md) · [Français](../fr/configuration.md) · [Deutsch](../de/configuration.md) · [日本語](../ja/configuration.md) · [简体中文](../zh/configuration.md)
 
-`metadbd --config` and `ServerTomlConfig::from_toml_file` / `from_toml_str` read TOML (`crates/metadb-server/src/config.rs`). Unknown keys that do not name a secret, authentication, or TLS setting are ignored, except inside `[raft]`: an unknown key there fails parsing. A misspelled `shared_secret`, a token, password, anonymous, or insecure key, or any TLS or certificate key is rejected and startup does not proceed, including those keys nested in tables or arrays. The only accepted keys directly under the root `[security]` table are `shared_secret` and `allow_unauthenticated`. Every known section is optional. Omitted fields take the defaults below.
+`metadbd --config` and `ServerTomlConfig::from_toml_file` / `from_toml_str` read TOML (`crates/metadb-server/src/config.rs`). Unknown keys that do not name a secret, authentication, or TLS setting are ignored, except inside `[raft]` and `[transport]`: an unknown key in either table fails parsing. A misspelled `shared_secret`, a token, password, anonymous, or insecure key, or any TLS or certificate key is rejected and startup does not proceed, including those keys nested in tables or arrays. The only accepted keys directly under the root `[security]` table are `shared_secret` and `allow_unauthenticated`. Every known section is optional. Omitted fields take the defaults below.
 
 ## Defaults
 
@@ -31,6 +31,12 @@
 | `raft.election_timeout_max_ms` | `900` | Yes. Must be greater than the minimum |
 | `raft.max_in_snapshot_log_to_keep` | `0` | Yes. Passed to OpenRaft |
 | `raft.max_segment_bytes` | `67108864` (64 MiB) | Yes, for new segment rotation. `0` is rejected. Existing segment files are not rewritten |
+| `transport.mode` | `tcp-grpc` | Yes. `tcp-grpc` keeps tonic gRPC over TCP. `prefer-rdma` also serves TCP/gRPC and records that RDMA was rejected. `rdma` (and `roce`, `rocev2`, `infiniband`, `ib`, `ibverbs`, `verbs`) refuses to start and does not bind. `tcp` and `grpc` are not aliases |
+| `transport.negotiation_timeout_ms` | `1000` | Yes, as the in-process negotiation budget. Allowed range is `1..=60000`. There is no network handshake |
+| `transport.max_inflight_negotiations` | `64` | Yes, as a ceiling. Allowed range is `1..=4096`. Zero is not unlimited |
+| `transport.max_queue_pairs` | `16` | Stored as a future ceiling only. Allowed range is `1..=1024`. No queue pair is created |
+| `transport.max_registered_bytes` | `16777216` (16 MiB) | Stored as a future ceiling only. Allowed range is `1..=67108864`. No memory is registered |
+| `transport.max_message_bytes` | `1048576` (1 MiB) | Stored as a future ceiling only. Allowed range is `1..=8388608`. No RDMA message is posted |
 
 `[raft]` is loaded. A missing table keeps `RaftNodeOptions::default()`. Unknown keys inside `[raft]` fail parsing. The inequalities are the same ones OpenRaft checks at group start. See [Operability](./operability.md).
 
@@ -90,7 +96,17 @@ An empty `shared_secret` does not start the process, including when every addres
 
 `empty_secret_on_loopback_does_not_listen` and `whitespace_secret_on_loopback_does_not_listen` cover those refusals. `explicit_unauthenticated_loopback_serves_without_credentials` covers the opt-in. A configured secret on loopback still rejects a missing header, `Authorization: Basic ...`, a lowercase `bearer` scheme, and a wrong bearer, and the rejected create is not visible afterwards.
 
-A key fails parsing when its normalized form (lowercase, hyphens become underscores) contains one of these substrings, including inside nested tables and arrays: `secret`, `password`, `passwd`, `token`, `credential`, `auth`, `anonymous`, `anon`, `insecure`, `api_key`, `apikey`, `bearer`, `jwt`, `private_key`, `privatekey`, `encryption`, `encrypt`, `tls`, `ssl`, `cert`, `x509`, `mtls`, `cipher`, `keystore`, `https`, `ca_file`, `cafile`, or it starts with `secur`. The only exceptions are the direct keys `[security].shared_secret` and `[security].allow_unauthenticated`. This is not a rejection of every unknown key. `bloom_bits_per_key` and a misspelled `grpc_listen_addr` or storage key are still ignored. Unknown keys inside `[raft]` fail parsing even when they do not match those substrings. `unknown_toml_keys_are_ignored_and_loopback_still_serves` parses `grpc_listen_addrr`, `memtable_size_bytez`, and `joinn`, keeps those defaults, and serves only because that fixture also sets `allow_unauthenticated`. Closing the remaining unknown-key hole means rejecting those keys, not teaching the server a new spelling.
+A key fails parsing when its normalized form (lowercase, hyphens become underscores) contains one of these substrings, including inside nested tables and arrays: `secret`, `password`, `passwd`, `token`, `credential`, `auth`, `anonymous`, `anon`, `insecure`, `api_key`, `apikey`, `bearer`, `jwt`, `private_key`, `privatekey`, `encryption`, `encrypt`, `tls`, `ssl`, `cert`, `x509`, `mtls`, `cipher`, `keystore`, `https`, `ca_file`, `cafile`, or it starts with `secur`. The only exceptions are the direct keys `[security].shared_secret` and `[security].allow_unauthenticated`. This is not a rejection of every unknown key. `bloom_bits_per_key` and a misspelled `grpc_listen_addr` or storage key are still ignored. Unknown keys inside `[raft]` and `[transport]` fail parsing even when they do not match those substrings. `unknown_toml_keys_are_ignored_and_loopback_still_serves` parses `grpc_listen_addrr`, `memtable_size_bytez`, and `joinn`, keeps those defaults, and serves only because that fixture also sets `allow_unauthenticated`. Closing the remaining unknown-key hole means rejecting those keys, not teaching the server a new spelling.
+
+## Transport
+
+The carried transport is tonic gRPC over TCP. That path is unchanged when `[transport]` is omitted. This process does not implement RDMA. `RDMA_BACKEND_IMPLEMENTED` is false. No queue pair, completion queue, or registered memory is created, and the process does not open `/dev/infiniband` or load Soft-RoCE.
+
+`mode = "rdma"` fails configuration parsing and `open_and_serve` before a data directory is created or a socket is bound. It does not fall back to TCP. `mode = "prefer-rdma"` starts the existing gRPC listener, logs that RDMA was rejected (`backend-not-implemented`), and records the selection as TCP/gRPC. The fallback is not an RDMA session.
+
+Unknown keys inside `[transport]` are rejected. A `device` or `libibverbs` key is rejected because no RDMA backend is implemented. `insecure` is already rejected by the security-key walk. RDMA is not a second authorization domain and does not bypass `[security].shared_secret` or `allow_unauthenticated`.
+
+Resource keys are ceilings for a backend this repository does not have. Setting them does not allocate those resources. The design note is [RDMA transport policy](../designs/rdma_transport.md). Locale copies of this page do not describe `[transport]` yet; they must not be read as enabling RDMA.
 
 ## What you cannot configure
 
@@ -99,3 +115,4 @@ A key fails parsing when its normalized form (lowercase, hyphens become undersco
 - A second cell's key range. `RegisterCell` returns an error and stores nothing.
 - Locality-compaction on/off. `to_lsm_config` always enables it. Raft timers are the `[raft]` table; see [Operability](./operability.md).
 - Native TLS certificates. A TLS key in this file is rejected. Termination belongs in an external proxy.
+- A working RDMA device, provider library, or unauthenticated bypass listener. `mode = "rdma"` refuses to start. `prefer-rdma` keeps TCP/gRPC after an explicit rejection.

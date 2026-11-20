@@ -560,7 +560,19 @@ impl PersistentMetaDbCluster {
     ///
     /// When `config.cluster.join` is set and this data directory does not already own a cell,
     /// the process registers with that leader and joins every shard Raft group before returning.
+    ///
+    /// Transport resolution runs before this function creates a data directory or binds a
+    /// socket. The carried transport is tonic gRPC over TCP. `mode = "rdma"` returns an
+    /// error. `mode = "prefer-rdma"` logs an explicit fallback and still serves TCP/gRPC.
     pub async fn open_and_serve(config: ServerTomlConfig) -> Result<(Arc<Self>, String)> {
+        let transport = config.resolve_transport()?;
+        if transport.explicit_rdma_fallback() {
+            tracing::warn!(
+                selected = "tcp-grpc",
+                rejection = "backend-not-implemented",
+                "RDMA was requested and is not implemented; carrying traffic on tonic gRPC over TCP. No RDMA resources were allocated"
+            );
+        }
         metadb_cluster::node_id_in_ha_range(config.node.node_id)?;
         if config.node.role != ServerRole::AllInOne {
             return Err(MetaDbError::CodecError(format!(
