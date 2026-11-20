@@ -288,6 +288,32 @@ pub fn load_directory(path: &Path) -> Result<BTreeMap<CellId, DirectoryCell>> {
     let mut raw = Vec::new();
     File::open(path)?.read_to_end(&mut raw)?;
     let body = verify_crc32c_le(&raw, CELL_DIRECTORY_FILE)?;
+    decode_directory_body(body)
+}
+
+/// Bytes stored inside the replicated snapshot. No CRC trailer.
+pub fn encode_directory_body(records: &BTreeMap<CellId, DirectoryCell>) -> Result<Vec<u8>> {
+    let persisted = PersistedDirectory {
+        version: CELL_DIRECTORY_VERSION,
+        cells: records
+            .values()
+            .map(|cell| PersistedDirectoryCell {
+                cell_id: cell.cell_id,
+                start_key: cell.range.start_key.clone(),
+                end_key: cell.range.end_key.clone(),
+                endpoints: cell.endpoints.clone(),
+                local: cell.local,
+                cluster_id: cell.cluster_id,
+                routes: cell.routes.clone(),
+            })
+            .collect(),
+    };
+    codec::serialize(&persisted)
+        .map_err(|error| MetaDbError::CodecError(format!("{CELL_DIRECTORY_FILE}: {error}")))
+}
+
+/// Decodes a directory body. A truncated or trailing-byte body fails closed.
+pub fn decode_directory_body(body: &[u8]) -> Result<BTreeMap<CellId, DirectoryCell>> {
     let parsed: PersistedDirectory = decode_exact(body)?;
     if parsed.version != CELL_DIRECTORY_VERSION {
         return Err(MetaDbError::CodecError(format!(
@@ -297,7 +323,23 @@ pub fn load_directory(path: &Path) -> Result<BTreeMap<CellId, DirectoryCell>> {
     }
     let mut records = BTreeMap::new();
     for cell in parsed.cells {
-        let range = CompositeKeyRange::new(cell.start_key, cell.end_key)?;
+        if cell.cell_id == 0 {
+            return Err(MetaDbError::CodecError(format!(
+                "{CELL_DIRECTORY_FILE} lists cell id 0; refusing to invent a cell"
+            )));
+        }
+        let range = CompositeKeyRange::new(cell.start_key, cell.end_key).map_err(|error| {
+            MetaDbError::CodecError(format!(
+                "{CELL_DIRECTORY_FILE} cell {} range: {error}",
+                cell.cell_id
+            ))
+        })?;
+        if cell.endpoints.is_empty() || cell.endpoints.iter().any(|endpoint| endpoint.is_empty()) {
+            return Err(MetaDbError::CodecError(format!(
+                "{CELL_DIRECTORY_FILE} cell {} has an empty endpoint",
+                cell.cell_id
+            )));
+        }
         if records
             .insert(
                 cell.cell_id,
@@ -318,27 +360,24 @@ pub fn load_directory(path: &Path) -> Result<BTreeMap<CellId, DirectoryCell>> {
             )));
         }
     }
+    let mut ordered: Vec<&DirectoryCell> = records.values().collect();
+    ordered.sort_by(|left, right| left.range.start_key.cmp(&right.range.start_key));
+    for pair in ordered.windows(2) {
+        if pair[0]
+            .range
+            .overlaps(&pair[1].range.start_key, &pair[1].range.end_key)
+        {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "{CELL_DIRECTORY_FILE} cell {} overlaps cell {}; refusing an inconsistent directory",
+                pair[0].cell_id, pair[1].cell_id
+            )));
+        }
+    }
     Ok(records)
 }
 
 pub fn store_directory(path: &Path, records: &BTreeMap<CellId, DirectoryCell>) -> Result<()> {
-    let persisted = PersistedDirectory {
-        version: CELL_DIRECTORY_VERSION,
-        cells: records
-            .values()
-            .map(|cell| PersistedDirectoryCell {
-                cell_id: cell.cell_id,
-                start_key: cell.range.start_key.clone(),
-                end_key: cell.range.end_key.clone(),
-                endpoints: cell.endpoints.clone(),
-                local: cell.local,
-                cluster_id: cell.cluster_id,
-                routes: cell.routes.clone(),
-            })
-            .collect(),
-    };
-    let mut raw = codec::serialize(&persisted)
-        .map_err(|error| MetaDbError::CodecError(format!("{CELL_DIRECTORY_FILE}: {error}")))?;
+    let mut raw = encode_directory_body(records)?;
     append_crc32c_le(&mut raw);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;

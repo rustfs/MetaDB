@@ -86,7 +86,7 @@ max_in_snapshot_log_to_keep = 0
 max_segment_bytes = 67108864
 ```
 
-Role strings are kebab-case: `all-in-one`, `be`, `proxy`, `cell-manager`, `global-manager`. `global-manager` loads `GLOBAL_CELL_DIRECTORY` and does not open `be/` or a cell Raft group. `cell-manager` opens one local cell and its Raft groups and can publish that cell. `be` opens local Raft replicas, serves their metadata, and does not publish a cell or mint ids. `proxy` does not open Raft; it forwards metadata and transactions to `[cluster] upstream`. That is one host, not a multi-cell route. The directory file is not a Raft group.
+Role strings are kebab-case: `all-in-one`, `be`, `proxy`, `cell-manager`, `global-manager`. `global-manager` loads `GLOBAL_CELL_DIRECTORY` and does not open `be/` or a cell Raft group. `cell-manager` opens one local cell and its Raft groups and can publish that cell. `be` opens local Raft replicas, serves their metadata, and does not publish a cell or mint ids. `proxy` does not open Raft; it forwards metadata and transactions to `[cluster] upstream`. That is one host, not a multi-cell route. The directory file is not a Raft group. A bootstrap leader stores a snapshot of it, and of `CELL_MANAGER_STATE`, in the lowest local shard's existing Raft log. A joined replica does not publish that snapshot.
 
 CLI flags override the file after it is parsed: `--node-id`, `--cell-id`, `--role`, `--listen`, `--data-dir`. `--cell-manager` is not a TOML field. It is only a `metadbd` flag.
 

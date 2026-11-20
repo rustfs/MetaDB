@@ -21,6 +21,9 @@ use crate::meta_cache::CompositeMetaCache;
 struct CellDirectory {
     path: Option<std::path::PathBuf>,
     records: BTreeMap<CellId, DirectoryCell>,
+    /// False when no file existed. A missing file can be restored from the
+    /// replicated snapshot. A file that was loaded is not rewritten to add cells.
+    loaded_from_file: bool,
 }
 
 /// Top-tier Two-Tier Control Plane manager (`GlobalManager` + `MetaCache` + `DurableIdAllocator`).
@@ -46,13 +49,15 @@ impl DurableGlobalManager {
             directory: Mutex::new(CellDirectory {
                 path: None,
                 records: BTreeMap::new(),
+                loaded_from_file: false,
             }),
         }
     }
 
     pub fn load_or_create_directory(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let records = if path.exists() {
+        let loaded_from_file = path.exists();
+        let records = if loaded_from_file {
             load_directory(path)?
         } else {
             BTreeMap::new()
@@ -60,8 +65,71 @@ impl DurableGlobalManager {
         *self.directory.lock().unwrap() = CellDirectory {
             path: Some(path.to_path_buf()),
             records,
+            loaded_from_file,
         };
         Ok(())
+    }
+
+    /// Compare the loaded file with the snapshot committed on `cell`.
+    ///
+    /// A corrupt snapshot fails closed. A loaded file that is missing a
+    /// replicated cell, or that disagrees on a remote cell, fails closed.
+    /// A file that was never created is filled from the snapshot. The local
+    /// cell's listen address may differ. This does not forward requests.
+    pub fn align_directory_with_replication(&self, cell: &DurableCellManager) -> Result<()> {
+        let Some(record) = cell.replicated_control()? else {
+            return Ok(());
+        };
+        let replicated = crate::cell_directory::decode_directory_body(&record.directory_body)?;
+        let mut directory = self.directory.lock().unwrap();
+        if !directory.loaded_from_file {
+            if replicated.is_empty() {
+                return Ok(());
+            }
+            let Some(path) = directory.path.clone() else {
+                return Err(MetaDbError::ShardRoutingError(
+                    "cell directory is not loaded".to_string(),
+                ));
+            };
+            store_directory(&path, &replicated)?;
+            directory.records = replicated;
+            directory.loaded_from_file = true;
+            return Ok(());
+        }
+        for cell_record in replicated.values() {
+            let Some(stored) = directory.records.get(&cell_record.cell_id) else {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "GLOBAL_CELL_DIRECTORY is missing replicated cell {}; refusing to drop it",
+                    cell_record.cell_id
+                )));
+            };
+            if !directory_cell_matches(stored, cell_record) {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "GLOBAL_CELL_DIRECTORY cell {} is inconsistent with the replicated snapshot; refusing to drop or invent cells",
+                    cell_record.cell_id
+                )));
+            }
+        }
+        if cell.joined_existing() {
+            for stored in directory.records.values() {
+                if !replicated.contains_key(&stored.cell_id) {
+                    return Err(MetaDbError::ShardRoutingError(format!(
+                        "GLOBAL_CELL_DIRECTORY cell {} is not in the replicated snapshot; refusing to invent it",
+                        stored.cell_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Propose the loaded directory and the cell's manager snapshot.
+    ///
+    /// `Ok(false)` means this process did not commit a new snapshot because it is
+    /// not the shard leader. The previous snapshot is unchanged.
+    pub async fn publish_replicated_directory(&self, cell: &DurableCellManager) -> Result<bool> {
+        let records = self.directory.lock().unwrap().records.clone();
+        cell.publish_control_plane(&records).await
     }
 
     /// Publishes this process's cell into the durable directory and the local map.
@@ -132,6 +200,7 @@ impl DurableGlobalManager {
             );
             store_directory(&path, &next)?;
             directory.records = next;
+            directory.loaded_from_file = true;
         }
         self.register_cell(range, cell);
         Ok(())
@@ -170,6 +239,7 @@ impl DurableGlobalManager {
         next.insert(stored.cell_id, stored);
         store_directory(&path, &next)?;
         directory.records = next;
+        directory.loaded_from_file = true;
         Ok(true)
     }
 
@@ -371,6 +441,15 @@ impl DurableGlobalManager {
         }
         Ok(out)
     }
+}
+
+fn directory_cell_matches(stored: &DirectoryCell, replicated: &DirectoryCell) -> bool {
+    stored.cell_id == replicated.cell_id
+        && stored.range == replicated.range
+        && stored.local == replicated.local
+        && stored.cluster_id == replicated.cluster_id
+        && (replicated.local
+            || (stored.endpoints == replicated.endpoints && stored.routes == replicated.routes))
 }
 
 #[tonic::async_trait]

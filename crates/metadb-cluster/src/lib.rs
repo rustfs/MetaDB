@@ -11,6 +11,7 @@ pub mod cell_manager;
 pub mod control_plane;
 pub mod control_plane_state;
 pub mod global_manager;
+pub mod heartbeat_scheduler;
 pub mod id_allocator;
 pub mod identity;
 pub mod jumbo;
@@ -18,6 +19,7 @@ pub mod jumbo_files;
 pub mod jumbo_placement;
 pub mod jumbo_remote;
 pub mod meta_cache;
+pub mod replicated_control;
 pub mod shard;
 pub mod split_worker;
 
@@ -25,8 +27,8 @@ pub use cell_directory::{
     shards_covering, DirectoryCell, RemotePrecheck, RemotePublication, CELL_DIRECTORY_FILE,
 };
 pub use cell_manager::{
-    join_scale_target, plan_membership_voters, CellDirectoryRole, DurableCellManager,
-    SplitPlanRecord, SplitPlanState,
+    join_scale_target, manager_nodes_from_body, manager_voters_from_body, plan_membership_voters,
+    CellDirectoryRole, DurableCellManager, SplitPlanRecord, SplitPlanState,
 };
 pub use control_plane::{CellId, CellLocalManager, GlobalManager, MetaCache, ShardRoute};
 pub use control_plane_state::{
@@ -34,6 +36,12 @@ pub use control_plane_state::{
     MAX_HEARTBEAT_SEQ_ADVANCE,
 };
 pub use global_manager::DurableGlobalManager;
+pub use heartbeat_scheduler::{
+    capture_mono_ns, decide_liveness, liveness_effects, publish_interval_elapsed,
+    trusted_wall_unix_ms, wall_unix_ms_is_trusted, HeartbeatScheduler, LivenessDecision,
+    LivenessEffects, LivenessRefusal, MeasuredSample, MeasurementReject, ScheduleNow,
+    HEARTBEAT_FRESHNESS_MS, WALL_CLOCK_FALLBACK_MS,
+};
 pub use id_allocator::{
     AllocIdKind, DurableIdAllocator, LocalIdBuffer, CELL_DIR_AFFINITY_BLOCK_SIZE,
     CELL_FILE_ID_BLOCK_SIZE, GLOBAL_ID_BLOCK_SIZE, GLOBAL_SHARD_ID_BLOCK_SIZE,
@@ -49,6 +57,7 @@ pub use jumbo_placement::{
 };
 pub use jumbo_remote::{RemoteHandoffRecord, RemoteJumboDisk, RemoteMoveOutcome, SpareDrainRecord};
 pub use meta_cache::{CompositeMetaCache, CompositeShardRoute};
+pub use replicated_control::validate_replicated_record;
 pub use shard::{
     PolicyShardSplitter, RaftMemberRole, RaftMembership, ShardDescriptor, ShardHealthState,
     ShardSplitMode,
