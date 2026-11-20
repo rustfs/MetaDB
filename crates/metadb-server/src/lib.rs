@@ -1463,8 +1463,11 @@ impl PersistentMetaDbCluster {
         if let Some(cell) = &self.cell_manager {
             // Hints are computed here and not applied. This does not call
             // transfer_leader, move a Jumbo shard, change membership, or
-            // replicate the cell directory.
+            // replicate the cell directory. The leadership gate does not read
+            // the hint. It refuses while automatic transfer is disabled and
+            // does not call `trigger().transfer_leader`.
             cell.observe_liveness_hints();
+            cell.consider_automatic_leadership_transfer();
         }
         Ok(())
     }

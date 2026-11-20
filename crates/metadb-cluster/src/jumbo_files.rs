@@ -556,6 +556,24 @@ fn sync_tree(dir: &Path) -> Result<()> {
     sync_dir(dir)
 }
 
+/// Phase byte of a visible `JUMBO_FILE_MOVE`, if the file names this shard.
+///
+/// `MOVE_STAGED` and `MOVE_LIVE` both block leadership transfer. A missing file
+/// is `Ok(None)`. A record for a different shard is an error so the caller
+/// fails closed instead of treating the directory as idle.
+pub fn visible_move_phase(dest: &Path, shard_id: ShardId) -> Result<Option<u32>> {
+    let Some(record) = read_record(dest)? else {
+        return Ok(None);
+    };
+    if record.shard_id != shard_id {
+        return Err(MetaDbError::CodecError(format!(
+            "{JUMBO_MOVE_FILE} names shard {} and not {shard_id}",
+            record.shard_id
+        )));
+    }
+    Ok(Some(record.phase))
+}
+
 fn read_record(dest: &Path) -> Result<Option<MoveRecord>> {
     let path = dest.join(JUMBO_MOVE_FILE);
     if !path.exists() {
