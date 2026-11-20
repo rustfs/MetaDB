@@ -11,7 +11,7 @@ MetaDB exposes three client access surfaces tailored to different integration ne
 
 ## 1. gRPC Service Surface (`metadb.v1`) `[Implemented]`
 
-`[Implemented]` means the process that hosts the shard serves these RPCs. A `global-manager` does not allocate ids or forward a key. `RegisterCell` persists a remote cell on the directory process after `GetRoutes` shows that cell covering the requested range exactly. It does not forward later metadata calls. `be` and `proxy` are rejected before listen.
+`[Implemented]` means the process that hosts the shard serves these RPCs. A `global-manager` does not allocate ids or forward a key. `RegisterCell` persists a remote cell on the directory process after `GetRoutes` shows that cell covering the requested range exactly. It does not forward later metadata calls. `be` serves the replicas it hosts. `proxy` forwards these calls to one upstream and does not host Raft.
 
 ### `MetadataService` (`proto/metadb/v1/metadata.proto`)
 * **Namespace Mutations (`1-RTT` Pushdown)**: `CreateFile`, `Mkdir`, `Unlink`, `Rmdir`, `SetAttr` (`chmod`, `chown`, `truncate`, `utimes`).

@@ -26,7 +26,7 @@ use tokio::sync::watch;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::service::Interceptor;
 use tonic::transport::{Endpoint, Server};
-use tonic::{Request, Status};
+use tonic::{Request, Response, Status};
 
 /// Server interceptor for metadata, transaction, control-plane, and Raft RPCs.
 ///
@@ -152,11 +152,14 @@ use metadb_core::{
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::control_plane_service_server::ControlPlaneServiceServer;
 use metadb_proto::metadata_service_server::MetadataServiceServer;
-use metadb_proto::raft_transport_service_server::RaftTransportServiceServer;
+use metadb_proto::raft_transport_service_server::{
+    RaftTransportService, RaftTransportServiceServer,
+};
 use metadb_proto::transaction_service_server::TransactionServiceServer;
 use metadb_proto::{
     GetRoutesRequest, RegisterNodeRequest, ScaleShardReplicasRequest, StoreHeartbeatRequest,
 };
+use metadb_proto::{RaftRpcEnvelope, RaftRpcReply, SnapshotChunkRequest, SnapshotChunkResponse};
 use metadb_proxy::{MetadataSqlCommand, SqlTemplateParser, StatelessProxyRouter};
 use metadb_raft::backup::{self, OnlineShard};
 use metadb_raft::{
@@ -546,6 +549,8 @@ pub struct PersistentMetaDbCluster {
     cell_manager: Option<Arc<DurableCellManager>>,
     /// `global-manager` publishes the cell directory and does not host Raft groups.
     directory_only: bool,
+    /// `proxy` forwards metadata to one upstream and does not host Raft groups.
+    proxy_gateway: bool,
     global_manager: Arc<DurableGlobalManager>,
     tx_router: Arc<DistributedTxRouter>,
     proxy_router: Arc<StatelessProxyRouter>,
@@ -597,6 +602,7 @@ async fn serve_global_directory(
         host: None,
         cell_manager: None,
         directory_only: true,
+        proxy_gateway: false,
         global_manager,
         tx_router,
         proxy_router,
@@ -617,7 +623,7 @@ async fn serve_global_directory(
         listener,
         grpc_svc,
         shared_secret,
-        MultiRaftRouter::new(),
+        RaftIngress::Groups(MultiRaftTransportServer::new(MultiRaftRouter::new())),
         shutdown_rx,
     );
     cluster.task_handles.lock().await.push(grpc_handle);
@@ -682,6 +688,181 @@ async fn register_cell_with_global_manager(
     Ok(())
 }
 
+fn validate_role_topology(config: &ServerTomlConfig, has_cell_range: bool) -> Result<()> {
+    let join = !config.cluster.join.trim().is_empty();
+    let global = !config.cluster.global_manager.trim().is_empty();
+    let upstream = config.cluster.upstream.trim();
+    let jumbo = !config.sharding.jumbo_dedicated_root.trim().is_empty();
+    match config.node.role {
+        ServerRole::Proxy => {
+            if upstream.is_empty() {
+                return Err(MetaDbError::CodecError(
+                    "proxy requires [cluster].upstream, the host:port of one shard host. This process does not open Raft groups and does not choose a cell by itself"
+                        .to_string(),
+                ));
+            }
+            if upstream.starts_with("https://") {
+                return Err(MetaDbError::CodecError(
+                    "proxy does not accept an https upstream; this process does not terminate TLS"
+                        .to_string(),
+                ));
+            }
+            if join || global || has_cell_range || jumbo {
+                return Err(MetaDbError::CodecError(
+                    "proxy forwards to one upstream; it does not join a shard, publish a cell, own a cell range, or place jumbo files"
+                        .to_string(),
+                ));
+            }
+        }
+        ServerRole::Be => {
+            if global {
+                return Err(MetaDbError::CodecError(
+                    "be hosts local shard replicas and does not publish a cell; use role cell-manager"
+                        .to_string(),
+                ));
+            }
+            if !upstream.is_empty() {
+                return Err(MetaDbError::CodecError(
+                    "be does not forward to an upstream; [cluster].upstream is only for role proxy"
+                        .to_string(),
+                ));
+            }
+        }
+        ServerRole::GlobalManager => {
+            if join || global || has_cell_range || jumbo || !upstream.is_empty() {
+                return Err(MetaDbError::CodecError(
+                    "global-manager stores the cell directory only; it does not join a shard, own a cell range, place jumbo files, or forward to an upstream"
+                        .to_string(),
+                ));
+            }
+        }
+        ServerRole::AllInOne => {
+            if global {
+                return Err(MetaDbError::CodecError(
+                    "all-in-one does not register with a separate global-manager; use role cell-manager"
+                        .to_string(),
+                ));
+            }
+            if !upstream.is_empty() {
+                return Err(MetaDbError::CodecError(
+                    "all-in-one does not forward to an upstream; [cluster].upstream is only for role proxy"
+                        .to_string(),
+                ));
+            }
+        }
+        ServerRole::CellManager => {
+            if !upstream.is_empty() {
+                return Err(MetaDbError::CodecError(
+                    "cell-manager does not forward to an upstream; [cluster].upstream is only for role proxy"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn serve_proxy(config: ServerTomlConfig) -> Result<(Arc<PersistentMetaDbCluster>, String)> {
+    let upstream = config.cluster.upstream.trim().to_string();
+    if config.security.shared_secret.trim().is_empty()
+        && !config::is_literal_loopback_addr(&upstream)
+    {
+        return Err(MetaDbError::CodecError(
+            "unauthenticated proxy only forwards to a literal loopback upstream. Set a shared secret before using a non-loopback upstream, or point upstream at 127.0.0.0/8 or ::1. This process does not terminate TLS"
+                .to_string(),
+        ));
+    }
+    let shard_tree = config.node.data_dir.join("be");
+    let cell_state = config
+        .node
+        .data_dir
+        .join(format!("cell_{}", config.node.cell_id))
+        .join("CELL_MANAGER_STATE");
+    if shard_tree.exists() || cell_state.exists() {
+        return Err(MetaDbError::CodecError(
+            "proxy does not host shard files; this data directory already has shard or cell state"
+                .to_string(),
+        ));
+    }
+    let listener = TcpListener::bind(&config.node.grpc_listen_addr).await?;
+    let bound = listener.local_addr().map_err(|error| {
+        MetaDbError::StorageIoError(format!("proxy listener has no local address: {error}"))
+    })?;
+    let bound_addr = bound.to_string();
+    config.reject_unauthenticated_bind(&bound_addr)?;
+
+    std::fs::create_dir_all(&config.node.data_dir)?;
+    let clock = Arc::new(HybridLogicalClock::with_max_drift_ms(
+        config.clock.max_clock_drift_ms,
+    ));
+    let id_allocator = Arc::new(DurableIdAllocator::open_for_node(
+        config.node.data_dir.join("global_allocator"),
+        config.node.node_id,
+    )?);
+    let id_buffer = Arc::new(LocalIdBuffer::new(
+        id_allocator.clone(),
+        config.node.node_id,
+    ));
+    let meta_cache = Arc::new(CompositeMetaCache::new());
+    let global_manager = Arc::new(DurableGlobalManager::new(
+        clock.clone(),
+        id_allocator,
+        meta_cache,
+    ));
+    let tx_router = Arc::new(
+        DistributedTxRouter::new(config.node.node_id, clock.clone(), global_manager.clone())
+            .with_forward_secret(config.security.shared_secret.clone()),
+    );
+    let proxy_router = Arc::new(StatelessProxyRouter::new(tx_router.clone()));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let operability = operability::Operability::starting();
+    let shared_secret = config.security.shared_secret.clone();
+    let cluster = Arc::new(PersistentMetaDbCluster {
+        config,
+        clock,
+        id_buffer,
+        host: None,
+        cell_manager: None,
+        directory_only: false,
+        proxy_gateway: true,
+        global_manager,
+        tx_router,
+        proxy_router,
+        shutdown_tx,
+        task_handles: tokio::sync::Mutex::new(Vec::new()),
+        metrics_addr: OnceLock::new(),
+        operability,
+    });
+    let grpc_svc = MetaDbGrpcService::new(
+        cluster.global_manager.clone(),
+        cluster.tx_router.clone(),
+        cluster.proxy_router.clone(),
+    )
+    .with_forward_secret(shared_secret.clone())
+    .with_upstream(upstream)
+    .with_remote_cell_registration(false)
+    .with_shard_host_only(false);
+    let grpc_handle = spawn_grpc_server(
+        listener,
+        grpc_svc,
+        shared_secret,
+        RaftIngress::Proxy,
+        shutdown_rx,
+    );
+    cluster.task_handles.lock().await.push(grpc_handle);
+    if let Err(error) = spawn_metrics_listener(&cluster).await {
+        cluster.operability.fail();
+        let _ = cluster.shutdown_without_flush().await;
+        return Err(error);
+    }
+    cluster.operability.mark_startup_finished();
+    std::fs::write(
+        cluster.config().node.data_dir.join("GRPC_ADDR"),
+        &bound_addr,
+    )?;
+    Ok((cluster, bound_addr))
+}
+
 impl PersistentMetaDbCluster {
     /// Opens or bootstraps a persistent MetaDB instance from `config` and starts its gRPC listener
     /// (binding to `config.node.grpc_listen_addr`, e.g., `"127.0.0.1:0"` for OS-assigned ephemeral ports).
@@ -703,38 +884,15 @@ impl PersistentMetaDbCluster {
         }
         metadb_cluster::node_id_in_ha_range(config.node.node_id)?;
         let owned_range = config.configured_cell_range()?;
-        match config.node.role {
-            ServerRole::Be | ServerRole::Proxy => {
-                return Err(MetaDbError::CodecError(format!(
-                    "server role {:?} is not implemented; there is no remote shard host and no forwarding router. only all-in-one, cell-manager, and global-manager run a process",
-                    config.node.role
-                )));
-            }
-            ServerRole::GlobalManager => {
-                if !config.cluster.join.trim().is_empty()
-                    || !config.cluster.global_manager.trim().is_empty()
-                    || owned_range.is_some()
-                    || !config.sharding.jumbo_dedicated_root.trim().is_empty()
-                {
-                    return Err(MetaDbError::CodecError(
-                        "global-manager stores the cell directory only; it does not join a shard, own a cell range, or place jumbo files"
-                            .to_string(),
-                    ));
-                }
-            }
-            ServerRole::AllInOne if !config.cluster.global_manager.trim().is_empty() => {
-                return Err(MetaDbError::CodecError(
-                    "all-in-one does not register with a separate global-manager; use role cell-manager"
-                        .to_string(),
-                ));
-            }
-            ServerRole::AllInOne | ServerRole::CellManager => {}
-        }
+        validate_role_topology(&config, owned_range.is_some())?;
         let directory_only = config.node.role == ServerRole::GlobalManager;
         config.raft_options.validate()?;
         config.reject_unauthenticated_bind(&config.node.grpc_listen_addr)?;
         if let Some(metrics_addr) = &config.node.metrics_listen_addr {
             config.reject_unauthenticated_bind(metrics_addr)?;
+        }
+        if config.node.role == ServerRole::Proxy {
+            return serve_proxy(config).await;
         }
         std::fs::create_dir_all(&config.node.data_dir)?;
         if directory_only {
@@ -896,6 +1054,7 @@ impl PersistentMetaDbCluster {
             host: Some(host),
             cell_manager: Some(cell_manager),
             directory_only: false,
+            proxy_gateway: false,
             global_manager,
             tx_router,
             proxy_router,
@@ -918,9 +1077,18 @@ impl PersistentMetaDbCluster {
             cluster.proxy_router.clone(),
         )
         .with_forward_secret(cluster.config.security.shared_secret.clone())
-        .with_remote_cell_registration(cluster.config.node.role != ServerRole::CellManager);
-        let grpc_handle =
-            spawn_grpc_server(listener, grpc_svc, shared_secret, raft_router, shutdown_rx);
+        .with_remote_cell_registration(
+            cluster.config.node.role != ServerRole::CellManager
+                && cluster.config.node.role != ServerRole::Be,
+        )
+        .with_shard_host_only(cluster.config.node.role == ServerRole::Be);
+        let grpc_handle = spawn_grpc_server(
+            listener,
+            grpc_svc,
+            shared_secret,
+            RaftIngress::Groups(MultiRaftTransportServer::new(raft_router)),
+            shutdown_rx,
+        );
         cluster.task_handles.lock().await.push(grpc_handle);
         // The probe listener is up before join so a scrape observes `starting`
         // instead of a later 200 that only means the socket is bound.
@@ -1236,6 +1404,7 @@ impl PersistentMetaDbCluster {
             self.operability.phase(),
             &self.shard_gates(),
             self.directory_only,
+            self.proxy_gateway,
         )
     }
 
@@ -1266,6 +1435,7 @@ impl PersistentMetaDbCluster {
             self.operability.phase(),
             &gates,
             self.directory_only,
+            self.proxy_gateway,
         );
         let mut snap = collect_cluster_metrics(&self.global_manager);
         snap.apply_operability(&report, &gates, &self.config.raft_options);
@@ -1495,11 +1665,79 @@ async fn spawn_metrics_listener(cluster: &Arc<PersistentMetaDbCluster>) -> Resul
     Ok(())
 }
 
+const PROXY_RAFT_REJECTION: &str = "proxy does not host raft groups";
+
+#[derive(Clone)]
+enum RaftIngress {
+    Groups(MultiRaftTransportServer),
+    Proxy,
+}
+
+#[tonic::async_trait]
+impl RaftTransportService for RaftIngress {
+    async fn append_entries(
+        &self,
+        request: Request<RaftRpcEnvelope>,
+    ) -> std::result::Result<Response<RaftRpcReply>, Status> {
+        match self {
+            Self::Groups(server) => server.append_entries(request).await,
+            Self::Proxy => Ok(Response::new(proxy_raft_reply())),
+        }
+    }
+
+    async fn vote(
+        &self,
+        request: Request<RaftRpcEnvelope>,
+    ) -> std::result::Result<Response<RaftRpcReply>, Status> {
+        match self {
+            Self::Groups(server) => server.vote(request).await,
+            Self::Proxy => Ok(Response::new(proxy_raft_reply())),
+        }
+    }
+
+    async fn transfer_leader(
+        &self,
+        request: Request<RaftRpcEnvelope>,
+    ) -> std::result::Result<Response<RaftRpcReply>, Status> {
+        match self {
+            Self::Groups(server) => server.transfer_leader(request).await,
+            Self::Proxy => Ok(Response::new(proxy_raft_reply())),
+        }
+    }
+
+    async fn install_snapshot(
+        &self,
+        request: Request<tonic::Streaming<SnapshotChunkRequest>>,
+    ) -> std::result::Result<Response<SnapshotChunkResponse>, Status> {
+        match self {
+            Self::Groups(server) => server.install_snapshot(request).await,
+            Self::Proxy => Err(Status::failed_precondition(PROXY_RAFT_REJECTION)),
+        }
+    }
+
+    async fn client_write(
+        &self,
+        request: Request<RaftRpcEnvelope>,
+    ) -> std::result::Result<Response<RaftRpcReply>, Status> {
+        match self {
+            Self::Groups(server) => server.client_write(request).await,
+            Self::Proxy => Ok(Response::new(proxy_raft_reply())),
+        }
+    }
+}
+
+fn proxy_raft_reply() -> RaftRpcReply {
+    RaftRpcReply {
+        bincode_payload: Vec::new(),
+        error_message: PROXY_RAFT_REJECTION.to_string(),
+    }
+}
+
 fn spawn_grpc_server(
     listener: TcpListener,
     grpc_svc: MetaDbGrpcService,
     shared_secret: String,
-    raft_router: MultiRaftRouter,
+    raft: RaftIngress,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let auth = BearerAuth::new(shared_secret);
@@ -1517,10 +1755,7 @@ fn spawn_grpc_server(
                 grpc_svc,
                 auth.clone(),
             ))
-            .add_service(RaftTransportServiceServer::with_interceptor(
-                MultiRaftTransportServer::new(raft_router),
-                auth,
-            ))
+            .add_service(RaftTransportServiceServer::with_interceptor(raft, auth))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                 let _ = shutdown_rx.changed().await;
             })

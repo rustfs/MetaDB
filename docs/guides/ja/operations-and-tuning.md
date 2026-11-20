@@ -6,7 +6,7 @@
 
 ## 1. `metadb-ctl` 管理 CLI `[実装済]`
 
-`[実装済]` means the `metadb-ctl` binary exists and talks to an all-in-one process. `cell register` does not create a cell. `metadbd --role be` is not a supported deployment. Output from a bench command is for the machine that ran it, not a checked-in result.
+`[実装済]` means the `metadb-ctl` binary exists and talks to an all-in-one process. `cell register` does not create a cell. `metadbd --role be` hosts local Raft replicas and does not mint id blocks. Output from a bench command is for the machine that ran it, not a checked-in result.
 
 ```bash
 # クラスター全体の Cell・BE ノード状態・3 ウォーターマーク遅延を確認

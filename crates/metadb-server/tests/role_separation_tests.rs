@@ -1,7 +1,7 @@
 //! `global-manager` serves only the cell directory. `cell-manager` hosts one
-//! local cell and can publish it. `be` and `proxy` still do not start.
-//! The directory file is not a Raft group, and the global process does not
-//! forward a key or mint an id.
+//! local cell and can publish it. `be` and `proxy` are covered in
+//! `be_proxy_tests`. The directory file is not a Raft group, and the global
+//! process does not forward a key or mint an id.
 
 use metadb_core::ROOT_INODE_ID;
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
@@ -20,25 +20,8 @@ fn loopback_config(dir: &std::path::Path) -> ServerTomlConfig {
     cfg
 }
 
-async fn rejected(role: ServerRole) -> String {
-    let dir = tempdir().unwrap();
-    let mut cfg = loopback_config(dir.path());
-    cfg.node.role = role;
-    match PersistentMetaDbCluster::open_and_serve(cfg).await {
-        Ok(_) => panic!("{role:?} must not start"),
-        Err(error) => error.to_string(),
-    }
-}
-
 #[tokio::test]
-async fn be_and_proxy_are_still_rejected_and_all_in_one_does_not_register() {
-    for role in [ServerRole::Be, ServerRole::Proxy] {
-        let message = rejected(role).await;
-        assert!(
-            message.contains("not implemented"),
-            "{role:?} error was: {message}"
-        );
-    }
+async fn all_in_one_does_not_register_with_a_global_manager() {
     let dir = tempdir().unwrap();
     let mut cfg = loopback_config(dir.path());
     cfg.cluster.global_manager = "127.0.0.1:1".into();
