@@ -22,9 +22,11 @@ pub use aux_sink::{AsyncAuxiliarySink, AuxUpdateTask};
 pub use pushdown::{PushdownExecutor, TwoPhaseCommitCoordinator};
 pub use recovery_worker::{AuxDispatcher, TxnRecoveryWorker};
 pub use state_machine_impl::{
-    command_payload, encode_proposed_command, fresh_proposal_id, node_instance_key,
-    proposal_receipt_key, NodeInstanceRecord, SetAttrPatch, TxRaftCmd, TxRaftOutput,
-    TxStateMachineHandler, MAX_2PC_LEASE_LIFETIME_MS, PROPOSAL_RECEIPT_RETENTION_MS,
+    command_payload, decode_replicated_control_record, encode_proposed_command, fresh_proposal_id,
+    node_instance_key, proposal_receipt_key, read_replicated_control_record, ControlPlaneValidator,
+    NodeInstanceRecord, ReplicatedControlRecord, SetAttrPatch, TxRaftCmd, TxRaftOutput,
+    TxStateMachineHandler, CONTROL_PLANE_STATE_KEY, MAX_2PC_LEASE_LIFETIME_MS,
+    PROPOSAL_RECEIPT_RETENTION_MS,
 };
 pub use two_pc::{
     DirPartitionStat, DirRenameLease, DistributedTxRouter, RoutedShardHandle, ShardDirectory,

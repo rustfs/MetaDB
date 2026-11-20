@@ -17,6 +17,7 @@ pub mod jumbo;
 pub mod jumbo_files;
 pub mod jumbo_placement;
 pub mod meta_cache;
+pub mod replicated_control;
 pub mod shard;
 pub mod split_worker;
 
@@ -24,8 +25,8 @@ pub use cell_directory::{
     shards_covering, DirectoryCell, RemotePrecheck, RemotePublication, CELL_DIRECTORY_FILE,
 };
 pub use cell_manager::{
-    join_scale_target, plan_membership_voters, CellDirectoryRole, DurableCellManager,
-    SplitPlanRecord, SplitPlanState,
+    join_scale_target, manager_nodes_from_body, manager_voters_from_body, plan_membership_voters,
+    CellDirectoryRole, DurableCellManager, SplitPlanRecord, SplitPlanState,
 };
 pub use control_plane::{CellId, CellLocalManager, GlobalManager, MetaCache, ShardRoute};
 pub use control_plane_state::{
@@ -46,6 +47,7 @@ pub use jumbo_placement::{
     PlacementDecision, PlacementObservation, PlacementPhase, ShardVoters,
 };
 pub use meta_cache::{CompositeMetaCache, CompositeShardRoute};
+pub use replicated_control::validate_replicated_record;
 pub use shard::{
     PolicyShardSplitter, RaftMemberRole, RaftMembership, ShardDescriptor, ShardHealthState,
     ShardSplitMode,

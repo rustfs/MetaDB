@@ -27,7 +27,7 @@ use metadb_storage::LsmEngineConfig;
 use metadb_tx::{RoutedShardHandle, TxStateMachineHandler};
 use tracing;
 
-use crate::cell_directory::{shards_covering, union_route_range};
+use crate::cell_directory::{encode_directory_body, shards_covering, union_route_range};
 use crate::control_plane_state::{
     decide_heartbeat, decode_control_plane, normalize_ids, remote_state_change_is_too_soon,
     unix_ms, HeartbeatDecision, HeartbeatWrite, PersistedControlPlane, StoredHeartbeat,
@@ -46,6 +46,7 @@ use crate::jumbo_placement::{
     PlacementObservation, PlacementPhase, ShardVoters, AUTOMATIC_TRANSFER_DISABLED_REASON,
 };
 use crate::meta_cache::{CompositeMetaCache, CompositeShardRoute};
+use crate::replicated_control::validate_replicated_record;
 use crate::shard::{ShardHealthState, ShardSplitMode};
 use crate::split_worker::{RaftShardSplitWorker, SplitCandidate, SplitCrashPoint};
 
@@ -106,6 +107,16 @@ struct CellStateJoinedOnly {
     routes: BTreeMap<ShardId, CompositeShardRoute>,
     split_plans: BTreeMap<u128, SplitPlanRecord>,
     joined_existing: bool,
+}
+
+/// Membership read from an exact `CELL_MANAGER_STATE` body.
+///
+/// Legacy layouts are not accepted here. A replicated snapshot is always the
+/// current layout; a body that only decodes as an older layout is corrupt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagerSnapshot {
+    pub nodes: BTreeMap<NodeId, String>,
+    pub voters: BTreeMap<ShardId, BTreeMap<NodeId, String>>,
 }
 
 /// On-disk layout before `joined_existing` was stored in the same record.
@@ -378,6 +389,10 @@ impl DurableCellManager {
             }
         }
         if let Err(error) = mgr.bind_local_instance().await {
+            let _ = mgr.host.shutdown_all().await;
+            return Err(error);
+        }
+        if let Err(error) = mgr.reconcile_replicated_membership() {
             let _ = mgr.host.shutdown_all().await;
             return Err(error);
         }
@@ -664,6 +679,7 @@ impl DurableCellManager {
                 wm.clone(),
             ));
             handler.set_instance_bindings(self.instance_bindings.clone());
+            handler.set_control_plane_validator(std::sync::Arc::new(validate_replicated_record));
             let sdir = self.host.shard_dir(route.shard_id);
             let group = ShardRaftGroup::start(
                 route.shard_id,
@@ -784,6 +800,8 @@ impl DurableCellManager {
                     wm.clone(),
                 ));
                 handler.set_instance_bindings(self.instance_bindings.clone());
+                handler
+                    .set_control_plane_validator(std::sync::Arc::new(validate_replicated_record));
                 let sdir = self.resolved_shard_dir(route.shard_id)?;
                 let group = ShardRaftGroup::start(
                     route.shard_id,
@@ -1099,6 +1117,7 @@ impl DurableCellManager {
             wm.clone(),
         ));
         handler.set_instance_bindings(self.instance_bindings.clone());
+        handler.set_control_plane_validator(std::sync::Arc::new(validate_replicated_record));
         let voters: BTreeMap<NodeId, String> = route
             .peers
             .iter()
@@ -1179,7 +1198,8 @@ impl DurableCellManager {
     ) -> Result<()> {
         node_id_in_ha_range(node_id)?;
         if instance_id == 0 {
-            return self.register_address_only(node_id, grpc_addr);
+            self.register_address_only(node_id, grpc_addr)?;
+            return self.publish_manager_snapshot().await;
         }
         if grpc_addr.trim().is_empty() {
             return Err(MetaDbError::IdentityRejected(
@@ -1207,7 +1227,8 @@ impl DurableCellManager {
         }
         self.propose_instance_binding(node_id, instance_id, grpc_addr.clone())
             .await?;
-        self.mirror_bindings_to_state()
+        self.mirror_bindings_to_state()?;
+        self.publish_manager_snapshot().await
     }
 
     fn register_address_only(&self, node_id: NodeId, grpc_addr: String) -> Result<()> {
@@ -1687,6 +1708,7 @@ impl DurableCellManager {
                 .await?;
             upgraded += 1;
         }
+        self.publish_manager_snapshot().await?;
         Ok(upgraded)
     }
 
@@ -1710,6 +1732,7 @@ impl DurableCellManager {
             self.persist_voter_set(sid, &committed, group.current_epoch())?;
             changed += 1;
         }
+        self.publish_manager_snapshot().await?;
         Ok(changed)
     }
 
@@ -2243,6 +2266,134 @@ impl DurableCellManager {
         fs::rename(&tmp, &dst)?;
         sync_dir(dir)?;
         Ok(())
+    }
+
+    fn control_group(&self) -> Result<std::sync::Arc<metadb_raft::ShardRaftGroup>> {
+        let shard_id = {
+            let state = self.state.lock().unwrap();
+            state.routes.keys().copied().min()
+        };
+        let Some(shard_id) = shard_id else {
+            return Err(MetaDbError::ShardRoutingError(
+                "cell has no shard that can store the replicated directory".to_string(),
+            ));
+        };
+        self.host.get_group(shard_id).ok_or_else(|| {
+            MetaDbError::ShardRoutingError(format!(
+                "shard {shard_id} is not running; the replicated directory was not published"
+            ))
+        })
+    }
+
+    /// Snapshot committed on this cell's existing shard Raft group, if any.
+    ///
+    /// A value that does not decode fails closed. This does not create cells.
+    pub fn replicated_control(&self) -> Result<Option<metadb_tx::ReplicatedControlRecord>> {
+        let group = self.control_group()?;
+        metadb_tx::read_replicated_control_record(group.engine().as_ref())
+    }
+
+    /// Fail closed when the replicated manager snapshot does not decode.
+    ///
+    /// A committed scale-in can leave this file behind the applied Raft
+    /// membership, or the other way around. That lag is not a dropped cell.
+    /// A body that does not decode is corrupt and refuses to open.
+    pub fn reconcile_replicated_membership(&self) -> Result<()> {
+        let Some(record) = self.replicated_control()? else {
+            return Ok(());
+        };
+        decode_manager_body_exact(&record.manager_body)?;
+        Ok(())
+    }
+
+    /// Propose `records` and this process's cell-manager snapshot.
+    ///
+    /// Returns `Ok(false)` when this process is not the shard leader or it joined
+    /// an existing group. The caller decides whether that is an error. An identical
+    /// snapshot is not rewritten and returns `Ok(true)`.
+    pub async fn publish_control_plane(
+        &self,
+        records: &BTreeMap<CellId, crate::cell_directory::DirectoryCell>,
+    ) -> Result<bool> {
+        if self.joined_existing() {
+            return Ok(false);
+        }
+        let directory_body = encode_directory_body(records)?;
+        let directory_cell_ids: Vec<CellId> = records.keys().copied().collect();
+        let manager_body = {
+            let state = self.state.lock().unwrap();
+            codec::serialize(&*state)
+                .map_err(|error| MetaDbError::CodecError(format!("CELL_MANAGER_STATE: {error}")))?
+        };
+        self.propose_control_plane(directory_cell_ids, directory_body, manager_body)
+            .await
+    }
+
+    /// Republish membership while keeping the directory body already committed.
+    ///
+    /// Not being the leader leaves the previous snapshot in place.
+    async fn publish_manager_snapshot(&self) -> Result<()> {
+        if self.joined_existing() {
+            return Ok(());
+        }
+        let manager_body = {
+            let state = self.state.lock().unwrap();
+            codec::serialize(&*state)
+                .map_err(|error| MetaDbError::CodecError(format!("CELL_MANAGER_STATE: {error}")))?
+        };
+        let (directory_cell_ids, directory_body) = match self.replicated_control()? {
+            Some(current) => (current.directory_cell_ids, current.directory_body),
+            None => (Vec::new(), encode_directory_body(&BTreeMap::new())?),
+        };
+        self.propose_control_plane(directory_cell_ids, directory_body, manager_body)
+            .await?;
+        Ok(())
+    }
+
+    async fn propose_control_plane(
+        &self,
+        directory_cell_ids: Vec<CellId>,
+        directory_body: Vec<u8>,
+        manager_body: Vec<u8>,
+    ) -> Result<bool> {
+        let group = self.control_group()?;
+        let leader = group.wait_for_leader(Duration::from_secs(15)).await?;
+        if leader != self.host.node_id() {
+            return Ok(false);
+        }
+        if let Some(current) = metadb_tx::read_replicated_control_record(group.engine().as_ref())? {
+            if current.directory_cell_ids == directory_cell_ids
+                && current.directory_body == directory_body
+                && current.manager_body == manager_body
+            {
+                return Ok(true);
+            }
+        }
+        let sequence = match metadb_tx::read_replicated_control_record(group.engine().as_ref())? {
+            Some(current) => current.sequence.saturating_add(1),
+            None => 1,
+        };
+        if sequence == 0 {
+            return Err(MetaDbError::CodecError(
+                "control-plane sequence overflow; refusing to publish".to_string(),
+            ));
+        }
+        let payload = metadb_tx::command_payload(&metadb_tx::TxRaftCmd::PublishControlPlane {
+            sequence,
+            directory_cell_ids,
+            directory_body,
+            manager_body,
+        })?;
+        let epoch = group.current_epoch();
+        group
+            .propose_until(
+                epoch,
+                self.host.clock().now(),
+                payload,
+                tokio::time::Instant::now() + Duration::from_secs(15),
+            )
+            .await?;
+        Ok(true)
     }
 
     /// The next `n` `CELL_CONTROL_PLANE` persists fail before the file is replaced.
@@ -3123,6 +3274,47 @@ struct LegacyPersistedCellState {
     nodes: BTreeMap<NodeId, String>,
     routes: BTreeMap<ShardId, CompositeShardRoute>,
     split_plans: BTreeMap<u128, LegacySplitPlanRecord>,
+}
+
+pub fn manager_voters_from_body(
+    body: &[u8],
+) -> Result<BTreeMap<ShardId, BTreeMap<NodeId, String>>> {
+    Ok(decode_manager_body_exact(body)?.voters)
+}
+
+pub fn manager_nodes_from_body(body: &[u8]) -> Result<BTreeMap<NodeId, String>> {
+    Ok(decode_manager_body_exact(body)?.nodes)
+}
+
+pub(crate) fn decode_manager_body_exact(body: &[u8]) -> Result<ManagerSnapshot> {
+    let state: PersistedCellState =
+        wincode::config::deserialize_exact(body, wincode::config::DefaultConfig::default())
+            .map_err(|error| {
+                MetaDbError::CodecError(format!(
+                    "CELL_MANAGER_STATE publication is corrupt or inconsistent: {error}"
+                ))
+            })?;
+    Ok(ManagerSnapshot {
+        nodes: state.nodes,
+        voters: voter_sets(&state.routes),
+    })
+}
+
+fn voter_sets(
+    routes: &BTreeMap<ShardId, CompositeShardRoute>,
+) -> BTreeMap<ShardId, BTreeMap<NodeId, String>> {
+    routes
+        .iter()
+        .map(|(shard_id, route)| {
+            let voters = route
+                .peers
+                .iter()
+                .filter(|(_, (_, is_voter))| *is_voter)
+                .map(|(node_id, (address, _))| (*node_id, address.clone()))
+                .collect();
+            (*shard_id, voters)
+        })
+        .collect()
 }
 
 fn decode_cell_state(body: &[u8]) -> Result<PersistedCellState> {
