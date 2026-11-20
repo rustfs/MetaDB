@@ -78,3 +78,39 @@ async fn local_jumbo_files_move_onto_a_dedicated_root_and_reopen_there() {
     assert!(!host.shard_dir(1).exists());
     host.shutdown_all().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_after_move_live_does_not_open_the_old_directory() {
+    let dir = tempdir().unwrap();
+    let disk = tempdir().unwrap();
+    let (host, cell) = open_cell(dir.path(), None).await;
+    let source = host.shard_dir(1);
+    cell.testing_mark_local_jumbo(1, 9).unwrap();
+    cell.testing_stop_before_jumbo_source_removal();
+    let stopped = cell
+        .relocate_jumbo_shard_files(1, disk.path())
+        .await
+        .unwrap_err();
+    assert!(
+        stopped
+            .to_string()
+            .contains("will not be opened on restart"),
+        "{stopped}"
+    );
+    assert!(source.exists(), "old directory remains until a later open");
+    assert!(cell.lookup_local_handle(1).is_ok());
+    host.shutdown_all().await.unwrap();
+    drop(cell);
+    drop(host);
+
+    let (host, cell) = open_cell(dir.path(), Some(disk.path())).await;
+    assert!(
+        !host.shard_dir(1).exists(),
+        "restart must remove the old directory after MOVE_LIVE"
+    );
+    assert!(cell.lookup_local_handle(1).is_ok());
+    let published = disk.path().join("shards").join(format!("{:020}", 1u64));
+    assert!(published.join("JUMBO_FILE_MOVE").is_file());
+    assert!(published.join("raft").is_dir());
+    host.shutdown_all().await.unwrap();
+}

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -162,6 +162,9 @@ pub struct DurableCellManager {
     jumbo_dedicated_root: Mutex<Option<PathBuf>>,
     /// Shard ids whose file move already failed in this process. Not retried until restart.
     jumbo_file_move_failed: Mutex<HashSet<ShardId>>,
+    /// Test hook: return after `MOVE_LIVE` and the dest group are durable, before
+    /// the old directory is removed.
+    stop_before_source_removal: AtomicBool,
 }
 
 impl DurableCellManager {
@@ -333,6 +336,7 @@ impl DurableCellManager {
             fail_control_dirsync: AtomicU32::new(0),
             jumbo_dedicated_root: Mutex::new(jumbo_dedicated_root),
             jumbo_file_move_failed: Mutex::new(HashSet::new()),
+            stop_before_source_removal: AtomicBool::new(false),
         });
 
         if let Err(error) = mgr.boot_local_shards().await {
@@ -446,6 +450,7 @@ impl DurableCellManager {
             fail_control_dirsync: AtomicU32::new(0),
             jumbo_dedicated_root: Mutex::new(None),
             jumbo_file_move_failed: Mutex::new(HashSet::new()),
+            stop_before_source_removal: AtomicBool::new(false),
         }))
     }
 
@@ -893,10 +898,13 @@ impl DurableCellManager {
         Ok(dest)
     }
 
-    /// Copies this process's jumbo shard directory onto `dedicated_root` and
-    /// reopens it there. The source is removed only after the copy verifies and
-    /// the new Raft group is running. Another machine's disk is not written.
-    /// `transfer_leader` is not called.
+    /// Copies this process's jumbo shard directory onto `dedicated_root`.
+    ///
+    /// Order: CRC the copy, fsync `MOVE_LIVE`, then open Raft on that directory,
+    /// then delete the old directory. A restart that sees `MOVE_LIVE` opens the
+    /// dedicated directory and does not open the old one. The dedicated directory
+    /// is not deleted after that record exists. Another machine's disk is not
+    /// written. `transfer_leader` is not called.
     pub async fn relocate_jumbo_shard_files(
         &self,
         shard_id: ShardId,
@@ -940,13 +948,12 @@ impl DurableCellManager {
         *self.jumbo_dedicated_root.lock().unwrap() = Some(dedicated_root.to_path_buf());
         let dest = shard_move_dir(dedicated_root, shard_id);
         if load_live_dir(dedicated_root, shard_id)?.is_some() {
-            if self.host.get_group(shard_id).is_some() {
-                return Ok(dest);
-            }
-            self.open_shard_group(&route, &dest).await?;
+            self.finish_live_move(shard_id, &route, &dest).await?;
             return Ok(dest);
         }
         let source = self.host.shard_dir(shard_id);
+        // A destination without MOVE_LIVE has never had Raft opened on it.
+        // A published destination is handled above and is not deleted.
         if dest.exists() {
             remove_tree(&dest)?;
         }
@@ -986,23 +993,56 @@ impl DurableCellManager {
             self.jumbo_file_move_failed.lock().unwrap().insert(shard_id);
             return Err(error);
         }
-        if let Err(error) = self.open_shard_group(&route, &dest).await {
-            let _ = remove_tree(&dest);
-            let _ = self.open_shard_group(&route, &source).await;
-            self.jumbo_file_move_failed.lock().unwrap().insert(shard_id);
-            return Err(error);
-        }
+        // MOVE_LIVE is durable before Raft opens dest. After this returns, a
+        // restart opens dest and must not delete it or reopen source.
         if let Err(error) = write_move_phase(&dest, shard_id, MOVE_LIVE, &files) {
+            let _ = remove_tree(&dest);
+            self.open_shard_group(&route, &source).await?;
             self.jumbo_file_move_failed.lock().unwrap().insert(shard_id);
             return Err(error);
         }
-        if let Err(error) = remove_tree(&source) {
+        if let Err(error) = self.open_shard_group(&route, &dest).await {
             return Err(MetaDbError::StorageIoError(format!(
-                "jumbo shard {shard_id} is open on {} but the old directory could not be removed: {error}",
+                "jumbo shard {shard_id} is published on {} but did not finish opening; the old directory will not be used on restart: {error}",
                 dest.display()
             )));
         }
+        if self
+            .stop_before_source_removal
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(MetaDbError::StorageIoError(format!(
+                "jumbo shard {shard_id} is published on {}; the old directory was left in place and will not be opened on restart",
+                dest.display()
+            )));
+        }
+        self.remove_source_after_live(shard_id, &dest)?;
         Ok(dest)
+    }
+
+    async fn finish_live_move(
+        &self,
+        shard_id: ShardId,
+        route: &CompositeShardRoute,
+        dest: &Path,
+    ) -> Result<()> {
+        if self.host.get_group(shard_id).is_none() {
+            self.open_shard_group(route, dest).await?;
+        }
+        self.remove_source_after_live(shard_id, dest)
+    }
+
+    fn remove_source_after_live(&self, shard_id: ShardId, dest: &Path) -> Result<()> {
+        let source = self.host.shard_dir(shard_id);
+        if !source.exists() {
+            return Ok(());
+        }
+        remove_tree(&source).map_err(|error| {
+            MetaDbError::StorageIoError(format!(
+                "jumbo shard {shard_id} is open on {} but the old directory could not be removed: {error}",
+                dest.display()
+            ))
+        })
     }
 
     /// Moves every local jumbo shard whose dedicated node is this process.
@@ -1079,6 +1119,13 @@ impl DurableCellManager {
             .unwrap()
             .insert(route.shard_id, handler);
         Ok(())
+    }
+
+    /// Test hook. The next move publishes `MOVE_LIVE` and opens the destination,
+    /// then returns before deleting the old directory.
+    pub fn testing_stop_before_jumbo_source_removal(&self) {
+        self.stop_before_source_removal
+            .store(true, Ordering::Relaxed);
     }
 
     /// Test hook. Persists the jumbo route flag without moving files.
