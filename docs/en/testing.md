@@ -237,7 +237,7 @@ METADB_LOAD_CONCURRENCY=2 \
 cargo test -p metadb-server --test prefix_load -- --ignored --nocapture --test-threads=1 official_prefix_load
 ```
 
-The harness does not start the three servers. Joining two voters is the procedure above. It is not a second cell, and `metadb-ctl cell register` still does not create one.
+The harness does not start the three servers. Joining two voters is the procedure above. That join is not a second cell. `metadb-ctl cell register` records another cell in `GLOBAL_CELL_DIRECTORY` after the endpoint's routes cover the requested range, and a later request contained by that cell is forwarded. That recording is not a production MetaCache of every shard and not a disaggregated production deployment.
 
 ## Persistent topology and join
 
