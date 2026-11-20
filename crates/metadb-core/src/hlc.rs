@@ -121,16 +121,20 @@ impl HybridLogicalClock {
     }
 
     /// Generates a strictly monotonic timestamp for a local event.
+    ///
+    /// The physical time comes from [`lease_wall_ms`]. An untracked wall is not
+    /// adopted, so a forward jump cannot become a later proposal or `commit_hlc`.
     pub fn now(&self) -> HlcTimestamp {
-        let wall_ms = Self::wall_clock_ms();
+        let current = HlcTimestamp(self.state.load(Ordering::Acquire));
+        let wall_ms = proposal_physical_ms(current.physical_ms(), lease_wall_ms());
         self.now_with_wall_ms(wall_ms)
     }
 
     /// Generates a timestamp strictly greater than both the current clock state and `floor`.
     pub fn now_strictly_after(&self, floor: HlcTimestamp) -> HlcTimestamp {
-        let wall_ms = Self::wall_clock_ms();
         loop {
             let current = HlcTimestamp(self.state.load(Ordering::Acquire));
+            let wall_ms = proposal_physical_ms(current.physical_ms(), lease_wall_ms());
             let base = current.max(floor);
             let wall_ts = HlcTimestamp::new(wall_ms, 0);
             let next = if wall_ts > base {
@@ -180,7 +184,8 @@ impl HybridLogicalClock {
     /// Updates the local HLC upon receiving a remote `HlcTimestamp` after enforcing
     /// `max_drift_ms` skew protection.
     pub fn update_checked(&self, remote: HlcTimestamp) -> Result<HlcTimestamp> {
-        let wall_ms = Self::wall_clock_ms();
+        let current = HlcTimestamp(self.state.load(Ordering::Acquire));
+        let wall_ms = proposal_physical_ms(current.physical_ms(), lease_wall_ms()).max(1);
         self.update_checked_with_wall_ms(remote, wall_ms)
     }
 
@@ -237,7 +242,8 @@ impl HybridLogicalClock {
     /// Updates the local HLC upon receiving a message with a remote `HlcTimestamp`
     /// and returns a new timestamp strictly greater than both local and remote states.
     pub fn update(&self, remote: HlcTimestamp) -> HlcTimestamp {
-        let wall_ms = Self::wall_clock_ms();
+        let current = HlcTimestamp(self.state.load(Ordering::Acquire));
+        let wall_ms = proposal_physical_ms(current.physical_ms(), lease_wall_ms());
         self.update_with_wall_ms(remote, wall_ms)
     }
 
@@ -429,6 +435,20 @@ pub fn wall_tracks_monotonic(elapsed_ms: u128, origin_wall: u64, wall: u64) -> O
     }
 }
 
+/// Physical time that a proposal HLC may adopt.
+///
+/// `tracked_ms` is [`lease_wall_ms`]. `None` means the process wall is missing
+/// or has stepped away from monotonic time. The raw wall is not used. The
+/// clock keeps `last_physical_ms`, so a jump is not written as `commit_hlc`
+/// and cannot prove that a lease expired. A tracked reading of `0` or `1` is
+/// the historical fallback and is not adopted either.
+pub fn proposal_physical_ms(last_physical_ms: u64, tracked_ms: Option<u64>) -> u64 {
+    match tracked_ms {
+        Some(ms) if ms > 1 => ms,
+        _ => last_physical_ms,
+    }
+}
+
 /// `now_ms` is this process's wall clock, and that wall does not track monotonic time.
 ///
 /// A timestamp more than the drift bound away from the process wall is a
@@ -598,6 +618,20 @@ mod tests {
         assert!(
             !lease_live_wall_is_untracked(1_000, Some(1_700_000_000_000), None),
             "a synthetic timestamp is not the process wall"
+        );
+        assert_eq!(proposal_physical_ms(50_000, None), 50_000);
+        assert_eq!(proposal_physical_ms(50_000, Some(1)), 50_000);
+        assert_eq!(proposal_physical_ms(50_000, Some(53_000)), 53_000);
+        let clock = HybridLogicalClock::with_max_drift_ms(500);
+        let held = clock.now_with_wall_ms(50_000);
+        let rejected = clock.update_checked_with_wall_ms(HlcTimestamp::new(80_000, 0), 50_000);
+        assert!(matches!(
+            rejected,
+            Err(MetaDbError::ClockSkewExceeded { .. })
+        ));
+        assert_eq!(
+            clock.now_with_wall_ms(50_000).physical_ms(),
+            held.physical_ms()
         );
     }
 
