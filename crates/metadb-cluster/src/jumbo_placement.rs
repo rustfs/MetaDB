@@ -40,7 +40,8 @@ pub struct PlacementObservation {
 /// leader lease before any peer answers `TransferLeader`. Older peers do not
 /// implement that RPC. Registration in the node map is not proof that they do.
 /// Automatic transfer stays off until a check that does not touch the lease can
-/// show every current voter implements it.
+/// show every current voter implements it. `leadership_transfer` reads this
+/// flag on the maintenance path and does not call `trigger().transfer_leader`.
 pub const AUTOMATIC_LEADERSHIP_TRANSFER_ENABLED: bool = false;
 
 pub const AUTOMATIC_TRANSFER_DISABLED_REASON: &str = "automatic leadership transfer is disabled; peer TransferLeader capability is unknown, and OpenRaft disables the leader lease before the RPC is known to succeed. Node registration is not that capability";
