@@ -6,6 +6,8 @@
 
 ## 1. `metadb-ctl` 运维命令行工具 `[已实现]`
 
+`[已实现]` means the `metadb-ctl` binary exists and talks to an all-in-one process. `cell register` does not create a cell. `metadbd --role be` is not a supported deployment. Output from a bench command is for the machine that ran it, not a checked-in result.
+
 ```bash
 # 查看各 Cell、BE 节点健康状态、分片分布与 Raft 三水位延迟
 metadb-ctl --endpoint 127.0.0.1:7800 cluster status
@@ -34,7 +36,7 @@ metadb-ctl --endpoint 127.0.0.1:7800 bench --workload hotspot-create --concurren
 ## 2. 超大目录（Jumbo Shard）治理策略
 
 1. **第一级防护：自动节点独占隔离 (`JumboIsolated`)**：
-   * 当单个目录 (`PID`) 占比超过超限分片容量的 `80%` 无法按 `PID` 边界切分时，`CellLocalManager` 自动将其标记为 `JumboIsolated`，并将同机其他普通分片的 Leader/副本迁移至其他节点，使该大目录独占整台 NVMe 服务器的 I/O 与 CPU。
+   * `JumboIsolated` is a route flag. When one parent owns more than 85% of the shard's `MetaTable` bytes, or the shard has a single parent, `JumboIsolationPlanner` writes `dedicated_node` from nodes already registered in this cell. It does not migrate co-hosted peer shards onto another host. With one node, the flag names this process.
 2. **第二级防护：双模细粒度分裂 (`DualModeFineGrained`)**：
    * 当单个目录规模突破单机物理上限（如数亿文件）时，通过 `metadb-ctl shard enable-dual-mode` 开启按 `(PID, name)` 子区间分裂。
    * 各非锚点子分片通过本地 `[0x04] DirShardDelta` 记录分片内局部统计信息：`create_file` / `unlink` 依然保持 **单分片 `1-RTT` 无锁写入**，而 `dirstat` 自动切换为 **`1-hop` 并行扇出聚合**。

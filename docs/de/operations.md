@@ -67,11 +67,13 @@ metadb-ctl --endpoint 127.0.0.1:7800 sql \
 
 ### `bench`
 
-Siehe [Tests und Benches](./testing.md#metadb-ctl-bench). Das ist ein Client gegen einen laufenden Server. Es ist kein Cargo-Bench-Ziel. Das Repository zeichnet dafür keine Durchsatzzahl auf.
+See [Tests and benches](./testing.md#metadb-ctl-bench). Remote `hotspot-create` and `bulk-ttl-delete` are a client against a running server. They print JSON with `attempted`, `succeeded`, and `failed`, and the process exits non-zero unless `succeeded` equals `--ops`. `--embedded` and `--workload mixed` run the [in-process stress harness](./testing.md#in-process-stress-harness) instead of dialing the endpoint. That path passes when `errors` and `correctness_errors` are both zero, and it prints latency percentiles in microseconds. Neither path is a Cargo benchmark target. The repository does not check in a throughput number for either path. A printed line is not a service-level result and is not the official 1,000,000-create profile.
+
+The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `SetAttr` overwrites, then 100,000 deletes, concurrency 64) is documented in [Tests and benches](../en/testing.md#prefix-load). GitHub Actions runs only the small profile. It does not run the 1,000,000-create profile.
 
 ## Metriken
 
-`node.metrics_listen_addr` setzen (zum Beispiel `127.0.0.1:9100`). `open_and_serve` nimmt auf dieser Adresse TCP-Verbindungen an. `GET /metrics` liefert Prometheus-Text. Jeder andere Pfad liefert 404, jede andere Methode 405. Wenn `[security].shared_secret` nicht leer ist, muss jede Anfrage auf diesem Listener `Authorization: Bearer <shared_secret>` senden. Ein fehlender, leerer oder falscher Bearer liefert HTTP 401 und einen Rumpf, der nicht der Metriktext ist, auch für `/status`. Eine Nicht-Loopback-Metrikadresse mit leerem Geheimnis verweigert den Start. Dieser Listener beendet TLS nicht.
+`node.metrics_listen_addr` setzen (zum Beispiel `127.0.0.1:9100`). `open_and_serve` nimmt auf dieser Adresse TCP-Verbindungen an. `GET /metrics` liefert Prometheus-Text. Jeder andere Pfad liefert 404, jede andere Methode 405. Wenn `[security].shared_secret` nicht leer ist, muss jede Anfrage auf diesem Listener `Authorization: Bearer <shared_secret>` senden. Ein fehlender, leerer oder falscher Bearer liefert HTTP 401 und einen Rumpf, der nicht der Metriktext ist, auch für `/status`. An empty secret does not start the process on any address, including loopback, unless `allow_unauthenticated = true`. That flag is loopback-only and still refuses a wildcard or other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. This listener does not terminate TLS.
 
 Gauges und Counter aus `render_prometheus_metrics`:
 
@@ -105,7 +107,7 @@ Was als Betriebsverfahren nicht funktioniert:
 3. `metadb-ctl cell register` erzeugt keine zweite Zelle. `open_and_serve` registriert nur die lokale Zelle beim Global Manager.
 4. Der Speicherpfad `MetaDbEngine::new_single_node`, den die Tests `T1`–`T6` nutzen, kann eine Wählerzahl im Speicher auf 3 setzen. Dieses Objekt hat weder Platte noch Raft. Es ist keine Skalierung von `metadbd`.
 
-[Offener Pull Request 2](https://github.com/rustfs/MetaDB/pull/2) (nicht zusammengeführt) zieht dieselbe Grenze: Sein verteilter Test ruft `DurableCellManager::scale_out_replicas` mit drei localhost-Raft-Wählern in einem Betriebssystemprozess auf. Er startet keine drei `metadbd`-Prozesse. Disaggregierte Rollen und eine zweite Zelle werden dort ebenfalls nicht als lebende Einsätze getestet. Die Jumbo-Isolation auf einem gewidmeten Knoten bleibt in diesem Pull Request das Verhalten des Speichersimulators.
+`topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. Disaggregated roles and a second Cell are still not live deployments. Jumbo dedicated-node isolation remains a route flag, not a move of shards onto another machine.
 
 ## Fehler, die auftreten können
 
@@ -131,13 +133,13 @@ Die Varianten sind in `crates/metadb-core/src/error.rs` definiert. gRPC-Methoden
 
 ## Bekannte Grenzen
 
-- Ein Betriebssystemprozess, nur Rolle `all-in-one`.
+- Role `all-in-one` only. `be`, `proxy`, `cell-manager`, and `global-manager` are rejected before listen.
 - Ein zweiter all-in-one-Prozess kann mit `[cluster] join` derselben Zelle beitreten. Das erzeugt keine zweite Zelle. `RegisterCell` liefert einen Fehler.
 - `GetRoutes` scheitert geschlossen bei einer unbekannten `cell_id` ungleich null. `StoreHeartbeat` ersetzt zwischengespeicherte Routen nicht.
 - Jumbo-Isolation ist ein Routenflag plus eine Knotenkennung aus der lokalen Knotentabelle. Sie verdrängt andere Shards nicht von einer Platte.
-- Heartbeats sind ein RPC ohne Sender in `metadbd`. `StoreHeartbeat` speichert nicht dauerhaft.
-- Ein nicht leeres gemeinsames Geheimnis authentifiziert Raft, die drei anderen gRPC-Dienste und den Metrik-Listener mit demselben Bearer. Ein leeres Geheimnis wird nur für Loopback-Binds akzeptiert und lässt diese Listener unauthentifiziert. Ein Wildcard-Bind mit leerem Geheimnis verweigert den Start. Der Prozess beendet TLS nicht.
-- `memtable_size_bytes` versiegelt die aktive Memtable und schreibt sie aus. `max_imm_memtables` begrenzt die eingereihten unveränderlichen Tabellen. Raft-Zeitgeberfelder ändern das Laufzeitverhalten über TOML nicht.
+- Registered-node liveness is fsynced in `CELL_CONTROL_PLANE`. `metadbd` persists its own record about every 3 seconds and sends it to the current leader when this process is not the leader. Descriptors on that RPC are annotations, not routes. The observation does not schedule placement. See [Scale control plane](../en/scale-control-plane-status.md).
+- A secret that contains a non-whitespace character authenticates Raft, the other three gRPC services, and the metrics listener, including `/livez`, `/readyz`, and `/healthz`, with the same bearer. An empty secret does not start the process. `allow_unauthenticated = true` is the explicit exception for literal loopback IPs (`127.0.0.0/8` or `::1`) and still refuses a wildcard bind. The hostname `localhost` is not accepted for that exception. The bound socket is checked again after listen. A whitespace-only secret is rejected and is not compared as a bearer. A usable secret combined with the flag is rejected. The process does not terminate TLS.
+- `memtable_size_bytes` versiegelt die aktive Memtable und schreibt sie aus. `max_imm_memtables` begrenzt die eingereihten unveränderlichen Tabellen. `[raft]` timers and `max_segment_bytes` apply when a group starts. They are not reloaded from a changed file, and the segment size does not rewrite segments already on disk.
 - `metadb-ctl bench` für `hotspot-create` und `bulk-ttl-delete` druckt JSON-Zeilen: einen Kopf mit `bench_pid`, dann Phasenberichte mit attempted, succeeded, failed und Latenzperzentilen. Der Prozess endet mit einem Fehler, wenn nicht jede angeforderte Operation gelingt. `--workload mixed` oder `--embedded` startet den prozessinternen Stress-Harness. `sql` druckt die Antwort als JSON und endet bei einem Anwendungsfehler mit einem Fehlerstatus.
 
 ## Dokumentationslücken
@@ -145,9 +147,8 @@ Die Varianten sind in `crates/metadb-core/src/error.rs` definiert. gRPC-Methoden
 Diese Punkte fehlen im Produkt, daher kann dieser Leitfaden kein Verfahren dafür beschreiben:
 
 1. Eine Mehrprozess-Anordnung für `be`, `proxy`, `cell-manager` und `global-manager`.
-2. Einen zweiten und dritten `metadbd`-Betriebssystemprozess einer bestehenden Raft-Gruppe hinzufügen.
-3. Eine zweite Zelle anlegen und dorthin routen.
-4. Einen Jumbo-Shard auf eine eigene Maschine legen und andere Shards von dieser Maschine wegziehen.
-5. Natives TLS. Dieser Prozess beendet TLS nicht. Konfigurationsschlüssel, die TLS oder ein Zertifikat verlangen, werden abgelehnt, statt Klartext zu dienen. Die Terminierung gehört in einen externen Proxy. Raft und Metriken nutzen denselben Bearer wie die anderen Dienste, wenn ein Geheimnis gesetzt ist; das ist kein gegenseitiges TLS. Eine heartbeat-getriebene Steuerschleife ist nicht implementiert.
-6. Einen Raft-Zeitgeber, den der Betrieb setzen und beobachten kann.
-7. Ein eingechecktes Ergebnis auf Dienstebene für `metadb-ctl bench`. Der Befehl druckt Zahlen für die Maschine, auf der man ihn ausführt. Dieses Repository zeichnet keine auf. Der nicht zusammengeführte Pull Request 2 berichtet einen eigenen eingebetteten Harness; diese Befehle sind nicht in diesem Baum. Siehe [Tests und Benches](./testing.md).
+2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
+3. Einen Jumbo-Shard auf eine eigene Maschine legen und andere Shards von dieser Maschine wegziehen.
+4. Natives TLS. Dieser Prozess beendet TLS nicht. Konfigurationsschlüssel, die TLS oder ein Zertifikat verlangen, werden abgelehnt, statt Klartext zu dienen. Die Terminierung gehört in einen externen Proxy. Raft und Metriken nutzen denselben Bearer wie die anderen Dienste, wenn ein Geheimnis gesetzt ist; das ist kein gegenseitiges TLS. Eine heartbeat-getriebene Steuerschleife ist nicht implementiert.
+5. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. A leader election makes `/readyz` and `/healthz` return 503 on replicas that do not know a leader. `[raft]` is loaded and is not `#[serde(skip)]`. Its values apply when a group starts and are not reloaded. See [Operability](../en/operability.md).
+6. A checked-in service-level result for `metadb-ctl bench`. The command prints numbers for the machine you run it on. This repository does not record one. See [Tests and benches](./testing.md).

@@ -33,6 +33,10 @@ message SnapshotChunkResponse {
 service RaftTransportService {
   rpc AppendEntries(RaftRpcEnvelope) returns (RaftRpcReply);
   rpc Vote(RaftRpcEnvelope) returns (RaftRpcReply);
+  // OpenRaft leadership transfer. The payload is `TransferLeaderRequest`.
+  // A node that does not implement this RPC must not be asked to take leadership:
+  // the sender disables its leader lease before the broadcast.
+  rpc TransferLeader(RaftRpcEnvelope) returns (RaftRpcReply);
   rpc InstallSnapshot(stream SnapshotChunkRequest) returns (SnapshotChunkResponse);
   // Follower client proposals. The handler calls `client_write` on the local
   // group and does not forward again.

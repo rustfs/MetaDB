@@ -10,6 +10,7 @@ async fn opposing_directory_renames_remain_reachable_with_eight_clients() {
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.path().to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
     let tx = cluster.tx_router().clone();
     tx.mkdir(ROOT_INODE_ID, "A", 10, 5, 0o755).await.unwrap();

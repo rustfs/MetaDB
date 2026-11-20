@@ -1,6 +1,7 @@
 //! Atomic `MANIFEST` edit log, `CURRENT` pointer rotation, and strict crash recovery.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -297,6 +298,29 @@ pub struct ManifestLog {
     file: File,
 }
 
+fn single_manifest_file_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    let mut components = Path::new(name).components();
+    let Some(std::path::Component::Normal(component)) = components.next() else {
+        return Err(MetaDbError::ManifestCorrupted(format!(
+            "invalid CURRENT content '{name}'"
+        )));
+    };
+    if components.next().is_some()
+        || name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.contains(':')
+        || component != OsStr::new(name)
+    {
+        return Err(MetaDbError::ManifestCorrupted(format!(
+            "invalid CURRENT content '{name}'"
+        )));
+    }
+    Ok(name)
+}
+
 impl ManifestLog {
     /// Opens an existing `lsm_dir` (replaying `CURRENT` + cleaning `.sst.tmp` / orphan `.sst`s)
     /// or initializes a fresh `MANIFEST-000001`.
@@ -314,25 +338,40 @@ impl ManifestLog {
     /// Offline backup uses this so a read of the source image cannot change the live file.
     pub fn read_checkpoint_readonly(lsm_dir: &Path) -> Result<DurableShardCheckpoint> {
         let current_path = lsm_dir.join("CURRENT");
-        let manifest_name = fs::read_to_string(&current_path)?.trim().to_string();
-        if manifest_name.contains('/')
-            || manifest_name.contains('\\')
-            || manifest_name.contains("..")
-        {
-            return Err(MetaDbError::ManifestCorrupted(format!(
-                "invalid CURRENT content '{manifest_name}'"
-            )));
-        }
-        let manifest_path = lsm_dir.join(&manifest_name);
+        let current = fs::read_to_string(&current_path)?;
+        // Validate before `join`: an absolute name would discard `lsm_dir`, and
+        // `../` would leave it. The manifest file is not opened until the name
+        // is one component.
+        let manifest_name = single_manifest_file_name(&current)?;
+        let manifest_path = lsm_dir.join(manifest_name);
         let mut raw = Vec::new();
         File::open(&manifest_path)?.read_to_end(&mut raw)?;
-        let (state, torn) = Self::replay_manifest_bytes(&raw)?;
+        Self::checkpoint_from_manifest_bytes(manifest_name, &raw)
+    }
+
+    /// Replays manifest bytes already read from an anchored directory.
+    ///
+    /// `manifest_name` must already be one relative file name. This does not
+    /// open a path; callers must reject escapes before they read bytes.
+    pub fn checkpoint_from_manifest_bytes(
+        manifest_name: &str,
+        raw: &[u8],
+    ) -> Result<DurableShardCheckpoint> {
+        Ok(Self::recovered_from_manifest_bytes(manifest_name, raw)?.checkpoint)
+    }
+
+    pub fn recovered_from_manifest_bytes(
+        manifest_name: &str,
+        raw: &[u8],
+    ) -> Result<RecoveredManifestState> {
+        let _ = single_manifest_file_name(manifest_name)?;
+        let (state, torn) = Self::replay_manifest_bytes(raw)?;
         if torn.is_some() {
             return Err(MetaDbError::ManifestCorrupted(
                 "incomplete MANIFEST in existing checkpoint".to_string(),
             ));
         }
-        Ok(state.checkpoint)
+        Ok(state)
     }
 
     fn open_internal(lsm_dir: &Path, recover: bool) -> Result<(Self, RecoveredManifestState)> {

@@ -6,6 +6,8 @@
 
 ## 1. `metadb-ctl` Administration CLI `[Implemented]`
 
+`[Implemented]` means the `metadb-ctl` binary exists and talks to an all-in-one process. `cell register` does not create a cell. `metadbd --role be` is not a supported deployment. Output from a bench command is for the machine that ran it, not a checked-in result.
+
 `metadb-ctl` connects to gRPC services to inspect local cluster state, manage shards, execute SQL templates, and run synthetic benchmarks. SQL results are complete JSON responses; command failures exit nonzero. Benchmark JSONL reports an allocated `bench_pid`, exact attempts, successes, failures, and latency statistics. See [upgrade and compatibility notes](../../designs/correctness_hardening.md).
 
 ```bash
@@ -87,4 +89,4 @@ cargo test -p metadb-server --test topology_distributed three_voter_leader_loss_
   * *Fix*: Handled automatically by `metadb-proxy` and the Rust SDK via `MetaCache` refresh + retry. Persistent occurrences indicate an unreachable `CellLocalManager`.
 * **Growing `.raftlog` Disk Usage**:
   * *Cause*: `safe_purge_index = min(state_flushed_index, aux_outbox_durable_index, last_snapshot_index)` is pinned by stalled L0 disk I/O or a blocked snapshot transfer. (Note: unreachable remote `QuotaTable` shards do **not** pin `.raftlog` indefinitely because overdue `AuxOutbox` tasks spill to local `[0x07]` SSTables on L0 flush.)
-  * *Fix*: Inspect NVMe write latency and the exposed `metadb_min_raft_safe_purge_index` metric (`:9100/metrics`). Compare per-shard logs during diagnosis; no per-shard watermark-lag metric is currently exported.
+  * *Fix*: Inspect NVMe write latency and the exposed `metadb_min_raft_safe_purge_index` metric (`:9100/metrics`). Compare per-shard logs during diagnosis; no per-shard watermark-lag metric is currently exported. `metadb_ready` and `metadb_shards_leader_unknown` are unlabeled process gauges. See [Operability](../../en/operability.md).

@@ -13,6 +13,7 @@ pub mod simulation;
 pub mod stress;
 
 mod metrics_http;
+mod operability;
 
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
@@ -27,9 +28,11 @@ use tonic::service::Interceptor;
 use tonic::transport::{Endpoint, Server};
 use tonic::{Request, Status};
 
-/// Server interceptor for metadata, transaction, and control-plane RPCs.
-/// An empty secret allows the call (loopback deployments without auth).
-/// A non-empty secret requires `authorization: Bearer <secret>` on the incoming request.
+/// Server interceptor for metadata, transaction, control-plane, and Raft RPCs.
+///
+/// An empty secret allows the call. `open_and_serve` only reaches that state when
+/// `allow_unauthenticated` is set. A whitespace-only secret rejects every call.
+/// Any other secret requires `authorization: Bearer <secret>` exactly.
 #[derive(Clone)]
 pub struct BearerAuth {
     secret: std::sync::Arc<str>,
@@ -58,28 +61,49 @@ pub(crate) fn bearer_header_matches(presented: &str, secret: &str) -> bool {
     diff == 0
 }
 
+pub(crate) enum SecretMaterial {
+    Absent,
+    WhitespaceOnly,
+    Configured,
+}
+
+pub(crate) fn classify_secret(secret: &str) -> SecretMaterial {
+    if secret.is_empty() {
+        SecretMaterial::Absent
+    } else if secret.trim().is_empty() {
+        SecretMaterial::WhitespaceOnly
+    } else {
+        SecretMaterial::Configured
+    }
+}
+
 impl Interceptor for BearerAuth {
     fn call(&mut self, request: Request<()>) -> std::result::Result<Request<()>, Status> {
-        if self.secret.is_empty() {
-            return Ok(request);
-        }
-        let presented = request
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        if bearer_header_matches(presented, &self.secret) {
-            Ok(request)
-        } else {
-            Err(Status::unauthenticated(
-                "missing or invalid authorization bearer token",
-            ))
+        match classify_secret(&self.secret) {
+            SecretMaterial::Absent => Ok(request),
+            SecretMaterial::WhitespaceOnly => Err(Status::unauthenticated(
+                "whitespace-only shared secret is not accepted",
+            )),
+            SecretMaterial::Configured => {
+                let presented = request
+                    .metadata()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("");
+                if bearer_header_matches(presented, &self.secret) {
+                    Ok(request)
+                } else {
+                    Err(Status::unauthenticated(
+                        "missing or invalid authorization bearer token",
+                    ))
+                }
+            }
         }
     }
 }
 
 /// Client interceptor. Attaches `authorization: Bearer <secret>` to outgoing RPCs.
-/// An empty secret leaves the request unchanged.
+/// An empty secret leaves the request unchanged. A whitespace-only secret is rejected.
 #[derive(Clone)]
 pub struct BearerAuthClient {
     secret: std::sync::Arc<str>,
@@ -95,8 +119,14 @@ impl BearerAuthClient {
 
 impl Interceptor for BearerAuthClient {
     fn call(&mut self, mut request: Request<()>) -> std::result::Result<Request<()>, Status> {
-        if self.secret.is_empty() {
-            return Ok(request);
+        match classify_secret(&self.secret) {
+            SecretMaterial::Absent => return Ok(request),
+            SecretMaterial::WhitespaceOnly => {
+                return Err(Status::unauthenticated(
+                    "whitespace-only shared secret is not a credential",
+                ));
+            }
+            SecretMaterial::Configured => {}
         }
         let mut token = String::from("Bearer ");
         token.push_str(&self.secret);
@@ -109,6 +139,7 @@ impl Interceptor for BearerAuthClient {
     }
 }
 
+use metadb_cluster::HEARTBEAT_INTERVAL_MS;
 use metadb_cluster::{
     CellDirectoryRole, CellId, CellLocalManager, CompositeMetaCache, DurableCellManager,
     DurableGlobalManager, DurableIdAllocator, GlobalManager, LocalIdBuffer, MetaCache,
@@ -116,7 +147,7 @@ use metadb_cluster::{
 };
 use metadb_core::{
     CompositeKeyRange, EntryType, FileId, HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId,
-    MetaDbError, MetaEntry, NodeId, QuotaRecord, Result, SecondaryIndexRecord, UserId,
+    MetaDbError, MetaEntry, NodeId, QuotaRecord, Result, SecondaryIndexRecord, ShardId, UserId,
     ROOT_INODE_ID,
 };
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
@@ -124,7 +155,9 @@ use metadb_proto::control_plane_service_server::ControlPlaneServiceServer;
 use metadb_proto::metadata_service_server::MetadataServiceServer;
 use metadb_proto::raft_transport_service_server::RaftTransportServiceServer;
 use metadb_proto::transaction_service_server::TransactionServiceServer;
-use metadb_proto::{GetRoutesRequest, RegisterNodeRequest, ScaleShardReplicasRequest};
+use metadb_proto::{
+    GetRoutesRequest, RegisterNodeRequest, ScaleShardReplicasRequest, StoreHeartbeatRequest,
+};
 use metadb_proxy::{MetadataSqlCommand, SqlTemplateParser, StatelessProxyRouter};
 use metadb_raft::backup::{self, OnlineShard};
 use metadb_raft::{
@@ -140,6 +173,7 @@ use metadb_tx::{
 pub use config::{ServerRole, ServerTomlConfig};
 pub use grpc_services::MetaDbGrpcService;
 pub use metrics::{collect_cluster_metrics, render_prometheus_metrics, ClusterMetricsSnapshot};
+pub use operability::{evaluate_readiness, ProcessPhase, ReadinessReport, ShardGate};
 
 /// Result returned from executing a lightweight metadata SQL statement through `MetaDbEngine`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,6 +551,7 @@ pub struct PersistentMetaDbCluster {
     shutdown_tx: watch::Sender<bool>,
     task_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     metrics_addr: OnceLock<String>,
+    operability: Arc<operability::Operability>,
 }
 
 impl PersistentMetaDbCluster {
@@ -546,6 +581,7 @@ impl PersistentMetaDbCluster {
                 config.node.role
             )));
         }
+        config.raft_options.validate()?;
         config.reject_unauthenticated_bind(&config.node.grpc_listen_addr)?;
         if let Some(metrics_addr) = &config.node.metrics_listen_addr {
             config.reject_unauthenticated_bind(metrics_addr)?;
@@ -574,12 +610,17 @@ impl PersistentMetaDbCluster {
                 if error.kind() == std::io::ErrorKind::AddrInUse && persisted_addr.is_some() =>
             {
                 // The saved port is busy. A sole voter can move; several voters cannot.
-                // `boot_local_shards` checks that after this bind.
+                // `boot_local_shards` checks that after this bind. Re-check the fallback
+                // string before binding it; do not resolve a hostname a second time.
+                config.reject_unauthenticated_bind(&config.node.grpc_listen_addr)?;
                 TcpListener::bind(&config.node.grpc_listen_addr).await?
             }
             Err(error) => return Err(error.into()),
         };
         let bound_addr = listener.local_addr()?.to_string();
+        // The socket is already the address that was validated. This rejects a
+        // bound IP that is not literal loopback when no bearer is configured.
+        config.reject_unauthenticated_bind(&bound_addr)?;
 
         let clock = Arc::new(HybridLogicalClock::with_max_drift_ms(
             config.clock.max_clock_drift_ms,
@@ -663,41 +704,7 @@ impl PersistentMetaDbCluster {
         );
         let proxy_router = Arc::new(StatelessProxyRouter::new(tx_router.clone()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let grpc_svc = MetaDbGrpcService::new(
-            global_manager.clone(),
-            tx_router.clone(),
-            proxy_router.clone(),
-        );
-        let shared_secret = config.security.shared_secret.clone();
-        if shared_secret.is_empty() {
-            tracing::warn!(
-                listen = %bound_addr,
-                "gRPC and metrics listeners have no authentication and this process does not terminate TLS. \
-                 An empty shared_secret is accepted only for loopback binds. \
-                 A wildcard or other non-loopback address refuses to serve. \
-                 RaftTransport on this listener requires the same bearer when the secret is set."
-            );
-        }
-        let grpc_handle =
-            spawn_grpc_server(listener, grpc_svc, shared_secret, raft_router, shutdown_rx);
-
-        if join_fresh {
-            // Raft RPCs from the leader arrive on this listener while membership is proposed.
-            wait_until_accepting(&bound_addr).await;
-            if let Err(error) = join_existing_raft_group(&config, &cell_manager, &bound_addr).await
-            {
-                shutdown_failed_startup(shutdown_tx, grpc_handle, &host).await;
-                return Err(error);
-            }
-        }
-
-        // A joined replica already has the root directory in the replicated state machine.
-        if !cell_manager.joined_existing() && tx_router.dirstat(ROOT_INODE_ID).await.is_err() {
-            let _ = tx_router
-                .init_dir_attr(ROOT_INODE_ID, ROOT_INODE_ID, 0, 0o755)
-                .await;
-        }
-
+        let operability = operability::Operability::starting();
         let cluster = Arc::new(Self {
             config,
             clock,
@@ -708,9 +715,66 @@ impl PersistentMetaDbCluster {
             tx_router,
             proxy_router,
             shutdown_tx,
-            task_handles: tokio::sync::Mutex::new(vec![grpc_handle]),
+            task_handles: tokio::sync::Mutex::new(Vec::new()),
             metrics_addr: OnceLock::new(),
+            operability,
         });
+        let shared_secret = cluster.config.security.shared_secret.clone();
+        if shared_secret.is_empty() {
+            tracing::warn!(
+                listen = %bound_addr,
+                "allow_unauthenticated is set. Loopback gRPC and metrics listeners have no authentication. \
+                 This process does not terminate TLS. Non-loopback binds are still refused."
+            );
+        }
+        let grpc_svc = MetaDbGrpcService::new(
+            cluster.global_manager.clone(),
+            cluster.tx_router.clone(),
+            cluster.proxy_router.clone(),
+        );
+        let grpc_handle =
+            spawn_grpc_server(listener, grpc_svc, shared_secret, raft_router, shutdown_rx);
+        cluster.task_handles.lock().await.push(grpc_handle);
+        // The probe listener is up before join so a scrape observes `starting`
+        // instead of a later 200 that only means the socket is bound.
+        if let Err(error) = spawn_metrics_listener(&cluster).await {
+            cluster.operability.fail();
+            let _ = cluster.shutdown_without_flush().await;
+            return Err(error);
+        }
+
+        if join_fresh {
+            // Raft RPCs from the leader arrive on this listener while membership is proposed.
+            wait_until_accepting(&bound_addr).await;
+            if let Err(error) =
+                join_existing_raft_group(cluster.config(), cluster.cell_manager(), &bound_addr)
+                    .await
+            {
+                cluster.operability.fail();
+                let _ = cluster.shutdown_without_flush().await;
+                return Err(error);
+            }
+        }
+
+        // A joined replica already has the root directory in the replicated state machine.
+        if !cluster.cell_manager().joined_existing()
+            && cluster.tx_router().dirstat(ROOT_INODE_ID).await.is_err()
+        {
+            let _ = cluster
+                .tx_router()
+                .init_dir_attr(ROOT_INODE_ID, ROOT_INODE_ID, 0, 0o755)
+                .await;
+        }
+        cluster.operability.mark_startup_finished();
+        let raft = &cluster.config.raft_options;
+        tracing::info!(
+            heartbeat_ms = raft.heartbeat_interval_ms,
+            election_min_ms = raft.election_timeout_min_ms,
+            election_max_ms = raft.election_timeout_max_ms,
+            max_in_snapshot_log_to_keep = raft.max_in_snapshot_log_to_keep,
+            max_segment_bytes = raft.max_segment_bytes,
+            "applied raft options"
+        );
 
         // Background maintenance task (`AuxDispatcher` + `TxnRecoveryWorker` every 250ms).
         let bg_cluster = Arc::downgrade(&cluster);
@@ -739,39 +803,8 @@ impl PersistentMetaDbCluster {
         });
         cluster.task_handles.lock().await.push(bg_handle);
 
-        if let Some(metrics_listen) = cluster.config.node.metrics_listen_addr.clone() {
-            let metrics_listener = match TcpListener::bind(&metrics_listen).await {
-                Ok(listener) => listener,
-                Err(error) => {
-                    let _ = cluster.shutdown().await;
-                    return Err(error.into());
-                }
-            };
-            let metrics_bound = match metrics_listener.local_addr() {
-                Ok(addr) => addr.to_string(),
-                Err(error) => {
-                    let _ = cluster.shutdown().await;
-                    return Err(error.into());
-                }
-            };
-            let _ = cluster.metrics_addr.set(metrics_bound.clone());
-            tracing::info!(
-                metrics_addr = %metrics_bound,
-                "Prometheus metrics endpoint listening"
-            );
-            let metrics_cluster = Arc::downgrade(&cluster);
-            let metrics_secret = cluster.config.security.shared_secret.clone();
-            let metrics_shutdown = cluster.shutdown_tx.subscribe();
-            let metrics_handle = tokio::spawn(metrics_http::serve(
-                metrics_listener,
-                metrics_cluster,
-                metrics_secret,
-                metrics_shutdown,
-            ));
-            cluster.task_handles.lock().await.push(metrics_handle);
-        }
-
-        // Publish only after bootstrap or join has finished, so readers know the port is serving.
+        // Publish only after bootstrap or join has finished. The file means the
+        // gRPC port is accepting; `/readyz` is the traffic gate.
         std::fs::write(
             cluster.config().node.data_dir.join("GRPC_ADDR"),
             &bound_addr,
@@ -890,6 +923,87 @@ impl PersistentMetaDbCluster {
                 grp.flush_snapshot_and_purge().await?;
             }
         }
+        if let Err(error) = self.publish_control_heartbeat_if_due().await {
+            tracing::warn!(%error, "control heartbeat was not published");
+        }
+        Ok(())
+    }
+
+    async fn publish_control_heartbeat_if_due(&self) -> Result<()> {
+        let now = metadb_cluster::control_plane_state::unix_ms();
+        if self
+            .cell_manager
+            .local_heartbeat_is_fresh(now, HEARTBEAT_INTERVAL_MS)
+        {
+            return Ok(());
+        }
+        self.publish_control_heartbeat().await
+    }
+
+    /// Persists this process's heartbeat, then sends that same sequence to the current
+    /// Raft leader when this process is not the leader. The sender does not include
+    /// shard descriptors. A failed send does not roll the local sequence back: the
+    /// next interval uses a new sequence, and a replay of this sequence is idempotent.
+    pub async fn publish_control_heartbeat(&self) -> Result<()> {
+        let heartbeat = self.cell_manager.publish_local_heartbeat()?;
+        let leaders = self.cell_manager.remote_leader_addrs();
+        for addr in leaders {
+            if let Err(error) = self.send_heartbeat_with_retry(&addr, &heartbeat).await {
+                tracing::warn!(%error, %addr, "leader did not accept the control heartbeat");
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_heartbeat_with_retry(
+        &self,
+        addr: &str,
+        heartbeat: &metadb_cluster::StoredHeartbeat,
+    ) -> Result<()> {
+        let first = self.send_heartbeat_once(addr, heartbeat).await;
+        if first.is_ok() {
+            return Ok(());
+        }
+        self.send_heartbeat_once(addr, heartbeat).await
+    }
+
+    async fn send_heartbeat_once(
+        &self,
+        addr: &str,
+        heartbeat: &metadb_cluster::StoredHeartbeat,
+    ) -> Result<()> {
+        let endpoint = normalize_rpc_addr(addr);
+        let mut client =
+            control_plane_client(&endpoint, &self.config.security.shared_secret).await?;
+        let response = client
+            .store_heartbeat(StoreHeartbeatRequest {
+                cell_id: self.cell_manager.cell_id(),
+                node_id: heartbeat.node_id,
+                disk_free_bytes: heartbeat.disk_free_bytes.unwrap_or(0),
+                disk_free_known: heartbeat.disk_free_bytes.is_some(),
+                monotonic_seq: heartbeat.seq,
+                shards: Vec::new(),
+                instance_id: {
+                    let instance = self.cell_manager.node_instance_id();
+                    if instance == 0 {
+                        Vec::new()
+                    } else {
+                        metadb_proto::convert::encode_u128_be(instance).to_vec()
+                    }
+                },
+                observation_generation: metadb_proto::convert::encode_u128_be(
+                    heartbeat.observation_generation,
+                )
+                .to_vec(),
+            })
+            .await
+            .map_err(|error| {
+                MetaDbError::ConsensusError(format!("store_heartbeat at {endpoint}: {error}"))
+            })?
+            .into_inner();
+        if let Some(error) = rpc_app_error(response.error) {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -904,8 +1018,35 @@ impl PersistentMetaDbCluster {
         Ok(())
     }
 
+    pub fn readiness(&self) -> ReadinessReport {
+        evaluate_readiness(self.operability.phase(), &self.shard_gates())
+    }
+
+    fn shard_gates(&self) -> Vec<ShardGate> {
+        self.host
+            .all_groups()
+            .iter()
+            .map(|group| {
+                let view = group.serve_view();
+                ShardGate {
+                    leader_known: view.leader_known,
+                    applied: view.applied,
+                    voter: view.voter,
+                    recovery_pending: view.recovery_pending,
+                    storage_unrecoverable: view.storage_unrecoverable,
+                    stopped: view.stopped,
+                    fatal: view.fatal,
+                }
+            })
+            .collect()
+    }
+
     pub fn metrics_snapshot(&self) -> ClusterMetricsSnapshot {
-        collect_cluster_metrics(&self.global_manager)
+        let gates = self.shard_gates();
+        let report = evaluate_readiness(self.operability.phase(), &gates);
+        let mut snap = collect_cluster_metrics(&self.global_manager);
+        snap.apply_operability(&report, &gates, &self.config.raft_options);
+        snap
     }
 
     /// Bound Prometheus address, when `node.metrics_listen_addr` was set.
@@ -919,6 +1060,7 @@ impl PersistentMetaDbCluster {
     /// so a stuck drain cannot pin process exit. Committed entries that are not in the
     /// memtable flush stay in the Raft log and replay on the next open.
     pub async fn shutdown(&self) -> Result<()> {
+        self.operability.begin_shutdown();
         self.stop_tasks().await;
         match tokio::time::timeout(Duration::from_secs(10), self.flush_all()).await {
             Ok(result) => result?,
@@ -947,6 +1089,7 @@ impl PersistentMetaDbCluster {
     /// This is the in-process crash used by failure-under-load tests: the LSM `LOCK` is
     /// released, but the memtable is not checkpointed first.
     pub async fn shutdown_without_flush(&self) -> Result<()> {
+        self.operability.begin_shutdown();
         self.stop_tasks().await;
         let result = self.host.shutdown_all_no_flush().await;
         backup::unregister_runtime(&self.config.node.data_dir);
@@ -1064,26 +1207,14 @@ impl PersistentMetaDbCluster {
 }
 
 /// Rejects a backup tree whose cell state names a shard the tree does not contain.
-pub fn check_backup_tree(root: &Path) -> Result<()> {
-    let copied = backup::list_shard_ids(root)?;
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if !name.starts_with("cell_") {
-            continue;
-        }
-        let state = entry.path().join("CELL_MANAGER_STATE");
-        if !state.is_file() {
-            continue;
-        }
-        let referenced = metadb_cluster::DurableCellManager::shard_ids_in_cell_state_file(&state)?;
+///
+/// `shard_ids` and `cell_states` are the shard directories and `CELL_MANAGER_STATE`
+/// frames already read through the anchored directory handle. This function does not
+/// open a path.
+pub fn check_backup_tree(shard_ids: &[ShardId], cell_states: &[(String, Vec<u8>)]) -> Result<()> {
+    let copied: BTreeSet<ShardId> = shard_ids.iter().copied().collect();
+    for (name, bytes) in cell_states {
+        let referenced = metadb_cluster::DurableCellManager::shard_ids_in_cell_state_bytes(bytes)?;
         for shard_id in referenced {
             if !copied.contains(&shard_id) {
                 return Err(MetaDbError::StorageIoError(format!(
@@ -1092,6 +1223,29 @@ pub fn check_backup_tree(root: &Path) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+async fn spawn_metrics_listener(cluster: &Arc<PersistentMetaDbCluster>) -> Result<()> {
+    let Some(metrics_listen) = cluster.config.node.metrics_listen_addr.clone() else {
+        return Ok(());
+    };
+    let listener = TcpListener::bind(&metrics_listen).await?;
+    let bound = listener.local_addr()?.to_string();
+    // Recheck the address the socket actually bound, including port 0.
+    cluster.config.reject_unauthenticated_bind(&bound)?;
+    let _ = cluster.metrics_addr.set(bound.clone());
+    tracing::info!(
+        metrics_addr = %bound,
+        "Prometheus metrics endpoint listening"
+    );
+    let handle = tokio::spawn(metrics_http::serve(
+        listener,
+        Arc::downgrade(cluster),
+        cluster.config.security.shared_secret.clone(),
+        cluster.shutdown_tx.subscribe(),
+    ));
+    cluster.task_handles.lock().await.push(handle);
     Ok(())
 }
 
@@ -1198,21 +1352,7 @@ fn listen_port_is_ephemeral(addr: &str) -> bool {
 ///
 /// Transient membership and transport errors are retried. A conflicting cluster or node
 /// identity is returned immediately. A failed attempt does not abort the process by itself;
-/// the caller shuts the listeners down and returns the error.
-/// Stops the listener and local Raft groups after startup cannot finish.
-///
-/// The error is returned to the caller. `metadbd` then ends because `main`
-/// returned that error. A join attempt does not abort the process itself.
-async fn shutdown_failed_startup(
-    shutdown_tx: watch::Sender<bool>,
-    grpc_handle: tokio::task::JoinHandle<()>,
-    host: &ShardGroupHost,
-) {
-    let _ = shutdown_tx.send(true);
-    let _ = grpc_handle.await;
-    let _ = host.shutdown_all().await;
-}
-
+/// the caller marks startup failed, shuts the listeners down, and returns the error.
 async fn join_existing_raft_group(
     config: &ServerTomlConfig,
     cell_manager: &DurableCellManager,
@@ -1483,5 +1623,13 @@ mod auth_tests {
         let mut client = BearerAuthClient::new("");
         let outgoing = client.call(Request::new(())).unwrap();
         assert!(authorization(&outgoing).is_none());
+    }
+
+    #[test]
+    fn whitespace_secret_is_rejected_by_client_and_server() {
+        let mut server = BearerAuth::new("   ");
+        assert!(server.call(Request::new(())).is_err());
+        let mut client = BearerAuthClient::new(" \t ");
+        assert!(client.call(Request::new(())).is_err());
     }
 }

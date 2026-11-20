@@ -37,6 +37,10 @@ locality_tombstone_ratio = 0.50
 [sharding]
 bootstrap_table_shards = true           # Shards 1 (Meta), 2 (Quota), 3 (SecondaryIndex)
 shard_split_threshold_bytes = 4294967296 # 4 GiB
+
+[security]
+# Loopback development only. Remove this flag when you set shared_secret.
+allow_unauthenticated = true
 ```
 
 ### Launching Standalone Node
@@ -49,9 +53,9 @@ metadbd --config /etc/metadb/standalone.toml
 
 ### Network exposure
 
-`MetadataService`, `TransactionService`, `ControlPlaneService`, and `RaftTransportService` do **not** terminate TLS. Neither does the metrics listener. With an empty `[security].shared_secret` (the default) they perform no application authentication, and only loopback binds are accepted. A wildcard or other non-loopback address without a non-empty secret refuses to start. The default `grpc_listen_addr` is `127.0.0.1:7800`. A TLS or certificate key in this file is rejected rather than served as plaintext.
+`MetadataService`, `TransactionService`, `ControlPlaneService`, `RaftTransportService`, and the metrics listener do **not** terminate TLS. An empty `[security].shared_secret` does not start the process, including on the default `127.0.0.1:7800` bind. Set `allow_unauthenticated = true` only for development on a literal loopback IP such as `127.0.0.1`. The hostname `localhost` is not accepted for that flag. A wildcard or other non-loopback address without a non-empty secret still refuses to start. A TLS, certificate, anonymous, or insecure key in this file is rejected rather than served as plaintext.
 
-Set a shared secret to require `authorization: Bearer <secret>` on metadata, transaction, control-plane, Raft transport, and `GET /metrics`. Peer Raft clients propagate the same token. `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --cell-manager` send that header:
+To require `authorization: Bearer <secret>` on metadata, transaction, control-plane, Raft transport, and every metrics-listener request (`GET /metrics`, `/livez`, `/readyz`, `/healthz`), replace the `[security]` table above. Do not leave `allow_unauthenticated` in the file. A whitespace-only `shared_secret` is rejected even if that flag remains, and it is not accepted as the bearer on those probes. `/readyz` reports traffic readiness, not merely that the port is open. See [Operability](../../en/operability.md). Peer Raft clients propagate the same token. `metadb-ctl --auth-token` (or `METADB_AUTH_TOKEN`) and `metadbd --cell-manager` send that header:
 
 ```toml
 [security]
@@ -68,38 +72,29 @@ As metadata grows past `shard_split_threshold_bytes`, `CellLocalManager` and `Po
 
 ---
 
-## Stage 3: Multi-Node Raft Tests and Intended Multi-Cell Topology
+## Stage 3: Intended multi-cell topology (not deployable today)
 
-### Step 3.1: Zero-Downtime Upgrade from `1-Voter` to `3-Voter` HA
+Stage 3 is a design target. The current binary does not deploy it.
 
-> **Current binary**: role-trimmed `be` / `proxy` / `cell-manager` / `global-manager` processes are not implemented. `metadbd` only runs `all-in-one`. The steps below describe the intended topology; launching those roles fails fast instead of silently starting every subsystem.
+`metadbd` only runs `--role all-in-one`. `PersistentMetaDbCluster::open_and_serve` in `crates/metadb-server/src/lib.rs` rejects `be`, `proxy`, `cell-manager`, and `global-manager` before it listens. `RegisterCell` in `crates/metadb-server/src/grpc_services.rs` returns an application error and does not store a second cell. This tree has no live multi-process multi-Cell deployment.
 
-1. Start two additional Backend (`be`) nodes pointing to the existing control plane:
-   ```bash
-   metadbd --role be --node-id 2 --listen 10.0.1.12:7800 --cell-manager 10.0.1.11:7800 --data-dir /var/lib/metadb
-   metadbd --role be --node-id 3 --listen 10.0.1.13:7800 --cell-manager 10.0.1.11:7800 --data-dir /var/lib/metadb
-   ```
-2. Trigger online replica promotion via `metadb-ctl`:
-   ```bash
-   metadb-ctl raft scale-replicas --cell-id 1 --target-voters 3
-   ```
-   **Internal Execution**:
-   * `ConfChangeOrchestrator` adds Nodes `2` and `3` as non-voting `Learner`s (`AddLearner`).
-   * Leader triggers a Coordinated Flush Barrier, hard-links an SSTable checkpoint, and streams `InstallSnapshot` + tail `.raftlog` entries.
-   * Once replication lag drops below `64` entries, OpenRaft executes joint-consensus `ChangeMembership` promoting Nodes `2` and `3` to `Voter`s with **zero write downtime**.
+A second `metadbd --role all-in-one` can join the **same** cell when `--join` or `--cell-manager` names the current leader and the data directory is fresh. That path is covered by `crates/metadb-server/tests/join_existing_group.rs`. The joiner is still an all-in-one process. It is not a role-trimmed backend, and the join does not create another cell. See [Operations](../../en/operations.md).
 
-### Step 3.2: Disaggregated Multi-Cell Topology (`100B – 10T+` Records)
+### Step 3.1: Voters inside one cell
 
-The following table describes an intended topology, not runnable role-trimmed daemon deployments:
+Do not start `metadbd --role be`. That role exits in `open_and_serve`, so those commands are not a runbook. `metadb-ctl raft scale-replicas` calls `ScaleShardReplicas` and requires the requested voter count to already be registered in the cell. A fresh all-in-one cell has one node, so `--target-voters 3` fails until those nodes exist. The constraints are in [Operations](../../en/operations.md).
 
-| Role | `--role` Flag | Recommended Deployment | Responsibility |
-| :--- | :--- | :--- | :--- |
-| **Global Manager** | `global-manager` | 3-node Raft group | Maps coarse `[start_key, end_key)` intervals to `CellId`; allocates `65,536`-ID blocks; coordinates cross-Cell directory rename leases. |
-| **Cell Local Manager** | `cell-manager` | 3-node Raft group per Cell | Processes 3s BE heartbeats (`20K–50K` shards/Cell), orchestrates `PID` splits, Jumbo node isolation, and `ConfChange`. |
-| **Backend Storage (`BE`)** | `be` | `12 – 60+` NVMe hosts per Cell | Hosts Multi-Raft shard groups, `MemMvccStore`, `LsmStorageBackend`, `PushdownExecutor`, and `AuxDispatcher`. |
-| **Stateless Proxy** | `proxy` | Autoscaled / co-deployed with RustFS | Embeds `MetaCache` (`>99.9%` single-hop hit rate), compiles 20 SQL templates, and coordinates cross-shard 2PC. |
+### Step 3.2: Design model for a disaggregated topology (`100B – 10T+` records)
 
-```bash
-# Register a new Cell in GlobalManager for horizontal expansion
-metadb-ctl cell register --cell-id 2 --endpoints 10.0.2.10:7801,10.0.2.11:7801,10.0.2.12:7801
-```
+`100B – 10T+` is a design-model range: arithmetic for how a future multi-cell topology might be sized. It is not a record count this repository has stored. It is also not a Baidu production figure claimed as a result of `rustfs/MetaDB`. Baidu's published sizes, including the BOS2 figure of 1.848 trillion records in `arXiv:2610.32247v1`, are Baidu production metrics, not results of this repository.
+
+The table is the intended role split. This binary does not run those roles. Jumbo isolation in this tree is a route flag. It does not move peer shards onto a dedicated host.
+
+| Role | Design `--role` | Intended responsibility |
+| :--- | :--- | :--- |
+| **Global Manager** | `global-manager` | Would map coarse `[start_key, end_key)` intervals to `CellId`, allocate `65,536`-ID blocks, and coordinate cross-Cell directory rename leases. |
+| **Cell Local Manager** | `cell-manager` | Would process BE heartbeats (`20K–50K` shards/Cell) and orchestrate `PID` splits and membership changes. |
+| **Backend Storage (`BE`)** | `be` | Would host Multi-Raft shard groups and the LSM engine on NVMe hosts. |
+| **Stateless Proxy** | `proxy` | Would embed `MetaCache`, compile the 20 SQL templates, and coordinate cross-shard 2PC. |
+
+`metadb-ctl cell register` calls `RegisterCell` and exits non-zero. It does not register a cell. Do not use it as a federation step.

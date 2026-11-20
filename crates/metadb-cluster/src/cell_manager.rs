@@ -26,9 +26,19 @@ use metadb_storage::sstable::sync_dir;
 use metadb_storage::LsmEngineConfig;
 use metadb_tx::{RoutedShardHandle, TxStateMachineHandler};
 
+use crate::control_plane_state::{
+    decide_heartbeat, decode_control_plane, normalize_ids, remote_state_change_is_too_soon,
+    unix_ms, HeartbeatDecision, HeartbeatWrite, PersistedControlPlane, StoredHeartbeat,
+    StoredPlacement, CONTROL_PLANE_FILE, CONTROL_PLANE_VERSION, PLACEMENT_RETRY_MS,
+};
 use crate::id_allocator::{AllocIdKind, DurableIdAllocator};
-use crate::identity::{node_id_in_ha_range, ClusterIdentity};
+use crate::identity::{node_id_in_ha_range, random_id, ClusterIdentity};
 use crate::jumbo::JumboIsolationPlanner;
+use crate::jumbo_placement::{
+    automatic_leadership_transfer_allowed, executable_placement_actions,
+    jumbo_membership_change_allowed, plan_jumbo_placement, CommittedMove, PlacementAction,
+    PlacementObservation, PlacementPhase, ShardVoters, AUTOMATIC_TRANSFER_DISABLED_REASON,
+};
 use crate::meta_cache::{CompositeMetaCache, CompositeShardRoute};
 use crate::shard::{ShardHealthState, ShardSplitMode};
 use crate::split_worker::{RaftShardSplitWorker, SplitCandidate, SplitCrashPoint};
@@ -136,6 +146,12 @@ pub struct DurableCellManager {
     membership_lock: tokio::sync::Mutex<()>,
     /// Raft-applied node instance bindings. Shared with every shard handler.
     instance_bindings: Arc<Mutex<BTreeMap<NodeId, (u128, String)>>>,
+    /// Heartbeats and jumbo placement records. Not a route table.
+    control: Mutex<PersistedControlPlane>,
+    /// Test hook: the next `n` `CELL_CONTROL_PLANE` persists fail before touching disk.
+    fail_control_persists: AtomicU32,
+    /// Test hook: the next `n` persists rename the file and then fail the directory sync.
+    fail_control_dirsync: AtomicU32,
 }
 
 impl DurableCellManager {
@@ -258,6 +274,7 @@ impl DurableCellManager {
             &persisted,
             is_existing,
         )?;
+        let control_plane = Self::load_control_plane(&state_dir)?;
 
         let mgr = Arc::new(Self {
             cell_id,
@@ -276,6 +293,9 @@ impl DurableCellManager {
             identity: Mutex::new(preexisting_identity),
             membership_lock: tokio::sync::Mutex::new(()),
             instance_bindings: Arc::new(Mutex::new(BTreeMap::new())),
+            control: Mutex::new(control_plane),
+            fail_control_persists: AtomicU32::new(0),
+            fail_control_dirsync: AtomicU32::new(0),
         });
 
         if let Err(error) = mgr.boot_local_shards().await {
@@ -366,6 +386,7 @@ impl DurableCellManager {
             state_existed,
         )?;
         let identity = ClusterIdentity::load(&state_dir)?;
+        let control_plane = Self::load_control_plane(&state_dir)?;
         Ok(Arc::new(Self {
             cell_id,
             state_dir,
@@ -383,6 +404,9 @@ impl DurableCellManager {
             identity: Mutex::new(identity),
             membership_lock: tokio::sync::Mutex::new(()),
             instance_bindings: Arc::new(Mutex::new(BTreeMap::new())),
+            control: Mutex::new(control_plane),
+            fail_control_persists: AtomicU32::new(0),
+            fail_control_dirsync: AtomicU32::new(0),
         }))
     }
 
@@ -1192,28 +1216,45 @@ impl DurableCellManager {
 
         match candidate {
             SplitCandidate::Jumbo { dominant_pid } => {
-                let mut st = self.state.lock().unwrap();
-                let nodes: Vec<NodeId> = st.nodes.keys().copied().collect();
-                let all_routes: Vec<CompositeShardRoute> = st.routes.values().cloned().collect();
-                let new_health = JumboIsolationPlanner::select_dedicated_node(
-                    shard_id,
-                    dominant_pid,
-                    live_route.leader_node,
-                    &nodes,
-                    &all_routes,
-                );
-                if st.routes.contains_key(&shard_id) {
-                    let mut next = st.clone();
-                    if let Some(r) = next.routes.get_mut(&shard_id) {
-                        r.health_state = new_health;
+                let dedicated_node = {
+                    let mut st = self.state.lock().unwrap();
+                    let nodes: Vec<NodeId> = st.nodes.keys().copied().collect();
+                    let all_routes: Vec<CompositeShardRoute> =
+                        st.routes.values().cloned().collect();
+                    let new_health = JumboIsolationPlanner::select_dedicated_node(
+                        shard_id,
+                        dominant_pid,
+                        live_route.leader_node,
+                        &nodes,
+                        &all_routes,
+                    );
+                    let ShardHealthState::JumboIsolated { dedicated_node, .. } = new_health else {
+                        return Err(MetaDbError::ShardRoutingError(
+                            "jumbo planner did not select a dedicated node".to_string(),
+                        ));
+                    };
+                    let already = st
+                        .routes
+                        .get(&shard_id)
+                        .is_some_and(|route| route.health_state == new_health);
+                    if !already && st.routes.contains_key(&shard_id) {
+                        let mut next = st.clone();
+                        if let Some(route) = next.routes.get_mut(&shard_id) {
+                            route.health_state = new_health;
+                        }
+                        let updated = next.routes.get(&shard_id).cloned();
+                        self.persist_sync(&next)?;
+                        *st = next;
+                        if let Some(updated) = updated {
+                            self.meta_cache.upsert_route(updated);
+                        }
                     }
-                    let updated = next.routes.get(&shard_id).cloned();
-                    self.persist_sync(&next)?;
-                    *st = next;
-                    if let Some(updated) = updated {
-                        self.meta_cache.upsert_route(updated);
-                    }
-                }
+                    dedicated_node
+                };
+                // The route flag is detection only. Placement below either performs a
+                // membership-safe move or records why it did not.
+                self.reconcile_jumbo_placement(shard_id, dominant_pid, dedicated_node)
+                    .await?;
                 Ok(None)
             }
             SplitCandidate::SplitAt {
@@ -1441,11 +1482,11 @@ impl DurableCellManager {
         Ok(())
     }
 
-    /// Shard ids named by a `CELL_MANAGER_STATE` file: published routes and split plans.
-    pub fn shard_ids_in_cell_state_file(path: &Path) -> Result<BTreeSet<ShardId>> {
-        let mut raw = Vec::new();
-        File::open(path)?.read_to_end(&mut raw)?;
-        let body = verify_crc32c_le(&raw, "CELL_MANAGER_STATE")?;
+    /// Shard ids named by `CELL_MANAGER_STATE` bytes: published routes and split plans.
+    ///
+    /// The bytes are the on-disk frame, including its CRC32C trailer. This does not open a path.
+    pub fn shard_ids_in_cell_state_bytes(raw: &[u8]) -> Result<BTreeSet<ShardId>> {
+        let body = verify_crc32c_le(raw, "CELL_MANAGER_STATE")?;
         let state = decode_cell_state(body)?;
         let mut ids = BTreeSet::new();
         ids.extend(state.routes.keys().copied());
@@ -1454,6 +1495,13 @@ impl DurableCellManager {
             ids.insert(plan.child_shard_id);
         }
         Ok(ids)
+    }
+
+    /// Shard ids named by a `CELL_MANAGER_STATE` file: published routes and split plans.
+    pub fn shard_ids_in_cell_state_file(path: &Path) -> Result<BTreeSet<ShardId>> {
+        let mut raw = Vec::new();
+        File::open(path)?.read_to_end(&mut raw)?;
+        Self::shard_ids_in_cell_state_bytes(&raw)
     }
 
     fn load_state_file(dir: &Path) -> Result<PersistedCellState> {
@@ -1880,6 +1928,731 @@ impl DurableCellManager {
         Ok(())
     }
 
+    /// The next `n` `CELL_CONTROL_PLANE` persists fail before the file is replaced.
+    pub fn testing_fail_next_control_persists(&self, n: u32) {
+        self.fail_control_persists.store(n, Ordering::Relaxed);
+    }
+
+    /// The next `n` control-plane writes rename the file and then fail `sync_dir`.
+    pub fn testing_fail_next_control_dirsync(&self, n: u32) {
+        self.fail_control_dirsync.store(n, Ordering::Relaxed);
+    }
+
+    /// Moves one stored heartbeat's observation time backward in memory only.
+    /// The sequence is unchanged. Tests use this to open the remote rate window.
+    pub fn testing_age_stored_heartbeat(&self, node_id: NodeId, earlier_by_ms: u64) {
+        if let Some(heartbeat) = self.control.lock().unwrap().heartbeats.get_mut(&node_id) {
+            heartbeat.observed_unix_ms = heartbeat.observed_unix_ms.saturating_sub(earlier_by_ms);
+        }
+    }
+
+    pub fn stored_heartbeat(&self, node_id: NodeId) -> Option<StoredHeartbeat> {
+        self.control
+            .lock()
+            .unwrap()
+            .heartbeats
+            .get(&node_id)
+            .cloned()
+    }
+
+    pub fn stored_placement(&self, shard_id: ShardId) -> Option<StoredPlacement> {
+        self.control
+            .lock()
+            .unwrap()
+            .placements
+            .get(&shard_id)
+            .cloned()
+    }
+
+    pub fn local_heartbeat_is_fresh(&self, now_ms: u64, interval_ms: u64) -> bool {
+        self.control
+            .lock()
+            .unwrap()
+            .heartbeats
+            .get(&self.host.node_id())
+            .is_some_and(|heartbeat| {
+                now_ms.saturating_sub(heartbeat.observed_unix_ms) < interval_ms
+            })
+    }
+
+    /// gRPC addresses of Raft leaders of local shards when this process is not that leader.
+    pub fn remote_leader_addrs(&self) -> Vec<String> {
+        let me = self.host.node_id();
+        let shard_ids: Vec<ShardId> = self.state.lock().unwrap().routes.keys().copied().collect();
+        let mut addrs = BTreeSet::new();
+        for shard_id in shard_ids {
+            let Some(group) = self.host.get_group(shard_id) else {
+                continue;
+            };
+            let Some(leader) = group.current_leader() else {
+                continue;
+            };
+            if leader == me {
+                continue;
+            }
+            if let Some(addr) = group.peer_addr(leader) {
+                if !addr.is_empty() {
+                    addrs.insert(addr);
+                }
+            }
+        }
+        addrs.into_iter().collect()
+    }
+
+    /// Records this process's own heartbeat. Shard descriptors from clients are not an input.
+    /// Disk free space is left unknown; a zero is not stored as a measurement.
+    pub fn publish_local_heartbeat(&self) -> Result<StoredHeartbeat> {
+        let me = self.host.node_id();
+        node_id_in_ha_range(me)?;
+        let hosted = {
+            let state = self.state.lock().unwrap();
+            let mut ids: Vec<ShardId> = state
+                .routes
+                .iter()
+                .filter(|(_, route)| route.peers.contains_key(&me))
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        let hosted = normalize_ids(hosted).map_err(MetaDbError::ShardRoutingError)?;
+        let mut guard = self.control.lock().unwrap();
+        let mut next = guard.clone();
+        if next.observation_generation == 0 {
+            next.observation_generation = random_id()?;
+        }
+        let seq = next.next_local_seq.max(1);
+        let write = HeartbeatWrite {
+            node_id: me,
+            seq,
+            observed_unix_ms: unix_ms(),
+            disk_free_bytes: None,
+            reported_shard_ids: Vec::new(),
+            local_hosted_shard_ids: hosted,
+            observation_generation: next.observation_generation,
+        };
+        let decision = decide_heartbeat(guard.heartbeats.get(&me), &write)
+            .map_err(MetaDbError::ShardRoutingError)?;
+        match decision {
+            HeartbeatDecision::Replay(existing) => {
+                if guard.observation_generation == 0 {
+                    self.store_control(&mut guard, next)?;
+                }
+                Ok(existing)
+            }
+            HeartbeatDecision::Store(heartbeat) => {
+                next.heartbeats.insert(me, heartbeat.clone());
+                next.next_local_seq = seq.saturating_add(1);
+                self.store_control(&mut guard, next)?;
+                Ok(heartbeat)
+            }
+        }
+    }
+
+    /// Persists a registered peer's liveness. `reported_shard_ids` are stored as an annotation
+    /// and are not installed into `CELL_MANAGER_STATE` or `CompositeMetaCache`.
+    pub fn accept_remote_heartbeat(
+        &self,
+        node_id: NodeId,
+        seq: u64,
+        disk_free_bytes: Option<u64>,
+        reported_shard_ids: Vec<ShardId>,
+        instance_id: Option<u128>,
+        observation_generation: u128,
+    ) -> Result<()> {
+        node_id_in_ha_range(node_id)?;
+        if node_id == self.host.node_id() {
+            return Err(MetaDbError::ShardRoutingError(
+                "refusing a remote heartbeat for the local node; this process writes its own heartbeat. Client shard descriptors are not applied to routes"
+                    .to_string(),
+            ));
+        }
+        {
+            let state = self.state.lock().unwrap();
+            if !state.nodes.contains_key(&node_id) {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "node {node_id} is not registered; client shard descriptors are not applied to routes"
+                )));
+            }
+            if let Some(bound) = state.node_instances.get(&node_id).copied() {
+                if instance_id != Some(bound) {
+                    return Err(MetaDbError::ShardRoutingError(format!(
+                        "heartbeat for node {node_id} does not carry the bound instance; registration is not a TransferLeader capability and this record is not a shard epoch"
+                    )));
+                }
+            }
+        }
+        let reported = normalize_ids(reported_shard_ids).map_err(MetaDbError::ShardRoutingError)?;
+        let write = HeartbeatWrite {
+            node_id,
+            seq,
+            observed_unix_ms: unix_ms(),
+            disk_free_bytes,
+            reported_shard_ids: reported,
+            local_hosted_shard_ids: Vec::new(),
+            observation_generation,
+        };
+        let mut guard = self.control.lock().unwrap();
+        let decision = decide_heartbeat(guard.heartbeats.get(&node_id), &write)
+            .map_err(MetaDbError::ShardRoutingError)?;
+        match decision {
+            HeartbeatDecision::Replay(_) => Ok(()),
+            HeartbeatDecision::Store(heartbeat) => {
+                if let Some(previous) = guard.heartbeats.get(&node_id) {
+                    if remote_state_change_is_too_soon(
+                        previous.observed_unix_ms,
+                        write.observed_unix_ms,
+                    ) {
+                        return Err(MetaDbError::ShardRoutingError(
+                            "heartbeat rate limit; the stored record was kept, including a generation change. A heartbeat is not a scheduling epoch"
+                                .to_string(),
+                        ));
+                    }
+                }
+                let mut next = guard.clone();
+                next.heartbeats.insert(node_id, heartbeat);
+                self.store_control(&mut guard, next)
+            }
+        }
+    }
+
+    /// Plans jumbo placement from live Raft voters and attempts only a safe move.
+    ///
+    /// A blocked plan is `Ok` with `PlacementPhase::Blocked` or `LeaderOnDedicated`.
+    /// That is not eviction. `Err` is a failed fsync of this record or a voter-set
+    /// persist after a committed membership change.
+    pub async fn reconcile_jumbo_placement(
+        &self,
+        shard_id: ShardId,
+        dominant_pid: InodeId,
+        dedicated_node: NodeId,
+    ) -> Result<StoredPlacement> {
+        let _membership = self.membership_lock.lock().await;
+        let previous = self.stored_placement(shard_id);
+        let mut committed_moves = previous
+            .as_ref()
+            .map(|record| record.committed_moves.clone())
+            .unwrap_or_default();
+        let transfer_attempt = previous
+            .as_ref()
+            .map(|record| record.last_transfer_attempt_unix_ms)
+            .unwrap_or(0);
+        let mut replace_attempt = previous
+            .as_ref()
+            .map(|record| record.last_replace_attempt_unix_ms)
+            .unwrap_or(0);
+
+        for _ in 0..8 {
+            let observation =
+                match self.placement_observation(shard_id, dominant_pid, dedicated_node) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        return self.finish_placement(placement_record(
+                            shard_id,
+                            dominant_pid,
+                            dedicated_node,
+                            PlacementPhase::Blocked,
+                            format!("{error}; no membership change was proposed"),
+                            committed_moves,
+                            transfer_attempt,
+                            replace_attempt,
+                        ));
+                    }
+                };
+            for shard in &observation.shards {
+                self.sync_route_voters_from_raft(shard.shard_id)?;
+            }
+            let decision = plan_jumbo_placement(&observation);
+            let actions = executable_placement_actions(&decision.actions);
+            if !automatic_leadership_transfer_allowed()
+                && decision
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action, PlacementAction::TransferLeadership { .. }))
+            {
+                let reason =
+                    append_reason(&decision.blocked_reason, AUTOMATIC_TRANSFER_DISABLED_REASON);
+                return self.finish_placement(placement_record(
+                    shard_id,
+                    dominant_pid,
+                    dedicated_node,
+                    PlacementPhase::Blocked,
+                    reason,
+                    committed_moves,
+                    transfer_attempt,
+                    replace_attempt,
+                ));
+            }
+            let Some(action) = actions.first().cloned() else {
+                return self.finish_placement(placement_record(
+                    shard_id,
+                    dominant_pid,
+                    dedicated_node,
+                    decision.phase,
+                    decision.blocked_reason,
+                    committed_moves,
+                    transfer_attempt,
+                    replace_attempt,
+                ));
+            };
+            if !action_runs_on(self.host.node_id(), &observation, &action) {
+                return self.finish_placement(placement_record(
+                    shard_id,
+                    dominant_pid,
+                    dedicated_node,
+                    decision.phase,
+                    decision.blocked_reason,
+                    committed_moves,
+                    transfer_attempt,
+                    replace_attempt,
+                ));
+            }
+            match action {
+                PlacementAction::TransferLeadership { .. } => {
+                    // Unreachable while automatic transfer is disabled. The filter
+                    // above drops the variant. Do not call `trigger().transfer_leader`.
+                    let reason =
+                        append_reason(&decision.blocked_reason, AUTOMATIC_TRANSFER_DISABLED_REASON);
+                    return self.finish_placement(placement_record(
+                        shard_id,
+                        dominant_pid,
+                        dedicated_node,
+                        PlacementPhase::Blocked,
+                        reason,
+                        committed_moves,
+                        transfer_attempt,
+                        replace_attempt,
+                    ));
+                }
+                PlacementAction::ReplaceDedicatedOnPeer {
+                    shard_id: target,
+                    remove,
+                    add,
+                } => {
+                    let now = unix_ms();
+                    if replace_attempt != 0
+                        && now.saturating_sub(replace_attempt) < PLACEMENT_RETRY_MS
+                    {
+                        let reason = append_reason(
+                            &decision.blocked_reason,
+                            "peer voter replacement is in cooldown and was not submitted again",
+                        );
+                        return self.finish_placement(placement_record(
+                            shard_id,
+                            dominant_pid,
+                            dedicated_node,
+                            decision.phase,
+                            reason,
+                            committed_moves,
+                            transfer_attempt,
+                            replace_attempt,
+                        ));
+                    }
+                    replace_attempt = now;
+                    self.save_placement(&placement_record(
+                        shard_id,
+                        dominant_pid,
+                        dedicated_node,
+                        decision.phase,
+                        decision.blocked_reason.clone(),
+                        committed_moves.clone(),
+                        transfer_attempt,
+                        replace_attempt,
+                    ))?;
+                    match self.replace_dedicated_voter(target, remove, add).await {
+                        ReplaceOutcome::NotProposed => {}
+                        ReplaceOutcome::Committed {
+                            route_persist_error,
+                        } => {
+                            push_move(
+                                &mut committed_moves,
+                                CommittedMove::VoterReplaced {
+                                    shard_id: target,
+                                    removed: remove,
+                                    added: add,
+                                },
+                            );
+                            let reason = match &route_persist_error {
+                                Some(error) => format!(
+                                    "membership committed but the route record failed to persist: {error}; committed_moves keeps VoterReplaced"
+                                ),
+                                None => decision.blocked_reason.clone(),
+                            };
+                            self.save_placement(&placement_record(
+                                shard_id,
+                                dominant_pid,
+                                dedicated_node,
+                                decision.phase,
+                                reason,
+                                committed_moves.clone(),
+                                transfer_attempt,
+                                replace_attempt,
+                            ))?;
+                            if let Some(error) = route_persist_error {
+                                return Err(error);
+                            }
+                        }
+                        ReplaceOutcome::Rejected(error) => {
+                            let reason = append_reason(
+                                &decision.blocked_reason,
+                                &format!(
+                                    "peer voter replacement was not committed: {error}; no VoterReplaced was recorded"
+                                ),
+                            );
+                            return self.finish_placement(placement_record(
+                                shard_id,
+                                dominant_pid,
+                                dedicated_node,
+                                PlacementPhase::Blocked,
+                                reason,
+                                committed_moves,
+                                transfer_attempt,
+                                replace_attempt,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Err(MetaDbError::ConsensusError(
+            "jumbo placement did not converge before the attempt limit".to_string(),
+        ))
+    }
+
+    fn placement_observation(
+        &self,
+        shard_id: ShardId,
+        dominant_pid: InodeId,
+        dedicated_node: NodeId,
+    ) -> Result<PlacementObservation> {
+        let routes: Vec<CompositeShardRoute> = self
+            .state
+            .lock()
+            .unwrap()
+            .routes
+            .values()
+            .cloned()
+            .collect();
+        let mut shards = Vec::new();
+        let mut proven = BTreeSet::new();
+        let mut reserved = BTreeSet::new();
+        for route in routes {
+            if route.shard_id != shard_id {
+                if let ShardHealthState::JumboIsolated {
+                    dedicated_node: other,
+                    ..
+                } = route.health_state
+                {
+                    reserved.insert(other);
+                }
+            }
+            let Some(group) = self.host.get_group(route.shard_id) else {
+                continue;
+            };
+            let voters_map = group.uniform_voter_addrs()?;
+            let voters = voters_map.keys().copied().collect();
+            proven.extend(voters_map.keys().copied());
+            shards.push(ShardVoters {
+                shard_id: route.shard_id,
+                voters,
+                leader: group.current_leader(),
+            });
+        }
+        Ok(PlacementObservation {
+            jumbo_shard_id: shard_id,
+            dominant_pid,
+            dedicated_node,
+            local_node: self.host.node_id(),
+            shards,
+            proven_voters: proven,
+            reserved_dedicated_nodes: reserved,
+        })
+    }
+
+    fn sync_route_voters_from_raft(&self, shard_id: ShardId) -> Result<()> {
+        let (_, group, _) = self.lookup_local_handle(shard_id)?;
+        let live = group.uniform_voter_addrs()?;
+        let stored = {
+            let state = self.state.lock().unwrap();
+            state.routes.get(&shard_id).map(|route| {
+                route
+                    .peers
+                    .iter()
+                    .filter(|(_, (_, voter))| *voter)
+                    .map(|(id, (addr, _))| (*id, addr.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+        };
+        if stored.as_ref() == Some(&live) {
+            return Ok(());
+        }
+        self.persist_voter_set(shard_id, &live, group.current_epoch())
+    }
+
+    /// Does not call `trigger().transfer_leader`. An already-correct leader is not a
+    /// committed move. A matching voter set that this call did not propose is
+    /// [`ReplaceOutcome::NotProposed`].
+    async fn replace_dedicated_voter(
+        &self,
+        shard_id: ShardId,
+        remove: NodeId,
+        add: NodeId,
+    ) -> ReplaceOutcome {
+        let (_, group, _) = match self.lookup_local_handle(shard_id) {
+            Ok(handle) => handle,
+            Err(error) => return ReplaceOutcome::Rejected(error),
+        };
+        if group.current_leader() != Some(self.host.node_id()) {
+            return ReplaceOutcome::NotProposed;
+        }
+        let current = match group.uniform_voter_addrs() {
+            Ok(voters) => voters,
+            Err(error) => return ReplaceOutcome::Rejected(error),
+        };
+        let old: BTreeSet<NodeId> = current.keys().copied().collect();
+        if !old.contains(&remove) {
+            return ReplaceOutcome::NotProposed;
+        }
+        let mut proposed = old.clone();
+        proposed.remove(&remove);
+        proposed.insert(add);
+        if let Err(refusal) = jumbo_membership_change_allowed(&old, &proposed) {
+            return ReplaceOutcome::Rejected(MetaDbError::ConsensusError(format!(
+                "refusing jumbo voter change on shard {shard_id}: {refusal:?}"
+            )));
+        }
+        let proven = match self.node_is_proven_voter(add) {
+            Ok(proven) => proven,
+            Err(error) => return ReplaceOutcome::Rejected(error),
+        };
+        if !proven {
+            return ReplaceOutcome::Rejected(MetaDbError::ConsensusError(format!(
+                "refusing to add node {add} on shard {shard_id}; it is not already a voter of a local shard"
+            )));
+        }
+        let proposed_change = if current.contains_key(&add) {
+            ConfChangeOrchestrator::change_voters(group.raft(), proposed.clone()).await
+        } else {
+            match self.proven_voter_addr(add) {
+                Ok(addr) => match group.prepare_learner_snapshot().await {
+                    Ok(min_matched) => {
+                        ConfChangeOrchestrator::add_learners_and_promote_voters(
+                            group.raft(),
+                            &[(add, addr)],
+                            proposed.clone(),
+                            64,
+                            Duration::from_secs(20),
+                            min_matched,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = proposed_change {
+            return self.finish_replace_after_proposal(group.as_ref(), &proposed, error);
+        }
+        match group.wait_uniform_voter_addrs().await {
+            Ok(committed) => self.committed_replace(shard_id, group.as_ref(), &proposed, committed),
+            Err(error) => self.finish_replace_after_proposal(group.as_ref(), &proposed, error),
+        }
+    }
+
+    fn finish_replace_after_proposal(
+        &self,
+        group: &metadb_raft::ShardRaftGroup,
+        proposed: &BTreeSet<NodeId>,
+        error: MetaDbError,
+    ) -> ReplaceOutcome {
+        match group.uniform_voter_addrs() {
+            Ok(live) if live.keys().copied().collect::<BTreeSet<_>>() == *proposed => {
+                self.committed_replace(group.shard_id(), group, proposed, live)
+            }
+            _ => ReplaceOutcome::Rejected(error),
+        }
+    }
+
+    fn committed_replace(
+        &self,
+        shard_id: ShardId,
+        group: &metadb_raft::ShardRaftGroup,
+        proposed: &BTreeSet<NodeId>,
+        committed: BTreeMap<NodeId, String>,
+    ) -> ReplaceOutcome {
+        let committed_ids: BTreeSet<NodeId> = committed.keys().copied().collect();
+        if committed_ids != *proposed {
+            return ReplaceOutcome::Rejected(MetaDbError::ConsensusError(format!(
+                "shard {shard_id} voters {committed_ids:?} are not the planned set {proposed:?}; no VoterReplaced was recorded"
+            )));
+        }
+        match self.persist_voter_set(shard_id, &committed, group.current_epoch()) {
+            Ok(()) => ReplaceOutcome::Committed {
+                route_persist_error: None,
+            },
+            Err(error) => ReplaceOutcome::Committed {
+                route_persist_error: Some(error),
+            },
+        }
+    }
+
+    fn node_is_proven_voter(&self, node_id: NodeId) -> Result<bool> {
+        let shard_ids: Vec<ShardId> = self.state.lock().unwrap().routes.keys().copied().collect();
+        for shard_id in shard_ids {
+            let Some(group) = self.host.get_group(shard_id) else {
+                continue;
+            };
+            if group.uniform_voter_addrs()?.contains_key(&node_id) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn proven_voter_addr(&self, node_id: NodeId) -> Result<String> {
+        let shard_ids: Vec<ShardId> = self.state.lock().unwrap().routes.keys().copied().collect();
+        for shard_id in shard_ids {
+            let Some(group) = self.host.get_group(shard_id) else {
+                continue;
+            };
+            if let Some(addr) = group.uniform_voter_addrs()?.get(&node_id) {
+                if !addr.is_empty() {
+                    return Ok(addr.clone());
+                }
+            }
+        }
+        Err(MetaDbError::ConsensusError(format!(
+            "node {node_id} has no raft address on a local shard"
+        )))
+    }
+
+    fn finish_placement(&self, record: StoredPlacement) -> Result<StoredPlacement> {
+        self.save_placement(&record)?;
+        Ok(self.stored_placement(record.shard_id).unwrap_or(record))
+    }
+
+    fn save_placement(&self, record: &StoredPlacement) -> Result<()> {
+        let mut guard = self.control.lock().unwrap();
+        if guard
+            .placements
+            .get(&record.shard_id)
+            .is_some_and(|current| current.same_outcome(record))
+        {
+            return Ok(());
+        }
+        let mut next = guard.clone();
+        next.placements.insert(record.shard_id, record.clone());
+        self.store_control(&mut guard, next)
+    }
+
+    /// Installs `next` when the new file is the visible directory entry, including
+    /// when the directory fsync fails after rename. A later persist then continues
+    /// from that state instead of writing the previous sequence back over it.
+    fn store_control(
+        &self,
+        guard: &mut PersistedControlPlane,
+        next: PersistedControlPlane,
+    ) -> Result<()> {
+        match self.persist_control(&next) {
+            Ok(()) => {
+                *guard = next;
+                Ok(())
+            }
+            Err(ControlPersistError::NotVisible(error)) => Err(error),
+            Err(ControlPersistError::VisibleDirSyncFailed(error)) => {
+                *guard = next;
+                Err(error)
+            }
+        }
+    }
+
+    fn persist_control(
+        &self,
+        state: &PersistedControlPlane,
+    ) -> std::result::Result<(), ControlPersistError> {
+        if state.version != CONTROL_PLANE_VERSION {
+            return Err(ControlPersistError::NotVisible(MetaDbError::CodecError(
+                format!(
+                    "{CONTROL_PLANE_FILE} version {} is not supported",
+                    state.version
+                ),
+            )));
+        }
+        if self.fail_control_persists.load(Ordering::Relaxed) > 0 {
+            self.fail_control_persists.fetch_sub(1, Ordering::Relaxed);
+            return Err(ControlPersistError::NotVisible(
+                MetaDbError::StorageIoError(
+                    "injected CELL_CONTROL_PLANE persist failure".to_string(),
+                ),
+            ));
+        }
+        self.write_control_file(&self.state_dir, state)
+    }
+
+    fn load_control_plane(dir: &Path) -> Result<PersistedControlPlane> {
+        let path = dir.join(CONTROL_PLANE_FILE);
+        if !path.exists() {
+            return Ok(PersistedControlPlane::default());
+        }
+        let mut raw = Vec::new();
+        File::open(&path)?.read_to_end(&mut raw)?;
+        let body = verify_crc32c_le(&raw, CONTROL_PLANE_FILE)?;
+        decode_control_plane(body)
+    }
+
+    fn write_control_file(
+        &self,
+        dir: &Path,
+        state: &PersistedControlPlane,
+    ) -> std::result::Result<(), ControlPersistError> {
+        let _shard_set = if dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("cell_"))
+        {
+            let root = dir.parent().unwrap_or_else(|| Path::new("."));
+            metadb_raft::backup::lock_be_shard_set(&root.join("be"))
+                .map(Some)
+                .map_err(ControlPersistError::NotVisible)?
+        } else {
+            None
+        };
+        let mut raw = codec::serialize(state).map_err(|error| {
+            ControlPersistError::NotVisible(MetaDbError::CodecError(error.to_string()))
+        })?;
+        append_crc32c_le(&mut raw);
+        let tmp = dir.join(format!("{CONTROL_PLANE_FILE}.tmp"));
+        let dst = dir.join(CONTROL_PLANE_FILE);
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .map_err(|error| ControlPersistError::NotVisible(error.into()))?;
+            file.write_all(&raw)
+                .map_err(|error| ControlPersistError::NotVisible(error.into()))?;
+            file.sync_data()
+                .map_err(|error| ControlPersistError::NotVisible(error.into()))?;
+        }
+        fs::rename(&tmp, &dst).map_err(|error| ControlPersistError::NotVisible(error.into()))?;
+        if self.fail_control_dirsync.load(Ordering::Relaxed) > 0 {
+            self.fail_control_dirsync.fetch_sub(1, Ordering::Relaxed);
+            return Err(ControlPersistError::VisibleDirSyncFailed(
+                MetaDbError::StorageIoError(
+                    "injected CELL_CONTROL_PLANE directory sync failure after rename".to_string(),
+                ),
+            ));
+        }
+        sync_dir(dir).map_err(|error| {
+            ControlPersistError::VisibleDirSyncFailed(MetaDbError::StorageIoError(format!(
+                "CELL_CONTROL_PLANE directory sync failed after rename: {error}"
+            )))
+        })?;
+        Ok(())
+    }
+
     fn verify_or_initialize_owner(
         dir: &Path,
         node_id: NodeId,
@@ -1929,6 +2702,80 @@ impl DurableCellManager {
         fs::rename(tmp, path)?;
         sync_dir(dir)?;
         Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+enum ControlPersistError {
+    /// The previous file is still the visible record. Memory must stay unchanged.
+    NotVisible(MetaDbError),
+    /// `rename` has published the new file. Memory must keep that state so a later
+    /// persist cannot write an older sequence over it. The directory fsync did not finish.
+    VisibleDirSyncFailed(MetaDbError),
+}
+
+enum ReplaceOutcome {
+    /// This call did not propose a voter change. An already-matching set is observation.
+    NotProposed,
+    /// Raft's uniform voter set matches the plan. `route_persist_error` is set when
+    /// that fact did not reach `CELL_MANAGER_STATE`.
+    Committed {
+        route_persist_error: Option<MetaDbError>,
+    },
+    /// No matching voter set was observed. Do not record `VoterReplaced`.
+    Rejected(MetaDbError),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn placement_record(
+    shard_id: ShardId,
+    dominant_pid: InodeId,
+    dedicated_node: NodeId,
+    phase: PlacementPhase,
+    blocked_reason: String,
+    committed_moves: Vec<CommittedMove>,
+    last_transfer_attempt_unix_ms: u64,
+    last_replace_attempt_unix_ms: u64,
+) -> StoredPlacement {
+    StoredPlacement {
+        shard_id,
+        dominant_pid,
+        dedicated_node,
+        phase,
+        blocked_reason,
+        committed_moves,
+        last_transfer_attempt_unix_ms,
+        last_replace_attempt_unix_ms,
+        updated_unix_ms: unix_ms(),
+    }
+}
+
+fn append_reason(existing: &str, extra: &str) -> String {
+    if existing.is_empty() {
+        extra.to_string()
+    } else {
+        format!("{existing}; {extra}")
+    }
+}
+
+fn action_runs_on(
+    local: NodeId,
+    observation: &PlacementObservation,
+    action: &PlacementAction,
+) -> bool {
+    let shard_id = match action {
+        PlacementAction::TransferLeadership { shard_id, .. }
+        | PlacementAction::ReplaceDedicatedOnPeer { shard_id, .. } => *shard_id,
+    };
+    observation
+        .shards
+        .iter()
+        .any(|shard| shard.shard_id == shard_id && shard.leader == Some(local))
+}
+
+fn push_move(moves: &mut Vec<CommittedMove>, movement: CommittedMove) {
+    if !moves.contains(&movement) {
+        moves.push(movement);
     }
 }
 

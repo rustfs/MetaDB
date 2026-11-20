@@ -44,27 +44,41 @@ Flags von `metadbd` (`crates/metadb-server/src/bin/metadbd.rs`):
 
 Jede Rolle außer `all-in-one` scheitert, bevor der Listener gebunden wird, mit `server role ... is not implemented; only all-in-one runs a process`.
 
-Beispiel, nur Loopback:
+`metadbd` with no config file uses an empty `shared_secret` and `allow_unauthenticated = false`, so that process does not start. The file below is the explicit loopback development opt-in. It is not a credential. Bind only a literal loopback IP (`127.0.0.1`). The hostname `localhost` is not accepted for this flag. Do not use it on a non-loopback address.
 
 ```bash
 mkdir -p /tmp/metadb-data
-cargo run -p metadb-server --bin metadbd -- \
-  --data-dir /tmp/metadb-data \
-  --listen 127.0.0.1:7800 \
-  --node-id 1 \
-  --cell-id 1 \
-  --role all-in-one
+cat > /tmp/metadb-loopback.toml <<'EOF'
+[node]
+data_dir = "/tmp/metadb-data"
+grpc_listen_addr = "127.0.0.1:7800"
+
+[security]
+allow_unauthenticated = true
+EOF
+cargo run -p metadb-server --bin metadbd -- --config /tmp/metadb-loopback.toml
 ```
 
-Mit einer Datei, siehe [Konfiguration](./configuration.md):
+A usable secret is a different file. Replace the `[security]` block. Do not set `allow_unauthenticated` in that same file. Both together are rejected. A whitespace-only secret is rejected.
 
 ```bash
-cargo run -p metadb-server --bin metadbd -- --config ./standalone.toml
+mkdir -p /tmp/metadb-data
+cat > /tmp/metadb-auth.toml <<'EOF'
+[node]
+data_dir = "/tmp/metadb-data"
+grpc_listen_addr = "127.0.0.1:7800"
+
+[security]
+shared_secret = "replace-with-a-long-random-string"
+EOF
+cargo run -p metadb-server --bin metadbd -- --config /tmp/metadb-auth.toml
 ```
+
+Pass that same secret to the client as `metadb-ctl --auth-token` or `METADB_AUTH_TOKEN`.
 
 Logs verwenden den `EnvFilter` von `tracing-subscriber`. Der Standardfilter ist `info`. Überschreiben mit der üblichen Variable `RUST_LOG`, zum Beispiel `RUST_LOG=debug`.
 
-Beim Start mit leerem `security.shared_secret` schreibt der Prozess eine Warnung, dass Loopback-gRPC keine Authentifizierung hat. Die Standardbindung ist `127.0.0.1`. Eine Wildcard oder eine andere Nicht-Loopback-Adresse mit leerem, fehlendem oder falsch geschriebenem Geheimnis verweigert das Binden. Ein nicht leeres `[security].shared_secret` verlangt denselben Bearer für Metadaten-, Transaktions-, Control-Plane- und Raft-Transport-RPCs sowie für `GET /metrics`. Der Prozess beendet TLS nicht. Ein TLS- oder Zertifikatsschlüssel in der Konfiguration lässt den Start fehlschlagen, statt Klartext zu dienen. Den Listener in einem vertrauenswürdigen Netz lassen, oder jeden Dienst hinter einen Proxy setzen, der Clients authentifiziert, und den direkten Zugriff auf diesen Prozess sperren.
+An empty `security.shared_secret` does not start the process. Loopback is not an implicit exception. Development without credentials sets `allow_unauthenticated = true` and keeps every listener on a literal loopback IP (`127.0.0.1` or `::1`). The hostname `localhost` is not accepted for that opt-in. A wildcard or other non-loopback address refuses to listen. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. A non-empty `[security].shared_secret` requires the same bearer for metadata, transaction, control-plane, and Raft transport RPCs, and for `GET /metrics`. The process does not terminate TLS. A TLS, certificate, anonymous, or insecure key in the configuration fails startup instead of serving plaintext. Keep an opted-in listener on a trusted network, or put every service behind a proxy that authenticates the client and block direct access to this process.
 
 Strg-C schreibt den Shard-Zustand und stoppt die OpenRaft-Gruppen (`cluster.shutdown()`).
 

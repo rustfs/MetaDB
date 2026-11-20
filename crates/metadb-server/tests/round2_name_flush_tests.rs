@@ -6,6 +6,7 @@ async fn accepted_user_name_must_be_representable_in_sstable() {
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.path().to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
     let created = cluster
         .create_file_auto_id(1, &"a".repeat(70_000), 7, 0o644, 1)

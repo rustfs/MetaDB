@@ -6,6 +6,7 @@ async fn start(dir: &std::path::Path) -> (Arc<PersistentMetaDbCluster>, String) 
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap()
 }
 
@@ -186,6 +187,7 @@ async fn idle_metrics_connection_must_not_block_other_scrapes() {
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.path().join("data");
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     cfg.node.metrics_listen_addr = Some("127.0.0.1:0".into());
     std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
     let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_metadbd"))

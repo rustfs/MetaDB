@@ -42,8 +42,12 @@ where
     configs.into_iter().flatten().collect()
 }
 
-/// Tuning parameters for OpenRaft timers and snapshot policies.
-#[derive(Debug, Clone)]
+/// Tuning parameters for OpenRaft timers and the segmented log.
+///
+/// Loaded from the `[raft]` table. Unknown keys in that table fail parsing.
+/// The values are read once at process start and are not reloaded while Raft is running.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct RaftNodeOptions {
     pub heartbeat_interval_ms: u64,
     pub election_timeout_min_ms: u64,
@@ -62,6 +66,63 @@ impl Default for RaftNodeOptions {
             max_segment_bytes: crate::log_store::DEFAULT_MAX_SEGMENT_BYTES,
         }
     }
+}
+
+impl RaftNodeOptions {
+    /// Checks the same OpenRaft timer inequalities `ShardRaftGroup::start` applies,
+    /// plus a non-zero segment size. A zero segment would open a new file on every append.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_segment_bytes == 0 {
+            return Err(MetaDbError::CodecError(
+                "invalid [raft] options: max_segment_bytes must be at least 1".to_string(),
+            ));
+        }
+        Config {
+            cluster_name: "metadb-raft-options".to_string(),
+            heartbeat_interval: self.heartbeat_interval_ms,
+            election_timeout_min: self.election_timeout_min_ms,
+            election_timeout_max: self.election_timeout_max_ms,
+            max_in_snapshot_log_to_keep: self.max_in_snapshot_log_to_keep,
+            purge_batch_size: 256,
+            ..Default::default()
+        }
+        .validate()
+        .map(|_| ())
+        .map_err(|error| {
+            MetaDbError::CodecError(format!(
+                "invalid [raft] options: {error}. election_timeout_min_ms must be greater than heartbeat_interval_ms and less than election_timeout_max_ms"
+            ))
+        })
+    }
+}
+
+/// `replay_state` values stored on a shard group.
+pub(crate) const REPLAY_NOT_REQUIRED: u8 = 0;
+pub(crate) const REPLAY_CAUGHT_UP: u8 = 1;
+pub(crate) const REPLAY_WAITING: u8 = 2;
+
+/// Startup replay is still incomplete when the wait timed out and the state
+/// machine has not applied the committed or purged index captured at open.
+pub fn replay_still_pending(state: u8, target: u64, applied_index: Option<u64>) -> bool {
+    if state != REPLAY_WAITING {
+        return false;
+    }
+    match applied_index {
+        Some(index) => index < target,
+        None => true,
+    }
+}
+
+/// Facts a readiness probe may use. No addresses, paths, or log payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardServeView {
+    pub leader_known: bool,
+    pub applied: bool,
+    pub voter: bool,
+    pub recovery_pending: bool,
+    pub storage_unrecoverable: bool,
+    pub stopped: bool,
+    pub fatal: bool,
 }
 
 /// Parks `client_write` callers inside `propose` until a failure test releases them.
@@ -174,6 +235,9 @@ pub struct ShardRaftGroup {
     testing_epoch_mismatch: std::sync::atomic::AtomicU32,
     testing_log_discarded: std::sync::atomic::AtomicU32,
     testing_read_quorum: std::sync::atomic::AtomicU32,
+    replay_state: std::sync::atomic::AtomicU8,
+    replay_target: std::sync::atomic::AtomicU64,
+    stopped: AtomicBool,
 }
 
 impl ShardRaftGroup {
@@ -238,9 +302,28 @@ impl ShardRaftGroup {
         // Replay a committed tail into the WAL-less memtable before serving.
         // A fresh log has no committed entry, and the recovery condition stays
         // false until initialize, so waiting here only burns the timeout.
-        if log_store.has_committed_entries() {
+        // A timeout does not fail open: the group records the target index and
+        // stays unready until apply catches it.
+        let replay_target = log_store.committed_or_purged_index();
+        let replay_state = if let Some(target) = replay_target {
+            match raft.wait_for_recovery(Some(Duration::from_secs(5))).await {
+                Ok(_) => REPLAY_CAUGHT_UP,
+                Err(error) => {
+                    tracing::warn!(
+                        shard_id,
+                        target,
+                        error = %error,
+                        "raft startup replay did not finish; this shard stays unready until the applied index catches the startup commit"
+                    );
+                    REPLAY_WAITING
+                }
+            }
+        } else if log_store.has_committed_entries() {
             let _ = raft.wait_for_recovery(Some(Duration::from_secs(5))).await;
-        }
+            REPLAY_NOT_REQUIRED
+        } else {
+            REPLAY_NOT_REQUIRED
+        };
 
         if let Some(reason) = state_machine.storage_unrecoverable() {
             return Err(MetaDbError::StorageIoError(format!(
@@ -266,6 +349,9 @@ impl ShardRaftGroup {
             testing_epoch_mismatch: std::sync::atomic::AtomicU32::new(0),
             testing_log_discarded: std::sync::atomic::AtomicU32::new(0),
             testing_read_quorum: std::sync::atomic::AtomicU32::new(0),
+            replay_state: std::sync::atomic::AtomicU8::new(replay_state),
+            replay_target: std::sync::atomic::AtomicU64::new(replay_target.unwrap_or(0)),
+            stopped: AtomicBool::new(false),
         });
         router.register_local_proposer(shard_id, group.clone());
         Ok(group)
@@ -394,6 +480,32 @@ impl ShardRaftGroup {
 
     pub fn state_machine(&self) -> &ShardStateMachine {
         &self.state_machine
+    }
+
+    /// Local facts for a readiness probe. The strings on an unrecoverable
+    /// snapshot stay inside the process; the view only carries a boolean.
+    pub fn serve_view(&self) -> ShardServeView {
+        let metrics = self.raft.metrics();
+        let snapshot = metrics.borrow_watched();
+        let applied_index = snapshot.last_applied.as_ref().map(|id| id.index);
+        let voter = snapshot
+            .membership_config
+            .membership()
+            .voter_ids()
+            .any(|id| id == self.node_id);
+        ShardServeView {
+            leader_known: snapshot.current_leader.is_some(),
+            applied: applied_index.is_some(),
+            voter,
+            recovery_pending: replay_still_pending(
+                self.replay_state.load(Ordering::Acquire),
+                self.replay_target.load(Ordering::Acquire),
+                applied_index,
+            ),
+            storage_unrecoverable: self.storage_unrecoverable().is_some(),
+            stopped: self.stopped.load(Ordering::Acquire),
+            fatal: snapshot.running_state.is_err(),
+        }
     }
 
     /// `Some` when this process must not be reported as a live voter.
@@ -881,6 +993,7 @@ impl ShardRaftGroup {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.stopped.store(true, Ordering::Release);
         self.raft
             .shutdown()
             .await
@@ -1091,12 +1204,16 @@ enum LegacyRegistryShardState {
 }
 
 /// Shard ids named by a `NODE_SHARD_REGISTRY` file.
-pub fn shard_ids_in_registry_file(path: &Path) -> Result<std::collections::BTreeSet<ShardId>> {
+pub fn shard_ids_in_registry_bytes(raw: &[u8]) -> Result<std::collections::BTreeSet<ShardId>> {
     use std::collections::BTreeSet;
+    let body = verify_crc32c_le(raw, "NODE_SHARD_REGISTRY")?;
+    Ok(decode_registry(body)?.into_keys().collect::<BTreeSet<_>>())
+}
+
+pub fn shard_ids_in_registry_file(path: &Path) -> Result<std::collections::BTreeSet<ShardId>> {
     let mut raw = Vec::new();
     File::open(path)?.read_to_end(&mut raw)?;
-    let body = verify_crc32c_le(&raw, "NODE_SHARD_REGISTRY")?;
-    Ok(decode_registry(body)?.into_keys().collect::<BTreeSet<_>>())
+    shard_ids_in_registry_bytes(&raw)
 }
 
 fn decode_registry(body: &[u8]) -> Result<BTreeMap<ShardId, RegistryShardState>> {
@@ -1160,5 +1277,49 @@ mod tests {
         enveloped.extend_from_slice(&[0; 24]);
         let kept = normalize_discarded_legacy(&enveloped, discarded);
         assert!(kept.is_retryable_write_consensus(), "{kept}");
+    }
+
+    #[test]
+    fn replay_pending_tracks_the_startup_commit_only() {
+        assert!(!replay_still_pending(REPLAY_NOT_REQUIRED, 10, None));
+        assert!(!replay_still_pending(REPLAY_CAUGHT_UP, 10, None));
+        assert!(replay_still_pending(REPLAY_WAITING, 10, None));
+        assert!(replay_still_pending(REPLAY_WAITING, 10, Some(9)));
+        assert!(!replay_still_pending(REPLAY_WAITING, 10, Some(10)));
+        assert!(!replay_still_pending(REPLAY_WAITING, 10, Some(11)));
+    }
+
+    #[test]
+    fn default_raft_options_match_the_openraft_inequalities() {
+        let options = RaftNodeOptions::default();
+        options.validate().expect("built-in defaults must start");
+        assert_eq!(options.heartbeat_interval_ms, 150);
+        assert_eq!(options.election_timeout_min_ms, 450);
+        assert_eq!(options.election_timeout_max_ms, 900);
+        assert_eq!(options.max_in_snapshot_log_to_keep, 0);
+        assert_eq!(options.max_segment_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn raft_option_bounds_fail_before_a_group_starts() {
+        let options = RaftNodeOptions {
+            max_segment_bytes: 0,
+            ..RaftNodeOptions::default()
+        };
+        assert!(options.validate().is_err());
+
+        let options = RaftNodeOptions {
+            heartbeat_interval_ms: 450,
+            ..RaftNodeOptions::default()
+        };
+        let heartbeat = options.validate().unwrap_err().to_string();
+        assert!(heartbeat.contains("invalid [raft] options"), "{heartbeat}");
+
+        let options = RaftNodeOptions {
+            election_timeout_min_ms: 900,
+            election_timeout_max_ms: 900,
+            ..RaftNodeOptions::default()
+        };
+        assert!(options.validate().is_err());
     }
 }

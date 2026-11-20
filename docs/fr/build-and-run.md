@@ -44,27 +44,41 @@ Options de `metadbd` (`crates/metadb-server/src/bin/metadbd.rs`) :
 
 Tout rôle autre que `all-in-one` échoue avant la liaison de l'écouteur, avec `server role ... is not implemented; only all-in-one runs a process`.
 
-Exemple, boucle locale seulement :
+`metadbd` with no config file uses an empty `shared_secret` and `allow_unauthenticated = false`, so that process does not start. The file below is the explicit loopback development opt-in. It is not a credential. Bind only a literal loopback IP (`127.0.0.1`). The hostname `localhost` is not accepted for this flag. Do not use it on a non-loopback address.
 
 ```bash
 mkdir -p /tmp/metadb-data
-cargo run -p metadb-server --bin metadbd -- \
-  --data-dir /tmp/metadb-data \
-  --listen 127.0.0.1:7800 \
-  --node-id 1 \
-  --cell-id 1 \
-  --role all-in-one
+cat > /tmp/metadb-loopback.toml <<'EOF'
+[node]
+data_dir = "/tmp/metadb-data"
+grpc_listen_addr = "127.0.0.1:7800"
+
+[security]
+allow_unauthenticated = true
+EOF
+cargo run -p metadb-server --bin metadbd -- --config /tmp/metadb-loopback.toml
 ```
 
-Avec un fichier, voir [Configuration](./configuration.md) :
+A usable secret is a different file. Replace the `[security]` block. Do not set `allow_unauthenticated` in that same file. Both together are rejected. A whitespace-only secret is rejected.
 
 ```bash
-cargo run -p metadb-server --bin metadbd -- --config ./standalone.toml
+mkdir -p /tmp/metadb-data
+cat > /tmp/metadb-auth.toml <<'EOF'
+[node]
+data_dir = "/tmp/metadb-data"
+grpc_listen_addr = "127.0.0.1:7800"
+
+[security]
+shared_secret = "replace-with-a-long-random-string"
+EOF
+cargo run -p metadb-server --bin metadbd -- --config /tmp/metadb-auth.toml
 ```
+
+Pass that same secret to the client as `metadb-ctl --auth-token` or `METADB_AUTH_TOKEN`.
 
 Les journaux utilisent l'`EnvFilter` de `tracing-subscriber`. Le filtre par défaut est `info`. On le remplace avec la variable standard `RUST_LOG`, par exemple `RUST_LOG=debug`.
 
-Au démarrage, si `security.shared_secret` est vide, le processus journalise un avertissement : le gRPC en boucle locale n'a pas d'authentification. La liaison par défaut est `127.0.0.1`. Un joker ou une autre adresse non locale avec un secret vide, absent ou mal orthographié refuse d'écouter. Un `[security].shared_secret` non vide exige le même bearer pour les RPC de métadonnées, de transaction, de plan de contrôle, de transport Raft, et pour `GET /metrics`. Le processus ne termine pas TLS. Une clé TLS ou de certificat dans la configuration fait échouer le démarrage au lieu de servir en clair. Garder l'écouteur sur un réseau de confiance, ou placer chaque service derrière un proxy qui authentifie les clients, et bloquer l'accès direct à ce processus.
+An empty `security.shared_secret` does not start the process. Loopback is not an implicit exception. Development without credentials sets `allow_unauthenticated = true` and keeps every listener on a literal loopback IP (`127.0.0.1` or `::1`). The hostname `localhost` is not accepted for that opt-in. A wildcard or other non-loopback address refuses to listen. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. A non-empty `[security].shared_secret` requires the same bearer for metadata, transaction, control-plane, and Raft transport RPCs, and for `GET /metrics`. The process does not terminate TLS. A TLS, certificate, anonymous, or insecure key in the configuration fails startup instead of serving plaintext. Keep an opted-in listener on a trusted network, or put every service behind a proxy that authenticates the client and block direct access to this process.
 
 Ctrl-C vide l'état des shards et arrête les groupes OpenRaft (`cluster.shutdown()`).
 

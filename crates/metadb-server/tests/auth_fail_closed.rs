@@ -3,13 +3,10 @@
 //! These tests only send a missing or wrong credential and expect rejection, or they
 //! expect startup to refuse a listener. They do not attempt to bypass authentication.
 //!
-//! Two cases lock current behavior that is still a gap:
-//!
-//! - An empty `shared_secret` on `127.0.0.1` serves metadata, transactions, the
-//!   control plane, and metrics with no credentials. A post-merge run that used
-//!   loopback and an empty secret did not prove fail-closed authentication.
-//! - Unknown TOML keys that do not look like a secret or TLS setting are ignored.
-//!   A misspelled storage or join key still starts the process.
+//! An empty secret does not listen, including on loopback, unless
+//! `allow_unauthenticated` is set. A whitespace-only secret never listens.
+//! Unknown auth-like keys are rejected. Unknown keys that are not auth or TLS
+//! settings are still ignored.
 
 use std::time::Duration;
 
@@ -272,18 +269,42 @@ fn with_authorization(
     request
 }
 
-/// Loopback with an empty secret is the local-development path. It is not fail-closed.
-///
-/// A run that binds `127.0.0.1` and leaves `shared_secret` empty, including the
-/// post-merge Mac mini run, accepts callers that send no credentials.
+/// Loopback is not an implicit exception. An empty secret must not listen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn empty_secret_on_loopback_serves_without_credentials() {
+async fn empty_secret_on_loopback_does_not_listen() {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let mut cfg = ServerTomlConfig::default();
+    cfg.node.data_dir = std::env::temp_dir().join(format!("metadb-empty-loopback-{port}"));
+    cfg.node.grpc_listen_addr = format!("127.0.0.1:{port}");
+    cfg.node.metrics_listen_addr = Some(format!("127.0.0.1:{port}"));
+    cfg.security.shared_secret.clear();
+    cfg.security.allow_unauthenticated = false;
+    let err = match PersistentMetaDbCluster::open_and_serve(cfg).await {
+        Ok((cluster, _)) => {
+            let _ = cluster.shutdown().await;
+            panic!("empty secret on loopback must not start");
+        }
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("not an implicit exception"),
+        "{err}"
+    );
+    expect_closed(&format!("127.0.0.1:{port}")).await;
+}
+
+/// The explicit opt-in still serves loopback without credentials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_unauthenticated_loopback_serves_without_credentials() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.path().to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
     cfg.node.metrics_listen_addr = Some("127.0.0.1:0".into());
     cfg.security.shared_secret.clear();
+    cfg.security.allow_unauthenticated = true;
     let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
     assert!(
         grpc_addr.starts_with("127.0.0.1:"),
@@ -528,40 +549,26 @@ async fn configured_secret_rejects_basic_auth_without_applying_the_write() {
     assert!(bearer_metrics.1.contains("metadb_shards_total"));
 }
 
-/// Whitespace is not an empty secret once a listener is up. Loopback still starts,
-/// and a missing bearer is rejected instead of being treated as anonymous access.
+/// A whitespace-only secret is not a credential and does not open loopback.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn whitespace_secret_on_loopback_rejects_anonymous_calls() {
-    let dir = tempfile::tempdir().unwrap();
+async fn whitespace_secret_on_loopback_does_not_listen() {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
     let mut cfg = ServerTomlConfig::default();
-    cfg.node.data_dir = dir.path().to_path_buf();
-    cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
-    cfg.node.metrics_listen_addr = Some("127.0.0.1:0".into());
+    cfg.node.grpc_listen_addr = format!("127.0.0.1:{port}");
+    cfg.node.metrics_listen_addr = Some(format!("127.0.0.1:{port}"));
     cfg.security.shared_secret = "   ".into();
-    let (cluster, grpc_addr) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
-    let metrics_dial = loopback_dial(cluster.metrics_addr().expect("metrics listener"));
-    let channel = Endpoint::from_shared(format!("http://{grpc_addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    let mut status = ControlPlaneServiceClient::new(channel);
-    let anonymous = status.get_routes(GetRoutesRequest { cell_id: 0 }).await;
-    let mut exact = tonic::Request::new(GetRoutesRequest { cell_id: 0 });
-    exact
-        .metadata_mut()
-        .insert("authorization", "Bearer    ".parse().unwrap());
-    let accepted = status.get_routes(exact).await;
-    let metrics = http_exchange(&metrics_dial, None, "/metrics").await;
-    cluster.shutdown().await.unwrap();
-
-    assert_eq!(anonymous.unwrap_err().code(), Code::Unauthenticated);
-    assert!(accepted
-        .expect("exact whitespace bearer")
-        .into_inner()
-        .error
-        .is_none());
-    assert_rejected_http(metrics.0, &metrics.1);
+    cfg.security.allow_unauthenticated = true;
+    let err = match PersistentMetaDbCluster::open_and_serve(cfg).await {
+        Ok((cluster, _)) => {
+            let _ = cluster.shutdown().await;
+            panic!("whitespace secret must not start, even with the loopback opt-in");
+        }
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("whitespace-only"), "{err}");
+    expect_closed(&format!("127.0.0.1:{port}")).await;
 }
 
 /// Unknown keys that do not name a secret or TLS setting are still ignored.
@@ -588,6 +595,7 @@ async fn unknown_toml_keys_are_ignored_and_loopback_still_serves() {
 
         [security]
         shared_secret = ""
+        allow_unauthenticated = true
         "#,
     )
     .expect("non-secret unknown keys are ignored and must not fail the parse");

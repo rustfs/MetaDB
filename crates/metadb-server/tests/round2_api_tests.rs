@@ -21,6 +21,7 @@ async fn start(
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     let (cluster, addr) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
     let client = MetadataServiceClient::connect(format!("http://{addr}"))
         .await

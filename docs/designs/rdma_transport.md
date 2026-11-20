@@ -4,6 +4,14 @@
 
 MetaDB carries bytes on tonic gRPC over TCP. That remains the default and the required fallback. This increment adds `metadb-transport` so an operator can name RDMA and receive a structured refusal. It does not add an RDMA backend, a feature flag, a simulation, or a transport trait that could be mistaken for one.
 
+## Current blocker
+
+A Linux RDMA backend is still not implemented. Three blockers remain, and any one of them is enough to keep this crate policy-only:
+
+1. `docs/DEVELOPMENT_PLAN.md` §1.3 forbids unsafe C/C++ bindings of the rocksdb/leveldb kind. The maintained Rust RDMA stacks (`async-rdma`, `rdma-sys`, `sideway`, `ibverbs`, UCX, and libfabric) bind `libibverbs` and/or `librdmacm`.
+2. Linking those libraries needs a license exception. `async-rdma` is GPL-3.0, `sideway` is MPL-2.0, and rdma-core is GPL-2.0 OR BSD-2-Clause. `deny.toml` is unchanged.
+3. The environment used for this check has no `/dev/infiniband` and no `libibverbs` or `librdmacm` on the dynamic linker path. A from-scratch Linux uverbs client would not link those libraries, and it would still be unvalidated. It is not in this tree, and it is not a working RDMA path or a hardware result.
+
 `RDMA_BACKEND_IMPLEMENTED` is `false`. The constant is not a runtime probe. The crate does not open `/dev/infiniband`, does not load `rdma_rxe` or `siw`, and does not link or `dlopen` a C library.
 
 ## What was considered

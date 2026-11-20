@@ -71,7 +71,7 @@ flowchart TD
 
 ## 2. Phase-by-Phase Implementation Plan
 
-### Phase 0: Architecture, EGM Specifications, Goldfish Review & Multilingual Guides (Current Gate)
+### Phase 0: Architecture, EGM Specifications, Goldfish Review & Multilingual Guides (design documents, not a first-launch pass)
 * **Objective**: Establish Zero-Decision architectural specifications, subsystem blueprints, phased engineering plan, adversarial zero-context Goldfish review resolutions, and 5-language user documentation (`en`, `ja`, `fr`, `zh`, `de`) before modifying Rust crate source code.
 * **Deliverables**:
   * `Architecture.md`
@@ -118,13 +118,13 @@ flowchart TD
 * **Key Invariants**:
   * **WAL-less Persistence**: `LsmStorageBackend` writes zero KV WAL files; durability before flush is owned by the Raft log, and `lsm_flushed_index` advances strictly after `L0` SSTable `fdatasync` + `MANIFEST` `fdatasync` + parent directory `fsync`.
   * **SSTable Integrity**: 4 KiB prefix-compressed data blocks with 16-entry restart intervals, per-block CRC32C trailers, Kirsch-Mitzenmacher Bloom filter (`10 bits/key` indexing both live values and `PhysicalTombstone`s), sparse block index, length-framed `MetaBlock` with monotonic `flush_generation: u64`, and canonical **64-byte** magic/version/checksum footer.
-  * **Mathematical MVCC Visibility (`SnapshotGuard` & `ReadCut`)**: `SnapshotGuard` pins a total `ReadCut { max_raft_index, max_hlc }` + `Arc<Version>` + `Vec<Arc<ImmMemTable>>` with bounded per-page step leases. An `ImmMemTable` covering writes up to `H_imm` flushes to an unversioned L0 SSTable **only when** `min_active_snapshot_hlc >= H_imm` (`<= 5,000ms` timeout), guaranteeing zero future-read/phantom-scan anomalies and zero persisted MVCC tombstones.
+  * **MVCC visibility (`SnapshotGuard` & `ReadCut`)**: `SnapshotGuard` pins a `ReadCut { max_raft_index, max_hlc }` plus the version and immutable memtables, with bounded per-page step leases. An `ImmMemTable` covering writes up to `H_imm` collapse-flushes to an unversioned L0 SSTable only when `min_active_snapshot_hlc >= H_imm` (retention `5,000ms`). That gate does not guarantee zero future-read or phantom-scan anomalies. Collapse may keep only the latest value. A range read at `start_hlc` can include later values of keys an open 2PC lease does not cover. Point reads of keys that lease records stay at the pre-image until commit.
   * **Bottommost-Safe Locality Compaction**: `LocalityCompactor` tracks tombstone density per 9-byte `[table_prefix][group_key: 8B]` bucket and compacts `[start_key, end_key)` across all overlapping levels (`L0..L_max`), dropping `PhysicalTombstone` entries **only** when no deeper overlapping SSTable can contain the key.
 * **Verification Commands**:
   * `cargo test -p metadb-storage`
   * `cargo clippy -p metadb-storage --all-targets -- -D warnings`
 * **Acceptance Criteria**:
-  * Crash/reopen tests verify `MANIFEST` recovery, orphan `.sst.tmp` cleanup, CRC32C corruption detection, Bloom filter zero false-negatives, `SnapshotGuard` isolation across concurrent `MemTable` seals and L0 flushes, `~60%` KV write reduction on rapid updates/deletes, and zero shadowed-key resurrection during multi-level `LocalityCompactor` runs.
+  * Crash/reopen tests cover `MANIFEST` recovery, orphan `.sst.tmp` cleanup, CRC32C corruption detection, one L0 tombstone shadowing an L1 value, `SnapshotGuard` isolation across concurrent memtable seals and L0 flushes, and a locality-compaction fixture that does not resurrect the shadowed key in that case. They do not measure a `~60%` KV write reduction. That percentage is a paper/model figure from `arXiv:2610.32247v1`, not a result of `mvcc_snapshot_tests.rs`. They also do not prove zero future-read anomalies for every range read.
 
 ---
 
@@ -186,7 +186,7 @@ flowchart TD
   * `cargo test -p metadb-cluster -p metadb-proxy`
   * `cargo clippy -p metadb-cluster -p metadb-proxy --all-targets -- -D warnings`
 * **Acceptance Criteria**:
-  * Tests verify concurrent client writes during live `PID`-boundary shard splits (`EpochMismatch` auto-retry with zero lost/duplicate writes), Jumbo Shard dedicated-node isolation, `DualModeFineGrained` scatter-gather `dirstat` + paginated `listdir` + 2PC `rmdir`, `IdRangeAllocator` uniqueness across restarts, and all 20 SQL templates.
+  * In-process tests cover `PID`-boundary splits, a `JumboIsolated` route flag (not a move of peer shards onto a dedicated host), `DualModeFineGrained` scatter-gather inside one process, `IdRangeAllocator` uniqueness across restarts, and the 20 SQL templates. Dedicated-host jumbo placement is not what those tests run.
 
 ---
 
@@ -199,11 +199,11 @@ flowchart TD
   * `crates/metadb-server/tests/{integration_tests.rs, e2e_cluster_evolution_tests.rs}`
   * Documentation status updates across `Architecture.md`, `README.md`, and `docs/guides/{en,ja,fr,zh,de}/`
 * **Key Invariants**:
-  * **Single Codebase Across Deployment Topologies**: `metadbd --role all-in-one` runs `GlobalManager + CellLocalManager + MetaCache + Proxy + BE (1-Voter OpenRaft)` in one process; `--role global-manager | cell-manager | be | proxy` runs disaggregated multi-node / multi-Cell clusters over `tonic` gRPC.
+  * **Single runnable role**: `metadbd --role all-in-one` runs `GlobalManager`, `CellLocalManager`, `MetaCache`, `Proxy`, and a `1-Voter` OpenRaft group in one process. `open_and_serve` rejects `global-manager`, `cell-manager`, `be`, and `proxy`. Those names are not a disaggregated deployment.
   * **Clean Lifecycle**: Graceful SIGINT/SIGTERM drain flushes active MemTables, persists `MANIFEST` and Raft state, and closes network listeners cleanly.
 * **Verification Commands**:
   * `cargo fmt --all -- --check`
   * `cargo clippy --workspace --all-targets -- -D warnings`
   * `cargo test --workspace`
 * **Acceptance Criteria**:
-  * End-to-end integration suite boots a persistent `1-Voter` `metadbd` node on disk, restarts and verifies crash recovery, splits shards across `PID` boundaries, joins two additional `metadbd` BE nodes over real local TCP/gRPC sockets, promotes shards to `3-Voter` Multi-Raft under live load, adds a second `Cell`, executes cross-shard 2PC `rename` and bulk-delete `LocalityCompactor` scans via `metadb-ctl` and gRPC clients, and updates all documentation status tables to `Implemented`.
+  * `e2e_cluster_evolution_tests.rs` boots one persistent all-in-one `PersistentMetaDbCluster`, restarts it from the same directory, calls `TriggerShardSplit`, and runs a cross-shard `Rename` plus bulk deletion on that one process. It does not start `metadbd --role be`, does not join two extra BE processes, and does not register a second Cell. A second all-in-one join is `join_existing_group`, not that end-to-end test. In-process 1-voter to 3-voter coverage is `multi_raft_failover_tests`, not a three-VM rehearsal.

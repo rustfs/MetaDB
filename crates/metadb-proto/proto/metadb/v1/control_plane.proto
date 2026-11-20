@@ -29,7 +29,21 @@ message StoreHeartbeatRequest {
   uint64 cell_id = 1;
   uint64 node_id = 2;
   uint64 disk_free_bytes = 3;
+  // Annotations only. The server does not install these descriptors as routes.
   repeated ShardHeartbeatStatsProto shards = 4;
+  // Required. Zero is rejected. A lower sequence than the stored one is rejected.
+  // The same sequence and the same disk/shard annotation is an idempotent replay.
+  uint64 monotonic_seq = 5;
+  // When false, disk_free_bytes is not a measurement and is stored as unknown.
+  bool disk_free_known = 6;
+  // 16-byte big-endian instance id. Required only when that node id is already
+  // bound to an instance. Empty does not authenticate the caller. This is not a
+  // shard epoch and does not schedule placement.
+  bytes instance_id = 7;
+  // 16-byte big-endian heartbeat-file generation. Required and non-zero.
+  // A receiver with no row accepts this generation's current sequence.
+  // The same generation still rejects jumps above 64. This is not a shard epoch.
+  bytes observation_generation = 8;
 }
 
 message StoreHeartbeatResponse {

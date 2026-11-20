@@ -19,6 +19,7 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 openraft = { workspace = true }
+getrandom = "0.4.3"
 
 [dev-dependencies]
 tempfile = { workspace = true }

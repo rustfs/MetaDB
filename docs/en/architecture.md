@@ -9,13 +9,13 @@ This page follows the code in `crates/`. It does not describe a multi-process Ce
 `PersistentMetaDbCluster::open_and_serve` (`crates/metadb-server/src/lib.rs`):
 
 1. Rejects any `node.role` other than `all-in-one`.
-2. Refuses a wildcard or other non-loopback `grpc_listen_addr` or `metrics_listen_addr` when `shared_secret` is empty. Then binds `node.grpc_listen_addr` (default `127.0.0.1:7800`; `127.0.0.1:0` asks the OS for a port).
+2. An empty `shared_secret` listens only when `allow_unauthenticated` is explicitly set, and only when every listener address is a literal loopback IP (`127.0.0.0/8` or `::1`). The hostname `localhost` is not accepted and is not resolved. A whitespace-only secret is rejected even when that flag is set. The flag does not permit a wildcard or any other address. The process then binds that same literal address (`grpc_listen_addr` defaults to `127.0.0.1:7800`; port `0` asks the OS for a port). After the socket is bound, the bound IP is checked again.
 3. Opens `DurableIdAllocator` at `<data_dir>/global_allocator`.
 4. Opens `ShardGroupHost` at `<data_dir>/be`.
 5. Opens or bootstraps `DurableCellManager` at `<data_dir>/cell_<cell_id>`.
 6. Registers that one cell on `DurableGlobalManager` for the key range `[0x01, 0x04)`.
 7. Ensures root directory inode `1` (`ROOT_INODE_ID`) has an attribute record.
-8. Serves four gRPC services on the same listener. All four take the same bearer interceptor. When `metrics_listen_addr` is set, `GET /metrics` on that address requires the same secret. A non-empty secret rejects a missing or wrong bearer. An empty secret is accepted only for loopback binds. This process does not terminate TLS.
+8. Serves four gRPC services on the same listener. All four take the same bearer interceptor. When `metrics_listen_addr` is set, `GET /metrics`, `GET /livez`, `GET /readyz`, and `GET /healthz` use `classify_secret`. A secret that contains a non-whitespace character rejects a missing or wrong bearer. A whitespace-only secret is 401 on those paths and does not match `Bearer` plus the same spaces. An empty secret listens only when `allow_unauthenticated` is set, and only for a literal loopback IP. The bound metrics address is checked again after that socket binds. This process does not terminate TLS.
 9. Spawns a maintenance task on a 250 ms interval.
 
 `metadbd` is a thin wrapper: it loads TOML, applies CLI overrides, calls `open_and_serve`, optionally calls `RegisterNode` on `--cell-manager`, and on Ctrl-C calls `shutdown`. Metrics, when configured, are served inside `open_and_serve`.
@@ -86,7 +86,7 @@ MVCC versions live in memory for `storage.mvcc_retention_ms` (default 5,000). A 
 
 ## Raft
 
-Each local shard is an `openraft` 0.10 group. The log is a segmented CRC32C file under `.../shards/<id>/raft`. Default options, which are **not** loaded from TOML (`raft_options` is `#[serde(skip)]`):
+Each local shard is an `openraft` 0.10 group. The log is a segmented CRC32C file under `.../shards/<id>/raft`. Defaults, loaded from `[raft]` when that table or a field is omitted:
 
 | Field | Default |
 | :--- | :--- |
@@ -125,7 +125,7 @@ A directory rename also holds one `DirRenameLease` in the ID allocator. Renewal 
 - Otherwise it picks a parent-id boundary near half the bytes. The split key is a PID prefix, so `_attr_` and the direct children of one parent stay together.
 - If the route is already `DualModeFineGrained` for that parent, the split key is a `(pid, name)` midpoint, excluding `_attr_`.
 
-A jumbo candidate does **not** move the shard directory. `JumboIsolationPlanner` writes `ShardHealthState::JumboIsolated { dedicated_node, dominant_pid }` onto the route. The chosen node is the registered node with the fewest jumbo routes, then the fewest other routes. With only the bootstrap node registered, that node is this process.
+A jumbo candidate does **not** move the shard directory. `JumboIsolationPlanner` writes `ShardHealthState::JumboIsolated { dedicated_node, dominant_pid }` onto the route. The chosen node is the registered node with the fewest jumbo routes, then the fewest other routes. With only the bootstrap node registered, that node is this process. That flag is detection. `reconcile_jumbo_placement` then writes `CELL_CONTROL_PLANE`. On one voter it records `LeaderOnDedicated` or `Blocked` and does not change the voter set. Automatic `transfer_leader` is not called: OpenRaft disables the leader lease before the peer answers, and this process cannot prove that older peers implement `TransferLeader`. A same-size voter replacement runs only when a node that is already a voter of some local shard can take the seat without lowering Raft fault tolerance. An already-correct leader is not recorded as this process's move. `DedicatedNodeNotShared` means that membership condition holds. It does not mean shard files moved to another machine. See [Scale control plane](./scale-control-plane-status.md).
 
 `enable_dual_mode_split` persists `split_mode = DualModeFineGrained` and `dual_mode_pid`. It does not itself copy keys. A later split uses the `(pid, name)` rule. The in-memory simulator (`CellLocalManager` in `control_plane.rs`) is a different type: its jumbo path returns `UnsplittableJumboShard` and its "scale to 3 voters" only edits a `BTreeMap`. Tests `T1`–`T6` exercise that simulator.
 
@@ -136,7 +136,7 @@ Split plans are stored in `CELL_MANAGER_STATE`. Crash points covered by `split_c
 | RPC | Behavior in this tree |
 | :--- | :--- |
 | `RegisterNode` | Inserts `(node_id, grpc_addr)` into this cell's `CELL_MANAGER_STATE` |
-| `StoreHeartbeat` | Does not install caller-supplied shard descriptors into the route cache. `metadbd` never sends this RPC |
+| `StoreHeartbeat` | For a registered node, fsyncs liveness into `CELL_CONTROL_PLANE`. The sender's heartbeat-file generation is required. A receiver with no row for that node accepts the current sequence, including values above 64. The same generation rejects a jump above 64, a stale sequence, and a conflicting body. A different generation is a new baseline, which is how a recreated sender file or a new leader recovers. A new sequence sooner than 1 second after the previous observation is rejected. Shard descriptors are annotations, not routes, and this record does not schedule splits or membership changes. A bound node instance must be repeated; an address-only registration has no second check. The shared bearer is still the only credential. The maintenance loop sends this process's own record, without shard descriptors, about every 3 seconds |
 | `GetRoutes` | `cell_id = 0` lists every cached route. An unknown non-zero `cell_id` returns an error instead of an empty shard list |
 | `AllocateIdBlock` | Allocates from the local durable allocator |
 | `AllocSplitPlan` / `ActivateSplit` | Forwards to the local cell manager |

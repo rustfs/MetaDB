@@ -1,6 +1,6 @@
 # EGM Subsystem Specification 1: Pure-Rust WAL-less LSM, `SnapshotGuard` MVCC & Locality-Aware Compaction (`metadb-storage`)
 
-* **Status**: Phase 0 Approved Specification
+* **Status**: Phase 0 design note. Not a first-launch acceptance of the running tree.
 * **Target Crate**: `crates/metadb-storage` (depends solely on `metadb-core` + pure-Rust utilities; zero C/C++ FFI)
 * **Primary Reference**: Zebin Ren ([@ZebinRen](https://github.com/ZebinRen)), Biao Cao, Kang Chen ([@kangchenPKU](https://github.com/kangchenPKU)), Zhihui Yin, Qiushi Chen, Jielong Jian, Jiwei Xiong, Xinxing Wang, Yan Xing, Liguo Duan, Ran Zheng, Xianjun Meng, and Zhenyu Hou, *"MetaDB: Putting File-System Structure Back into Distributed Databases"*, [arXiv:2610.32247v1](https://arxiv.org/html/2610.32247v1) (Vrije Universiteit Amsterdam, Baidu & Peking University, 2026), §3.2 & §6
 * **Semantic Boundaries**:
@@ -25,7 +25,7 @@ At the same time, omitting version metadata inside SSTables introduces two letha
 
 ### Goals
 * **G1 (Pluggable Pure-Rust WAL-less LSM)**: Provide a trait-abstracted `StorageBackend` backed by a disk-persistent sorted SSTable engine (`LsmStorageBackend`) with zero local KV WAL files (relying on `metadb-raft` for pre-flush durability).
-* **G2 (Mathematically Sound Unversioned SSTable Flush)**: Guarantee Snapshot Isolation within the `5,000ms` transaction window via `ActiveSnapshotRegistry` (`SnapshotGuard`) while writing **only** unversioned collapsed values or single physical tombstones to disk (`~60%` KV write reduction, zero double-tombstones).
+* **G2 (Unversioned SSTable flush)**: `ActiveSnapshotRegistry` holds an `ImmMemTable` until `min_active_snapshot_hlc >= imm.max_hlc`, then writes a collapsed unversioned value or one physical tombstone. That is not a guarantee of zero future-read or phantom anomalies. Collapse may keep only the latest value. A range read at `start_hlc` can include later values of keys an open 2PC lease does not cover. Point reads of keys that lease records stay at the pre-image until commit. The `~60%` KV write reduction is a paper/model figure from `arXiv:2610.32247v1`, not a ratio asserted by `mvcc_snapshot_tests.rs`.
 * **G3 (Coordinated Flush Barrier)**: Allow upper-layer `AsyncAttrAggregator` (`_attr_` folded deltas) and `AuxOutbox` (`[0x07]` overflow spills) to inject deterministic key-value entries atomically into the sealing `ImmMemTable` flush batch before `lsm_flushed_index` advances.
 * **G4 (Bottommost-Safe Locality-Aware Compaction)**: Track physical tombstone density per 9-byte spatial prefix bucket (`[table_prefix][group_key: 8B]`) and compact dense buckets down to the deepest overlapping SSTable level so physical tombstones are legally purged in milliseconds.
 * **G5 (Zero-Copy Checkpoint for Raft Snapshots)**: Materialize consistent point-in-time shard snapshots via hard-linked immutable `.sst` files and a standalone `MANIFEST`.
@@ -93,7 +93,7 @@ When `imm` flushes to L0 SSTable, $H_{\text{disk}}$ advances to $\max(H_{\text{d
 * Every mutation with $hlc > H_{\text{disk}}$ still resides in younger `ImmMemTable`s or the active `MemTable` with full `(hlc, MvccValue)` chains.
 * During `get(K, &g)` or `scan([start, end), &g)`:
   1. Inspect `ActiveMemTable` then `ImmMemTable`s from newest to oldest for the latest version of `K` with $v.\text{hlc} \le g.\text{read\_hlc}$. If found, return `Some(v)` or `None` (if `MvccValue::Tombstone`) immediately without consulting older `ImmMemTable`s or SSTables.
-  2. If no version with $v.\text{hlc} \le g.\text{read\_hlc}$ exists in memory, `K` experienced zero mutations in $(H_{\text{disk}}, g.\text{read\_hlc}]$. Therefore, `K`'s exact value at $g.\text{read\_hlc}$ equals its collapsed state at $H_{\text{disk}}$ in `L0..L3` SSTables.
+  2. If no version with $v.\text{hlc} \le g.\text{read\_hlc}$ exists in memory, the flush-gate argument treats `K` as unchanged in $(H_{\text{disk}}, g.\text{read\_hlc}]$. That argument does not cover an open 2PC lease. Collapse may retain only the latest value of a prepared key, which is still the pre-image until commit, and it does not pin every older version of other keys. A range read at `start_hlc` can include later values of keys the lease does not cover.
 
 ### 6.3 Coordinated Flush Barrier API
 When sealing `ActiveMemTable` at `max_raft_index = M`:

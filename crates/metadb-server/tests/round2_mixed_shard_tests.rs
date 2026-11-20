@@ -6,6 +6,7 @@ async fn all_tables_single_shard_configuration_must_support_split() {
     let mut cfg = ServerTomlConfig::default();
     cfg.node.data_dir = dir.path().to_path_buf();
     cfg.node.grpc_listen_addr = "127.0.0.1:0".into();
+    cfg.security.allow_unauthenticated = true;
     cfg.sharding.bootstrap_table_shards = false;
     let (cluster, _) = PersistentMetaDbCluster::open_and_serve(cfg).await.unwrap();
     let tx = cluster.tx_router();
