@@ -135,15 +135,17 @@ impl Operability {
 /// An empty shard list is not ready. A healthy shard list does not override
 /// `Starting`, `ShuttingDown`, or `Failed`.
 pub fn evaluate_readiness(phase: ProcessPhase, shards: &[ShardGate]) -> ReadinessReport {
-    evaluate_process_readiness(phase, shards, false)
+    evaluate_process_readiness(phase, shards, false, false)
 }
 
 /// `directory_only` is a `global-manager` with no local Raft groups.
+/// `proxy_gateway` is a `proxy` that forwards to one upstream and hosts no shards.
 /// An empty shard list is still not ready for every other role.
 pub fn evaluate_process_readiness(
     phase: ProcessPhase,
     shards: &[ShardGate],
     directory_only: bool,
+    proxy_gateway: bool,
 ) -> ReadinessReport {
     let blocked = |reason: &'static str| ReadinessReport {
         live: phase != ProcessPhase::Failed,
@@ -168,6 +170,14 @@ pub fn evaluate_process_readiness(
                         ready: true,
                         phase,
                         reason: "directory_only",
+                    };
+                }
+                if proxy_gateway {
+                    return ReadinessReport {
+                        live: true,
+                        ready: true,
+                        phase,
+                        reason: "proxy_gateway",
                     };
                 }
                 return blocked("no_local_shards");
@@ -299,9 +309,13 @@ mod tests {
             evaluate_readiness(ProcessPhase::Serving, &[]).reason,
             "no_local_shards"
         );
-        let directory = evaluate_process_readiness(ProcessPhase::Serving, &[], true);
+        let directory = evaluate_process_readiness(ProcessPhase::Serving, &[], true, false);
         assert!(directory.ready);
         assert_eq!(directory.reason, "directory_only");
+        let proxy = evaluate_process_readiness(ProcessPhase::Serving, &[], false, true);
+        assert!(proxy.ready);
+        assert_eq!(proxy.reason, "proxy_gateway");
+        assert!(!evaluate_process_readiness(ProcessPhase::Serving, &[], false, false).ready);
     }
 
     #[test]

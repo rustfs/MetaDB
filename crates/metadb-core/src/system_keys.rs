@@ -256,6 +256,25 @@ impl WriteIntentRecord {
     }
 }
 
+/// `true` when this `0x0D` row must be deleted.
+///
+/// A row is an orphan when it does not decode, or when its transaction is not in
+/// `live_txns`. A live holder or pending record keeps the row. This does not
+/// invent a pre-image and does not wait for tombstone compaction.
+pub fn lease_preimage_is_orphan(
+    storage_key: &[u8],
+    raw: &[u8],
+    live_txns: &BTreeSet<TxnId>,
+) -> bool {
+    if storage_key.first().copied() != Some(SYSTEM_PREFIX_LEASE_PREIMAGE) {
+        return false;
+    }
+    match decode_lease_preimage(storage_key, raw) {
+        Some((txn_id, _, _, _)) => !live_txns.contains(&txn_id),
+        None => true,
+    }
+}
+
 /// A live `0x0D` row blocks a split. A corrupt row is fatal. Absence is success.
 pub fn lease_preimage_blocks_split(storage_key: &[u8], raw: &[u8]) -> Result<()> {
     if storage_key.first().copied() != Some(SYSTEM_PREFIX_LEASE_PREIMAGE) {
@@ -815,6 +834,23 @@ mod lease_preimage_codec_tests {
             decoded.resolved_fence_holders().unwrap()[&owner].start_hlc,
             Some(HlcTimestamp::new(5_000, 0))
         );
+    }
+
+    #[test]
+    fn orphan_and_corrupt_preimages_are_collected_without_touching_a_live_txn() {
+        let user_key = MetaKey::child(1, "a").encode();
+        let live_key = lease_preimage_key(7, &user_key);
+        let orphan_key = lease_preimage_key(8, &user_key);
+        let body = encode_lease_preimage(
+            HlcTimestamp::new(1_000, 0),
+            &LeasePreimageValue::Value(b"v".to_vec()),
+        );
+        let mut live = std::collections::BTreeSet::new();
+        live.insert(7u128);
+        assert!(!lease_preimage_is_orphan(&live_key, &body, &live));
+        assert!(lease_preimage_is_orphan(&orphan_key, &body, &live));
+        assert!(lease_preimage_is_orphan(&orphan_key, b"corrupt", &live));
+        assert!(!lease_preimage_is_orphan(&user_key, &body, &live));
     }
 
     #[test]

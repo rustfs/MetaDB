@@ -75,7 +75,7 @@ A second `metadbd --role all-in-one` can join the **same** cell when `--join` or
 
 ### Step 3.1: Voters inside one cell
 
-Do not start `metadbd --role be`. That role exits in `open_and_serve`, so those commands are not a runbook. `metadb-ctl raft scale-replicas` calls `ScaleShardReplicas` and requires the requested voter count to already be registered in the cell. A fresh all-in-one cell has one node, so `--target-voters 3` fails until those nodes exist. The constraints are in [Operations](../../fr/operations.md).
+`metadbd --role be` hosts local Raft replicas. It is not a remote disk that a cell manager places a shard onto by itself. `metadb-ctl raft scale-replicas` calls `ScaleShardReplicas` and requires the requested voter count to already be registered in the cell. A fresh all-in-one cell has one node, so `--target-voters 3` fails until those nodes exist. The constraints are in [Operations](../../fr/operations.md).
 
 ### Step 3.2: Design model for a disaggregated topology (`100B – 10T+` records)
 

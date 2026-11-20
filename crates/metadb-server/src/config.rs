@@ -24,8 +24,9 @@ use metadb_transport::{
 /// `all-in-one` hosts the global directory, the cell, and local Raft groups.
 /// `global-manager` hosts only the cell directory. `cell-manager` hosts one
 /// cell and its local Raft groups, and can publish that cell to a
-/// `global-manager`. `be` and `proxy` are parsed and still rejected: there is
-/// no remote shard host and no forwarding router.
+/// `global-manager`. `be` hosts local Raft replicas and serves their metadata.
+/// It does not publish a cell or mint id blocks. `proxy` forwards metadata and
+/// transactions to one `[ClusterSection::upstream]` and does not open Raft.
 ///
 /// A second all-in-one process joins an existing Raft group when [`ClusterSection::join`]
 /// is set and its data directory does not already own a cell.
@@ -293,6 +294,9 @@ pub struct ClusterSection {
     /// to publish this cell after the listener is up. Empty means this process
     /// does not register anywhere.
     pub global_manager: String,
+    /// `host:port` of one shard host. Only `proxy` uses it. The proxy forwards
+    /// metadata and transaction RPCs there and does not open a Raft group.
+    pub upstream: String,
 }
 
 /// Top-level TOML configuration matching `docs/guides/{en,ja,fr,zh,de}/deployment.md`.

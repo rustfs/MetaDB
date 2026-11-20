@@ -3,7 +3,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
 use metadb_cluster::{
@@ -15,9 +18,12 @@ use metadb_core::{
     AuxOutboxEntry, CompositeKeyRange, HlcTimestamp, MetaDbError, ShardEpoch, TxnState,
     WriteIntentKey, WriteIntentRecord,
 };
+use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::control_plane_service_server::ControlPlaneService;
+use metadb_proto::metadata_service_client::MetadataServiceClient;
 use metadb_proto::metadata_service_server::MetadataService;
 use metadb_proto::sql_param_value;
+use metadb_proto::transaction_service_client::TransactionServiceClient;
 use metadb_proto::transaction_service_server::TransactionService;
 use metadb_proto::*;
 use metadb_proxy::{ProxySqlResult, SqlParam, StatelessProxyRouter};
@@ -141,8 +147,12 @@ pub struct MetaDbGrpcService {
     role: Option<metadb_security::RolePresentation>,
     /// `global-manager` publishes routes and does not mint ids or rename leases.
     directory_only: bool,
-    /// `cell-manager` keeps its own cell and refuses to store a remote cell.
+    /// `cell-manager` and `be` keep their own cell and refuse to store a remote cell.
     accepts_remote_cells: bool,
+    /// `be` serves shard replicas and does not mint id blocks or rename leases.
+    shard_host_only: bool,
+    /// `proxy` forwards metadata and transactions to this one shard host.
+    upstream: Option<String>,
 }
 
 impl MetaDbGrpcService {
@@ -160,6 +170,8 @@ impl MetaDbGrpcService {
             role: None,
             directory_only: false,
             accepts_remote_cells: true,
+            shard_host_only: false,
+            upstream: None,
         }
     }
 
@@ -194,10 +206,105 @@ impl MetaDbGrpcService {
         self
     }
 
+    pub fn with_shard_host_only(mut self, shard_host_only: bool) -> Self {
+        self.shard_host_only = shard_host_only;
+        self
+    }
+
+    pub fn with_upstream(mut self, upstream: impl Into<String>) -> Self {
+        self.upstream = Some(upstream.into());
+        self
+    }
+
     fn directory_only_error() -> MetaDbError {
         MetaDbError::ShardRoutingError(
             "global-manager does not allocate ids or rename leases".to_string(),
         )
+    }
+
+    fn shard_host_error() -> MetaDbError {
+        MetaDbError::ShardRoutingError(
+            "be hosts shard replicas and does not allocate ids or rename leases".to_string(),
+        )
+    }
+
+    fn proxy_control_error() -> MetaDbError {
+        MetaDbError::ShardRoutingError(
+            "proxy forwards metadata to one upstream and does not host the control plane"
+                .to_string(),
+        )
+    }
+
+    async fn dial_upstream(&self) -> std::result::Result<Channel, Status> {
+        let Some(upstream) = self.upstream.as_deref() else {
+            return Err(Status::internal("proxy upstream is not configured"));
+        };
+        let endpoint = self
+            .transport_security
+            .prepare_url(upstream)
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "proxy upstream is not usable with the configured transport: {error}"
+                ))
+            })?;
+        let channel = Endpoint::from_shared(endpoint.clone())
+            .map_err(|error| {
+                Status::unavailable(format!("proxy upstream {endpoint} is invalid: {error}"))
+            })?
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(10));
+        self.transport_security
+            .connect(channel)
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "proxy upstream {endpoint} is not reachable: {error}"
+                ))
+            })
+    }
+
+    fn bearer(&self) -> crate::BearerAuthClient {
+        let mut auth = crate::BearerAuthClient::new(self.forward_secret.clone());
+        if let Some(role) = &self.role {
+            auth = auth.with_role(role.clone());
+        }
+        auth
+    }
+
+    async fn metadata_client(
+        &self,
+    ) -> std::result::Result<
+        MetadataServiceClient<InterceptedService<Channel, crate::BearerAuthClient>>,
+        Status,
+    > {
+        Ok(MetadataServiceClient::with_interceptor(
+            self.dial_upstream().await?,
+            self.bearer(),
+        ))
+    }
+
+    async fn transaction_client(
+        &self,
+    ) -> std::result::Result<
+        TransactionServiceClient<InterceptedService<Channel, crate::BearerAuthClient>>,
+        Status,
+    > {
+        Ok(TransactionServiceClient::with_interceptor(
+            self.dial_upstream().await?,
+            self.bearer(),
+        ))
+    }
+
+    async fn control_client(
+        &self,
+    ) -> std::result::Result<
+        ControlPlaneServiceClient<InterceptedService<Channel, crate::BearerAuthClient>>,
+        Status,
+    > {
+        Ok(ControlPlaneServiceClient::with_interceptor(
+            self.dial_upstream().await?,
+            self.bearer(),
+        ))
     }
 
     fn server_hlc(&self) -> u64 {
@@ -221,6 +328,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<CreateFileRequest>,
     ) -> Result<Response<CreateFileResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.create_file(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         let caller_hlc = req.header.as_ref().map(|h| h.caller_hlc).unwrap_or(0);
         if let Err(e) = self.observe_caller_hlc(caller_hlc) {
@@ -260,6 +372,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<MkdirRequest>,
     ) -> Result<Response<MkdirResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.mkdir(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         let caller_hlc = req.header.as_ref().map(|h| h.caller_hlc).unwrap_or(0);
         if let Err(e) = self.observe_caller_hlc(caller_hlc) {
@@ -291,6 +408,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<UnlinkRequest>,
     ) -> Result<Response<UnlinkResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.unlink(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         match self.tx_router.unlink(req.pid, &req.name).await {
             Ok(attr) => Ok(Response::new(UnlinkResponse {
@@ -310,6 +432,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<RmdirRequest>,
     ) -> Result<Response<RmdirResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.rmdir(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         match self.tx_router.rmdir(req.pid, &req.name).await {
             Ok(attr) => Ok(Response::new(RmdirResponse {
@@ -329,6 +456,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<SetAttrRequest>,
     ) -> Result<Response<SetAttrResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.set_attr(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         let patch = SetAttrPatch {
             mode: req.has_mode.then_some(req.mode),
@@ -357,6 +489,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<LookupRequest>,
     ) -> Result<Response<LookupResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.lookup(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         match self.tx_router.lookup(req.pid, &req.name).await {
             Ok(Some(entry)) => Ok(Response::new(LookupResponse {
@@ -384,6 +521,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<DirStatRequest>,
     ) -> Result<Response<DirStatResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.dir_stat(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         match self.tx_router.dirstat(req.pid).await {
             Ok(attr) => Ok(Response::new(DirStatResponse {
@@ -403,6 +545,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<GetDirPartitionStatRequest>,
     ) -> Result<Response<GetDirPartitionStatResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.get_dir_partition_stat(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         let Some(hdr) = req.header else {
             return Err(Status::invalid_argument("missing routing header"));
@@ -444,6 +591,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<ListDirRequest>,
     ) -> Result<Response<ListDirResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.list_dir(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         let after = (!req.after_name.is_empty()).then_some(req.after_name.as_str());
         let pfx = (!req.name_prefix.is_empty()).then_some(req.name_prefix.as_str());
@@ -473,6 +625,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<ExecuteSqlRequest>,
     ) -> Result<Response<ExecuteSqlResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.execute_sql(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         if let Err(e) = self.observe_caller_hlc(req.caller_hlc) {
             return Ok(Response::new(ExecuteSqlResponse {
@@ -538,6 +695,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<GetQuotaRequest>,
     ) -> Result<Response<GetQuotaResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.get_quota(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         match self.tx_router.get_quota(req.uid).await {
             Ok(Some(rec)) => Ok(Response::new(GetQuotaResponse {
@@ -562,6 +724,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<SetQuotaLimitRequest>,
     ) -> Result<Response<SetQuotaLimitResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.set_quota_limit(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         match self
             .tx_router
@@ -583,6 +750,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<ListQuotasRequest>,
     ) -> Result<Response<ListQuotasResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.list_quotas(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         match self
             .tx_router
@@ -604,6 +776,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<GetSecondaryIndexRequest>,
     ) -> Result<Response<GetSecondaryIndexResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.get_secondary_index(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         match self.tx_router.get_secondary_index(req.fid).await {
             Ok(Some(rec)) => Ok(Response::new(GetSecondaryIndexResponse {
@@ -628,6 +805,11 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<ScanSecondaryIndexRequest>,
     ) -> Result<Response<ScanSecondaryIndexResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.metadata_client().await?;
+            return client.scan_secondary_index(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         match self
             .tx_router
@@ -652,6 +834,11 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<RenameRequest>,
     ) -> Result<Response<RenameResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.transaction_client().await?;
+            return client.rename(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         if let Err(e) = self.observe_caller_hlc(req.caller_hlc) {
             return Ok(Response::new(RenameResponse {
@@ -688,6 +875,11 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<Prepare2pcRequest>,
     ) -> Result<Response<Prepare2pcResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.transaction_client().await?;
+            return client.prepare2pc(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         let Some(hdr) = req.header else {
             return Err(Status::invalid_argument("missing routing header"));
@@ -763,6 +955,11 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<CommitPrimary2pcRequest>,
     ) -> Result<Response<CommitPrimary2pcResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.transaction_client().await?;
+            return client.commit_primary2pc(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         let Some(hdr) = req.header else {
             return Err(Status::invalid_argument("missing header"));
@@ -803,6 +1000,11 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<CommitSecondary2pcRequest>,
     ) -> Result<Response<CommitSecondary2pcResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.transaction_client().await?;
+            return client.commit_secondary2pc(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         let Some(hdr) = req.header else {
             return Err(Status::invalid_argument("missing header"));
@@ -854,6 +1056,11 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<Abort2pcRequest>,
     ) -> Result<Response<Abort2pcResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.transaction_client().await?;
+            return client.abort2pc(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         let Some(hdr) = req.header else {
             return Err(Status::invalid_argument("missing header"));
@@ -888,6 +1095,11 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<CheckTxnStatusRequest>,
     ) -> Result<Response<CheckTxnStatusResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.transaction_client().await?;
+            return client.check_txn_status(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         let (_, grp, _) = match self.global_manager.route_user_key(&req.primary_key) {
             Ok(t) => t,
@@ -937,6 +1149,11 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<ApplyAuxBatchRequest>,
     ) -> Result<Response<ApplyAuxBatchResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.transaction_client().await?;
+            return client.apply_aux_batch(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         let Some(hdr) = req.header else {
             return Err(Status::invalid_argument("missing header"));
@@ -987,6 +1204,11 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<ForwardRouterRequest>,
     ) -> Result<Response<ForwardRouterResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.transaction_client().await?;
+            return client.forward_router(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         match self.tx_router.execute_forwarded_bytes(&req.op).await {
             Ok(result) => Ok(Response::new(ForwardRouterResponse {
@@ -1007,6 +1229,11 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<RegisterNodeRequest>,
     ) -> Result<Response<RegisterNodeResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(RegisterNodeResponse { error: Some(error) }));
+        }
+
         let req = request.into_inner();
         let Some(cell) = self.global_manager.get_cell(req.cell_id) else {
             let e = MetaDbError::ShardRoutingError(format!("unknown cell {}", req.cell_id));
@@ -1037,6 +1264,11 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<StoreHeartbeatRequest>,
     ) -> Result<Response<StoreHeartbeatResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(StoreHeartbeatResponse { error: Some(error) }));
+        }
+
         // Shard descriptors in this RPC are annotations. They are not installed
         // into `CompositeMetaCache` and they do not schedule splits.
         let req = request.into_inner();
@@ -1095,6 +1327,11 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<GetRoutesRequest>,
     ) -> Result<Response<GetRoutesResponse>, Status> {
+        if self.upstream.is_some() {
+            let mut client = self.control_client().await?;
+            return client.get_routes(request.into_inner()).await;
+        }
+
         let req = request.into_inner();
         let (routes, cluster_id) = if req.cell_id == 0 {
             let cells = self.global_manager.all_cells();
@@ -1166,8 +1403,24 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<AllocateIdBlockRequest>,
     ) -> Result<Response<AllocateIdBlockResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(AllocateIdBlockResponse {
+                error: Some(error),
+                ..Default::default()
+            }));
+        }
+
         if self.directory_only {
             let error = Self::directory_only_error();
+            return Ok(Response::new(AllocateIdBlockResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+                start_id: 0,
+                count: 0,
+            }));
+        }
+        if self.shard_host_only {
+            let error = Self::shard_host_error();
             return Ok(Response::new(AllocateIdBlockResponse {
                 error: Some(ErrorDetailProto::from(&error)),
                 start_id: 0,
@@ -1204,6 +1457,14 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<AllocSplitPlanRequest>,
     ) -> Result<Response<AllocSplitPlanResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(AllocSplitPlanResponse {
+                error: Some(error),
+                ..Default::default()
+            }));
+        }
+
         let req = request.into_inner();
         let Some(cell) = self.global_manager.get_cell(req.cell_id) else {
             let e = MetaDbError::ShardRoutingError(format!("unknown cell {}", req.cell_id));
@@ -1234,6 +1495,11 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<ActivateSplitRequest>,
     ) -> Result<Response<ActivateSplitResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(ActivateSplitResponse { error: Some(error) }));
+        }
+
         let req = request.into_inner();
         let Some(cell) = self.global_manager.get_cell(req.cell_id) else {
             let e = MetaDbError::ShardRoutingError(format!("unknown cell {}", req.cell_id));
@@ -1264,8 +1530,24 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<AcquireDirRenameLeaseRequest>,
     ) -> Result<Response<AcquireDirRenameLeaseResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(AcquireDirRenameLeaseResponse {
+                error: Some(error),
+                ..Default::default()
+            }));
+        }
+
         if self.directory_only {
             let error = Self::directory_only_error();
+            return Ok(Response::new(AcquireDirRenameLeaseResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+                rename_fence_token: 0,
+                expire_hlc: 0,
+            }));
+        }
+        if self.shard_host_only {
+            let error = Self::shard_host_error();
             return Ok(Response::new(AcquireDirRenameLeaseResponse {
                 error: Some(ErrorDetailProto::from(&error)),
                 rename_fence_token: 0,
@@ -1295,8 +1577,21 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<ReleaseDirRenameLeaseRequest>,
     ) -> Result<Response<ReleaseDirRenameLeaseResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(ReleaseDirRenameLeaseResponse {
+                error: Some(error),
+            }));
+        }
+
         if self.directory_only {
             let error = Self::directory_only_error();
+            return Ok(Response::new(ReleaseDirRenameLeaseResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+            }));
+        }
+        if self.shard_host_only {
+            let error = Self::shard_host_error();
             return Ok(Response::new(ReleaseDirRenameLeaseResponse {
                 error: Some(ErrorDetailProto::from(&error)),
             }));
@@ -1318,6 +1613,14 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<TriggerShardSplitRequest>,
     ) -> Result<Response<TriggerShardSplitResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(TriggerShardSplitResponse {
+                error: Some(error),
+                ..Default::default()
+            }));
+        }
+
         let req = request.into_inner();
         for cell in self.global_manager.all_cells() {
             if cell
@@ -1356,6 +1659,13 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<EnableDualModeSplitRequest>,
     ) -> Result<Response<EnableDualModeSplitResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(EnableDualModeSplitResponse {
+                error: Some(error),
+            }));
+        }
+
         let req = request.into_inner();
         for cell in self.global_manager.all_cells() {
             if cell
@@ -1381,6 +1691,14 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<ScaleShardReplicasRequest>,
     ) -> Result<Response<ScaleShardReplicasResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(ScaleShardReplicasResponse {
+                error: Some(error),
+                ..Default::default()
+            }));
+        }
+
         let req = request.into_inner();
         let Some(cell) = self.global_manager.get_cell(req.cell_id) else {
             let e = MetaDbError::ShardRoutingError(format!("unknown cell {}", req.cell_id));
@@ -1409,9 +1727,14 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<RegisterCellRequest>,
     ) -> Result<Response<RegisterCellResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(RegisterCellResponse { error: Some(error) }));
+        }
+
         if !self.accepts_remote_cells {
             let error = MetaDbError::ShardRoutingError(
-                "cell-manager does not store a remote cell; register it with the global-manager"
+                "this process does not store a remote cell; register it with the global-manager"
                     .to_string(),
             );
             return Ok(Response::new(RegisterCellResponse {
