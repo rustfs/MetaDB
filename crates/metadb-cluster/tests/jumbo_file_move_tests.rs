@@ -114,3 +114,44 @@ async fn restart_after_move_live_does_not_open_the_old_directory() {
     assert!(published.join("raft").is_dir());
     host.shutdown_all().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_rename_dirsync_failure_does_not_reopen_the_old_directory() {
+    let dir = tempdir().unwrap();
+    let disk = tempdir().unwrap();
+    let (host, cell) = open_cell(dir.path(), None).await;
+    let source = host.shard_dir(1);
+    cell.testing_mark_local_jumbo(1, 9).unwrap();
+    metadb_cluster::jumbo_files::testing_fail_next_live_dirsync(2);
+    let failed = cell
+        .relocate_jumbo_shard_files(1, disk.path())
+        .await
+        .unwrap_err();
+    assert!(
+        failed.to_string().contains("directory fsync failed"),
+        "{failed}"
+    );
+    assert!(failed.to_string().contains("not reopened"), "{failed}");
+    assert!(source.exists(), "old directory must stay");
+    assert!(
+        host.get_group(1).is_none(),
+        "the old directory must not be reopened"
+    );
+    let published = disk.path().join("shards").join(format!("{:020}", 1u64));
+    assert!(
+        metadb_cluster::jumbo_files::load_live_dir(disk.path(), 1)
+            .unwrap()
+            .is_some(),
+        "MOVE_LIVE stays visible"
+    );
+    assert!(published.join("raft").is_dir());
+    host.shutdown_all().await.unwrap();
+    drop(cell);
+    drop(host);
+
+    let (host, cell) = open_cell(dir.path(), Some(disk.path())).await;
+    assert!(!host.shard_dir(1).exists());
+    assert!(cell.lookup_local_handle(1).is_ok());
+    assert!(published.join("JUMBO_FILE_MOVE").is_file());
+    host.shutdown_all().await.unwrap();
+}

@@ -10,6 +10,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,33 @@ pub const JUMBO_MOVE_FILE: &str = "JUMBO_FILE_MOVE";
 const MOVE_VERSION: u32 = 1;
 pub const MOVE_STAGED: u32 = 1;
 pub const MOVE_LIVE: u32 = 2;
+
+static FAIL_LIVE_DIRSYNC: AtomicU32 = AtomicU32::new(0);
+
+/// The next `n` directory fsyncs after a successful `MOVE_LIVE` rename fail.
+/// The renamed file stays visible.
+pub fn testing_fail_next_live_dirsync(n: u32) {
+    FAIL_LIVE_DIRSYNC.store(n, Ordering::Relaxed);
+}
+
+/// Why [`write_move_phase`] failed.
+#[derive(Debug)]
+pub enum MovePhaseError {
+    /// The phase name is not visible. A staged copy was not published.
+    NotPublished(String),
+    /// `MOVE_LIVE` was renamed into place. The following directory fsync failed.
+    LiveVisibleDirSyncFailed(String),
+}
+
+impl std::fmt::Display for MovePhaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPublished(message) | Self::LiveVisibleDirSyncFailed(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
 
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
@@ -187,7 +215,7 @@ pub fn write_move_phase(
     shard_id: ShardId,
     phase: u32,
     files: &[MovedFile],
-) -> Result<()> {
+) -> std::result::Result<(), MovePhaseError> {
     let record = MoveRecord {
         version: MOVE_VERSION,
         shard_id,
@@ -195,23 +223,54 @@ pub fn write_move_phase(
         files: files.to_vec(),
     };
     let mut raw = codec::serialize(&record)
-        .map_err(|error| MetaDbError::CodecError(format!("{JUMBO_MOVE_FILE}: {error}")))?;
+        .map_err(|error| MovePhaseError::NotPublished(format!("{JUMBO_MOVE_FILE}: {error}")))?;
     append_crc32c_le(&mut raw);
     let path = dest.join(JUMBO_MOVE_FILE);
-    refuse_symlink_allow_missing(&path)?;
+    refuse_symlink_allow_missing(&path)
+        .map_err(|error| MovePhaseError::NotPublished(error.to_string()))?;
     let tmp = dest.join(format!("{JUMBO_MOVE_FILE}.tmp"));
     {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&tmp)?;
-        file.write_all(&raw)?;
-        file.sync_data()?;
+            .open(&tmp)
+            .map_err(|error| MovePhaseError::NotPublished(error.to_string()))?;
+        file.write_all(&raw)
+            .map_err(|error| MovePhaseError::NotPublished(error.to_string()))?;
+        file.sync_data()
+            .map_err(|error| MovePhaseError::NotPublished(error.to_string()))?;
     }
-    fs::rename(&tmp, &path)?;
-    sync_dir(dest)?;
+    fs::rename(&tmp, &path).map_err(|error| {
+        MovePhaseError::NotPublished(format!(
+            "{JUMBO_MOVE_FILE} rename failed and the phase is not visible: {error}"
+        ))
+    })?;
+    // The new name is visible. A directory fsync failure must not hide that.
+    if let Err(error) = sync_published_dir(dest, phase) {
+        if phase == MOVE_LIVE {
+            return Err(MovePhaseError::LiveVisibleDirSyncFailed(error));
+        }
+        return Err(MovePhaseError::NotPublished(error));
+    }
     Ok(())
+}
+
+fn sync_published_dir(dest: &Path, phase: u32) -> std::result::Result<(), String> {
+    let attempts = if phase == MOVE_LIVE { 2 } else { 1 };
+    let mut last = String::new();
+    for _ in 0..attempts {
+        if phase == MOVE_LIVE && FAIL_LIVE_DIRSYNC.load(Ordering::Relaxed) > 0 {
+            FAIL_LIVE_DIRSYNC.fetch_sub(1, Ordering::Relaxed);
+            last = format!("{JUMBO_MOVE_FILE} is visible but the directory fsync failed");
+            continue;
+        }
+        match sync_dir(dest) {
+            Ok(()) => return Ok(()),
+            Err(error) => last = error.to_string(),
+        }
+    }
+    Err(last)
 }
 
 pub fn remove_tree(path: &Path) -> Result<()> {

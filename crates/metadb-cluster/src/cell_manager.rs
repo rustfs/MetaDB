@@ -38,7 +38,7 @@ use crate::identity::{node_id_in_ha_range, random_id, ClusterIdentity};
 use crate::jumbo::JumboIsolationPlanner;
 use crate::jumbo_files::{
     copy_shard_tree, load_live_dir, refuse_dedicated_root, remove_tree, shard_move_dir,
-    write_move_phase, MOVE_LIVE, MOVE_STAGED,
+    write_move_phase, MovePhaseError, MOVE_LIVE, MOVE_STAGED,
 };
 use crate::jumbo_placement::{
     automatic_leadership_transfer_allowed, executable_placement_actions,
@@ -991,15 +991,22 @@ impl DurableCellManager {
             let _ = remove_tree(&dest);
             self.open_shard_group(&route, &source).await?;
             self.jumbo_file_move_failed.lock().unwrap().insert(shard_id);
-            return Err(error);
+            return Err(MetaDbError::StorageIoError(error.to_string()));
         }
-        // MOVE_LIVE is durable before Raft opens dest. After this returns, a
-        // restart opens dest and must not delete it or reopen source.
+        // MOVE_LIVE is durable before Raft opens dest. After the LIVE rename
+        // is visible, a restart opens dest and must not delete it or reopen
+        // source, including when the directory fsync fails.
         if let Err(error) = write_move_phase(&dest, shard_id, MOVE_LIVE, &files) {
+            if matches!(error, MovePhaseError::LiveVisibleDirSyncFailed(_)) {
+                return Err(MetaDbError::StorageIoError(format!(
+                    "jumbo shard {shard_id} MOVE_LIVE is visible on {} but the directory fsync failed; the old directory was not reopened and the dedicated copy was not deleted: {error}",
+                    dest.display()
+                )));
+            }
             let _ = remove_tree(&dest);
             self.open_shard_group(&route, &source).await?;
             self.jumbo_file_move_failed.lock().unwrap().insert(shard_id);
-            return Err(error);
+            return Err(MetaDbError::StorageIoError(error.to_string()));
         }
         if let Err(error) = self.open_shard_group(&route, &dest).await {
             return Err(MetaDbError::StorageIoError(format!(
