@@ -33,6 +33,10 @@ use crate::control_plane_state::{
     unix_ms, HeartbeatDecision, HeartbeatWrite, PersistedControlPlane, StoredHeartbeat,
     StoredPlacement, CONTROL_PLANE_FILE, CONTROL_PLANE_VERSION, PLACEMENT_RETRY_MS,
 };
+use crate::heartbeat_scheduler::{
+    capture_mono_ns, HeartbeatScheduler, LivenessDecision, MeasuredSample, MeasurementReject,
+    ScheduleNow,
+};
 use crate::id_allocator::{AllocIdKind, DurableIdAllocator};
 use crate::identity::{node_id_in_ha_range, random_id, ClusterIdentity};
 use crate::jumbo::JumboIsolationPlanner;
@@ -165,6 +169,8 @@ pub struct DurableCellManager {
     instance_bindings: Arc<Mutex<BTreeMap<NodeId, (u128, String)>>>,
     /// Heartbeats and jumbo placement records. Not a route table.
     control: Mutex<PersistedControlPlane>,
+    /// Measured recv and round-trip samples. Not reloaded from `CELL_CONTROL_PLANE`.
+    liveness: Mutex<HeartbeatScheduler>,
     /// Test hook: the next `n` `CELL_CONTROL_PLANE` persists fail before touching disk.
     fail_control_persists: AtomicU32,
     /// Test hook: the next `n` persists rename the file and then fail the directory sync.
@@ -343,6 +349,7 @@ impl DurableCellManager {
             membership_lock: tokio::sync::Mutex::new(()),
             instance_bindings: Arc::new(Mutex::new(BTreeMap::new())),
             control: Mutex::new(control_plane),
+            liveness: Mutex::new(HeartbeatScheduler::default()),
             fail_control_persists: AtomicU32::new(0),
             fail_control_dirsync: AtomicU32::new(0),
             jumbo_dedicated_root: Mutex::new(jumbo_dedicated_root),
@@ -461,6 +468,7 @@ impl DurableCellManager {
             membership_lock: tokio::sync::Mutex::new(()),
             instance_bindings: Arc::new(Mutex::new(BTreeMap::new())),
             control: Mutex::new(control_plane),
+            liveness: Mutex::new(HeartbeatScheduler::default()),
             fail_control_persists: AtomicU32::new(0),
             fail_control_dirsync: AtomicU32::new(0),
             jumbo_dedicated_root: Mutex::new(None),
@@ -2444,13 +2452,17 @@ impl DurableCellManager {
     }
 
     pub fn local_heartbeat_is_fresh(&self, now_ms: u64, interval_ms: u64) -> bool {
+        if !crate::heartbeat_scheduler::wall_unix_ms_is_trusted(now_ms) {
+            return false;
+        }
         self.control
             .lock()
             .unwrap()
             .heartbeats
             .get(&self.host.node_id())
             .is_some_and(|heartbeat| {
-                now_ms.saturating_sub(heartbeat.observed_unix_ms) < interval_ms
+                now_ms >= heartbeat.observed_unix_ms
+                    && now_ms - heartbeat.observed_unix_ms < interval_ms
             })
     }
 
@@ -2480,9 +2492,11 @@ impl DurableCellManager {
 
     /// Records this process's own heartbeat. Shard descriptors from clients are not an input.
     /// Disk free space is left unknown; a zero is not stored as a measurement.
+    /// The wall stamp is not a measured heartbeat and is not recorded for the scheduler.
     pub fn publish_local_heartbeat(&self) -> Result<StoredHeartbeat> {
         let me = self.host.node_id();
         node_id_in_ha_range(me)?;
+        let observed_unix_ms = self.trusted_heartbeat_wall()?;
         let hosted = {
             let state = self.state.lock().unwrap();
             let mut ids: Vec<ShardId> = state
@@ -2504,7 +2518,7 @@ impl DurableCellManager {
         let write = HeartbeatWrite {
             node_id: me,
             seq,
-            observed_unix_ms: unix_ms(),
+            observed_unix_ms,
             disk_free_bytes: None,
             reported_shard_ids: Vec::new(),
             local_hosted_shard_ids: hosted,
@@ -2540,6 +2554,7 @@ impl DurableCellManager {
         observation_generation: u128,
     ) -> Result<()> {
         node_id_in_ha_range(node_id)?;
+        let observed_unix_ms = self.trusted_heartbeat_wall()?;
         if node_id == self.host.node_id() {
             return Err(MetaDbError::ShardRoutingError(
                 "refusing a remote heartbeat for the local node; this process writes its own heartbeat. Client shard descriptors are not applied to routes"
@@ -2565,7 +2580,7 @@ impl DurableCellManager {
         let write = HeartbeatWrite {
             node_id,
             seq,
-            observed_unix_ms: unix_ms(),
+            observed_unix_ms,
             disk_free_bytes,
             reported_shard_ids: reported,
             local_hosted_shard_ids: Vec::new(),
@@ -2575,7 +2590,7 @@ impl DurableCellManager {
         let decision = decide_heartbeat(guard.heartbeats.get(&node_id), &write)
             .map_err(MetaDbError::ShardRoutingError)?;
         match decision {
-            HeartbeatDecision::Replay(_) => Ok(()),
+            HeartbeatDecision::Replay(_) => {}
             HeartbeatDecision::Store(heartbeat) => {
                 if let Some(previous) = guard.heartbeats.get(&node_id) {
                     if remote_state_change_is_too_soon(
@@ -2590,9 +2605,127 @@ impl DurableCellManager {
                 }
                 let mut next = guard.clone();
                 next.heartbeats.insert(node_id, heartbeat);
-                self.store_control(&mut guard, next)
+                self.store_control(&mut guard, next)?;
             }
         }
+        drop(guard);
+        self.note_measured_recv(node_id, seq, observed_unix_ms);
+        Ok(())
+    }
+
+    fn trusted_heartbeat_wall(&self) -> Result<u64> {
+        self.liveness
+            .lock()
+            .unwrap()
+            .effective_wall_unix_ms()
+            .ok_or_else(|| {
+                MetaDbError::ShardRoutingError(
+                    "untrusted wall clock; the heartbeat was not stored and is not a scheduling input"
+                        .to_string(),
+                )
+            })
+    }
+
+    fn note_measured_recv(&self, node_id: NodeId, seq: u64, wall_unix_ms: u64) {
+        let sample = MeasuredSample {
+            node_id,
+            seq,
+            sent_mono_ns: None,
+            recv_mono_ns: capture_mono_ns(),
+            wall_unix_ms,
+        };
+        if let Err(error) = self.liveness.lock().unwrap().record(sample) {
+            tracing::debug!(
+                node_id,
+                seq,
+                ?error,
+                "recv heartbeat was not a trusted measurement"
+            );
+        }
+    }
+
+    /// Records a send/ack round trip for `node_id`. A zero or backwards gap is ignored.
+    /// An untrusted wall clock records nothing. This does not change routes.
+    pub fn record_acknowledged_round_trip(
+        &self,
+        node_id: NodeId,
+        seq: u64,
+        sent_mono_ns: u64,
+        recv_mono_ns: u64,
+    ) {
+        let mut scheduler = self.liveness.lock().unwrap();
+        let Some(wall_unix_ms) = scheduler.effective_wall_unix_ms() else {
+            return;
+        };
+        let sample = MeasuredSample {
+            node_id,
+            seq,
+            sent_mono_ns: Some(sent_mono_ns),
+            recv_mono_ns,
+            wall_unix_ms,
+        };
+        let _ = scheduler.record(sample);
+    }
+
+    pub fn control_heartbeat_publish_is_due(&self, now_mono_ns: u64) -> bool {
+        self.liveness.lock().unwrap().publish_is_due(now_mono_ns)
+    }
+
+    pub fn note_control_heartbeat_published(&self, now_mono_ns: u64) {
+        self.liveness.lock().unwrap().note_published(now_mono_ns);
+    }
+
+    /// Liveness hint for one node. A missing, expired, or untrusted input is a refusal.
+    /// The result does not transfer leadership or move a Jumbo shard.
+    pub fn liveness_decision(&self, node_id: NodeId) -> LivenessDecision {
+        let scheduler = self.liveness.lock().unwrap();
+        let now = scheduler.schedule_now();
+        scheduler.decide(node_id, &now)
+    }
+
+    pub fn liveness_decision_at(&self, node_id: NodeId, now: ScheduleNow) -> LivenessDecision {
+        self.liveness.lock().unwrap().decide(node_id, &now)
+    }
+
+    /// Computes a hint for every measured sample and does not apply it.
+    pub fn observe_liveness_hints(&self) {
+        let scheduler = self.liveness.lock().unwrap();
+        let now = scheduler.schedule_now();
+        for decision in scheduler.decide_all(&now) {
+            match decision {
+                LivenessDecision::HintLive { node_id, seq, .. } => {
+                    tracing::trace!(
+                        node_id,
+                        seq,
+                        "liveness hint recorded; no transfer_leader and no jumbo move"
+                    );
+                }
+                LivenessDecision::Refuse { node_id, reason } => {
+                    tracing::trace!(node_id, ?reason, "liveness scheduler refused");
+                }
+            }
+        }
+    }
+
+    /// Test hook. `Some(1)` and `None` are the untrusted-clock path.
+    pub fn testing_set_heartbeat_wall(&self, wall: Option<u64>) {
+        self.liveness.lock().unwrap().set_wall_override(wall);
+    }
+
+    pub fn testing_record_measured_recv(
+        &self,
+        node_id: NodeId,
+        seq: u64,
+        recv_mono_ns: u64,
+        wall_unix_ms: u64,
+    ) -> std::result::Result<(), MeasurementReject> {
+        self.liveness.lock().unwrap().record(MeasuredSample {
+            node_id,
+            seq,
+            sent_mono_ns: None,
+            recv_mono_ns,
+            wall_unix_ms,
+        })
     }
 
     /// Plans jumbo placement from live Raft voters and attempts only a safe move.
