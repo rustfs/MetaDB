@@ -34,15 +34,15 @@
 
 ### `cluster status`
 
-`cell_id = 0` で `GetRoutes` を呼びます。各シャードについて `shard`、`cell`、`leader`、投票者数、`epoch=(conf_ver, ver)`、`dual_mode`、`jumbo` を印字します。空きディスク、QPS、Raft 水位は印字しません。
+`cell_id = 0` で `GetRoutes` を呼びます。各シャードについて `shard`、`cell`、`leader`、投票者数、`epoch=(conf_ver, ver)`、`dual_mode`、`jumbo` を印字します。It then prints local `CELL_CONTROL_PLANE` placement rows (`phase`, `phase_code`, `dedicated_node`, `dominant_pid`, `moves`, attempt timestamps, `reason`) and `placement_automatic_transfer_enabled=false`. Those rows are not routes. A remote cell contributes no placement rows. It does not print disk free space, QPS, Raft watermarks, or `MOVE_STAGED` / `MOVE_LIVE`. The reconciler does not publish phase `recorded`. It does not stamp `transfer_attempt_unix_ms`. A new row stores 0. A later reconcile keeps a non-zero value already in the file.
 
 ### `shard list --cell-id <u64>`
 
-そのセルの `GetRoutes` を呼びます（キャッシュされたすべてのルートには `0`）。`shard`、`cell`、生の開始キーと終了キー、エポック `(conf_ver, version)` を印字します。
+そのセルの `GetRoutes` を呼びます（キャッシュされたすべてのルートには `0`）。`shard`、`cell`、生の開始キーと終了キー、エポック `(conf_ver, version)` を印字し、その後に同じローカル placement 行を印字します。A remote cell prints `Placements: 0`.
 
 ### `shard split --shard-id <u64>`
 
-`TriggerShardSplit` を呼び、シャードが `shard_split_threshold_bytes` 未満でも分割検査を強制します。`split_executed` と `child_shard_id` を印字します。`split_executed=false` は、ワーカーが境界を見つけなかったことを意味します（たとえばキーが 2 つ未満、またはルートフラグを反転するだけのジャンボ候補）。
+`TriggerShardSplit` を呼び、シャードが `shard_split_threshold_bytes` 未満でも分割検査を強制します。On success it prints `split_executed`, `child_shard_id`, and the placement fields. When no placement row exists, including an ordinary split, the line is `placement_phase=` and `placement_phase_code=0`. Code 0 is only that no-record case. Stored rows use codes 1–4. `split_executed=false` は子シャードを作らなかったことを意味します（キーが 2 つ未満、またはジャンボ候補が placement 行を書いても `split_executed=false` のまま）。
 
 ### `shard enable-dual-mode --shard-id <u64> --pid <u64>`
 
@@ -88,8 +88,18 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 | `metadb_tombstones_traversed_on_scans_total` | counter |
 | `metadb_locality_compactions_total` | counter |
 | `metadb_min_raft_safe_purge_index` | gauge |
+| `metadb_placement_records` | gauge, local placement rows |
+| `metadb_placement_phase_recorded` | gauge; the reconciler does not publish this phase |
+| `metadb_placement_phase_leader_on_dedicated` | gauge |
+| `metadb_placement_phase_dedicated_not_shared` | gauge |
+| `metadb_placement_phase_blocked` | gauge |
+| `metadb_placement_moves_leadership` | gauge |
+| `metadb_placement_moves_voter_replaced` | gauge |
+| `metadb_placement_rows_with_transfer_attempt` | gauge; the reconciler does not stamp a new value and keeps one already in the file |
+| `metadb_placement_rows_with_replace_attempt` | gauge |
+| `metadb_placement_automatic_transfer_enabled` | gauge, 0 in this build |
 
-There is no `metadb_raft_watermark_lag_entries` series. `metadb_cells_total` counts rows in this process's `GLOBAL_CELL_DIRECTORY`, including a remote cell after `RegisterCell`. `metadb_shards_total` counts only local shards. A fresh process has one cell.
+There is no `metadb_raft_watermark_lag_entries` series and no per-shard placement label. There is no `MOVE_STAGED` or `MOVE_LIVE` series. `metadb_cells_total` counts rows in this process's `GLOBAL_CELL_DIRECTORY`, including a remote cell after `RegisterCell`. `metadb_shards_total` counts only local shards. A fresh process has one cell. The English operability page lists the readiness gauges that this table does not repeat.
 
 ## スケールアウト
 

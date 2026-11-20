@@ -34,15 +34,15 @@ Le client ouvre un nouveau canal gRPC par commande. Il ne parle pas `RaftTranspo
 
 ### `cluster status`
 
-Appelle `GetRoutes` avec `cell_id = 0`. Pour chaque shard il imprime `shard`, `cell`, `leader`, le nombre de votants, `epoch=(conf_ver, ver)`, `dual_mode` et `jumbo`. Il n'imprime ni l'espace disque libre, ni le QPS, ni les filigranes Raft.
+Appelle `GetRoutes` avec `cell_id = 0`. Pour chaque shard il imprime `shard`, `cell`, `leader`, le nombre de votants, `epoch=(conf_ver, ver)`, `dual_mode` et `jumbo`. It then prints local `CELL_CONTROL_PLANE` placement rows (`phase`, `phase_code`, `dedicated_node`, `dominant_pid`, `moves`, attempt timestamps, `reason`) and `placement_automatic_transfer_enabled=false`. Those rows are not routes. A remote cell contributes no placement rows. It does not print disk free space, QPS, Raft watermarks, or `MOVE_STAGED` / `MOVE_LIVE`. The reconciler does not publish phase `recorded`. It does not stamp `transfer_attempt_unix_ms`. A new row stores 0. A later reconcile keeps a non-zero value already in the file.
 
 ### `shard list --cell-id <u64>`
 
-Appelle `GetRoutes` pour cette cellule (utiliser `0` pour chaque route en cache). Imprime `shard`, `cell`, les octets bruts de début et de fin de clé, et l'époque `(conf_ver, version)`.
+Appelle `GetRoutes` pour cette cellule (utiliser `0` pour chaque route en cache). Imprime `shard`, `cell`, les octets bruts de début et de fin de clé, et l'époque `(conf_ver, version)`, puis les mêmes lignes de placement locales. A remote cell prints `Placements: 0`.
 
 ### `shard split --shard-id <u64>`
 
-Appelle `TriggerShardSplit`, qui force un contrôle de découpage même si le shard est sous `shard_split_threshold_bytes`. Imprime `split_executed` et `child_shard_id`. `split_executed=false` signifie que le worker n'a pas trouvé de frontière (par exemple moins de deux clés, ou un candidat jumbo qui ne fait que basculer l'indicateur de route).
+Appelle `TriggerShardSplit`, qui force un contrôle de découpage même si le shard est sous `shard_split_threshold_bytes`. On success it prints `split_executed`, `child_shard_id`, and the placement fields. When no placement row exists, including an ordinary split, the line is `placement_phase=` and `placement_phase_code=0`. Code 0 is only that no-record case. Stored rows use codes 1–4. `split_executed=false` signifie qu'aucun shard enfant n'a été créé (moins de deux clés, ou un candidat jumbo qui écrit une ligne de placement et laisse `split_executed=false`).
 
 ### `shard enable-dual-mode --shard-id <u64> --pid <u64>`
 
@@ -88,8 +88,18 @@ Jauges et compteurs de `render_prometheus_metrics` :
 | `metadb_tombstones_traversed_on_scans_total` | counter |
 | `metadb_locality_compactions_total` | counter |
 | `metadb_min_raft_safe_purge_index` | gauge |
+| `metadb_placement_records` | gauge, local placement rows |
+| `metadb_placement_phase_recorded` | gauge; the reconciler does not publish this phase |
+| `metadb_placement_phase_leader_on_dedicated` | gauge |
+| `metadb_placement_phase_dedicated_not_shared` | gauge |
+| `metadb_placement_phase_blocked` | gauge |
+| `metadb_placement_moves_leadership` | gauge |
+| `metadb_placement_moves_voter_replaced` | gauge |
+| `metadb_placement_rows_with_transfer_attempt` | gauge; the reconciler does not stamp a new value and keeps one already in the file |
+| `metadb_placement_rows_with_replace_attempt` | gauge |
+| `metadb_placement_automatic_transfer_enabled` | gauge, 0 in this build |
 
-There is no `metadb_raft_watermark_lag_entries` series. `metadb_cells_total` counts rows in this process's `GLOBAL_CELL_DIRECTORY`, including a remote cell after `RegisterCell`. `metadb_shards_total` counts only local shards. A fresh process has one cell.
+There is no `metadb_raft_watermark_lag_entries` series and no per-shard placement label. There is no `MOVE_STAGED` or `MOVE_LIVE` series. `metadb_cells_total` counts rows in this process's `GLOBAL_CELL_DIRECTORY`, including a remote cell after `RegisterCell`. `metadb_shards_total` counts only local shards. A fresh process has one cell. The English operability page lists the readiness gauges that this table does not repeat.
 
 ## Montée en charge
 

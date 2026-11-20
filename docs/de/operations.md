@@ -34,15 +34,15 @@ Der Client öffnet je Befehl einen neuen gRPC-Kanal. Er spricht nicht `RaftTrans
 
 ### `cluster status`
 
-Ruft `GetRoutes` mit `cell_id = 0` auf. Je Shard druckt es `shard`, `cell`, `leader`, Wählerzahl, `epoch=(conf_ver, ver)`, `dual_mode` und `jumbo`. Es druckt weder freien Plattenspeicher noch QPS noch Raft-Wasserstände.
+Ruft `GetRoutes` mit `cell_id = 0` auf. Je Shard druckt es `shard`, `cell`, `leader`, Wählerzahl, `epoch=(conf_ver, ver)`, `dual_mode` und `jumbo`. It then prints local `CELL_CONTROL_PLANE` placement rows (`phase`, `phase_code`, `dedicated_node`, `dominant_pid`, `moves`, attempt timestamps, `reason`) and `placement_automatic_transfer_enabled=false`. Those rows are not routes. A remote cell contributes no placement rows. It does not print disk free space, QPS, Raft watermarks, or `MOVE_STAGED` / `MOVE_LIVE`. The reconciler does not publish phase `recorded`. It does not stamp `transfer_attempt_unix_ms`. A new row stores 0. A later reconcile keeps a non-zero value already in the file.
 
 ### `shard list --cell-id <u64>`
 
-Ruft `GetRoutes` für diese Zelle auf (`0` für jede gecachte Route). Druckt `shard`, `cell`, rohe Start-/Endschlüsselbytes und Epoch `(conf_ver, version)`.
+Ruft `GetRoutes` für diese Zelle auf (`0` für jede gecachte Route). Druckt `shard`, `cell`, rohe Start-/Endschlüsselbytes und Epoch `(conf_ver, version)`, then the same local placement lines. A remote cell prints `Placements: 0`.
 
 ### `shard split --shard-id <u64>`
 
-Ruft `TriggerShardSplit` auf, das eine Split-Prüfung erzwingt, auch wenn der Shard unter `shard_split_threshold_bytes` liegt. Druckt `split_executed` und `child_shard_id`. `split_executed=false` heißt, der Worker fand keine Grenze (zum Beispiel weniger als zwei Schlüssel, oder ein Jumbo-Kandidat, der nur das Routenflag umlegt).
+Ruft `TriggerShardSplit` auf, das eine Split-Prüfung erzwingt, auch wenn der Shard unter `shard_split_threshold_bytes` liegt. On success it prints `split_executed`, `child_shard_id`, and the placement fields. When no placement row exists, including an ordinary split, the line is `placement_phase=` and `placement_phase_code=0`. Code 0 is only that no-record case. Stored rows use codes 1–4. `split_executed=false` heißt, der Worker hat kein Kind erzeugt (zum Beispiel weniger als zwei Schlüssel, oder ein Jumbo-Kandidat, der eine Placement-Zeile schreibt und trotzdem `split_executed=false` lässt).
 
 ### `shard enable-dual-mode --shard-id <u64> --pid <u64>`
 
@@ -88,8 +88,18 @@ Gauges und Counter aus `render_prometheus_metrics`:
 | `metadb_tombstones_traversed_on_scans_total` | counter |
 | `metadb_locality_compactions_total` | counter |
 | `metadb_min_raft_safe_purge_index` | gauge |
+| `metadb_placement_records` | gauge, local placement rows |
+| `metadb_placement_phase_recorded` | gauge; the reconciler does not publish this phase |
+| `metadb_placement_phase_leader_on_dedicated` | gauge |
+| `metadb_placement_phase_dedicated_not_shared` | gauge |
+| `metadb_placement_phase_blocked` | gauge |
+| `metadb_placement_moves_leadership` | gauge |
+| `metadb_placement_moves_voter_replaced` | gauge |
+| `metadb_placement_rows_with_transfer_attempt` | gauge; the reconciler does not stamp a new value and keeps one already in the file |
+| `metadb_placement_rows_with_replace_attempt` | gauge |
+| `metadb_placement_automatic_transfer_enabled` | gauge, 0 in this build |
 
-There is no `metadb_raft_watermark_lag_entries` series. `metadb_cells_total` counts rows in this process's `GLOBAL_CELL_DIRECTORY`, including a remote cell after `RegisterCell`. `metadb_shards_total` counts only local shards. A fresh process has one cell.
+There is no `metadb_raft_watermark_lag_entries` series and no per-shard placement label. There is no `MOVE_STAGED` or `MOVE_LIVE` series. `metadb_cells_total` counts rows in this process's `GLOBAL_CELL_DIRECTORY`, including a remote cell after `RegisterCell`. `metadb_shards_total` counts only local shards. A fresh process has one cell. The English operability page lists the readiness gauges that this table does not repeat.
 
 ## Skalierung
 

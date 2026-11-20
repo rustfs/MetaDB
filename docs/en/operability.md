@@ -88,7 +88,7 @@ These stay out of the probe on purpose. Treating them as ready would be a broade
 
 - The 250 ms `TxnRecoveryWorker` pass. Expired 2PC intents are not required to be drained before `/readyz` returns 200. The first pass runs after the phase flips to `serving`, and a failed pass is ignored by that loop.
 - Backup holds, online backup copies, and restore. Those are a separate operator path.
-- Whether a remote cell in `GLOBAL_CELL_DIRECTORY` is reachable. `/readyz` answers for this process's local shards only. Jumbo file movement and RDMA are not readiness signals. Heartbeats stay a local liveness annotation and do not make a cell ready or scheduled.
+- Whether a remote cell in `GLOBAL_CELL_DIRECTORY` is reachable. `/readyz` answers for this process's local shards only. Jumbo file movement and RDMA are not readiness signals. Heartbeats stay a local liveness annotation and do not make a cell ready or scheduled. Placement gauges are not readiness inputs. A `leader_on_dedicated` row does not make `/readyz` return 200, and a `blocked` row does not make it return 503.
 - Disk space, clock health, and "this node can reach a quorum right now" beyond the leader id OpenRaft has published. `leader_unknown` is the check this process can make without starting a proposal.
 - Per-shard series. Gauges below are counts. A shard id is not a label.
 
@@ -96,7 +96,7 @@ The shard gauges count flags independently. One group can increment both `metadb
 
 ## Metrics
 
-Series names are unchanged: `metadb_cells_total`, `metadb_shards_total`, `metadb_in_memory_mvcc_writes_total`, `metadb_pruned_mvcc_versions_total`, `metadb_persistent_kv_writes_total`, `metadb_active_physical_tombstones`, `metadb_tombstones_traversed_on_scans_total`, `metadb_locality_compactions_total`, `metadb_min_raft_safe_purge_index`. `metadb_cells_total` counts directory rows, including a remote cell. `metadb_shards_total` stays local.
+Storage and Raft series names stay: `metadb_cells_total`, `metadb_shards_total`, `metadb_in_memory_mvcc_writes_total`, `metadb_pruned_mvcc_versions_total`, `metadb_persistent_kv_writes_total`, `metadb_active_physical_tombstones`, `metadb_tombstones_traversed_on_scans_total`, `metadb_locality_compactions_total`, `metadb_min_raft_safe_purge_index`. `metadb_cells_total` counts directory rows, including a remote cell. `metadb_shards_total` stays local. Placement gauges below count local `CELL_CONTROL_PLANE` rows. They are not readiness inputs.
 
 Unlabeled gauges added for operators:
 
@@ -118,8 +118,18 @@ Unlabeled gauges added for operators:
 | `metadb_raft_election_timeout_max_ms` | Configured maximum election timeout |
 | `metadb_raft_max_in_snapshot_log_to_keep` | Configured OpenRaft snapshot-log retention |
 | `metadb_raft_max_segment_bytes` | Configured segment size for new segment rotation |
+| `metadb_placement_records` | Local placement rows on this process |
+| `metadb_placement_phase_recorded` | Rows whose phase is `recorded`. The reconciler does not publish that phase, so this stays 0 unless an older file already has it |
+| `metadb_placement_phase_leader_on_dedicated` | Rows whose dedicated node is already the leader. Peer shards may still list that node |
+| `metadb_placement_phase_dedicated_not_shared` | Rows where other local shards exist and none of them has the dedicated node as a voter |
+| `metadb_placement_phase_blocked` | Rows where a required move was refused |
+| `metadb_placement_moves_leadership` | Stored `LeadershipTransferred` entries. Maintenance does not append one |
+| `metadb_placement_moves_voter_replaced` | Stored `VoterReplaced` entries |
+| `metadb_placement_rows_with_transfer_attempt` | Rows with a non-zero transfer-attempt timestamp. The reconciler does not stamp a new value. It keeps one already stored in the file |
+| `metadb_placement_rows_with_replace_attempt` | Rows with a non-zero replace-attempt timestamp |
+| `metadb_placement_automatic_transfer_enabled` | 1 only when this build calls `transfer_leader`. This build is 0 |
 
-No series carries a secret, a peer address, a data-directory path, or a user key. The storage-unrecoverable detail string stays in the process log and is not copied into the probe body.
+No series carries a secret, a peer address, a data-directory path, a user key, a shard id, or a node id. The storage-unrecoverable detail string stays in the process log and is not copied into the probe body. There is no `MOVE_STAGED` or `MOVE_LIVE` series. `metadb-ctl` prints the placement reason and the node ids; the scrape does not.
 
 ## `[raft]`
 

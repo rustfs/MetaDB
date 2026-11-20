@@ -10,8 +10,9 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
 use metadb_cluster::{
-    AllocIdKind, CompositeShardRoute, DurableGlobalManager, RemotePrecheck, RemotePublication,
-    ShardHealthState, ShardSplitMode,
+    automatic_leadership_transfer_allowed, AllocIdKind, CommittedMove, CompositeShardRoute,
+    DurableCellManager, DurableGlobalManager, RemotePrecheck, RemotePublication, ShardHealthState,
+    ShardSplitMode, StoredPlacement,
 };
 use metadb_core::codec;
 use metadb_core::{
@@ -104,6 +105,69 @@ pub fn composite_route_from_proto(
     descriptor: ShardDescriptorProto,
 ) -> std::result::Result<CompositeShardRoute, MetaDbError> {
     route_conv::from_proto_route(descriptor)
+}
+
+fn placement_to_proto(cell_id: u64, record: &StoredPlacement) -> PlacementRecordProto {
+    let committed_moves = record
+        .committed_moves
+        .iter()
+        .map(|movement| match movement {
+            CommittedMove::LeadershipTransferred { shard_id, to } => PlacementMoveProto {
+                kind: movement.kind_code(),
+                shard_id: *shard_id,
+                node_id: *to,
+                removed_node: 0,
+            },
+            CommittedMove::VoterReplaced {
+                shard_id,
+                removed,
+                added,
+            } => PlacementMoveProto {
+                kind: movement.kind_code(),
+                shard_id: *shard_id,
+                node_id: *added,
+                removed_node: *removed,
+            },
+        })
+        .collect();
+    PlacementRecordProto {
+        cell_id,
+        shard_id: record.shard_id,
+        dominant_pid: record.dominant_pid,
+        dedicated_node: record.dedicated_node,
+        phase: record.phase.code(),
+        phase_name: record.phase.as_str().to_string(),
+        blocked_reason: record.blocked_reason.clone(),
+        committed_moves,
+        last_transfer_attempt_unix_ms: record.last_transfer_attempt_unix_ms,
+        last_replace_attempt_unix_ms: record.last_replace_attempt_unix_ms,
+        updated_unix_ms: record.updated_unix_ms,
+    }
+}
+
+fn local_placement_records(cells: &[Arc<DurableCellManager>]) -> Vec<PlacementRecordProto> {
+    let mut records = Vec::new();
+    for cell in cells {
+        for record in cell.stored_placements() {
+            records.push(placement_to_proto(cell.cell_id(), &record));
+        }
+    }
+    records
+}
+
+fn routes_response(
+    error: Option<ErrorDetailProto>,
+    shards: Vec<ShardDescriptorProto>,
+    cluster_id: Vec<u8>,
+    placements: Vec<PlacementRecordProto>,
+) -> GetRoutesResponse {
+    GetRoutesResponse {
+        error,
+        shards,
+        cluster_id,
+        placements,
+        automatic_leadership_transfer_enabled: automatic_leadership_transfer_allowed(),
+    }
 }
 
 fn decode_req_txn_id(bytes: &[u8]) -> Result<u128, Status> {
@@ -1333,8 +1397,9 @@ impl ControlPlaneService for MetaDbGrpcService {
         }
 
         let req = request.into_inner();
-        let (routes, cluster_id) = if req.cell_id == 0 {
+        let (routes, cluster_id, placements) = if req.cell_id == 0 {
             let cells = self.global_manager.all_cells();
+            let placements = local_placement_records(&cells);
             let cluster_ids: BTreeSet<u128> = cells
                 .iter()
                 .map(|cell| cell.cluster_id())
@@ -1350,11 +1415,12 @@ impl ControlPlaneService for MetaDbGrpcService {
                 match cell.routes_for_live_status() {
                     Ok(live) => routes.extend(live),
                     Err(error) => {
-                        return Ok(Response::new(GetRoutesResponse {
-                            error: Some(ErrorDetailProto::from(&error)),
-                            shards: Vec::new(),
-                            cluster_id: Vec::new(),
-                        }));
+                        return Ok(Response::new(routes_response(
+                            Some(ErrorDetailProto::from(&error)),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        )));
                     }
                 }
             }
@@ -1364,39 +1430,43 @@ impl ControlPlaneService for MetaDbGrpcService {
                 }
                 routes.extend(remote.routes);
             }
-            (routes, cluster_id)
+            (routes, cluster_id, placements)
         } else if let Some(remote) = self.global_manager.remote_publication(req.cell_id) {
-            (remote.routes, remote.cluster_id)
+            (remote.routes, remote.cluster_id, Vec::new())
         } else if let Some(cell) = self.global_manager.get_cell(req.cell_id) {
+            let placements = local_placement_records(std::slice::from_ref(&cell));
             let cluster_id = cell.cluster_id();
             match cell.routes_for_live_status() {
-                Ok(routes) => (routes, cluster_id),
+                Ok(routes) => (routes, cluster_id, placements),
                 Err(error) => {
-                    return Ok(Response::new(GetRoutesResponse {
-                        error: Some(ErrorDetailProto::from(&error)),
-                        shards: Vec::new(),
-                        cluster_id: Vec::new(),
-                    }));
+                    return Ok(Response::new(routes_response(
+                        Some(ErrorDetailProto::from(&error)),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )));
                 }
             }
         } else {
             let e = MetaDbError::ShardRoutingError(format!("unknown cell {}", req.cell_id));
-            return Ok(Response::new(GetRoutesResponse {
-                error: Some(ErrorDetailProto::from(&e)),
-                shards: Vec::new(),
-                cluster_id: Vec::new(),
-            }));
+            return Ok(Response::new(routes_response(
+                Some(ErrorDetailProto::from(&e)),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )));
         };
         let cluster_id = if cluster_id == 0 {
             Vec::new()
         } else {
             metadb_proto::convert::encode_u128_be(cluster_id).to_vec()
         };
-        Ok(Response::new(GetRoutesResponse {
-            error: None,
-            shards: routes.iter().map(route_conv::to_proto_route).collect(),
+        Ok(Response::new(routes_response(
+            None,
+            routes.iter().map(route_conv::to_proto_route).collect(),
             cluster_id,
-        }))
+            placements,
+        )))
     }
 
     async fn allocate_id_block(
@@ -1629,30 +1699,34 @@ impl ControlPlaneService for MetaDbGrpcService {
                 .any(|r| r.shard_id == req.shard_id)
             {
                 return match cell.maybe_split_or_isolate_shard(req.shard_id, true).await {
-                    Ok(Some(child_id)) => Ok(Response::new(TriggerShardSplitResponse {
-                        error: None,
-                        split_executed: true,
-                        child_shard_id: child_id,
-                    })),
-                    Ok(None) => Ok(Response::new(TriggerShardSplitResponse {
-                        error: None,
-                        split_executed: false,
-                        child_shard_id: 0,
-                    })),
-                    Err(e) => Ok(Response::new(TriggerShardSplitResponse {
-                        error: Some(ErrorDetailProto::from(&e)),
-                        split_executed: false,
-                        child_shard_id: 0,
-                    })),
+                    Ok(Some(child_id)) => Ok(Response::new(self.split_response(
+                        None,
+                        true,
+                        child_id,
+                        req.shard_id,
+                    ))),
+                    Ok(None) => Ok(Response::new(self.split_response(
+                        None,
+                        false,
+                        0,
+                        req.shard_id,
+                    ))),
+                    Err(e) => Ok(Response::new(self.split_response(
+                        Some(ErrorDetailProto::from(&e)),
+                        false,
+                        0,
+                        req.shard_id,
+                    ))),
                 };
             }
         }
         let e = MetaDbError::ShardRoutingError(format!("unknown shard {}", req.shard_id));
-        Ok(Response::new(TriggerShardSplitResponse {
-            error: Some(ErrorDetailProto::from(&e)),
-            split_executed: false,
-            child_shard_id: 0,
-        }))
+        Ok(Response::new(self.split_response(
+            Some(ErrorDetailProto::from(&e)),
+            false,
+            0,
+            req.shard_id,
+        )))
     }
 
     async fn enable_dual_mode_split(
@@ -1808,6 +1882,31 @@ impl ControlPlaneService for MetaDbGrpcService {
 }
 
 impl MetaDbGrpcService {
+    fn split_response(
+        &self,
+        error: Option<ErrorDetailProto>,
+        split_executed: bool,
+        child_shard_id: u64,
+        shard_id: u64,
+    ) -> TriggerShardSplitResponse {
+        TriggerShardSplitResponse {
+            error,
+            split_executed,
+            child_shard_id,
+            placement: self.placement_for_shard(shard_id),
+            automatic_leadership_transfer_enabled: automatic_leadership_transfer_allowed(),
+        }
+    }
+
+    fn placement_for_shard(&self, shard_id: u64) -> Option<PlacementRecordProto> {
+        for cell in self.global_manager.all_cells() {
+            if let Some(record) = cell.stored_placement(shard_id) {
+                return Some(placement_to_proto(cell.cell_id(), &record));
+            }
+        }
+        None
+    }
+
     async fn probe_cell_routes(
         &self,
         cell_id: u64,

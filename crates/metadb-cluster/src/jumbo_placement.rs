@@ -131,6 +131,40 @@ pub enum PlacementPhase {
     Blocked,
 }
 
+impl PlacementPhase {
+    /// Operator and metrics code. `0` means no placement row and is not a variant.
+    ///
+    /// The reconciler publishes `LeaderOnDedicated`, `DedicatedNodeNotShared`, and
+    /// `Blocked`. It does not publish `Recorded`.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Recorded => 1,
+            Self::LeaderOnDedicated => 2,
+            Self::DedicatedNodeNotShared => 3,
+            Self::Blocked => 4,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::LeaderOnDedicated => "leader_on_dedicated",
+            Self::DedicatedNodeNotShared => "dedicated_not_shared",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+impl CommittedMove {
+    /// `1` leadership_transferred, `2` voter_replaced. `0` is not a stored move.
+    pub const fn kind_code(&self) -> u32 {
+        match self {
+            Self::LeadershipTransferred { .. } => 1,
+            Self::VoterReplaced { .. } => 2,
+        }
+    }
+}
+
 /// What the executor should attempt, and the phase to publish if it attempts nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementDecision {
@@ -483,5 +517,40 @@ mod tests {
         let decision = plan_jumbo_placement(&observation);
         assert!(decision.actions.is_empty(), "{decision:?}");
         assert_eq!(decision.phase, PlacementPhase::LeaderOnDedicated);
+    }
+
+    #[test]
+    fn operator_phase_codes_do_not_use_zero() {
+        assert_eq!(PlacementPhase::Recorded.code(), 1);
+        assert_eq!(PlacementPhase::LeaderOnDedicated.code(), 2);
+        assert_eq!(PlacementPhase::DedicatedNodeNotShared.code(), 3);
+        assert_eq!(PlacementPhase::Blocked.code(), 4);
+        assert_eq!(PlacementPhase::Recorded.as_str(), "recorded");
+        assert_eq!(
+            PlacementPhase::LeaderOnDedicated.as_str(),
+            "leader_on_dedicated"
+        );
+        assert_eq!(
+            PlacementPhase::DedicatedNodeNotShared.as_str(),
+            "dedicated_not_shared"
+        );
+        assert_eq!(PlacementPhase::Blocked.as_str(), "blocked");
+        assert_eq!(
+            CommittedMove::LeadershipTransferred { shard_id: 1, to: 2 }.kind_code(),
+            1
+        );
+        assert_eq!(
+            CommittedMove::VoterReplaced {
+                shard_id: 3,
+                removed: 4,
+                added: 5
+            }
+            .kind_code(),
+            2
+        );
+        assert_ne!(
+            plan_jumbo_placement(&obs(1, vec![shard(1, &[1], Some(1))], &[1])).phase,
+            PlacementPhase::Recorded
+        );
     }
 }

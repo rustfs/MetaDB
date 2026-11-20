@@ -2,7 +2,7 @@
 
 [Overview](./README.md) · [Architecture](./architecture.md) · [Operations](./operations.md)
 
-This page is the evidence record for multi-cell routing, role separation, Jumbo shard placement, heartbeats, and membership safety. It describes the tree after the control-plane increment that added `CELL_CONTROL_PLANE`. It is not a first-ship pass and it is not a scale gate. Figures in arXiv:2610.32247 (including Baidu's 575-node BOS2 cluster and 1.848 trillion records) are Baidu production metrics. They are not results of this repository, and this change does not produce them.
+This page is the evidence record for multi-cell routing, role separation, Jumbo shard placement, heartbeats, and membership safety. It describes the tree after the control-plane increment that added `CELL_CONTROL_PLANE`, plus the later operator-status increment that prints local placement rows and counts them. It is not a first-ship pass and it is not a scale gate. Figures in arXiv:2610.32247 (including Baidu's 575-node BOS2 cluster and 1.848 trillion records) are Baidu production metrics. They are not results of this repository, and this change does not produce them.
 
 `Architecture.md` section 12 still says several of these subsystems are "Implemented & Tested". Where that matrix and this page disagree, follow this page and the code. Locale guides under `docs/{fr,de,ja,zh}` were not rewritten here.
 
@@ -36,12 +36,13 @@ Root `Architecture.md` was left unchanged on purpose. Consolidating it with the 
 | Heartbeat-driven scheduling | Design text in `docs/designs/sharding_and_control_plane.md` §6.1. | **Missing.** Splits still run from the local maintenance tick. |
 | Membership safety for operator scale-in | `plan_membership_voters`, `remove_voter`, joint-config handling in `uniform_voter_addrs`. | **Present, and it can shrink.** Scale-in to 2 or 1 voters is an explicit operator path. It is not a three-VM result. |
 | Membership safety for jumbo moves | `jumbo_membership_change_allowed`. | **Present** for the jumbo path only. It does not change operator scale-in. |
+| Operator placement status | `GetRoutes.placements`, `TriggerShardSplitResponse.placement`, `metadb-ctl` placement lines, unlabeled `metadb_placement_*` gauges. | **Partial.** Local rows only. `split_executed` stays false when the worker did not create a child. File-move phase is not on this surface. |
 | Raft majority on the data path | OpenRaft joint consensus via `ConfChangeOrchestrator`. | **Unchanged** by this increment. This page does not re-certify it. |
-| 2PC lease / storage formats | `a48d038` ("Pin 2PC lease pre-images and reject an over-cap rename TTL") is not an ancestor of this branch. | **Not imported.** Lease and storage formats were not changed. |
+| 2PC lease / storage formats | Current `main` includes `da547f4`, which reclaims orphan 2PC pre-images. | **Not changed here.** The placement-status commit does not edit lease recovery. Commit `a48d038` was not imported as its own commit. |
 
 ## Remaining backlog and dependencies
 
-These items block a scale gate. None of them is delivered by this change.
+These items block a scale gate. Item 8 is a partial operator view of a local placement row. The others are not delivered by that view.
 
 1. **Shared cell map.** Each process has its own `GLOBAL_CELL_DIRECTORY`. Registering on process A does not make process B list A's cell. Clients must ask the process that stored the row. There is still no replicated global manager and no cross-cell forwarding. A second cell's node id must be disjoint from nodes already in the directory. Uncovered tables are not served.
 2. **Remote placement and multi-cell proxy routing.** `be` can host and join local replicas. `proxy` forwards to one configured shard host. A cell manager still cannot place a shard on a BE it does not already run, and the proxy does not read the cell directory to choose a target. Auth fail-closed rules are unchanged.
@@ -49,9 +50,9 @@ These items block a scale gate. None of them is delivered by this change.
 4. **Safe automatic leadership transfer.** Still missing. It needs a capability check that does not disable the leader lease, then a wait of at least the configured `election_timeout_max_ms` (#38, head `f55cc6cf`, not merged here). Until that exists, maintenance must keep the action disabled.
 5. **Heartbeat as a scheduler.** Per-shard bytes, QPS, and disk free measured by this process, sent on a trusted channel, and used only as hints. The scheduler must keep using local Raft and LSM state for splits. Client descriptors must stay non-authoritative. A 3-second cell-wide heartbeat bus for tens of thousands of shards is not built.
 6. **Global and cell managers on Raft.** `CELL_MANAGER_STATE` and `CELL_CONTROL_PLANE` are local files. They are not a replicated control-plane group. A follower's placement file is not the leader's file.
-7. **2PC lease pre-images.** Commit `a48d038` is unreviewed and was not imported. Later lease work has to land on its own review. This increment does not depend on it and does not change the 3-second lease, the 60-second cap, or the intent/txn record layout.
-8. **Operator status for the placement record.** There is no `metadb-ctl` field and no metrics series for `PlacementPhase`. `TriggerShardSplit` still reports `split_executed = false` for a jumbo shard even when a later leadership transfer is only recorded in `CELL_CONTROL_PLANE`. Health, metrics, and operator Raft timer configuration belong to another workstream and were not edited.
-9. **Docs outside this English set.** `docs/{fr,de,ja,zh}` still describe the previous heartbeat and jumbo behavior in places. Root `Architecture.md` section 12 still marks the control plane and jumbo isolation as implemented. Those updates belong to documentation consolidation.
+7. **2PC lease pre-images.** Commit `a48d038` was not imported as its own commit. Current `main` includes `da547f4` (reclaim orphan pre-images). The placement-status change does not edit that recovery, the 3-second lease, the 60-second cap, or the intent/txn record layout.
+8. **Operator status for the placement record.** `metadb-ctl cluster status` and `shard list` print each local placement row: phase name and code (`recorded` 1, `leader_on_dedicated` 2, `dedicated_not_shared` 3, `blocked` 4), dedicated node, dominant pid, committed moves, both attempt timestamps, update time, and blocked reason. `placement_automatic_transfer_enabled` is this process and is false. `shard split` prints the phase fields on success. When no placement row exists, including an ordinary split, the line is `placement_phase=` and `placement_phase_code=0`. Code 0 is that no-record case. Stored rows use 1–4. `split_executed` stays false when no child was created. The reconciler does not stamp `transfer_attempt_unix_ms` and does not call `transfer_leader`. It keeps a non-zero transfer timestamp already in the file. A new row stores 0. Rows are insert-only; this process does not delete one when the shard is no longer jumbo. Unlabeled gauges count local rows by phase, stored moves, and rows with a non-zero attempt timestamp. They are not readiness inputs. Still missing from this surface: `MOVE_STAGED` / `MOVE_LIVE`, placement rows for a remote cell, publication of `PlacementPhase::Recorded`, per-shard labels, and any series whose value is a node id, a path, or bytes copied onto another machine. Health probes and `[raft]` loading belong to the operability workstream and were not redefined here.
+9. **Docs outside this English set.** Locale operations pages name the placement fields and gauges. Other sections of `docs/{fr,de,ja,zh}` still describe the previous heartbeat and jumbo behavior. Root `Architecture.md` section 12 still marks the control plane and jumbo isolation as implemented. Those updates belong to documentation consolidation.
 10. **Gates this page does not move.** No-ship stays in force. A first-ship gate is a separate bar from a scale gate (multi-cell, disaggregated roles, jumbo disk isolation, and a heartbeat bus that can carry a cell of 20k–30k shards). This increment is neither gate. CI workflows were not edited. The commands below were not run.
 
 ## Base
@@ -82,3 +83,15 @@ Do not read the list below as a test report for this increment. The following we
 - Any benchmark, three-voter jumbo transfer, or multi-cell drill
 
 `crates/metadb-cluster/tests/scale_control_plane_tests.rs` and the heartbeat cases in `crates/metadb-server/tests/control_plane_claim_tests.rs` are the regression source. They cover sequence replay, conflict, a failed fsync, reload, a corrupt `CELL_CONTROL_PLANE` file, and a one-voter placement that must not change voter sets. They do not boot three voters.
+
+## Placement status check
+
+These commands were executed again after merging `main` `3e7ac6ddfd653c105950e200fc7d052547698be8`. They are not a workspace run and they are not a CI result:
+
+- `cargo test -p metadb-cluster --lib jumbo_placement::tests::operator_phase_codes_do_not_use_zero --locked`
+- `cargo test -p metadb-server --lib metrics::tests --locked`
+- `cargo test -p metadb-server --test placement_status_tests --locked`
+- `cargo clippy -p metadb-proto -p metadb-cluster -p metadb-server --all-targets --locked --no-deps -- -D warnings -A clippy::assertions_on_constants`
+- `cargo fmt --all -- --check`
+
+They do not boot three voters, do not copy a jumbo directory, and do not enable automatic leadership transfer. `cargo test --workspace --locked` was not run. GitHub Actions was not enabled.
