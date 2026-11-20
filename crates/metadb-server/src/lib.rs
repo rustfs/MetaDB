@@ -147,7 +147,7 @@ use metadb_cluster::{
 };
 use metadb_core::{
     CompositeKeyRange, EntryType, FileId, HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId,
-    MetaDbError, MetaEntry, NodeId, QuotaRecord, Result, SecondaryIndexRecord, UserId,
+    MetaDbError, MetaEntry, NodeId, QuotaRecord, Result, SecondaryIndexRecord, ShardId, UserId,
     ROOT_INODE_ID,
 };
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
@@ -1195,26 +1195,14 @@ impl PersistentMetaDbCluster {
 }
 
 /// Rejects a backup tree whose cell state names a shard the tree does not contain.
-pub fn check_backup_tree(root: &Path) -> Result<()> {
-    let copied = backup::list_shard_ids(root)?;
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if !name.starts_with("cell_") {
-            continue;
-        }
-        let state = entry.path().join("CELL_MANAGER_STATE");
-        if !state.is_file() {
-            continue;
-        }
-        let referenced = metadb_cluster::DurableCellManager::shard_ids_in_cell_state_file(&state)?;
+///
+/// `shard_ids` and `cell_states` are the shard directories and `CELL_MANAGER_STATE`
+/// frames already read through the anchored directory handle. This function does not
+/// open a path.
+pub fn check_backup_tree(shard_ids: &[ShardId], cell_states: &[(String, Vec<u8>)]) -> Result<()> {
+    let copied: BTreeSet<ShardId> = shard_ids.iter().copied().collect();
+    for (name, bytes) in cell_states {
+        let referenced = metadb_cluster::DurableCellManager::shard_ids_in_cell_state_bytes(bytes)?;
         for shard_id in referenced {
             if !copied.contains(&shard_id) {
                 return Err(MetaDbError::StorageIoError(format!(

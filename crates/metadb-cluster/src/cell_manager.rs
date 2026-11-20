@@ -1482,11 +1482,11 @@ impl DurableCellManager {
         Ok(())
     }
 
-    /// Shard ids named by a `CELL_MANAGER_STATE` file: published routes and split plans.
-    pub fn shard_ids_in_cell_state_file(path: &Path) -> Result<BTreeSet<ShardId>> {
-        let mut raw = Vec::new();
-        File::open(path)?.read_to_end(&mut raw)?;
-        let body = verify_crc32c_le(&raw, "CELL_MANAGER_STATE")?;
+    /// Shard ids named by `CELL_MANAGER_STATE` bytes: published routes and split plans.
+    ///
+    /// The bytes are the on-disk frame, including its CRC32C trailer. This does not open a path.
+    pub fn shard_ids_in_cell_state_bytes(raw: &[u8]) -> Result<BTreeSet<ShardId>> {
+        let body = verify_crc32c_le(raw, "CELL_MANAGER_STATE")?;
         let state = decode_cell_state(body)?;
         let mut ids = BTreeSet::new();
         ids.extend(state.routes.keys().copied());
@@ -1495,6 +1495,13 @@ impl DurableCellManager {
             ids.insert(plan.child_shard_id);
         }
         Ok(ids)
+    }
+
+    /// Shard ids named by a `CELL_MANAGER_STATE` file: published routes and split plans.
+    pub fn shard_ids_in_cell_state_file(path: &Path) -> Result<BTreeSet<ShardId>> {
+        let mut raw = Vec::new();
+        File::open(path)?.read_to_end(&mut raw)?;
+        Self::shard_ids_in_cell_state_bytes(&raw)
     }
 
     fn load_state_file(dir: &Path) -> Result<PersistedCellState> {
