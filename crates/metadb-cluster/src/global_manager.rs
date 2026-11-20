@@ -92,6 +92,9 @@ impl DurableGlobalManager {
     /// cell's listen address may differ. This does not forward requests.
     pub fn align_directory_with_replication(&self, cell: &DurableCellManager) -> Result<()> {
         let Some(record) = cell.replicated_control()? else {
+            // A missing record is a fresh cell. A handed-off carrier with no
+            // readable snapshot returns an error above instead of this branch,
+            // so the caller cannot publish an empty directory in its place.
             return Ok(());
         };
         let replicated = crate::cell_directory::decode_directory_body(&record.directory_body)?;
