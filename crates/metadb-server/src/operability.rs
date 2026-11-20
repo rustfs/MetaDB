@@ -400,7 +400,7 @@ mod tests {
         );
         let tls_err = tls.unwrap_err().to_string();
         assert!(
-            tls_err.contains("does not terminate TLS"),
+            tls_err.contains("does not fall open to plaintext"),
             "raft parsing must not skip the security-key rejection: {tls_err}"
         );
     }

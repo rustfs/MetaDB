@@ -1,6 +1,6 @@
 //! Prometheus HTTP listener. Uses the same bearer as the gRPC services.
 
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use http_body_util::Full;
@@ -9,9 +9,12 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+
+use metadb_security::TransportSecurity;
 
 use crate::bearer_header_matches;
 use crate::classify_secret;
@@ -29,6 +32,7 @@ pub async fn serve(
     cluster: Weak<PersistentMetaDbCluster>,
     shared_secret: String,
     mut shutdown: watch::Receiver<bool>,
+    security: Arc<TransportSecurity>,
 ) {
     let mut connections = JoinSet::new();
     loop {
@@ -39,10 +43,11 @@ pub async fn serve(
                 let Ok((socket, _)) = accepted else { break; };
                 let cluster = cluster.clone();
                 let shared_secret = shared_secret.clone();
+                let security = Arc::clone(&security);
                 connections.spawn(async move {
                     let _ = tokio::time::timeout(
                         METRICS_IO_TIMEOUT,
-                        metrics_connection(socket, cluster, shared_secret),
+                        metrics_connection(socket, cluster, shared_secret, &security),
                     )
                     .await;
                 });
@@ -57,7 +62,29 @@ async fn metrics_connection(
     socket: TcpStream,
     cluster: Weak<PersistentMetaDbCluster>,
     shared_secret: String,
+    security: &TransportSecurity,
 ) -> Result<(), hyper::Error> {
+    if security.is_plaintext() {
+        return serve_metrics(socket, cluster, shared_secret).await;
+    }
+    let io = match security.accept_metrics(socket).await {
+        Ok(io) => io,
+        Err(error) => {
+            tracing::warn!(%error, "metrics tls handshake rejected");
+            return Ok(());
+        }
+    };
+    serve_metrics(io, cluster, shared_secret).await
+}
+
+async fn serve_metrics<S>(
+    socket: S,
+    cluster: Weak<PersistentMetaDbCluster>,
+    shared_secret: String,
+) -> Result<(), hyper::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let service = service_fn(move |request: Request<Incoming>| {
         let cluster = cluster.clone();
         let shared_secret = shared_secret.clone();

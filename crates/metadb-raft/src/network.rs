@@ -25,6 +25,7 @@ use metadb_core::{MetaDbError, ShardId};
 use metadb_proto::raft_transport_service_client::RaftTransportServiceClient;
 use metadb_proto::raft_transport_service_server::RaftTransportService;
 use metadb_proto::{RaftRpcEnvelope, RaftRpcReply, SnapshotChunkRequest, SnapshotChunkResponse};
+use metadb_security::TransportSecurity;
 
 use crate::state_machine::ShardStateMachine;
 use crate::types::{MetaDbRaftRequest, MetaDbRaftResponse, MetaDbTypeConfig, SnapshotArchive};
@@ -97,12 +98,20 @@ impl MultiRaftRouter {
 pub struct ChannelPool {
     channels: Arc<AsyncMutex<HashMap<String, Channel>>>,
     shared_secret: Arc<RwLock<Option<String>>>,
+    security: Arc<RwLock<TransportSecurity>>,
 }
 
 impl ChannelPool {
     /// Configures authentication for all Raft clients sharing this pool.
     pub fn set_shared_secret(&self, secret: Option<String>) {
         *self.shared_secret.write().unwrap() = secret.filter(|s| !s.trim().is_empty());
+    }
+
+    /// Installs the process TLS policy. Plaintext is the default.
+    ///
+    /// Call this before the first outbound Raft or forwarded client RPC.
+    pub fn set_transport_security(&self, security: TransportSecurity) {
+        *self.security.write().unwrap() = security;
     }
 
     fn authenticate<T>(&self, mut request: Request<T>) -> Result<Request<T>, io::Error> {
@@ -119,11 +128,10 @@ impl ChannelPool {
     }
 
     pub async fn connect(&self, addr: &str) -> Result<Channel, io::Error> {
-        let url = if addr.starts_with("http://") || addr.starts_with("https://") {
-            addr.to_string()
-        } else {
-            format!("http://{}", addr)
-        };
+        let security = self.security.read().unwrap().clone();
+        let url = security
+            .prepare_url(addr)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         {
             let guard = self.channels.lock().await;
             if let Some(ch) = guard.get(&url) {
@@ -133,10 +141,10 @@ impl ChannelPool {
         let endpoint = Endpoint::from_shared(url.clone())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
             .connect_timeout(Duration::from_secs(3));
-        let channel = endpoint
-            .connect()
+        let channel = security
+            .connect(endpoint)
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
+            .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error.to_string()))?;
         self.channels.lock().await.insert(url, channel.clone());
         Ok(channel)
     }

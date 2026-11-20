@@ -11,6 +11,7 @@ use metadb_core::{
 };
 use metadb_proto::transaction_service_client::TransactionServiceClient;
 use metadb_proto::{ErrorDetailProto, ForwardRouterRequest};
+use metadb_security::TransportSecurity;
 use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
@@ -171,6 +172,7 @@ pub async fn forward_op(
     addr: &str,
     op: &ForwardedRouterOp,
     deadline: tokio::time::Instant,
+    security: &TransportSecurity,
 ) -> Result<ForwardedRouterOut> {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
@@ -178,16 +180,14 @@ pub async fn forward_op(
             "forwarded read exceeded the routing deadline".to_string(),
         ));
     }
-    let url = if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
-    } else {
-        format!("http://{addr}")
-    };
+    let url = security.prepare_url(addr).map_err(|error| {
+        MetaDbError::RpcError(format!("invalid leader address {addr}: {error}"))
+    })?;
     let endpoint = Endpoint::from_shared(url.clone())
         .map_err(|error| MetaDbError::RpcError(format!("invalid leader address {url}: {error}")))?
         .connect_timeout(remaining.min(Duration::from_secs(3)))
         .timeout(remaining);
-    let channel: Channel = match tokio::time::timeout(remaining, endpoint.connect()).await {
+    let channel: Channel = match tokio::time::timeout(remaining, security.connect(endpoint)).await {
         Ok(channel) => channel.map_err(|error| {
             MetaDbError::RpcError(format!("connect to leader {url} failed: {error}"))
         })?,

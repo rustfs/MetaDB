@@ -146,7 +146,10 @@ async fn misspelled_secret_and_tls_options_do_not_start() {
         "#,
     );
     let tls_err = tls.unwrap_err().to_string();
-    assert!(tls_err.contains("does not terminate TLS"), "{tls_err}");
+    assert!(
+        tls_err.contains("does not fall open to plaintext"),
+        "{tls_err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -634,7 +637,7 @@ async fn unknown_toml_keys_are_ignored_and_loopback_still_serves() {
     );
     let tls_err = tls_note.unwrap_err().to_string();
     assert!(
-        tls_err.contains("does not terminate TLS"),
+        tls_err.contains("does not fall open to plaintext"),
         "a TLS key must not be ignored: {tls_err}"
     );
 

@@ -135,6 +135,9 @@ pub struct MetaDbGrpcService {
     /// Bearer sent when this process probes another cell. Empty means the
     /// process was allowed to start without a secret, so probes stay on loopback.
     forward_secret: String,
+    /// TLS policy for those probes. Plaintext is the default. The certificate
+    /// principal is not a role; method RBAC is not installed.
+    transport_security: std::sync::Arc<metadb_security::TransportSecurity>,
 }
 
 impl MetaDbGrpcService {
@@ -148,11 +151,20 @@ impl MetaDbGrpcService {
             tx_router,
             proxy_router,
             forward_secret: String::new(),
+            transport_security: std::sync::Arc::new(metadb_security::TransportSecurity::plaintext()),
         }
     }
 
     pub fn with_forward_secret(mut self, secret: String) -> Self {
         self.forward_secret = secret;
+        self
+    }
+
+    pub fn with_transport_security(
+        mut self,
+        security: std::sync::Arc<metadb_security::TransportSecurity>,
+    ) -> Self {
+        self.transport_security = security;
         self
     }
 
@@ -1368,7 +1380,7 @@ impl ControlPlaneService for MetaDbGrpcService {
             for endpoint in &req.cell_manager_endpoints {
                 if !crate::config::is_literal_loopback_addr(endpoint) {
                     let error = MetaDbError::ShardRoutingError(
-                        "unauthenticated RegisterCell only probes a literal loopback address. Set a shared secret before registering a non-loopback cell, or bind that cell to 127.0.0.0/8 or ::1. This process does not terminate TLS"
+                        "unauthenticated RegisterCell only probes a literal loopback address. Set a shared secret before registering a non-loopback cell, or bind that cell to 127.0.0.0/8 or ::1. TLS mode does not replace this rule"
                             .to_string(),
                     );
                     return Ok(Response::new(RegisterCellResponse {
@@ -1420,20 +1432,22 @@ impl MetaDbGrpcService {
                 "RegisterCell requires a cell manager endpoint".to_string(),
             ));
         };
-        let endpoint = crate::normalize_rpc_addr(endpoint);
-        if endpoint.starts_with("https://") {
-            return Err(MetaDbError::ShardRoutingError(
-                "RegisterCell does not accept an https endpoint; this process does not terminate TLS"
-                    .to_string(),
-            ));
-        }
-        let mut client = crate::control_plane_client(&endpoint, &self.forward_secret)
-            .await
+        let endpoint = self
+            .transport_security
+            .prepare_url(endpoint)
             .map_err(|error| {
                 MetaDbError::ShardRoutingError(format!(
-                    "cell {cell_id} manager at {endpoint} is not reachable: {error}"
+                    "RegisterCell endpoint is not usable with the configured TLS mode: {error}"
                 ))
             })?;
+        let mut client =
+            crate::control_plane_client(&endpoint, &self.forward_secret, &self.transport_security)
+                .await
+                .map_err(|error| {
+                    MetaDbError::ShardRoutingError(format!(
+                        "cell {cell_id} manager at {endpoint} is not reachable: {error}"
+                    ))
+                })?;
         let listed = client
             .get_routes(GetRoutesRequest { cell_id })
             .await
