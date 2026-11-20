@@ -11,7 +11,7 @@ MetaDB 提供三类客户端接入方式：
 
 ## 1. gRPC 服务契约概览 (`metadb.v1`) `[已实现]`
 
-`[已实现]` means the process that hosts the shard serves these RPCs. A `global-manager` does not allocate ids or forward a key. `RegisterCell` persists a remote cell on the directory process after `GetRoutes` shows exact coverage. It does not forward later metadata calls. `be` serves the replicas it hosts. `proxy` forwards these calls to one upstream and does not host Raft.
+`[已实现]` means the process that hosts the shard serves these RPCs. A `global-manager` does not allocate ids or forward a key. `RegisterCell` persists a remote cell on the directory process after `GetRoutes` shows exact coverage. It does not forward later metadata calls. `be` serves the replicas it hosts. `proxy` dials one registered cell when that cell contains a metadata call, `ExecuteSql`, or a user-key transaction, and returns a placement error otherwise. Those calls are not sent to `[cluster] upstream`. `CommitPrimary2pc`, `ApplyAuxBatch`, `ForwardRouter`, and `GetRoutes` may still use that upstream. `AllocateIdBlock` is refused. The proxy does not host Raft.
 
 * **`MetadataService` (`metadata.proto`)**：
   * 单分片 `1-RTT` 写操作：`CreateFile`、`Mkdir`、`Unlink`、`Rmdir`、`SetAttr`（`chmod`、`chown`、`truncate`、`utimes`）。

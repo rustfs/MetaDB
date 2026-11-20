@@ -2,7 +2,7 @@
 
 [Overview](./README.md) · [Français](../fr/architecture.md) · [Deutsch](../de/architecture.md) · [日本語](../ja/architecture.md) · [简体中文](../zh/architecture.md)
 
-This page follows the code in `crates/`. `global-manager`, `cell-manager`, `be`, and `proxy` can run as separate processes. A bootstrap leader copies `GLOBAL_CELL_DIRECTORY` and a `CELL_MANAGER_STATE` snapshot into the lowest local shard's existing Raft log. `global-manager` still loads only a local file and does not open that group. The proxy forwards to one upstream and does not choose a cell. See [Operations](./operations.md#known-limitations).
+This page follows the code in `crates/`. `global-manager`, `cell-manager`, `be`, and `proxy` can run as separate processes. A bootstrap leader copies `GLOBAL_CELL_DIRECTORY` and a `CELL_MANAGER_STATE` snapshot into the lowest local shard's existing Raft log. `global-manager` still loads only a local file and does not open that group. The proxy chooses a registered cell for a contained metadata call, `ExecuteSql`, or user-key transaction, and fails closed otherwise. See [Operations](./operations.md#known-limitations).
 
 ## Process shape
 
@@ -73,7 +73,7 @@ A metadata call enters either the embedded `DistributedTxRouter` (`cluster.tx_ro
 
 `metadb-ctl sql` sends `ExecuteSql` with an empty parameter list, so the statement must use literals.
 
-Routing uses `CompositeMetaCache`. On a miss or an epoch mismatch the cache is refreshed from the local cell and the call is retried against the local shard group. `DurableGlobalManager::route_user_key` looks up a **local** shard handle and refuses a key owned by a registered remote cell. The gRPC metadata and transaction handlers forward that request to the stored endpoint before calling the local router. The receiver sees `x-metadb-cell-forwarded` and does not forward again. An unreachable cell fails the call. `proxy` still sends every metadata and transaction call to one `[cluster] upstream`.
+Routing uses `CompositeMetaCache`. On a miss or an epoch mismatch the cache is refreshed from the local cell and the call is retried against the local shard group. `DurableGlobalManager::route_user_key` looks up a **local** shard handle and refuses a key owned by a registered remote cell. The gRPC metadata and transaction handlers forward that request to the stored endpoint before calling the local router. The receiver sees `x-metadb-cell-forwarded` and does not forward again. An unreachable cell fails the call. On `proxy`, `execute_sql_via_registered_cell` dials that cell with `x-metadb-cell-forwarded` when one registered cell contains the statement, and otherwise returns a placement error. Metadata calls and user-key transactions use the same rule. A missing directory, a request that is not contained by one cell, keys split across two cells, or a range that only overlaps a cell fails closed. None of those calls is sent to `[cluster] upstream` or applied locally. `CommitPrimary2pc`, `ApplyAuxBatch`, `ForwardRouter`, and `GetRoutes` may still go to `[cluster] upstream`. `AllocateIdBlock` is refused. This is not a production MetaCache of every shard.
 
 ## Storage
 

@@ -2,9 +2,9 @@
 
 * **返回指南首页**: [简体中文概览](./README.md) | [文档中心](../../README.md)
 
-The current binary runs a persistent deployment only as `all-in-one`. A second `all-in-one` process can join the same cell. Role-split processes and the multi-cell topology are a design target, not a deployment this repository runs. The `100B`–`10T+` range is a design model, not a measurement of this repository. Trillion-scale figures in `arXiv:2610.32247v1` are Baidu production metrics, not results of this repository.
+The current binary starts `all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` when that role's configuration is valid. A second `all-in-one` process can join the same cell. `proxy` dials the registered cell that contains a metadata call, `ExecuteSql`, or a user-key transaction, and fails closed otherwise. Those calls are not sent to `[cluster] upstream`. The disaggregated production topology is still a design target, not a deployment this repository runs. The `100B`–`10T+` range is a design model, not a measurement of this repository. Trillion-scale figures in `arXiv:2610.32247v1` are Baidu production metrics, not results of this repository.
 
-> **What this tree runs**: persistent LSM, Raft replication, same-process shard splits, and all-in-one gRPC/CLI have tests in this workspace. Only `all-in-one` starts a daemon. `be`, `proxy`, `cell-manager`, `global-manager`, and remote `RegisterCell` are rejected. Jumbo isolation is a route flag and does not move peer shards. See [correctness notes](../../designs/correctness_hardening.md).
+> **What this tree runs**: persistent LSM, Raft replication, same-process shard splits, and all-in-one gRPC/CLI have tests in this workspace. `all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` start when the configuration is valid. `proxy` dials a registered cell for a contained metadata call, `ExecuteSql`, or user-key transaction and fails closed otherwise. Jumbo isolation is a route flag and does not move peer shards. See [correctness notes](../../designs/correctness_hardening.md).
 
 ---
 
@@ -46,7 +46,7 @@ allow_unauthenticated = true
 
 ### 启动单机服务
 
-工具链固定为 Rust **1.100.0**（`rust-toolchain.toml`）。当前只有 `all-in-one` 会真正启动；`be` / `proxy` / `cell-manager` / `global-manager` 会被拒绝，而不是静默变成全功能进程。
+The toolchain is Rust **1.100.0** (`rust-toolchain.toml`). `all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` start when the configuration is valid. An invalid combination fails before listen.
 
 The `[security]` block above is the explicit loopback development opt-in. It is not a credential. `grpc_listen_addr` and `metrics_listen_addr` stay on the literal IP `127.0.0.1`. The hostname `localhost` is not accepted for `allow_unauthenticated`. An empty secret without that flag does not start the process.
 
@@ -77,7 +77,7 @@ shared_secret = "replace-with-a-long-random-string"
 
 Stage 3 is a design target. The current binary does not deploy it.
 
-`metadbd` only runs `--role all-in-one`. `PersistentMetaDbCluster::open_and_serve` in `crates/metadb-server/src/lib.rs` rejects `be`, `proxy`, `cell-manager`, and `global-manager` before it listens. `RegisterCell` stores a second all-in-one cell in the caller's `GLOBAL_CELL_DIRECTORY` after that cell's routes cover the requested range. The caller does not forward keys. This is not a disaggregated deployment.
+`metadbd` starts `--role all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` when that role's configuration is valid. `proxy` dials the registered cell that contains a metadata call, `ExecuteSql`, or a user-key transaction, and returns a placement error otherwise. Those calls are not sent to `[cluster] upstream`. `CommitPrimary2pc`, `ApplyAuxBatch`, `ForwardRouter`, and `GetRoutes` may still use that upstream. `AllocateIdBlock` is refused. This is not a production MetaCache of every shard and not a disaggregated production deployment.
 
 A second `metadbd --role all-in-one` can join the **same** cell when `--join` or `--cell-manager` names the current leader and the data directory is fresh. That path is covered by `crates/metadb-server/tests/join_existing_group.rs`. The joiner is still an all-in-one process. It is not a role-trimmed backend, and the join does not create another cell. See [Operations](../../zh/operations.md).
 
