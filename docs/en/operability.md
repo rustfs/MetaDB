@@ -88,7 +88,7 @@ These stay out of the probe on purpose. Treating them as ready would be a broade
 
 - The 250 ms `TxnRecoveryWorker` pass. Expired 2PC intents are not required to be drained before `/readyz` returns 200. The first pass runs after the phase flips to `serving`, and a failed pass is ignored by that loop.
 - Backup holds, online backup copies, and restore. Those are a separate operator path.
-- Whether a remote cell in `GLOBAL_CELL_DIRECTORY` is reachable. `/readyz` answers for this process's local shards only. Jumbo file movement and RDMA are not readiness signals. Heartbeats stay a local liveness annotation and do not make a cell ready or scheduled. Placement gauges are not readiness inputs. A `leader_on_dedicated` row does not make `/readyz` return 200, and a `blocked` row does not make it return 503.
+- Whether a remote cell in `GLOBAL_CELL_DIRECTORY` is reachable. `/readyz` answers for this process's local shards only. Jumbo file movement and RDMA are not readiness signals. Heartbeats stay a local liveness annotation. A measured `HintLive` result is not a readiness input and does not make a cell scheduled. Placement gauges are not readiness inputs. A `leader_on_dedicated` row does not make `/readyz` return 200, and a `blocked` row does not make it return 503.
 - Disk space, clock health, and "this node can reach a quorum right now" beyond the leader id OpenRaft has published. `leader_unknown` is the check this process can make without starting a proposal.
 - Per-shard series. Gauges below are counts. A shard id is not a label.
 
@@ -113,7 +113,7 @@ Unlabeled gauges added for operators:
 | `metadb_shards_storage_unrecoverable` | Local groups whose snapshot cannot be rebuilt |
 | `metadb_shards_raft_stopped` | Local groups whose `shutdown` has started |
 | `metadb_shards_raft_fatal` | Local groups whose OpenRaft `running_state` is an error |
-| `metadb_raft_heartbeat_interval_ms` | Configured heartbeat. Not a measured RTT |
+| `metadb_raft_heartbeat_interval_ms` | Configured Raft heartbeat. Not a measured control-plane RTT. The liveness hint is not a gauge |
 | `metadb_raft_election_timeout_min_ms` | Configured minimum election timeout |
 | `metadb_raft_election_timeout_max_ms` | Configured maximum election timeout |
 | `metadb_raft_max_in_snapshot_log_to_keep` | Configured OpenRaft snapshot-log retention |
