@@ -6,7 +6,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
 use metadb_core::{
-    CellId, CompositeKeyRange, HybridLogicalClock, InodeId, MetaDbError, NodeId, Result,
+    lease_wall_ms, CellId, CompositeKeyRange, HlcTimestamp, HybridLogicalClock, InodeId,
+    LeaseRenewReject, MetaDbError, NodeId, Result,
 };
 use metadb_tx::{DirRenameLease, RoutedShardHandle, ShardDirectory, MAX_2PC_LEASE_LIFETIME_MS};
 
@@ -42,6 +43,10 @@ pub enum CellPlacement {
 
 /// Top-tier Two-Tier Control Plane manager (`GlobalManager` + `MetaCache` + `DurableIdAllocator`).
 pub struct DurableGlobalManager {
+    /// Shared process clock. Lease acquire and extend do not read it.
+    /// Those decisions use `lease_wall_ms`, which rejects a wall that has
+    /// stepped away from monotonic time.
+    #[allow(dead_code)]
     clock: Arc<HybridLogicalClock>,
     id_allocator: Arc<DurableIdAllocator>,
     meta_cache: Arc<CompositeMetaCache>,
@@ -602,8 +607,13 @@ impl ShardDirectory for DurableGlobalManager {
         _moved_dir_id: InodeId,
         ttl_ms: u64,
     ) -> Result<DirRenameLease> {
+        let Some(wall_ms) = lease_wall_ms() else {
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::UntrustedClock,
+            ));
+        };
         let (token, expire_hlc) = self.id_allocator.acquire_dir_rename_lease(
-            self.clock.now(),
+            HlcTimestamp::new(wall_ms, 0),
             ttl_ms,
             MAX_2PC_LEASE_LIFETIME_MS,
         )?;
@@ -618,9 +628,16 @@ impl ShardDirectory for DurableGlobalManager {
         token: u64,
         ttl_ms: u64,
     ) -> Result<Option<metadb_core::HlcTimestamp>> {
-        let expire = self
-            .id_allocator
-            .extend_dir_rename_lease(token, self.clock.now(), ttl_ms)?;
+        let Some(wall_ms) = lease_wall_ms() else {
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::UntrustedClock,
+            ));
+        };
+        let expire = self.id_allocator.extend_dir_rename_lease(
+            token,
+            HlcTimestamp::new(wall_ms, 0),
+            ttl_ms,
+        )?;
         Ok(Some(expire))
     }
 

@@ -429,6 +429,25 @@ pub fn wall_tracks_monotonic(elapsed_ms: u128, origin_wall: u64, wall: u64) -> O
     }
 }
 
+/// `now_ms` is this process's wall clock, and that wall does not track monotonic time.
+///
+/// A timestamp more than the drift bound away from the process wall is a
+/// caller-supplied clock, such as a test HLC, and is not this check. A true
+/// result must not acquire, extend, replace, or abort a lease.
+pub fn lease_live_wall_is_untracked(
+    now_ms: u64,
+    raw_wall_ms: Option<u64>,
+    tracked_ms: Option<u64>,
+) -> bool {
+    let Some(raw) = raw_wall_ms else {
+        return false;
+    };
+    if now_ms.abs_diff(raw) > DEFAULT_MAX_CLOCK_DRIFT_MS {
+        return false;
+    }
+    tracked_ms.is_none()
+}
+
 /// Wall time for a lease decision, or `None` when it cannot be trusted.
 ///
 /// The first accepted reading is the monotonic anchor. A later reading that
@@ -570,6 +589,16 @@ mod tests {
         assert!(wall_tracks_monotonic(1_000, 50_000, 51_000 + 501).is_none());
         assert!(wall_tracks_monotonic(1_000, 50_000, 50_000).is_none());
         assert!(wall_tracks_monotonic(0, 50_000, 1).is_none());
+        assert!(lease_live_wall_is_untracked(90_000, Some(90_100), None));
+        assert!(!lease_live_wall_is_untracked(
+            90_000,
+            Some(90_100),
+            Some(90_100)
+        ));
+        assert!(
+            !lease_live_wall_is_untracked(1_000, Some(1_700_000_000_000), None),
+            "a synthetic timestamp is not the process wall"
+        );
     }
 
     #[test]

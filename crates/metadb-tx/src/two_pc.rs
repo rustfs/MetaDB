@@ -340,6 +340,14 @@ impl Drop for LeaseTask {
     }
 }
 
+/// Monotonic-tracking wall time. This does not read [`HybridLogicalClock::now`].
+///
+/// `None` means the wall stepped away from monotonic time or cannot be read.
+/// Callers must not abort prepared shards or publish a later `expire_hlc` from it.
+fn monotonic_lease_hlc() -> Option<HlcTimestamp> {
+    lease_wall_ms().map(|ms| HlcTimestamp::new(ms, 0))
+}
+
 async fn renew_open_lease(
     directory: &dyn ShardDirectory,
     keeper: &LeaseKeeper,
@@ -802,7 +810,11 @@ impl DistributedTxRouter {
                             target_user_keys: vec![user_key.to_vec()],
                         };
                         let _ = self
-                            .propose_participant_retry_epoch(user_key, &abort, self.clock.now())
+                            .propose_participant_retry_epoch(
+                                user_key,
+                                &abort,
+                                monotonic_lease_hlc().unwrap_or(HlcTimestamp::new(2, 0)),
+                            )
                             .await;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(5 * (attempt as u64 + 1)))
@@ -1570,7 +1582,11 @@ impl DistributedTxRouter {
         // Waiting for split publication must not consume a transaction's lease
         // before its first prepare. A directory-rename lease is not renewed during
         // that wait; if it already expired, fail before writing intents.
-        let start_hlc = self.clock.now();
+        let Some(start_hlc) = monotonic_lease_hlc() else {
+            return Err(MetaDbError::TransactionAborted(
+                "2PC lease clock stepped away from monotonic time; refusing to open a lease".into(),
+            ));
+        };
         let rename_fence_token = lease_opt.map(|lease| lease.rename_fence_token);
         let rename_cap_ms = lease_opt
             .map(|lease| lease.expire_hlc.physical_ms())
@@ -1632,7 +1648,11 @@ impl DistributedTxRouter {
                 held_before_prepare = true;
                 tokio::time::sleep(self.pre_prepare_hold).await;
             }
-            let now = self.clock.now();
+            let Some(now) = monotonic_lease_hlc() else {
+                // A jumped wall is not expiry and must not move the deadline.
+                tokio::time::sleep(ROUTE_RETRY_INTERVAL).await;
+                continue;
+            };
             let expire_hlc = keeper.expire_for(now, self.ttl_ms);
             if expire_hlc <= now {
                 self.abort_prepared_shards(txn_id, &prepared_shards).await;
@@ -1676,6 +1696,7 @@ impl DistributedTxRouter {
             ordered_groups.sort_by_key(|(sid, _)| *sid == shard_id);
             let mut prepared_this_round: Vec<PreparedShardBatch> = Vec::new();
             let mut regroup = false;
+            let mut wait_clock = false;
             for (sid, (_epoch, _group, shard_intents)) in ordered_groups {
                 let shard_keys: Vec<Vec<u8>> =
                     shard_intents.iter().map(|(key, _)| key.clone()).collect();
@@ -1700,7 +1721,11 @@ impl DistributedTxRouter {
                     .unwrap_or_else(|| primary_key.to_vec());
                 // Recompute immediately before this proposal. A NotLeader retry
                 // longer than the remaining TTL must not reuse a stale expire.
-                let attempt_now = self.clock.now();
+                let Some(attempt_now) = monotonic_lease_hlc() else {
+                    // Do not abort shards prepared earlier in this round.
+                    wait_clock = true;
+                    break;
+                };
                 let attempt_expire = keeper.expire_for(attempt_now, self.ttl_ms);
                 if attempt_expire <= attempt_now {
                     self.abort_prepared_shards(txn_id, &prepared_shards).await;
@@ -1762,6 +1787,11 @@ impl DistributedTxRouter {
                     }
                 }
             }
+            if wait_clock {
+                keeper.clear();
+                tokio::time::sleep(ROUTE_RETRY_INTERVAL).await;
+                continue;
+            }
             if regroup {
                 keeper.clear();
                 self.abort_prepared_shards(txn_id, &prepared_this_round)
@@ -1796,7 +1826,13 @@ impl DistributedTxRouter {
                 ));
             }
         }
-        if keeper.failed() || self.clock.now() > keeper.published() {
+        let last_applied = prepared_shards
+            .first()
+            .map(|(_, group, _)| group.engine().mvcc().latest_watermarks().1)
+            .unwrap_or(HlcTimestamp::ZERO);
+        if keeper.failed()
+            || lease_expiry_is_proved(last_applied, keeper.published(), lease_wall_ms())
+        {
             self.abort_prepared_shards(txn_id, &prepared_shards).await;
             return Err(MetaDbError::TransactionAborted(
                 "2PC lease expired before commit".into(),
@@ -1804,7 +1840,19 @@ impl DistributedTxRouter {
         }
 
         // Phase 2a: Atomic Commit on Primary Shard (`[0x06] TxnRecord -> Committed`).
-        let commit_hlc = self.clock.update(max_prepared_hlc);
+        // Do not fold a raw wall jump into the commit timestamp. A monotonic
+        // reading may advance it; otherwise stay on the prepared HLC.
+        let commit_hlc = match monotonic_lease_hlc() {
+            Some(wall) if wall > max_prepared_hlc => wall,
+            _ => {
+                let next = max_prepared_hlc.next_strict();
+                if next > max_prepared_hlc {
+                    next
+                } else {
+                    max_prepared_hlc
+                }
+            }
+        };
         let commit_primary_cmd = TxRaftCmd::CommitPrimary2pc {
             txn_id,
             commit_hlc,
@@ -1977,7 +2025,7 @@ impl DistributedTxRouter {
     }
 
     async fn abort_prepared_shards(&self, txn_id: TxnId, prepared: &[PreparedShardBatch]) {
-        let now = self.clock.now();
+        let now = monotonic_lease_hlc().unwrap_or(HlcTimestamp::new(2, 0));
         for (_ep, _grp, keys) in prepared {
             let cmd = TxRaftCmd::Abort2pc {
                 txn_id,

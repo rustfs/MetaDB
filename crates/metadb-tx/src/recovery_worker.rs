@@ -268,7 +268,7 @@ impl TxnRecoveryWorker {
                             };
                             let bytes = crate::command_payload(&abort_cmd).unwrap();
                             let _ = group
-                                .propose(group.current_epoch(), clock.now(), bytes)
+                                .propose(group.current_epoch(), propose_hlc, bytes)
                                 .await;
                         }
                         recovered_count += 1;
@@ -291,7 +291,7 @@ impl TxnRecoveryWorker {
                         };
                         let bytes = crate::command_payload(&abort_cmd).unwrap();
                         let _ = group
-                            .propose(group.current_epoch(), clock.now(), bytes)
+                            .propose(group.current_epoch(), propose_hlc, bytes)
                             .await;
                     }
                     TxnState::Committed { commit_hlc } => {
@@ -379,7 +379,11 @@ impl TxnRecoveryWorker {
                 TxnState::Pending => continue,
             };
             let bytes = crate::command_payload(&cmd)?;
-            if grp.propose(ep, clock.now(), bytes).await.is_ok() {
+            let stamp = lease_wall_ms()
+                .map(|ms| HlcTimestamp::new(ms, 0))
+                .unwrap_or(HlcTimestamp::new(2, 0));
+            let _ = clock;
+            if grp.propose(ep, stamp, bytes).await.is_ok() {
                 newly_acked.extend(keys);
             }
         }
@@ -390,8 +394,11 @@ impl TxnRecoveryWorker {
                 acked_user_keys: newly_acked,
             };
             let bytes = crate::command_payload(&ack_cmd)?;
+            let stamp = lease_wall_ms()
+                .map(|ms| HlcTimestamp::new(ms, 0))
+                .unwrap_or(HlcTimestamp::new(2, 0));
             let _ = primary_group
-                .propose(primary_group.current_epoch(), clock.now(), bytes)
+                .propose(primary_group.current_epoch(), stamp, bytes)
                 .await;
         }
         Ok(())

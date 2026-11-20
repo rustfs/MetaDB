@@ -20,9 +20,9 @@ pub use epoch::{CellId, CompositeKeyRange, ShardEpoch, TxnId};
 pub use error::{LeaseRenewReject, MetaDbError, Result, RetryableConsensusKind};
 pub use hlc::{
     lease_clock_can_extend, lease_exceeds_lifetime, lease_expiry_is_proved,
-    lease_observation_inside_window, lease_wall_ms, lease_window_is_legal, observation_millis,
-    trusted_lease_observation, wall_tracks_monotonic, HlcTimestamp, HybridLogicalClock,
-    DEFAULT_MAX_CLOCK_DRIFT_MS,
+    lease_live_wall_is_untracked, lease_observation_inside_window, lease_wall_ms,
+    lease_window_is_legal, observation_millis, trusted_lease_observation, wall_tracks_monotonic,
+    HlcTimestamp, HybridLogicalClock, DEFAULT_MAX_CLOCK_DRIFT_MS,
 };
 pub use schema::{
     is_dir_inode_id, is_file_inode_id, make_file_inode_id, negate_accounted_size,

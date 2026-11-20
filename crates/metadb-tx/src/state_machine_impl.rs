@@ -13,14 +13,14 @@ use metadb_core::codec;
 use metadb_core::schema::validate_user_entry_name;
 use metadb_core::{
     decode_lease_preimage, lease_exceeds_lifetime, lease_preimage_is_orphan, lease_preimage_prefix,
-    lease_preimage_prefix_end, lease_window_is_legal, negate_accounted_size, saturating_add_i64,
-    trusted_lease_observation, validate_dir_inode_id, validate_file_size, AttrDeltaSpec,
-    AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, CompositeKeyRange, DirShardDeltaKey,
-    DirShardDeltaRecord, EntryType, FenceHolder, FileId, HlcTimestamp, HybridLogicalClock,
-    InodeAttr, InodeId, IntentOp, LeasePreimageValue, LeaseRenewReject, MetaDbError, MetaEntry,
-    MetaKey, QuotaKey, QuotaRecord, Result, SecondaryIndexKey, SecondaryIndexRecord, ShardEpoch,
-    ShardId, TxnId, TxnRecordKey, TxnState, TxnStatusRecord, UserId, WriteIntentKey,
-    WriteIntentRecord, ATTR_ENTRY_NAME, PROPOSAL_ENVELOPE_MAGIC, SYSTEM_PREFIX_LEASE_PREIMAGE,
+    lease_preimage_prefix_end, lease_wall_ms, lease_window_is_legal, negate_accounted_size,
+    saturating_add_i64, trusted_lease_observation, validate_dir_inode_id, validate_file_size,
+    AttrDeltaSpec, AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, CompositeKeyRange,
+    DirShardDeltaKey, DirShardDeltaRecord, EntryType, FenceHolder, FileId, HlcTimestamp, InodeAttr,
+    InodeId, IntentOp, LeasePreimageValue, LeaseRenewReject, MetaDbError, MetaEntry, MetaKey,
+    QuotaKey, QuotaRecord, Result, SecondaryIndexKey, SecondaryIndexRecord, ShardEpoch, ShardId,
+    TxnId, TxnRecordKey, TxnState, TxnStatusRecord, UserId, WriteIntentKey, WriteIntentRecord,
+    ATTR_ENTRY_NAME, PROPOSAL_ENVELOPE_MAGIC, SYSTEM_PREFIX_LEASE_PREIMAGE,
 };
 use metadb_raft::{MetaDbRaftRequest, ShardApplyHandler, ShardWatermarkTracker};
 use metadb_storage::{
@@ -3142,8 +3142,10 @@ impl TxStateMachineHandler {
     /// without a stored start is not given one.
     fn rehydrate_lease_holds(&self, engine: &LifecycleStorageEngine) {
         let last_applied = engine.mvcc().latest_watermarks().1;
+        // `try_wall_clock_ms` accepts a forward jump. Only a reading that still
+        // tracks the monotonic anchor may rebuild a hold.
         let Some(now) =
-            trusted_lease_observation(last_applied, HybridLogicalClock::try_wall_clock_ms())
+            lease_wall_ms().and_then(|ms| trusted_lease_observation(last_applied, Some(ms)))
         else {
             return;
         };
