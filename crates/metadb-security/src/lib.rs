@@ -1,46 +1,24 @@
-//! Transport policy for MetaDB listeners and outbound clients.
+//! TLS 1.3 transport policy for MetaDB listeners and outbound clients.
 //!
-//! Successful startup is plaintext. `tls` and `mtls` are recognized and refused
-//! before a listener exists. This crate does not terminate TLS, does not link a
-//! TLS provider, and does not install method RBAC.
+//! The cryptography is rustls 0.23 with the maintained `ring` provider.
+//! `aws-lc-rs` is not enabled. Certificate chain, hostname, and extended key
+//! usage are checked with rustls WebPKI verifiers and the configured CA.
+//! There is no accept-all verifier and no skip-verify switch.
 //!
-//! The scale stream owns process role separation. A later authorizer must not
-//! treat `[security].shared_secret` as a role. See
+//! Method RBAC is not installed. A verified certificate name is not a role,
+//! and TLS does not replace the bearer secret. See
 //! `docs/designs/transport_security.md`.
 
+mod identity;
 mod session;
 mod spec;
 
-pub use session::TransportSecurity;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
+pub use identity::AuthenticatedPrincipal;
+pub use session::{TlsServerIo, TransportSecurity};
 pub use spec::{SecurityError, TlsMode, TlsSpec};
-
-/// Certificate identity for a future authorizer.
-///
-/// Nothing in this tree constructs a principal from a peer certificate, because
-/// TLS is not terminated. The string is not a role.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthenticatedPrincipal {
-    identity: String,
-}
-
-impl AuthenticatedPrincipal {
-    pub fn as_str(&self) -> &str {
-        &self.identity
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_identity_unchecked(identity: impl Into<String>) -> Self {
-        Self {
-            identity: identity.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for AuthenticatedPrincipal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.identity)
-    }
-}
 
 /// Method authorization is not installed.
 ///
@@ -89,15 +67,12 @@ mod tests {
     }
 
     #[test]
-    fn tls_and_mtls_are_refused_without_reading_key_material() {
+    fn missing_material_fails_before_any_listener_and_does_not_echo_a_key() {
         let spec =
             TlsSpec::from_fields("mtls", "cert.pem", "key.pem", "ca.pem", "127.0.0.1").unwrap();
         let error = TransportSecurity::load(&spec).unwrap_err();
         let text = error.to_string();
-        assert!(text.contains("does not terminate TLS"), "{text}");
-        assert!(text.contains("ISC"), "{text}");
-        assert!(text.contains("rustls-pure"), "{text}");
-        assert!(text.contains("revocation"), "{text}");
+        assert!(text.contains("cannot read"), "{text}");
         assert!(!text.contains("BEGIN"));
         assert!(!text.contains("PRIVATE"));
 
@@ -125,5 +100,111 @@ mod tests {
             unspecified.to_string().contains("server_name"),
             "{unspecified}"
         );
+    }
+
+    fn scratch() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "metadb-security-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    #[test]
+    fn mtls_material_verifies_and_bad_material_fails_closed() {
+        let dir = scratch();
+        let mut ca = crate::testing::TestCa::new("metadb-test-ca");
+        let issued = ca.issue(crate::testing::IssueRequest::server_and_client(
+            "127.0.0.1".parse().unwrap(),
+            "spiffe://metadb/node/test",
+        ));
+        let (cert, key, ca_pem) =
+            crate::testing::write_bundle(&dir, ca.pem(), &issued.cert_pem, &issued.key_pem);
+        let spec = TlsSpec::from_fields("mtls", &cert, &key, &ca_pem, "127.0.0.1").unwrap();
+        let loaded = TransportSecurity::load(&spec).expect("valid mtls material");
+        assert!(!loaded.is_plaintext());
+        assert!(loaded.verifies_peer_certificates());
+        assert_eq!(loaded.server_name(), Some("127.0.0.1"));
+        let http = loaded.prepare_url("http://127.0.0.1:7800").unwrap_err();
+        assert!(http.to_string().contains("plaintext"), "{http}");
+
+        let expired = ca.issue(crate::testing::IssueRequest {
+            uri: Some("spiffe://metadb/node/expired"),
+            dns: None,
+            ip: Some("127.0.0.1".parse().unwrap()),
+            server_auth: true,
+            client_auth: true,
+            validity: crate::testing::expired_validity(),
+        });
+        let (cert, key, ca_pem) =
+            crate::testing::write_bundle(&dir, ca.pem(), &expired.cert_pem, &expired.key_pem);
+        let error = TransportSecurity::load(
+            &TlsSpec::from_fields("mtls", &cert, &key, &ca_pem, "127.0.0.1").unwrap(),
+        )
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains("not verified") || text.contains("extended key usage"),
+            "{text}"
+        );
+        assert!(!text.contains("BEGIN PRIVATE"));
+
+        let wrong_name = ca.issue(crate::testing::IssueRequest::server_and_client(
+            "127.0.0.2".parse().unwrap(),
+            "spiffe://metadb/node/other",
+        ));
+        let (cert, key, ca_pem) =
+            crate::testing::write_bundle(&dir, ca.pem(), &wrong_name.cert_pem, &wrong_name.key_pem);
+        let error = TransportSecurity::load(
+            &TlsSpec::from_fields("mtls", &cert, &key, &ca_pem, "127.0.0.1").unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("subject alternative name")
+                || error.to_string().contains("not verified"),
+            "{error}"
+        );
+
+        let mut missing_eku = crate::testing::IssueRequest::server_and_client(
+            "127.0.0.1".parse().unwrap(),
+            "spiffe://metadb/node/no-eku",
+        );
+        missing_eku.server_auth = false;
+        missing_eku.client_auth = false;
+        let issued = ca.issue(missing_eku);
+        let (cert, key, ca_pem) =
+            crate::testing::write_bundle(&dir, ca.pem(), &issued.cert_pem, &issued.key_pem);
+        let error = TransportSecurity::load(
+            &TlsSpec::from_fields("mtls", &cert, &key, &ca_pem, "127.0.0.1").unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("extended key usage"), "{error}");
+
+        let wildcard = ca.issue(crate::testing::IssueRequest {
+            uri: None,
+            dns: Some("*.example.test"),
+            ip: None,
+            server_auth: true,
+            client_auth: true,
+            validity: crate::testing::validity_from_now(std::time::Duration::from_secs(3600)),
+        });
+        let (cert, key, ca_pem) =
+            crate::testing::write_bundle(&dir, ca.pem(), &wildcard.cert_pem, &wildcard.key_pem);
+        let error = TransportSecurity::load(
+            &TlsSpec::from_fields("tls", &cert, &key, &ca_pem, "node.example.test").unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("wildcard"), "{error}");
+
+        let marker = "SUPER-SECRET-KEY-MATERIAL";
+        std::fs::write(dir.join("key.pem"), marker).unwrap();
+        let error = TransportSecurity::load(&spec).unwrap_err();
+        assert!(!error.to_string().contains(marker), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

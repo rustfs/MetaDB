@@ -63,18 +63,26 @@ async fn metrics_connection(
     shared_secret: String,
     security: &TransportSecurity,
 ) -> Result<(), hyper::Error> {
-    if !security.is_plaintext() {
-        tracing::error!("refusing metrics: TLS termination is not available");
-        return Ok(());
+    if security.is_plaintext() {
+        return serve_metrics(socket, cluster, shared_secret).await;
     }
-    serve_metrics(socket, cluster, shared_secret).await
+    match security.accept_metrics(socket).await {
+        Ok(tls) => serve_metrics(tls, cluster, shared_secret).await,
+        Err(error) => {
+            tracing::warn!(%error, "metrics tls handshake refused");
+            Ok(())
+        }
+    }
 }
 
-async fn serve_metrics(
-    socket: TcpStream,
+async fn serve_metrics<I>(
+    socket: I,
     cluster: Weak<PersistentMetaDbCluster>,
     shared_secret: String,
-) -> Result<(), hyper::Error> {
+) -> Result<(), hyper::Error>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let service = service_fn(move |request: Request<Incoming>| {
         let cluster = cluster.clone();
         let shared_secret = shared_secret.clone();

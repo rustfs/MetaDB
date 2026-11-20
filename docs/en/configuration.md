@@ -28,7 +28,7 @@
 | `sharding.jumbo_dedicated_root` | empty | Yes. A real directory outside the data directory. Empty does not move files. A symlink, or a path inside the data directory, refuses startup. The copy stays on this machine |
 | `security.shared_secret` | `""` | Yes. Empty does not start a listener. A value with a non-whitespace character requires the same bearer on gRPC and the metrics listener. Whitespace-only is rejected |
 | `security.allow_unauthenticated` | `false` | Yes. Explicit loopback-only development opt-in. It does not allow a non-loopback bind, and it cannot be combined with a usable secret |
-| `security.tls.mode` | `off` | Yes. `off` is plaintext. `tls` and `mtls` are refused before a data directory is created. This process does not terminate TLS |
+| `security.tls.mode` | `off` | Yes. `off` is plaintext and refuses `https`. `tls` and `mtls` are TLS 1.3 through rustls and ring. Bad material is refused before a data directory is created. This is not a production security acceptance |
 | `raft.heartbeat_interval_ms` | `150` | Yes, when each local Raft group starts. Not reloaded while the process runs |
 | `raft.election_timeout_min_ms` | `450` | Yes. Must be greater than the heartbeat and less than the maximum |
 | `raft.election_timeout_max_ms` | `900` | Yes. Must be greater than the minimum |
@@ -91,7 +91,7 @@ CLI flags override the file after it is parsed: `--node-id`, `--cell-id`, `--rol
 
 ## Security
 
-`[security.tls]` is the only TLS table. `mode = "off"` (the default, including when the table is omitted) keeps plaintext listeners. `mode = "tls"` or `mode = "mtls"` is refused before a data directory or listener is created. The certificate files are not opened. This process does not terminate TLS. The accepted keys are `mode`, `cert_file`, `key_file`, `ca_file`, and `server_name`. Any other TLS, SSL, or certificate key, including a key nested outside `[security.tls]`, fails parsing and does not fall open to plaintext.
+`[security.tls]` is the only TLS table. `mode = "off"` (the default, including when the table is omitted) keeps plaintext listeners and refuses `https`. `mode = "tls"` or `mode = "mtls"` terminates TLS 1.3 with rustls and the ring provider. `cert_file`, `key_file`, `ca_file`, and `server_name` are required for a listener. `mtls` also requires a client certificate. The files are read and verified before a data directory or listener is created. A missing, unreadable, expired, or mismatched file refuses startup. `http` is refused while TLS is on. A wildcard listen address is refused. Trust anchors are the configured CA only. There is no CRL, OCSP, or certificate reload. TLS does not replace the bearer, and method RBAC is not installed. This is not a production security acceptance. The accepted keys are `mode`, `cert_file`, `key_file`, `ca_file`, and `server_name`. Any other TLS, SSL, or certificate key, including a key nested outside `[security.tls]`, fails parsing and does not fall open to plaintext.
 
 `http://` is the only scheme while mode is `off`. `https://` is refused. There is no skip-verify setting, no revocation check, and no credential rotation. Method RBAC is not installed. The provider and license blockers are in [transport security](../designs/transport_security.md).
 

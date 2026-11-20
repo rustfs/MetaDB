@@ -773,8 +773,7 @@ impl PersistentMetaDbCluster {
                 .prepare_url(&config.cluster.global_manager)
                 .map_err(security_startup_error)?;
         }
-        // TLS mode is rejected here, before a data directory or listener exists.
-        // Certificate files are not opened.
+        // Certificate material is checked here, before a data directory or listener exists.
         let transport_security =
             Arc::new(TransportSecurity::load(&tls_spec).map_err(security_startup_error)?);
         std::fs::create_dir_all(&config.node.data_dir)?;
@@ -1602,14 +1601,49 @@ fn spawn_grpc_server(
                 MultiRaftTransportServer::new(raft_router),
                 auth,
             ));
-        if !security.is_plaintext() {
-            tracing::error!("refusing to serve: TLS termination is not available");
+        if security.is_plaintext() {
+            let _ = router
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.changed().await;
+                })
+                .await;
             return;
         }
+        let mut accept_shutdown = shutdown_rx.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<
+            std::result::Result<metadb_security::TlsServerIo, std::io::Error>,
+        >(32);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = accept_shutdown.changed() => break,
+                    accepted = listener.accept() => {
+                        let Ok((tcp, _)) = accepted else { break; };
+                        let security = Arc::clone(&security);
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            match security.accept_grpc(tcp).await {
+                                Ok(io) => {
+                                    if tx.send(Ok(io)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "tls handshake refused");
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
         let _ = router
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                let _ = shutdown_rx.changed().await;
-            })
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+                async move {
+                    let _ = shutdown_rx.changed().await;
+                },
+            )
             .await;
     })
 }
