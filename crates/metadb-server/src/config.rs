@@ -25,8 +25,8 @@ use metadb_transport::{
 /// `global-manager` hosts only the cell directory. `cell-manager` hosts one
 /// cell and its local Raft groups, and can publish that cell to a
 /// `global-manager`. `be` hosts local Raft replicas and serves their metadata.
-/// It does not publish a cell or mint id blocks. `proxy` forwards metadata and
-/// transactions to one `[ClusterSection::upstream]` and does not open Raft.
+/// It does not publish a cell or mint id blocks. `proxy` dials a registered
+/// cell when that cell contains the request. It does not open Raft.
 ///
 /// A second all-in-one process joins an existing Raft group when [`ClusterSection::join`]
 /// is set and its data directory does not already own a cell.
@@ -294,8 +294,10 @@ pub struct ClusterSection {
     /// to publish this cell after the listener is up. Empty means this process
     /// does not register anywhere.
     pub global_manager: String,
-    /// `host:port` of one shard host. Only `proxy` uses it. The proxy forwards
-    /// metadata and transaction RPCs there and does not open a Raft group.
+    /// `host:port` of one shard host. Only `proxy` uses it. `CommitPrimary2pc`
+    /// has no user key and is sent here. `GetRoutes`, `ApplyAuxBatch`, and
+    /// `ForwardRouter` are sent here as well. A metadata or transaction request
+    /// contained by one registered cell is dialed at that cell instead.
     pub upstream: String,
 }
 

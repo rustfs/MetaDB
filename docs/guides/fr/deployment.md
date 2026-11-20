@@ -2,7 +2,7 @@
 
 * **Retour à l'index**: [Présentation Français](./README.md) | [Portail](../../README.md)
 
-The current binary runs a persistent deployment only as `all-in-one`. A second `all-in-one` process can join the same cell. Role-split processes and the multi-cell topology are a design target, not a deployment this repository runs. The `100B`–`10T+` range is a design model, not a measurement of this repository. Trillion-scale figures in `arXiv:2610.32247v1` are Baidu production metrics, not results of this repository.
+The current binary starts `all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` when that role's configuration is valid. A second `all-in-one` process can join the same cell. `proxy` dials the registered cell that contains a metadata call, `ExecuteSql`, or a user-key transaction, and fails closed otherwise. Those calls are not sent to `[cluster] upstream`. The disaggregated production topology is still a design target, not a deployment this repository runs. The `100B`–`10T+` range is a design model, not a measurement of this repository. Trillion-scale figures in `arXiv:2610.32247v1` are Baidu production metrics, not results of this repository.
 
 ---
 
@@ -40,7 +40,7 @@ shard_split_threshold_bytes = 4294967296 # 4 Gio
 allow_unauthenticated = true
 ```
 
-Rust 1.100.0 (`rust-toolchain.toml`). Only `all-in-one` starts. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
+Rust 1.100.0 (`rust-toolchain.toml`). `all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` start when the configuration is valid. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
 
 The `[security]` block above is the explicit loopback development opt-in. It is not a credential. `grpc_listen_addr` and `metrics_listen_addr` stay on the literal IP `127.0.0.1`. The hostname `localhost` is not accepted for `allow_unauthenticated`. An empty secret without that flag does not start the process.
 
@@ -69,7 +69,7 @@ Lorsqu'un shard dépasse `shard_split_threshold_bytes`, `PolicyShardSplitter` ch
 
 Stage 3 is a design target. The current binary does not deploy it.
 
-`metadbd` only runs `--role all-in-one`. `PersistentMetaDbCluster::open_and_serve` in `crates/metadb-server/src/lib.rs` rejects `be`, `proxy`, `cell-manager`, and `global-manager` before it listens. `RegisterCell` stores a second all-in-one cell in the caller's `GLOBAL_CELL_DIRECTORY` after that cell's routes cover the requested range. The caller does not forward keys. This is not a disaggregated deployment.
+`metadbd` starts `--role all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` when that role's configuration is valid. `proxy` dials the registered cell that contains a metadata call, `ExecuteSql`, or a user-key transaction, and returns a placement error otherwise. Those calls are not sent to `[cluster] upstream`. `CommitPrimary2pc`, `ApplyAuxBatch`, `ForwardRouter`, and `GetRoutes` may still use that upstream. `AllocateIdBlock` is refused. This is not a production MetaCache of every shard and not a disaggregated production deployment.
 
 A second `metadbd --role all-in-one` can join the **same** cell when `--join` or `--cell-manager` names the current leader and the data directory is fresh. That path is covered by `crates/metadb-server/tests/join_existing_group.rs`. The joiner is still an all-in-one process. It is not a role-trimmed backend, and the join does not create another cell. See [Operations](../../fr/operations.md).
 
@@ -81,7 +81,7 @@ A second `metadbd --role all-in-one` can join the **same** cell when `--join` or
 
 `100B – 10T+` is a design-model range: arithmetic for how a future multi-cell topology might be sized. It is not a record count this repository has stored. It is also not a Baidu production figure claimed as a result of `rustfs/MetaDB`. Baidu's published sizes, including the BOS2 figure of 1.848 trillion records in `arXiv:2610.32247v1`, are Baidu production metrics, not results of this repository.
 
-The table is the intended role split. This binary does not run those roles. Jumbo isolation in this tree is a route flag. It does not move peer shards onto a dedicated host.
+Le tableau est la répartition de rôles prévue. Ce binaire démarre ces noms de rôle lorsque la configuration est valide. Il n'accomplit pas les tâches de production désagrégées du tableau : un gestionnaire de cellule qui place des shards sur d'autres machines, ou un gestionnaire global qui est son propre groupe Raft. `proxy` choisit la cellule enregistrée qui contient un appel de métadonnées, `ExecuteSql` ou une transaction à clé utilisateur, et échoue fermé sinon. Ce choix n'est pas un MetaCache de production de tous les shards. L'isolation jumbo dans cet arbre est un indicateur de route. Elle ne déplace pas les shards pairs vers un hôte dédié.
 
 | Role | Design `--role` | Intended responsibility |
 | :--- | :--- | :--- |
@@ -90,4 +90,4 @@ The table is the intended role split. This binary does not run those roles. Jumb
 | **Backend Storage (`BE`)** | `be` | Would host Multi-Raft shard groups and the LSM engine on NVMe hosts. |
 | **Stateless Proxy** | `proxy` | Would embed `MetaCache`, compile the 20 SQL templates, and coordinate cross-shard 2PC. |
 
-`metadb-ctl cell register` calls `RegisterCell`. Without `--start-key` and `--end-key` it sends `[01, 04)`, which overlaps a default cell and exits non-zero. With those keys it persists the cell only when the endpoint's routes cover that range. It does not forward keys.
+`metadb-ctl cell register` appelle `RegisterCell`. Sans `--start-key` et `--end-key`, il envoie `[01, 04)`, ce qui chevauche une cellule par défaut, et se termine avec un statut non nul. Avec ces clés, la cellule n'est conservée que lorsque les routes du point d'accès couvrent cet intervalle. Un appel ultérieur contenu par cette cellule est transmis au point d'accès enregistré.

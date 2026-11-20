@@ -301,7 +301,9 @@ pub struct MetaDbGrpcService {
     accepts_remote_cells: bool,
     /// `be` serves shard replicas and does not mint id blocks or rename leases.
     shard_host_only: bool,
-    /// `proxy` forwards metadata and transactions to this one shard host.
+    /// `proxy` sends shard-addressed calls with no user key, and `GetRoutes`,
+    /// to this one shard host. A metadata or transaction request contained by
+    /// one registered cell is dialed at that cell instead.
     upstream: Option<String>,
     /// `global-manager` grants id blocks from this file. It is not a per-cell allocator.
     shared_allocator: Option<Arc<SharedIdAllocator>>,
@@ -412,8 +414,7 @@ impl MetaDbGrpcService {
 
     fn proxy_control_error() -> MetaDbError {
         MetaDbError::ShardRoutingError(
-            "proxy forwards metadata to one upstream and does not host the control plane"
-                .to_string(),
+            "proxy does not serve this control-plane method and does not host Raft".to_string(),
         )
     }
 
@@ -451,18 +452,6 @@ impl MetaDbGrpcService {
             auth = auth.with_role(role.clone());
         }
         auth
-    }
-
-    async fn metadata_client(
-        &self,
-    ) -> std::result::Result<
-        MetadataServiceClient<InterceptedService<Channel, crate::BearerAuthClient>>,
-        Status,
-    > {
-        Ok(MetadataServiceClient::with_interceptor(
-            self.dial_upstream().await?,
-            self.bearer(),
-        ))
     }
 
     async fn transaction_client(
@@ -533,6 +522,116 @@ impl MetaDbGrpcService {
         match placement {
             CellPlacement::Local => Ok(None),
             CellPlacement::Remote { endpoints, .. } => Ok(Some(endpoints)),
+        }
+    }
+
+    /// `None` means this process is not a proxy. The caller keeps the local
+    /// and cell-forward path. `Some` means the proxy must dial that cell or
+    /// fail closed. A proxy does not apply the request on a local shard and
+    /// does not send an unplaced request to `[cluster] upstream`.
+    fn proxy_plan_keys<T>(
+        &self,
+        request: &Request<T>,
+        keys: &[Vec<u8>],
+    ) -> Option<std::result::Result<Vec<String>, MetaDbError>> {
+        self.upstream.as_ref()?;
+        let borrowed: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        Some(self.proxy_contained(request, self.global_manager.placement_for_keys(&borrowed)))
+    }
+
+    fn proxy_plan_range<T>(
+        &self,
+        request: &Request<T>,
+        start: &[u8],
+        end: &[u8],
+    ) -> Option<std::result::Result<Vec<String>, MetaDbError>> {
+        self.upstream.as_ref()?;
+        Some(self.proxy_contained(request, self.global_manager.placement_for_range(start, end)))
+    }
+
+    fn proxy_contained<T>(
+        &self,
+        request: &Request<T>,
+        placement: std::result::Result<CellPlacement, MetaDbError>,
+    ) -> std::result::Result<Vec<String>, MetaDbError> {
+        if self.request_was_cell_forwarded(request) {
+            return Err(MetaDbError::ShardRoutingError(
+                "request was already cell-forwarded; the proxy will not forward it again and will not apply it locally"
+                    .to_string(),
+            ));
+        }
+        if self.global_manager.published_cell_count() == 0 {
+            return Err(MetaDbError::ShardRoutingError(
+                "proxy cell directory is missing; this process will not apply the request locally and will not invent a placement"
+                    .to_string(),
+            ));
+        }
+        match placement {
+            Ok(CellPlacement::Remote { endpoints, cell_id }) => {
+                if endpoints.is_empty() {
+                    Err(MetaDbError::ShardRoutingError(format!(
+                        "cell {cell_id} has no endpoint; the proxy will not apply the request locally and will not invent a placement"
+                    )))
+                } else {
+                    Ok(endpoints)
+                }
+            }
+            Ok(CellPlacement::Local) => Err(MetaDbError::ShardRoutingError(
+                "proxy cell directory does not contain this request in one registered cell; this process will not apply it locally and will not invent a placement"
+                    .to_string(),
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn execute_sql_via_registered_cell(
+        &self,
+        request: Request<ExecuteSqlRequest>,
+    ) -> Result<Response<ExecuteSqlResponse>, Status> {
+        let sql_params = match decode_sql_params(&request.get_ref().params) {
+            Ok(params) => params,
+            Err(error) => {
+                return Ok(Response::new(ExecuteSqlResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                    server_hlc: self.server_hlc(),
+                    ..Default::default()
+                }));
+            }
+        };
+        let cmd = match SqlTemplateParser::parse_with_params(&request.get_ref().sql, &sql_params) {
+            Ok(cmd) => cmd,
+            Err(error) => {
+                let error = MetaDbError::ShardRoutingError(format!(
+                    "proxy cannot place this statement ({error}); this process will not apply it locally and will not invent a placement"
+                ));
+                return Ok(Response::new(ExecuteSqlResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                    server_hlc: self.server_hlc(),
+                    ..Default::default()
+                }));
+            }
+        };
+        let plan = match sql_route(&cmd) {
+            SqlRoute::Keys(keys) => self.proxy_plan_keys(&request, &keys),
+            SqlRoute::Range(start, end) => self.proxy_plan_range(&request, &start, &end),
+        };
+        let Some(plan) = plan else {
+            return Err(Status::internal(
+                "proxy SQL routing was reached without an upstream",
+            ));
+        };
+        match plan {
+            Ok(endpoints) => {
+                let mut client = self.metadata_client_for(&endpoints).await?;
+                client
+                    .execute_sql(self.cell_forward_request(request.into_inner()))
+                    .await
+            }
+            Err(error) => Ok(Response::new(ExecuteSqlResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+                server_hlc: self.server_hlc(),
+                ..Default::default()
+            })),
         }
     }
 
@@ -678,11 +777,24 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<CreateFileRequest>,
     ) -> Result<Response<CreateFileResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.create_file(request.into_inner()).await;
-        }
         let create_key = MetaKey::child(request.get_ref().pid, &request.get_ref().name).encode();
+        if let Some(plan) = self.proxy_plan_keys(&request, std::slice::from_ref(&create_key)) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .create_file(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(CreateFileResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        entry: None,
+                        server_hlc: self.server_hlc(),
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) = match self.remote_endpoints(&request, &[create_key]) {
             Ok(plan) => plan,
             Err(error) => {
@@ -738,14 +850,27 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<MkdirRequest>,
     ) -> Result<Response<MkdirResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.mkdir(request.into_inner()).await;
-        }
         let mkdir_keys = vec![
             MetaKey::child(request.get_ref().pid, &request.get_ref().name).encode(),
             MetaKey::dir_attr(request.get_ref().dir_id).encode(),
         ];
+        if let Some(plan) = self.proxy_plan_keys(&request, &mkdir_keys) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .mkdir(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(MkdirResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        entry: None,
+                        server_hlc: self.server_hlc(),
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) = match self.remote_endpoints(&request, &mkdir_keys) {
             Ok(plan) => plan,
             Err(error) => {
@@ -793,11 +918,24 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<UnlinkRequest>,
     ) -> Result<Response<UnlinkResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.unlink(request.into_inner()).await;
-        }
         let unlink_key = MetaKey::child(request.get_ref().pid, &request.get_ref().name).encode();
+        if let Some(plan) = self.proxy_plan_keys(&request, std::slice::from_ref(&unlink_key)) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .unlink(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(UnlinkResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        removed_attr: None,
+                        server_hlc: self.server_hlc(),
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) = match self.remote_endpoints(&request, &[unlink_key]) {
             Ok(plan) => plan,
             Err(error) => {
@@ -833,11 +971,24 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<RmdirRequest>,
     ) -> Result<Response<RmdirResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.rmdir(request.into_inner()).await;
-        }
         let rmdir_key = MetaKey::child(request.get_ref().pid, &request.get_ref().name).encode();
+        if let Some(plan) = self.proxy_plan_keys(&request, std::slice::from_ref(&rmdir_key)) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .rmdir(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(RmdirResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        removed_attr: None,
+                        server_hlc: self.server_hlc(),
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) = match self.remote_endpoints(&request, &[rmdir_key]) {
             Ok(plan) => plan,
             Err(error) => {
@@ -873,11 +1024,24 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<SetAttrRequest>,
     ) -> Result<Response<SetAttrResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.set_attr(request.into_inner()).await;
-        }
         let setattr_key = MetaKey::child(request.get_ref().pid, &request.get_ref().name).encode();
+        if let Some(plan) = self.proxy_plan_keys(&request, std::slice::from_ref(&setattr_key)) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .set_attr(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(SetAttrResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        entry: None,
+                        server_hlc: self.server_hlc(),
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) = match self.remote_endpoints(&request, &[setattr_key]) {
             Ok(plan) => plan,
             Err(error) => {
@@ -922,11 +1086,25 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<LookupRequest>,
     ) -> Result<Response<LookupResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.lookup(request.into_inner()).await;
-        }
         let lookup_key = MetaKey::child(request.get_ref().pid, &request.get_ref().name).encode();
+        if let Some(plan) = self.proxy_plan_keys(&request, std::slice::from_ref(&lookup_key)) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .lookup(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(LookupResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        found: false,
+                        entry: None,
+                        server_hlc: self.server_hlc(),
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) = match self.remote_endpoints(&request, &[lookup_key]) {
             Ok(plan) => plan,
             Err(error) => {
@@ -971,11 +1149,24 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<DirStatRequest>,
     ) -> Result<Response<DirStatResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.dir_stat(request.into_inner()).await;
-        }
         let stat_key = MetaKey::dir_attr(request.get_ref().pid).encode();
+        if let Some(plan) = self.proxy_plan_keys(&request, std::slice::from_ref(&stat_key)) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .dir_stat(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(DirStatResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        attr: None,
+                        server_hlc: self.server_hlc(),
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) = match self.remote_endpoints(&request, &[stat_key]) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1011,11 +1202,25 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<GetDirPartitionStatRequest>,
     ) -> Result<Response<GetDirPartitionStatResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.get_dir_partition_stat(request.into_inner()).await;
-        }
         let partition_key = MetaKey::dir_attr(request.get_ref().pid).encode();
+        if let Some(plan) = self.proxy_plan_keys(&request, std::slice::from_ref(&partition_key)) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .get_dir_partition_stat(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(GetDirPartitionStatResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        is_anchor: false,
+                        partition_attr: None,
+                        max_applied_hlc: 0,
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) = match self.remote_endpoints(&request, &[partition_key]) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1074,11 +1279,26 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<ListDirRequest>,
     ) -> Result<Response<ListDirResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.list_dir(request.into_inner()).await;
-        }
         let list_key = MetaKey::dir_attr(request.get_ref().pid).encode();
+        if let Some(plan) = self.proxy_plan_keys(&request, std::slice::from_ref(&list_key)) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .list_dir(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(ListDirResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        entries: vec![],
+                        next_cursor: String::new(),
+                        has_more: false,
+                        server_hlc: self.server_hlc(),
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) = match self.remote_endpoints(&request, &[list_key]) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1127,8 +1347,7 @@ impl MetadataService for MetaDbGrpcService {
         request: Request<ExecuteSqlRequest>,
     ) -> Result<Response<ExecuteSqlResponse>, Status> {
         if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.execute_sql(request.into_inner()).await;
+            return self.execute_sql_via_registered_cell(request).await;
         }
         let sql_params = match decode_sql_params(&request.get_ref().params) {
             Ok(params) => params,
@@ -1234,14 +1453,27 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<GetQuotaRequest>,
     ) -> Result<Response<GetQuotaResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.get_quota(request.into_inner()).await;
-        }
         let quota_key = QuotaKey {
             uid: request.get_ref().uid,
         }
         .encode();
+        if let Some(plan) = self.proxy_plan_keys(&request, std::slice::from_ref(&quota_key)) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .get_quota(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(GetQuotaResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        found: false,
+                        record: None,
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) = match self.remote_endpoints(&request, &[quota_key]) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1282,14 +1514,26 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<SetQuotaLimitRequest>,
     ) -> Result<Response<SetQuotaLimitResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.set_quota_limit(request.into_inner()).await;
-        }
         let quota_key = QuotaKey {
             uid: request.get_ref().uid,
         }
         .encode();
+        if let Some(plan) = self.proxy_plan_keys(&request, std::slice::from_ref(&quota_key)) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .set_quota_limit(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(SetQuotaLimitResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        record: None,
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) = match self.remote_endpoints(&request, &[quota_key]) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1326,16 +1570,29 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<ListQuotasRequest>,
     ) -> Result<Response<ListQuotasResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.list_quotas(request.into_inner()).await;
-        }
         let quota_start = QuotaKey {
             uid: request.get_ref().start_uid,
         }
         .encode();
+        let quota_end = quota_table_end();
+        if let Some(plan) = self.proxy_plan_range(&request, &quota_start, &quota_end) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .list_quotas(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(ListQuotasResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        records: vec![],
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) =
-            match self.remote_endpoints_for_range(&request, &quota_start, &quota_table_end()) {
+            match self.remote_endpoints_for_range(&request, &quota_start, &quota_end) {
                 Ok(plan) => plan,
                 Err(error) => {
                     return Ok(Response::new(ListQuotasResponse {
@@ -1372,14 +1629,27 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<GetSecondaryIndexRequest>,
     ) -> Result<Response<GetSecondaryIndexResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.get_secondary_index(request.into_inner()).await;
-        }
         let index_key = SecondaryIndexKey {
             fid: request.get_ref().fid,
         }
         .encode();
+        if let Some(plan) = self.proxy_plan_keys(&request, std::slice::from_ref(&index_key)) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .get_secondary_index(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(GetSecondaryIndexResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        found: false,
+                        record: None,
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) = match self.remote_endpoints(&request, &[index_key]) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1420,16 +1690,29 @@ impl MetadataService for MetaDbGrpcService {
         &self,
         request: Request<ScanSecondaryIndexRequest>,
     ) -> Result<Response<ScanSecondaryIndexResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.metadata_client().await?;
-            return client.scan_secondary_index(request.into_inner()).await;
-        }
         let index_start = SecondaryIndexKey {
             fid: request.get_ref().after_fid,
         }
         .encode();
+        let index_end = index_table_end();
+        if let Some(plan) = self.proxy_plan_range(&request, &index_start, &index_end) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.metadata_client_for(&endpoints).await?;
+                    return client
+                        .scan_secondary_index(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(ScanSecondaryIndexResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        records: vec![],
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) =
-            match self.remote_endpoints_for_range(&request, &index_start, &index_table_end()) {
+            match self.remote_endpoints_for_range(&request, &index_start, &index_end) {
                 Ok(plan) => plan,
                 Err(error) => {
                     return Ok(Response::new(ScanSecondaryIndexResponse {
@@ -1469,14 +1752,27 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<RenameRequest>,
     ) -> Result<Response<RenameResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.transaction_client().await?;
-            return client.rename(request.into_inner()).await;
-        }
         let rename_keys = vec![
             MetaKey::child(request.get_ref().src_pid, &request.get_ref().src_name).encode(),
             MetaKey::child(request.get_ref().dst_pid, &request.get_ref().dst_name).encode(),
         ];
+        if let Some(plan) = self.proxy_plan_keys(&request, &rename_keys) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.transaction_client_for(&endpoints).await?;
+                    return client
+                        .rename(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(RenameResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        entry: None,
+                        commit_hlc: self.server_hlc(),
+                    }));
+                }
+            }
+        }
         if let Some(endpoints) = match self.remote_endpoints(&request, &rename_keys) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1529,9 +1825,21 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<Prepare2pcRequest>,
     ) -> Result<Response<Prepare2pcResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.transaction_client().await?;
-            return client.prepare2pc(request.into_inner()).await;
+        if let Some(plan) = self.proxy_plan_keys(&request, &prepare_user_keys(request.get_ref())) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.transaction_client_for(&endpoints).await?;
+                    return client
+                        .prepare2pc(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(Prepare2pcResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        prepared_hlc: 0,
+                    }));
+                }
+            }
         }
         if let Some(endpoints) = match self.forward_shard_rpc(
             &request,
@@ -1631,6 +1939,8 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<CommitPrimary2pcRequest>,
     ) -> Result<Response<CommitPrimary2pcResponse>, Status> {
+        // No user key. This stays shard-addressed on the configured upstream.
+        // The directory is not used to invent a cell for this call.
         if self.upstream.is_some() {
             let mut client = self.transaction_client().await?;
             return client.commit_primary2pc(request.into_inner()).await;
@@ -1676,9 +1986,21 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<CommitSecondary2pcRequest>,
     ) -> Result<Response<CommitSecondary2pcResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.transaction_client().await?;
-            return client.commit_secondary2pc(request.into_inner()).await;
+        if let Some(plan) = self.proxy_plan_keys(&request, &request.get_ref().target_user_keys) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.transaction_client_for(&endpoints).await?;
+                    return client
+                        .commit_secondary2pc(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(CommitSecondary2pcResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        already_applied: false,
+                    }));
+                }
+            }
         }
         if let Some(endpoints) = match self.forward_shard_rpc(
             &request,
@@ -1754,9 +2076,20 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<Abort2pcRequest>,
     ) -> Result<Response<Abort2pcResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.transaction_client().await?;
-            return client.abort2pc(request.into_inner()).await;
+        if let Some(plan) = self.proxy_plan_keys(&request, &request.get_ref().target_user_keys) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.transaction_client_for(&endpoints).await?;
+                    return client
+                        .abort2pc(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(Abort2pcResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                    }));
+                }
+            }
         }
         if let Some(endpoints) = match self.forward_shard_rpc(
             &request,
@@ -1814,11 +2147,29 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<CheckTxnStatusRequest>,
     ) -> Result<Response<CheckTxnStatusResponse>, Status> {
-        if self.upstream.is_some() {
-            let mut client = self.transaction_client().await?;
-            return client.check_txn_status(request.into_inner()).await;
-        }
         let primary = request.get_ref().primary_key.clone();
+        let status_keys = if primary.is_empty() {
+            Vec::new()
+        } else {
+            vec![primary.clone()]
+        };
+        if let Some(plan) = self.proxy_plan_keys(&request, &status_keys) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.transaction_client_for(&endpoints).await?;
+                    return client
+                        .check_txn_status(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(CheckTxnStatusResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        txn_state: 0,
+                        commit_hlc: 0,
+                    }));
+                }
+            }
+        }
         if !primary.is_empty() {
             if let Some(endpoints) = match self.remote_endpoints(&request, &[primary]) {
                 Ok(plan) => plan,
@@ -1953,6 +2304,8 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<ApplyAuxBatchRequest>,
     ) -> Result<Response<ApplyAuxBatchResponse>, Status> {
+        // No user key. This call is not placed by the cell directory. The proxy
+        // still delivers it to the configured upstream and does not apply it locally.
         if self.upstream.is_some() {
             let mut client = self.transaction_client().await?;
             return client.apply_aux_batch(request.into_inner()).await;
@@ -2008,6 +2361,8 @@ impl TransactionService for MetaDbGrpcService {
         &self,
         request: Request<ForwardRouterRequest>,
     ) -> Result<Response<ForwardRouterResponse>, Status> {
+        // The payload is an opaque forwarded router operation. The proxy does
+        // not decode a cell placement from it and still sends it upstream.
         if self.upstream.is_some() {
             let mut client = self.transaction_client().await?;
             return client.forward_router(request.into_inner()).await;
@@ -2608,11 +2963,6 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<RegisterCellRequest>,
     ) -> Result<Response<RegisterCellResponse>, Status> {
-        if self.upstream.is_some() {
-            let error = ErrorDetailProto::from(&Self::proxy_control_error());
-            return Ok(Response::new(RegisterCellResponse { error: Some(error) }));
-        }
-
         if !self.accepts_remote_cells {
             let error = MetaDbError::ShardRoutingError(
                 "this process does not store a remote cell; register it with the global-manager"

@@ -2,7 +2,7 @@
 
 * **ガイド目次へ戻る**: [日本語概要](./README.md) | [ハブ](../../README.md)
 
-The current binary runs a persistent deployment only as `all-in-one`. A second `all-in-one` process can join the same cell. Role-split processes and the multi-cell topology are a design target, not a deployment this repository runs. The `100B`–`10T+` range is a design model, not a measurement of this repository. Trillion-scale figures in `arXiv:2610.32247v1` are Baidu production metrics, not results of this repository.
+The current binary starts `all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` when that role's configuration is valid. A second `all-in-one` process can join the same cell. `proxy` dials the registered cell that contains a metadata call, `ExecuteSql`, or a user-key transaction, and fails closed otherwise. Those calls are not sent to `[cluster] upstream`. The disaggregated production topology is still a design target, not a deployment this repository runs. The `100B`–`10T+` range is a design model, not a measurement of this repository. Trillion-scale figures in `arXiv:2610.32247v1` are Baidu production metrics, not results of this repository.
 
 ---
 
@@ -40,7 +40,7 @@ shard_split_threshold_bytes = 4294967296 # 4 GiB
 allow_unauthenticated = true
 ```
 
-Rust 1.100.0 (`rust-toolchain.toml`). Only `all-in-one` starts. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
+Rust 1.100.0 (`rust-toolchain.toml`). `all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` start when the configuration is valid. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
 
 The `[security]` block above is the explicit loopback development opt-in. It is not a credential. `grpc_listen_addr` and `metrics_listen_addr` stay on the literal IP `127.0.0.1`. The hostname `localhost` is not accepted for `allow_unauthenticated`. An empty secret without that flag does not start the process.
 
@@ -69,7 +69,7 @@ shared_secret = "replace-with-a-long-random-string"
 
 Stage 3 is a design target. The current binary does not deploy it.
 
-`metadbd` only runs `--role all-in-one`. `PersistentMetaDbCluster::open_and_serve` in `crates/metadb-server/src/lib.rs` rejects `be`, `proxy`, `cell-manager`, and `global-manager` before it listens. `RegisterCell` stores a second all-in-one cell in the caller's `GLOBAL_CELL_DIRECTORY` after that cell's routes cover the requested range. The caller does not forward keys. This is not a disaggregated deployment.
+`metadbd` starts `--role all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` when that role's configuration is valid. `proxy` dials the registered cell that contains a metadata call, `ExecuteSql`, or a user-key transaction, and returns a placement error otherwise. Those calls are not sent to `[cluster] upstream`. `CommitPrimary2pc`, `ApplyAuxBatch`, `ForwardRouter`, and `GetRoutes` may still use that upstream. `AllocateIdBlock` is refused. This is not a production MetaCache of every shard and not a disaggregated production deployment.
 
 A second `metadbd --role all-in-one` can join the **same** cell when `--join` or `--cell-manager` names the current leader and the data directory is fresh. That path is covered by `crates/metadb-server/tests/join_existing_group.rs`. The joiner is still an all-in-one process. It is not a role-trimmed backend, and the join does not create another cell. See [Operations](../../ja/operations.md).
 
@@ -81,7 +81,7 @@ A second `metadbd --role all-in-one` can join the **same** cell when `--join` or
 
 `100B – 10T+` is a design-model range: arithmetic for how a future multi-cell topology might be sized. It is not a record count this repository has stored. It is also not a Baidu production figure claimed as a result of `rustfs/MetaDB`. Baidu's published sizes, including the BOS2 figure of 1.848 trillion records in `arXiv:2610.32247v1`, are Baidu production metrics, not results of this repository.
 
-The table is the intended role split. This binary does not run those roles. Jumbo isolation in this tree is a route flag. It does not move peer shards onto a dedicated host.
+表は想定するロール分担です。このバイナリは設定が妥当ならこれらのロール名を起動します。表にある分離本番の仕事はしません。セルマネージャがシャードを別のマシンへ置くこと、またはグローバルマネージャが独自の Raft グループであることは含まれません。`proxy` はメタデータ呼び出し、`ExecuteSql`、またはユーザキー付きトランザクションを含む登録済みセルを選び、そうでなければ失敗して閉じます。この選択は全シャードの本番 MetaCache ではありません。このツリーのジャンボ隔離はルートフラグです。ピアシャードを専用ホストへ移しません。
 
 | Role | Design `--role` | Intended responsibility |
 | :--- | :--- | :--- |
@@ -90,4 +90,4 @@ The table is the intended role split. This binary does not run those roles. Jumb
 | **Backend Storage (`BE`)** | `be` | Would host Multi-Raft shard groups and the LSM engine on NVMe hosts. |
 | **Stateless Proxy** | `proxy` | Would embed `MetaCache`, compile the 20 SQL templates, and coordinate cross-shard 2PC. |
 
-`metadb-ctl cell register` calls `RegisterCell`. Without `--start-key` and `--end-key` it sends `[01, 04)`, which overlaps a default cell and exits non-zero. With those keys it persists the cell only when the endpoint's routes cover that range. It does not forward keys.
+`metadb-ctl cell register` は `RegisterCell` を呼びます。`--start-key` と `--end-key` が無いと `[01, 04)` を送り、これは既定セルと重なるため非ゼロで終了します。これらのキーがあるとき、エンドポイントのルートがその範囲を覆う場合にだけセルを残します。そのセルに含まれる後続の要求は、保存されたエンドポイントへ転送されます。

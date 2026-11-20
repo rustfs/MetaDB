@@ -564,7 +564,7 @@ pub struct PersistentMetaDbCluster {
     cell_manager: Option<Arc<DurableCellManager>>,
     /// `global-manager` publishes the cell directory and does not host Raft groups.
     directory_only: bool,
-    /// `proxy` forwards metadata to one upstream and does not host Raft groups.
+    /// `proxy` routes contained metadata to a registered cell and does not host Raft groups.
     proxy_gateway: bool,
     global_manager: Arc<DurableGlobalManager>,
     tx_router: Arc<DistributedTxRouter>,
@@ -740,7 +740,7 @@ fn validate_role_topology(config: &ServerTomlConfig, has_cell_range: bool) -> Re
         ServerRole::Proxy => {
             if upstream.is_empty() {
                 return Err(MetaDbError::CodecError(
-                    "proxy requires [cluster].upstream, the host:port of one shard host. This process does not open Raft groups and does not choose a cell by itself"
+                    "proxy requires [cluster].upstream, the host:port of one shard host. CommitPrimary2pc has no user key and stays on that host. This process does not open Raft groups"
                         .to_string(),
                 ));
             }
@@ -752,7 +752,7 @@ fn validate_role_topology(config: &ServerTomlConfig, has_cell_range: bool) -> Re
             }
             if join || global || has_cell_range || jumbo {
                 return Err(MetaDbError::CodecError(
-                    "proxy forwards to one upstream; it does not join a shard, publish a cell, own a cell range, or place jumbo files"
+                    "proxy does not join a shard, publish its own cell, own a cell range, or place jumbo files"
                         .to_string(),
                 ));
             }
@@ -856,6 +856,14 @@ async fn serve_proxy(
         id_allocator,
         meta_cache,
     ));
+    // The directory is a local file of registered cells. It is not a shard
+    // cache and it is not replicated from this process.
+    global_manager.load_or_create_directory(
+        config
+            .node
+            .data_dir
+            .join(metadb_cluster::CELL_DIRECTORY_FILE),
+    )?;
     let tx_router = Arc::new(
         DistributedTxRouter::new(config.node.node_id, clock.clone(), global_manager.clone())
             .with_forward_secret(config.security.shared_secret.clone())
@@ -893,7 +901,7 @@ async fn serve_proxy(
     .with_transport_security(Arc::clone(&transport_security))
     .with_role_presentation(roles.as_ref().map(|roles| roles.local().clone()))
     .with_upstream(upstream)
-    .with_remote_cell_registration(false)
+    .with_remote_cell_registration(true)
     .with_shard_host_only(false);
     let grpc_handle = spawn_grpc_server(
         listener,

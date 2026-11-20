@@ -54,7 +54,7 @@
 
 ### `cell register --cell-id <u64> --endpoints <a,b,c>`
 
-Calls `RegisterCell`. The server fsyncs `GLOBAL_CELL_DIRECTORY` only when the endpoint's routes cover the requested range exactly. Omitting the keys sends `[01, 04)`, which overlaps a default cell, and `metadb-ctl` exits non-zero. The caller does not forward keys.
+`RegisterCell` を呼びます。エンドポイントのルートが要求範囲をちょうど覆うときだけ、サーバは `GLOBAL_CELL_DIRECTORY` を fsync します。キーを省略すると `[01, 04)` を送り、これは既定セルと重なるため `metadb-ctl` は非ゼロで終了します。そのセルに含まれる後続の要求は、保存されたエンドポイントへ転送されます。
 
 ### `sql <文>`
 
@@ -110,14 +110,14 @@ There is no `metadb_raft_watermark_lag_entries` series and no per-shard placemen
 - ジャンボフラグ。1 つの親がシャード上の `MetaTable` バイトの 85% を超えるとき、またはシャードの親が 1 つのとき、ルートは `JumboIsolated` になります。専用ノード ID は、このセルにすでに登録されたノードから選ばれます。ノードが 1 つのとき、フラグはこのプロセスを指します。フラグ自体はファイルを別ホストへ移しません。ループバックの `MOVE_STAGED` / `MOVE_LIVE` は `127.0.0.1` のリスナーへディレクトリを置けます。`metadbd` はそのリスナーを起動せず、Raft を開かず、`transfer_leader` を呼ばず、本番のホスト間コピーではありません。`docs/en/scale-control-plane-status.md` を参照。
 - プロセス内の投票者。`DurableCellManager::scale_out_replicas` は、それらのノード ID が登録されており、**かつ** 各アドレスがそのシャードのグループに対してすでに `RaftTransportService` を提供しているときに、learner を追加して昇格できます。`crates/metadb-raft/tests/multi_raft_failover_tests.rs` は、1 つのテストプロセス内の 3 つのリスナーと基本的な KV ステートマシンでこれを行います。メタデータのステートマシンではなく、`metadbd` を 3 プロセス起動するのでもありません。
 
-運用手順として動かないもの:
+これらのプロセスが行うこと:
 
-1. `metadbd --role be` hosts local Raft replicas and serves their metadata. It does not publish a cell or mint ids. `metadbd --role proxy` forwards metadata and transactions to one `[cluster] upstream` and does not host Raft. `--role global-manager` serves `GLOBAL_CELL_DIRECTORY` only and does not open Raft groups. `--role cell-manager` hosts one local cell and its Raft groups, and publishes that cell when `[cluster] global_manager` is set. The directory file is not a Raft group, and the global process does not forward keys.
+1. `metadbd --role be` はローカルの Raft レプリカを持ち、そのメタデータを提供します。セルを公開せず、ID ブロックもリネームリースも発行しません。2 つ目の `be` は `[cluster] join` で最初のプロセスに参加できます。`metadbd --role proxy` は `[cluster] upstream` を必要とし、Raft グループを開きません。メタデータ呼び出し、`ExecuteSql`、またはユーザキーを持つトランザクションは、それを含む登録済みセルへ `x-metadb-cell-forwarded` 付きで接続されます。ディレクトリが無い、一つのセルに含まれない、キーが二つのセルに分かれる、または範囲がセルに重なるだけで含まれない場合は、配置エラーを返し、upstream には送りません。`CommitPrimary2pc`、`ApplyAuxBatch`、`ForwardRouter`、`GetRoutes` はその upstream を使うことがあります。`AllocateIdBlock` は拒否されます。`--role global-manager` は `GLOBAL_CELL_DIRECTORY` を提供し、`shared_id_allocator/SHARED_ID_ALLOCATOR` を開いて、そのファイルから `AllocateIdBlock` を付与します。登録済みセルに含まれる要求もそのセルへ転送します。シャードグループを開かないため、このプロセスのディレクトリファイルは Raft ログへコピーされず、それ自体も Raft グループではありません。`--role cell-manager` はローカルセルを一つ持ち、公開できます。ディレクトリファイルは引き続き独自の Raft グループではありません。ブートストラップのリーダーは、ディレクトリと `CELL_MANAGER_STATE` のスナップショットを、最も番号の小さいローカルシャードの既存 Raft ログへコピーします。
 2. 2 つ目の `metadbd --role all-in-one` は、データディレクトリが空で `--join` または `--cell-manager` が現在のリーダーを指すとき、既存の Raft グループに参加します。リーダーは空エントリを追記してスナップショットを取り、参加者を learner から voter へ昇格します。`--join` はそのリーダーに届く必要があります。すでに Raft 状態があるディレクトリはそれを開き直し、新しい join アドレスを無視します。ノード ID 2 から 32767 の新しいアロケータは、そのノード自身の inode、file id、shard id 名前空間から始まるため、ノード 1 が既に発行した ID を再発行しません。既に低い ID を発行したアロケータファイルは移し替えません。リーダーが分かっている follower への `Lookup`、ディレクトリ一覧、ディレクトリ統計、`GetDirPartitionStat`、クォータ読み取り、セカンダリインデックス読み取りは、そのリーダーへ転送します。リーダーが不明な follower は引き続き `NotLeader` を返します。メンバーシップが joint の間、`GetRoutes` は適用済みの全投票者、現在のリーダー、適用済み epoch を報告します。均一構成がコミットされた後、それらの投票者と `conf_ver` は Raft と一致します。参加は一時的なエラーを 45 秒間再試行し、その後リスナーとローカル Raft グループを止めてエラーを返します。`metadbd` が終わるのは、起動がそのエラーを返したためです。最初の失敗だけではプロセスを中断しません。
-3. `metadb-ctl cell register` records a second cell only after that cell's routes cover the requested range. This process does not forward those keys. `open_and_serve` still starts one local cell.
+3. `metadb-ctl cell register` は、そのセルのルートが要求範囲を覆ったあとでのみ第二のセルを記録します。その後、そのセルに含まれる要求は転送されます。`open_and_serve` は設定が妥当なら `all-in-one`、`be`、`proxy`、`cell-manager`、`global-manager` を起動します。
 4. テスト `T1`–`T6` が使うメモリ内の `MetaDbEngine::new_single_node` は、メモリ上の投票者数を 3 に増やせます。そのオブジェクトにはディスクも Raft もありません。`metadbd` のスケールアウトではありません。
 
-`topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. Disaggregated roles are still not a live deployment. A second cell can be recorded in this process's directory; that is not a production multi-cell deployment. This process can copy its own jumbo shard directory onto `jumbo_dedicated_root`. A loopback `MOVE_STAGED` / `MOVE_LIVE` placement is specified in `docs/en/scale-control-plane-status.md`. It does not call `transfer_leader`, does not replicate the cell directory, and is not a production move.
+`topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. `be`、`proxy`、`cell-manager`、`global-manager` は妥当な設定で起動します。これは分離した本番配置ではありません。第二のセルはこのプロセスのディレクトリに記録できますが、本番の複数セル配置ではありません。 This process can copy its own jumbo shard directory onto `jumbo_dedicated_root`. A loopback `MOVE_STAGED` / `MOVE_LIVE` placement is specified in `docs/en/scale-control-plane-status.md`. It does not call `transfer_leader`, does not replicate the cell directory, and is not a production move.
 
 ## 遭遇しうるエラー
 
@@ -139,12 +139,12 @@ There is no `metadb_raft_watermark_lag_entries` series and no per-shard placemen
 | `ConsensusError` | 登録ノード不足、learner の追いつきタイムアウト（10 秒）、または OpenRaft のメンバーシップエラー |
 | `SqlParseError` | 文が 20 テンプレートのどれでもない |
 
-未実装ロールの拒否と不正な TOML も `CodecError` です。
+不正なロールの組み合わせと不正な TOML は `CodecError` です。`be`、`proxy`、`cell-manager`、`global-manager` はその拒否ではありません。妥当な設定なら起動します。
 
 ## 既知の制限
 
-- `all-in-one`, `cell-manager`, `global-manager`, `be`, and `proxy` start on a valid config. `be` hosts local replicas and does not mint ids. `proxy` forwards to one upstream and does not host Raft. `global-manager` has no local shards and does not forward. `cell-manager` still colocates its Raft groups.
-- A second all-in-one process can join the same cell with `[cluster] join`. That does not create a second cell. `RegisterCell` records a different cell only after its routes cover the requested range, and this process does not forward keys.
+- `all-in-one`、`cell-manager`、`global-manager`、`be`、`proxy` は妥当な設定で起動します。`be` はローカルレプリカを持ち、ID を発行しません。`proxy` は含まれるメタデータ呼び出し、`ExecuteSql`、またはユーザキー付きトランザクションを登録済みセルへ送り、そうでなければ失敗して閉じます。`CommitPrimary2pc`、`ApplyAuxBatch`、`ForwardRouter`、`GetRoutes` は引き続き `[cluster] upstream` を使うことがあります。`AllocateIdBlock` は拒否されます。proxy は Raft を持ちません。`global-manager` にローカルシャードはありません。登録済みセルに含まれる要求は転送し、`SHARED_ID_ALLOCATOR` から共有 ID ブロックを付与します。シャードグループを開かないため、そのディレクトリファイルはシャードログへコピーされません。`cell-manager` は引き続き Raft グループを同じプロセスに置きます。
+- 2 つ目の all-in-one プロセスは `[cluster] join` で同じセルに参加できます。その参加は第二のセルを作りません。`RegisterCell` はルートが要求範囲を覆うとき、別のセルを記録します。このプロセスは、そのセルに含まれる後続の要求を転送します。
 - 未知で非ゼロの `cell_id` に対する `GetRoutes` は失敗して閉じる。`StoreHeartbeat` はキャッシュ済みルートを置き換えない。
 - ジャンボ隔離はルートフラグと、ローカルノード表から選んだノード ID である。他のシャードをディスクから追い出すことはしない。
 - Registered-node liveness is fsynced in `CELL_CONTROL_PLANE`. `metadbd` persists its own record about every 3 seconds and sends it to the current leader when this process is not the leader. Descriptors on that RPC are annotations, not routes. The observation does not schedule placement. See [Scale control plane](../en/scale-control-plane-status.md).
@@ -156,8 +156,8 @@ There is no `metadb_raft_watermark_lag_entries` series and no per-shard placemen
 
 次の項目は製品に無いため、このガイドは手順を書けません。
 
-1. `be`、`proxy`、`cell-manager`、`global-manager` の複数プロセス配置。
-2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
+1. 全シャードの本番 MetaCache でも、分離した本番配置でもありません。`be`、`proxy`、`cell-manager`、`global-manager` は妥当な設定で起動します。
+2. `RegisterCell` はエラーのままではありません。ルートが範囲を覆うと `GLOBAL_CELL_DIRECTORY` を書き、そのセルに含まれる後続の要求を転送します。join は現在のリーダーに届く必要があります。follower はメンバーシップ変更を転送しません。
 3. ジャンボシャードを専用マシンに置き、他のシャードをそのマシンから移すこと。ループバックのリスナーは `MOVE_STAGED` / `MOVE_LIVE` でジャンボディレクトリを受け取れます。それは `metadbd` ではなく、認証もなく、Raft を開かず、`transfer_leader` を呼ばず、別ホストへの本番コピーではありません。
 4. プロセス内の TLS。このプロセスは TLS を終端しない。TLS や証明書を求める設定キーは、平文で提供する代わりに拒否される。終端は外部プロキシに置く。シークレットがあるとき、Raft とメトリクスは他のサービスと同じベアラを使う。これは相互 TLS ではない。ハートビート駆動の制御ループは未実装である。
 5. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. A leader election makes `/readyz` and `/healthz` return 503 on replicas that do not know a leader. `[raft]` is loaded and is not `#[serde(skip)]`. Its values apply when a group starts and are not reloaded. See [Operability](../en/operability.md).

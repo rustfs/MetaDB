@@ -54,7 +54,7 @@
 
 ### `cell register --cell-id <u64> --endpoints <a,b,c>`
 
-Calls `RegisterCell`. The server fsyncs `GLOBAL_CELL_DIRECTORY` only when the endpoint's routes cover the requested range exactly. Omitting the keys sends `[01, 04)`, which overlaps a default cell, and `metadb-ctl` exits non-zero. The caller does not forward keys.
+调用 `RegisterCell`。只有端点的路由恰好覆盖请求范围时，服务器才对 `GLOBAL_CELL_DIRECTORY` 做 fsync。省略键会发送 `[01, 04)`，它与默认单元重叠，`metadb-ctl` 以非零状态退出。该单元包含的后续请求会转发到已保存的端点。
 
 ### `sql <语句>`
 
@@ -110,14 +110,14 @@ There is no `metadb_raft_watermark_lag_entries` series and no per-shard placemen
 - 巨型标志。当一个父项超过该分片上 `MetaTable` 字节的 85%，或分片只有一个父项时，路由变为 `JumboIsolated`。专用节点标识从本单元已注册的节点中选出。只有一个节点时，标志指向本进程。标志本身不会把文件搬到另一台主机。回环上的 `MOVE_STAGED` / `MOVE_LIVE` 可以把目录放到 `127.0.0.1` 监听器。`metadbd` 不启动该监听器，不打开 Raft，不调用 `transfer_leader`，也不是跨主机的生产拷贝。见 `docs/en/scale-control-plane-status.md`。
 - 进程内投票者。当这些节点标识已经注册，**并且** 每个地址已经为该分片的组提供 `RaftTransportService` 时，`DurableCellManager::scale_out_replicas` 可以添加 learner 并提升它们。`crates/metadb-raft/tests/multi_raft_failover_tests.rs` 用一个测试进程里的三个监听器和基本 KV 状态机做这件事，不是元数据状态机，也不是三个 `metadbd` 进程。
 
-不能当作运维步骤的做法：
+这些进程会做的事：
 
-1. `metadbd --role be` hosts local Raft replicas and serves their metadata. It does not publish a cell or mint ids. `metadbd --role proxy` forwards metadata and transactions to one `[cluster] upstream` and does not host Raft. `--role global-manager` serves `GLOBAL_CELL_DIRECTORY` only and does not open Raft groups. `--role cell-manager` hosts one local cell and its Raft groups, and publishes that cell when `[cluster] global_manager` is set. The directory file is not a Raft group, and the global process does not forward keys.
+1. `metadbd --role be` 托管本地 Raft 副本并提供它们的元数据。它不发布单元，不分配标识块，也不发放重命名租约。第二个 `be` 可以用 `[cluster] join` 加入第一个。`metadbd --role proxy` 需要 `[cluster] upstream`，并且不打开 Raft 组。元数据调用、`ExecuteSql` 或带用户键的事务会拨到包含它的那一个已注册单元，并带上 `x-metadb-cell-forwarded`。目录缺失、请求不被一个单元包含、键分属两个单元，或范围只与单元重叠时，返回放置错误，不会发给 upstream。`CommitPrimary2pc`、`ApplyAuxBatch`、`ForwardRouter` 和 `GetRoutes` 仍可以走该 upstream。`AllocateIdBlock` 会被拒绝。`--role global-manager` 提供 `GLOBAL_CELL_DIRECTORY`，打开 `shared_id_allocator/SHARED_ID_ALLOCATOR`，并从该文件授予 `AllocateIdBlock`。被一个已注册单元完整包含的请求也会转发到该单元。它不打开分片组，因此该进程的目录文件不会复制到 Raft 日志上，本身也不是 Raft 组。`--role cell-manager` 托管一个本地单元，并可以发布它。目录文件仍然不是自己的 Raft 组。引导领导者会把目录和 `CELL_MANAGER_STATE` 快照复制到编号最低的本地分片的现有 Raft 日志中。
 2. 第二个 `metadbd --role all-in-one` 在数据目录为空、且 `--join` 或 `--cell-manager` 指向当前 leader 时，会加入已有 Raft 组。leader 先追加一条空日志并做快照，再把加入者从 learner 提升为 voter。`--join` 必须打到该 leader。已经有 Raft 状态的目录会重新打开本地状态，并忽略新的 join 地址。节点号 2 到 32767 的全新分配器从该节点自己的 inode、file id 和 shard id 命名空间起步，因此不会重发节点 1 已经发出的 id。已经发过低位 id 的分配器文件不会被搬迁。已知 leader 的 follower 上，`Lookup`、列目录、目录统计、`GetDirPartitionStat`、配额读和二级索引读会转发到该 leader。不知道 leader 时仍返回 `NotLeader`。成员变更处于 joint 时，`GetRoutes` 报告已经应用的全部投票者、当前 leader 和应用后的 epoch。统一配置提交后，这些投票者和 `conf_ver` 与 Raft 一致。加入在 45 秒内重试暂时性错误，然后关闭监听和本地 Raft 组并返回错误。`metadbd` 结束是因为启动返回了这个错误。第一次失败本身不会中止进程。
-3. `metadb-ctl cell register` records a second cell only after that cell's routes cover the requested range. This process does not forward those keys. `open_and_serve` still starts one local cell.
+3. `metadb-ctl cell register` 只在该单元的路由覆盖请求范围之后记录第二个单元。此后，被该单元包含的请求会被转发。配置有效时，`open_and_serve` 会启动 `all-in-one`、`be`、`proxy`、`cell-manager` 和 `global-manager`。
 4. 测试 `T1`–`T6` 使用的内存路径 `MetaDbEngine::new_single_node` 可以把内存中的投票者计数加到 3。那个对象没有磁盘，也没有 Raft。它不是 `metadbd` 的扩容。
 
-`topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. Disaggregated roles are still not a live deployment. A second cell can be recorded in this process's directory; that is not a production multi-cell deployment. This process can copy its own jumbo shard directory onto `jumbo_dedicated_root`. A loopback `MOVE_STAGED` / `MOVE_LIVE` placement is specified in `docs/en/scale-control-plane-status.md`. It does not call `transfer_leader`, does not replicate the cell directory, and is not a production move.
+`topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. 配置有效时，`be`、`proxy`、`cell-manager` 和 `global-manager` 都会启动。这不是拆分后的生产部署。第二个单元可以记在本进程的目录里；这不是生产多单元部署。 This process can copy its own jumbo shard directory onto `jumbo_dedicated_root`. A loopback `MOVE_STAGED` / `MOVE_LIVE` placement is specified in `docs/en/scale-control-plane-status.md`. It does not call `transfer_leader`, does not replicate the cell directory, and is not a production move.
 
 ## 会遇到的错误
 
@@ -139,12 +139,12 @@ There is no `metadb_raft_watermark_lag_entries` series and no per-shard placemen
 | `ConsensusError` | 已注册节点不足、learner 追赶超时（10 秒），或 OpenRaft 成员错误 |
 | `SqlParseError` | 语句不是 20 条模板之一 |
 
-未实现角色的拒绝和非法 TOML 也使用 `CodecError`。
+非法的角色组合和非法 TOML 使用 `CodecError`。`be`、`proxy`、`cell-manager` 和 `global-manager` 不是这种拒绝：配置有效时它们会启动。
 
 ## 已知限制
 
-- `all-in-one`, `cell-manager`, `global-manager`, `be`, and `proxy` start on a valid config. `be` hosts local replicas and does not mint ids. `proxy` forwards to one upstream and does not host Raft. `global-manager` has no local shards and does not forward. `cell-manager` still colocates its Raft groups.
-- A second all-in-one process can join the same cell with `[cluster] join`. That does not create a second cell. `RegisterCell` records a different cell only after its routes cover the requested range, and this process does not forward keys.
+- 配置有效时，`all-in-one`、`cell-manager`、`global-manager`、`be` 和 `proxy` 都会启动。`be` 托管本地副本，不分配标识。`proxy` 把被包含的元数据调用、`ExecuteSql` 或带用户键的事务拨到已注册单元，否则失败关闭。`CommitPrimary2pc`、`ApplyAuxBatch`、`ForwardRouter` 和 `GetRoutes` 仍可以使用 `[cluster] upstream`。`AllocateIdBlock` 会被拒绝。proxy 不托管 Raft。`global-manager` 没有本地分片。它会转发被已注册单元包含的请求，并从 `SHARED_ID_ALLOCATOR` 授予共享标识块。因为它不打开分片组，目录文件不会复制到分片日志上。`cell-manager` 仍把 Raft 组放在同一进程里。
+- 第二个 all-in-one 进程可以用 `[cluster] join` 加入同一单元。这次加入不会创建第二个单元。路由覆盖请求范围时，`RegisterCell` 会记录另一个单元。该进程会转发此后被这个单元包含的请求。
 - 未知且非零的 `cell_id` 上，`GetRoutes` 失败关闭。`StoreHeartbeat` 不会替换缓存路由。
 - 巨型隔离是路由标志加上从本地节点表选出的节点标识。它不会把其他分片从磁盘上赶走。
 - Registered-node liveness is fsynced in `CELL_CONTROL_PLANE`. `metadbd` persists its own record about every 3 seconds and sends it to the current leader when this process is not the leader. Descriptors on that RPC are annotations, not routes. The observation does not schedule placement. See [Scale control plane](../en/scale-control-plane-status.md).
@@ -156,8 +156,8 @@ There is no `metadb_raft_watermark_lag_entries` series and no per-shard placemen
 
 下列能力产品里没有，因此本指南无法为它们写出步骤：
 
-1. `be`、`proxy`、`cell-manager` 和 `global-manager` 的多进程布局。
-2. A second Cell. `RegisterCell` stays an error. Join reaches only the current leader; a follower does not forward it.
+1. 不是覆盖全部分片的生产 MetaCache，也不是拆分后的生产部署。配置有效时，`be`、`proxy`、`cell-manager` 和 `global-manager` 都会启动。
+2. `RegisterCell` 不再保持为错误。路由覆盖范围时它会写入 `GLOBAL_CELL_DIRECTORY`，此后被该单元包含的请求会被转发。join 仍必须到达当前 leader；follower 不会转发成员变更。
 3. 把巨型分片放到独立机器上，并把其他分片从那台机器移走。回环监听器可以用 `MOVE_STAGED` / `MOVE_LIVE` 接收一个巨型目录。它不是 `metadbd`，没有鉴权，不打开 Raft，不调用 `transfer_leader`，也不是搬到另一台主机的生产拷贝。
 4. 本进程内的 TLS。进程不终结 TLS。要求 TLS 或证书的配置键会被拒绝，而不是以明文提供服务。请在外部代理终结 TLS。密钥非空时，Raft 和指标与其他服务使用同一个持有者令牌；这不是双向 TLS。由心跳驱动的控制循环没有实现。
 5. A gRPC health RPC, probes when `metrics_listen_addr` is unset, and per-shard Prometheus series. `/readyz` does not wait for the 250 ms 2PC recovery pass. A leader election makes `/readyz` and `/healthz` return 503 on replicas that do not know a leader. `[raft]` is loaded and is not `#[serde(skip)]`. Its values apply when a group starts and are not reloaded. See [Operability](../en/operability.md).

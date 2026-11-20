@@ -11,7 +11,7 @@ MetaDB 提供三类客户端接入方式：
 
 ## 1. gRPC 服务契约概览 (`metadb.v1`) `[已实现]`
 
-`[已实现]` means the process that hosts the shard serves these RPCs. A `global-manager` does not allocate ids or forward a key. `RegisterCell` persists a remote cell on the directory process after `GetRoutes` shows exact coverage. It does not forward later metadata calls. `be` serves the replicas it hosts. `proxy` forwards these calls to one upstream and does not host Raft.
+`[已实现]` 表示托管该分片的进程提供这些 RPC。`global-manager` 从 `SHARED_ID_ALLOCATOR` 授予标识块，并转发被已发布单元包含的键。`RegisterCell` 在 `GetRoutes` 表明该单元恰好覆盖请求范围之后，把远端单元写入目录进程。此后被该单元包含的元数据调用会被转发。`be` 提供它所托管的副本，并且不分配标识。`proxy` 在一个已注册单元包含元数据调用、`ExecuteSql` 或带用户键的事务时拨到该单元，否则返回放置错误。`ExecuteSql` 使用 `execute_sql_via_registered_cell`，不会发给 `[cluster] upstream`。`CommitPrimary2pc`、`ApplyAuxBatch`、`ForwardRouter` 和 `GetRoutes` 仍可以使用该 upstream。`AllocateIdBlock` 在 proxy 上会被拒绝。proxy 不托管 Raft。
 
 * **`MetadataService` (`metadata.proto`)**：
   * 单分片 `1-RTT` 写操作：`CreateFile`、`Mkdir`、`Unlink`、`Rmdir`、`SetAttr`（`chmod`、`chown`、`truncate`、`utimes`）。
