@@ -18,6 +18,7 @@ pub mod jumbo;
 pub mod jumbo_files;
 pub mod jumbo_placement;
 pub mod jumbo_remote;
+pub mod leadership_transfer;
 pub mod meta_cache;
 pub mod replicated_control;
 pub mod shard;
@@ -57,6 +58,10 @@ pub use jumbo_placement::{
     SpareDrainPlan, SpareDrainRequest,
 };
 pub use jumbo_remote::{RemoteHandoffRecord, RemoteJumboDisk, RemoteMoveOutcome, SpareDrainRecord};
+pub use leadership_transfer::{
+    leadership_transfer_refusal, run_automatic_leadership_transfer, LeadershipTransferAttempt,
+    LeadershipTransferInput, LeadershipTransferOutcome, TransferObservation, TransferRefusal,
+};
 pub use meta_cache::{CompositeMetaCache, CompositeShardRoute};
 pub use replicated_control::validate_replicated_record;
 pub use shard::{

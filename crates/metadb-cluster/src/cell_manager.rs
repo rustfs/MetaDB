@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -43,7 +43,7 @@ use crate::identity::{node_id_in_ha_range, random_id, ClusterIdentity};
 use crate::jumbo::JumboIsolationPlanner;
 use crate::jumbo_files::{
     copy_shard_tree, load_live_dir, refuse_dedicated_root, remove_tree, shard_move_dir,
-    write_move_phase, MovePhaseError, MOVE_LIVE, MOVE_STAGED,
+    visible_move_phase, write_move_phase, MovePhaseError, MOVE_LIVE, MOVE_STAGED,
 };
 use crate::jumbo_placement::{
     automatic_leadership_transfer_allowed, executable_placement_actions,
@@ -56,6 +56,10 @@ use crate::jumbo_remote::{
     handoff_blocks_local_open, load_handoffs, load_spare_drains, outcome_from_drain,
     push_jumbo_shard, refuse_non_loopback, DestinationCut, PushResult, RemoteHandoffRecord,
     RemoteMoveOutcome, SpareDrainRecord,
+};
+use crate::leadership_transfer::{
+    run_automatic_leadership_transfer, LeadershipTransferAttempt, LeadershipTransferInput,
+    LeadershipTransferOutcome, TransferObservation,
 };
 use crate::meta_cache::{CompositeMetaCache, CompositeShardRoute};
 use crate::replicated_control::validate_replicated_record;
@@ -193,6 +197,14 @@ pub struct DurableCellManager {
     /// Test hook: the next control-plane propose reports that this process is
     /// not the leader and writes nothing.
     control_propose_not_leader: AtomicBool,
+    /// Times the leadership gate entered its callback. Not an OpenRaft call.
+    leadership_transfer_requests: AtomicU64,
+}
+
+struct LeadershipGroupFacts {
+    open: bool,
+    leader: Option<NodeId>,
+    voters: BTreeSet<NodeId>,
 }
 
 impl DurableCellManager {
@@ -367,6 +379,7 @@ impl DurableCellManager {
             jumbo_file_move_failed: Mutex::new(HashSet::new()),
             stop_before_source_removal: AtomicBool::new(false),
             control_propose_not_leader: AtomicBool::new(false),
+            leadership_transfer_requests: AtomicU64::new(0),
         });
 
         if let Err(error) = mgr.boot_local_shards().await {
@@ -491,6 +504,7 @@ impl DurableCellManager {
             jumbo_file_move_failed: Mutex::new(HashSet::new()),
             stop_before_source_removal: AtomicBool::new(false),
             control_propose_not_leader: AtomicBool::new(false),
+            leadership_transfer_requests: AtomicU64::new(0),
         }))
     }
 
@@ -3504,6 +3518,184 @@ impl DurableCellManager {
             recv_mono_ns,
             wall_unix_ms,
         })
+    }
+
+    /// Test hook. Points jumbo move detection at a dedicated root without copying.
+    pub fn testing_set_jumbo_dedicated_root(&self, root: Option<PathBuf>) {
+        *self.jumbo_dedicated_root.lock().unwrap() = root;
+    }
+
+    /// How many times the leadership gate entered its callback.
+    ///
+    /// The callback does not call `trigger().transfer_leader`.
+    pub fn leadership_transfer_requests(&self) -> u64 {
+        self.leadership_transfer_requests.load(Ordering::Relaxed)
+    }
+
+    /// Evaluates every local group. A `HintLive` sample is not read.
+    ///
+    /// `group_transfer_allowed` is [`automatic_leadership_transfer_allowed`],
+    /// which is false. This does not call `trigger().transfer_leader`, does not
+    /// change membership, does not delete a shard directory, and does not write
+    /// a leader.
+    pub fn consider_automatic_leadership_transfer(&self) {
+        for group in self.host.all_groups() {
+            let shard_id = group.shard_id();
+            let facts = self.leadership_group_facts(shard_id);
+            let input = LeadershipTransferInput {
+                shard_id,
+                local_node: self.host.node_id(),
+                current_leader: facts.leader,
+                live_voters: facts.voters.clone(),
+                intended_voters: facts.voters,
+                target: self.jumbo_transfer_target(shard_id),
+                group_transfer_allowed: automatic_leadership_transfer_allowed(),
+                clock_trusted: self.leadership_clock_trusted(),
+                jumbo_move_in_progress: self.jumbo_move_blocks_transfer(shard_id),
+                remote_handoff: self.remote_handoff_blocks_transfer(shard_id),
+                source_group_open: facts.open,
+                hint_live_only: false,
+            };
+            let _ = self.finish_leadership_transfer(&input, &self.host.shard_dir(shard_id));
+        }
+    }
+
+    /// Same gate as [`Self::consider_automatic_leadership_transfer`], with the
+    /// caller's observations. Production maintenance does not call this.
+    pub fn testing_attempt_leadership_transfer(
+        &self,
+        attempt: &LeadershipTransferAttempt,
+    ) -> LeadershipTransferOutcome {
+        let facts = self.leadership_group_facts(attempt.shard_id);
+        let live_voters = attempt.observed_live_voters.clone().unwrap_or(facts.voters);
+        let current_leader = match attempt.observed_leader {
+            Some(leader) => leader,
+            None => facts.leader,
+        };
+        let input = LeadershipTransferInput {
+            shard_id: attempt.shard_id,
+            local_node: self.host.node_id(),
+            current_leader,
+            live_voters,
+            intended_voters: attempt.intended_voters.clone(),
+            target: attempt.target,
+            group_transfer_allowed: attempt.group_transfer_allowed,
+            clock_trusted: self.leadership_clock_trusted(),
+            jumbo_move_in_progress: self.jumbo_move_blocks_transfer(attempt.shard_id),
+            remote_handoff: self.remote_handoff_blocks_transfer(attempt.shard_id),
+            source_group_open: facts.open,
+            hint_live_only: attempt.hint_live_only,
+        };
+        self.finish_leadership_transfer(&input, &attempt.source_directory)
+    }
+
+    fn finish_leadership_transfer(
+        &self,
+        input: &LeadershipTransferInput,
+        source_directory: &Path,
+    ) -> LeadershipTransferOutcome {
+        let leader_before = self.raft_leader(input.shard_id);
+        let voters_before = self.raft_voter_ids(input.shard_id).ok();
+        let shard_dir = self.host.shard_dir(input.shard_id);
+        let shard_existed = shard_dir.exists();
+        let mut outcome = run_automatic_leadership_transfer(input, source_directory, |_target| {
+            self.leadership_transfer_requests
+                .fetch_add(1, Ordering::Relaxed);
+            // OpenRaft disables the leader lease before any peer answers.
+            // Capability is still unknown, so this callback does not call
+            // `trigger().transfer_leader` and does not report a new leader.
+            TransferObservation {
+                openraft_called: false,
+                target_became_leader: false,
+            }
+        });
+        if voters_before != self.raft_voter_ids(input.shard_id).ok() {
+            outcome.membership_changed = true;
+        }
+        if shard_existed && !shard_dir.exists() {
+            outcome.source_directory_deleted = true;
+        }
+        if leader_before != self.raft_leader(input.shard_id) {
+            outcome.invented_leader = true;
+        }
+        outcome
+    }
+
+    fn raft_leader(&self, shard_id: ShardId) -> Option<NodeId> {
+        self.host
+            .get_group(shard_id)
+            .and_then(|group| group.current_leader())
+    }
+
+    fn leadership_clock_trusted(&self) -> bool {
+        self.liveness
+            .lock()
+            .unwrap()
+            .effective_wall_unix_ms()
+            .is_some()
+    }
+
+    fn leadership_group_facts(&self, shard_id: ShardId) -> LeadershipGroupFacts {
+        let Some(group) = self.host.get_group(shard_id) else {
+            return LeadershipGroupFacts {
+                open: false,
+                leader: None,
+                voters: BTreeSet::new(),
+            };
+        };
+        if group.serve_view().stopped {
+            return LeadershipGroupFacts {
+                open: false,
+                leader: group.current_leader(),
+                voters: BTreeSet::new(),
+            };
+        }
+        match group.uniform_voter_addrs() {
+            Ok(voters) => LeadershipGroupFacts {
+                open: true,
+                leader: group.current_leader(),
+                voters: voters.into_keys().collect(),
+            },
+            Err(_) => LeadershipGroupFacts {
+                open: false,
+                leader: group.current_leader(),
+                voters: BTreeSet::new(),
+            },
+        }
+    }
+
+    /// Any visible move phase blocks. A missing dedicated root does not.
+    /// An unreadable record fails closed.
+    fn jumbo_move_blocks_transfer(&self, shard_id: ShardId) -> bool {
+        let Some(root) = self.jumbo_dedicated_root.lock().unwrap().clone() else {
+            return false;
+        };
+        let dest = shard_move_dir(&root, shard_id);
+        match visible_move_phase(&dest, shard_id) {
+            Ok(None) => false,
+            Ok(Some(_)) | Err(_) => true,
+        }
+    }
+
+    fn remote_handoff_blocks_transfer(&self, shard_id: ShardId) -> bool {
+        handoff_blocks_local_open(&self.state_dir, shard_id).unwrap_or(true)
+    }
+
+    /// Dedicated node of a jumbo route, when it is someone else. Otherwise no
+    /// target: node 0 is not a live voter, so the gate refuses.
+    fn jumbo_transfer_target(&self, shard_id: ShardId) -> NodeId {
+        let state = self.state.lock().unwrap();
+        let Some(route) = state.routes.get(&shard_id) else {
+            return 0;
+        };
+        match route.health_state {
+            ShardHealthState::JumboIsolated { dedicated_node, .. }
+                if dedicated_node != self.host.node_id() =>
+            {
+                dedicated_node
+            }
+            _ => 0,
+        }
     }
 
     /// Plans jumbo placement from live Raft voters and attempts only a safe move.
