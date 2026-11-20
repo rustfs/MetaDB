@@ -155,11 +155,10 @@ impl Interceptor for BearerAuthClient {
     }
 }
 
-use metadb_cluster::HEARTBEAT_INTERVAL_MS;
 use metadb_cluster::{
-    CellDirectoryRole, CellId, CellLocalManager, CompositeMetaCache, DurableCellManager,
-    DurableGlobalManager, DurableIdAllocator, GlobalManager, LocalIdBuffer, MetaCache,
-    ShardDescriptor, SharedIdAllocator,
+    capture_mono_ns, CellDirectoryRole, CellId, CellLocalManager, CompositeMetaCache,
+    DurableCellManager, DurableGlobalManager, DurableIdAllocator, GlobalManager, LocalIdBuffer,
+    MetaCache, ShardDescriptor, SharedIdAllocator,
 };
 use metadb_core::{
     EntryType, FileId, HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId, MetaDbError,
@@ -1438,6 +1437,12 @@ impl PersistentMetaDbCluster {
         if let Err(error) = self.publish_control_heartbeat_if_due().await {
             tracing::warn!(%error, "control heartbeat was not published");
         }
+        if let Some(cell) = &self.cell_manager {
+            // Hints are computed here and not applied. This does not call
+            // transfer_leader, move a Jumbo shard, change membership, or
+            // replicate the cell directory.
+            cell.observe_liveness_hints();
+        }
         Ok(())
     }
 
@@ -1445,11 +1450,13 @@ impl PersistentMetaDbCluster {
         let Some(cell) = &self.cell_manager else {
             return Ok(());
         };
-        let now = metadb_cluster::control_plane_state::unix_ms();
-        if cell.local_heartbeat_is_fresh(now, HEARTBEAT_INTERVAL_MS) {
+        let now = capture_mono_ns();
+        if !cell.control_heartbeat_publish_is_due(now) {
             return Ok(());
         }
-        self.publish_control_heartbeat().await
+        self.publish_control_heartbeat().await?;
+        cell.note_control_heartbeat_published(capture_mono_ns());
+        Ok(())
     }
 
     /// Persists this process's heartbeat, then sends that same sequence to the current
@@ -1497,6 +1504,7 @@ impl PersistentMetaDbCluster {
             self.roles().map(|roles| roles.local()),
         )
         .await?;
+        let sent_mono_ns = capture_mono_ns();
         let response = client
             .store_heartbeat(StoreHeartbeatRequest {
                 cell_id: self.cell_manager().cell_id(),
@@ -1525,6 +1533,15 @@ impl PersistentMetaDbCluster {
             .into_inner();
         if let Some(error) = rpc_app_error(response.error) {
             return Err(error);
+        }
+        let recv_mono_ns = capture_mono_ns();
+        if let Some(cell) = &self.cell_manager {
+            cell.record_acknowledged_round_trip(
+                heartbeat.node_id,
+                heartbeat.seq,
+                sent_mono_ns,
+                recv_mono_ns,
+            );
         }
         Ok(())
     }

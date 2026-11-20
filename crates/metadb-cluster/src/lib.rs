@@ -11,6 +11,7 @@ pub mod cell_manager;
 pub mod control_plane;
 pub mod control_plane_state;
 pub mod global_manager;
+pub mod heartbeat_scheduler;
 pub mod id_allocator;
 pub mod identity;
 pub mod jumbo;
@@ -34,6 +35,12 @@ pub use control_plane_state::{
     MAX_HEARTBEAT_SEQ_ADVANCE,
 };
 pub use global_manager::{CellPlacement, DurableGlobalManager};
+pub use heartbeat_scheduler::{
+    capture_mono_ns, decide_liveness, liveness_effects, publish_interval_elapsed,
+    trusted_wall_unix_ms, wall_unix_ms_is_trusted, HeartbeatScheduler, LivenessDecision,
+    LivenessEffects, LivenessRefusal, MeasuredSample, MeasurementReject, ScheduleNow,
+    HEARTBEAT_FRESHNESS_MS, WALL_CLOCK_FALLBACK_MS,
+};
 pub use id_allocator::{
     AllocIdKind, DurableIdAllocator, LocalIdBuffer, CELL_DIR_AFFINITY_BLOCK_SIZE,
     CELL_FILE_ID_BLOCK_SIZE, GLOBAL_ID_BLOCK_SIZE, GLOBAL_SHARD_ID_BLOCK_SIZE,

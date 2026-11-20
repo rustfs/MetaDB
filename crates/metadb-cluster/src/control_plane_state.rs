@@ -35,8 +35,8 @@ pub const MAX_HEARTBEAT_SEQ_ADVANCE: u64 = 64;
 /// Minimum gap between two remote heartbeats that carry a new sequence.
 pub const MIN_REMOTE_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 
-/// Heartbeats are an unreplicated local observation. They are not a shard epoch
-/// and must not schedule splits, membership changes, or leadership transfer.
+/// Durable heartbeat rows are not a shard epoch. A measured liveness hint is not
+/// one either: it must not schedule splits, membership changes, or leadership transfer.
 pub fn heartbeat_is_scheduling_truth() -> bool {
     false
 }
