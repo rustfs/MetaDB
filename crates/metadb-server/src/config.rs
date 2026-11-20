@@ -20,9 +20,11 @@ use metadb_transport::{
 
 /// Operational role of a `metadbd` process.
 ///
-/// Only [`ServerRole::AllInOne`] is implemented. The other variants are accepted by
-/// config parsing so deployments can name them, but `PersistentMetaDbCluster::open_and_serve`
-/// rejects them instead of silently starting every subsystem.
+/// `all-in-one` hosts the global directory, the cell, and local Raft groups.
+/// `global-manager` hosts only the cell directory. `cell-manager` hosts one
+/// cell and its local Raft groups, and can publish that cell to a
+/// `global-manager`. `be` and `proxy` are parsed and still rejected: there is
+/// no remote shard host and no forwarding router.
 ///
 /// A second all-in-one process joins an existing Raft group when [`ClusterSection::join`]
 /// is set and its data directory does not already own a cell.
@@ -189,6 +191,10 @@ pub struct ClusterSection {
     pub cell_start_key: String,
     /// Hex cell end, exclusive. See `cell_start_key`.
     pub cell_end_key: String,
+    /// `host:port` of a `global-manager` process. Only `cell-manager` uses it,
+    /// to publish this cell after the listener is up. Empty means this process
+    /// does not register anywhere.
+    pub global_manager: String,
 }
 
 /// Top-level TOML configuration matching `docs/guides/{en,ja,fr,zh,de}/deployment.md`.
