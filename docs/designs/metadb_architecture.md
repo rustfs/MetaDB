@@ -91,7 +91,7 @@ Furthermore, adopters need an engine that can run in **Single-Node All-in-One Mo
 
 1. **Single-Directory Skew (Jumbo Shard)**: This tree writes `JumboIsolated { dedicated_node, dominant_pid }` on the route and does not place the shard on a dedicated host or evict peer shards. `DualModeFineGrained` is a route flag; a later split may use shard-local `[0x04] DirShardDelta` records. That later split is not performed by the flag write itself.
 2. **Unbounded Raft Log Growth During Remote Sink Partitions**: Mitigated by spilling overdue `AuxOutbox` entries into `[0x07] SpilledAuxOutbox` inside the local L0 SSTable flush, advancing `aux_outbox_durable_index` immediately.
-3. **Future-read limit and stale parent attributes**: `ActiveSnapshotRegistry` gates an unversioned L0 flush until `min_active_snapshot_hlc >= imm.max_hlc`. That gate does not remove the collapse-flush range-read limit: a range read at `start_hlc` can include later values of keys an open 2PC lease does not cover. Parent-attribute reconciliation is the coordinated flush barrier plus the read path, not a proof of zero future reads.
+3. **Future-read limit and stale parent attributes**: `ActiveSnapshotRegistry` gates an unversioned L0 flush until `min_active_snapshot_hlc >= imm.max_hlc`. A range read behind the flush watermark returns `TransactionTimeout` for the whole range. One leased key does not prove the others. Parent-attribute reconciliation is the coordinated flush barrier plus the read path, not a proof of zero future reads.
 
 ---
 

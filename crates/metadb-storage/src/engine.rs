@@ -530,7 +530,12 @@ impl LifecycleStorageEngine {
         self.maintain_memtables().expect("memtable size flush");
     }
 
-    /// Point lookup at `read_hlc` consulting `MemMvccStore` first and falling back to persistent storage.
+    /// Point lookup at `read_hlc`.
+    ///
+    /// `Ok(None)` is proven absence, including a captured tombstone. When the
+    /// flush watermark is ahead of `read_hlc` and no memory version or lease
+    /// capture proves the value, this returns [`MetaDbError::TransactionTimeout`]
+    /// rather than a newer collapsed value or a guessed absence.
     pub fn get(&self, key: &[u8], read_hlc: HlcTimestamp) -> Result<Option<Vec<u8>>> {
         if let Some(mvcc_val) = self.mvcc.get_at(key, read_hlc)? {
             return match mvcc_val {
@@ -546,6 +551,12 @@ impl LifecycleStorageEngine {
     }
 
     /// Range scan over `[start_key, end_key)` at `read_hlc`.
+    ///
+    /// `Ok` is a complete set of values visible at `read_hlc`. A key that is
+    /// absent from that set was proven absent. When `read_hlc` is behind the
+    /// flush watermark the history of absent and deleted keys cannot be proved,
+    /// and this returns [`MetaDbError::TransactionTimeout`] instead of a partial
+    /// or newer folded view. That timeout is not an empty range.
     pub fn scan_range(
         &self,
         start_key: &[u8],

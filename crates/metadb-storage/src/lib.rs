@@ -32,7 +32,7 @@ pub use engine::{
 pub use manifest::{DurableShardCheckpoint, ManifestLog, VersionEdit};
 pub use mvcc::{
     ActiveMemTable, ActiveSnapshotRegistry, ImmMemTable, MemMvccStore, MvccValue, MvccVersion,
-    PinnedSnapshotData, PreFlushHook, ReadCut, SnapshotGuard, ViewAtRaftIndex,
+    PinnedSnapshotData, PreFlushHook, ReadCut, SnapshotGuard, ViewAtRaftIndex, VisibleAt,
     DEFAULT_MVCC_RETENTION_MS,
 };
 pub use raft_log::{

@@ -2297,9 +2297,7 @@ impl DistributedTxRouter {
             let ik = WriteIntentKey::new(key_bytes.clone()).encode();
             if let Some(raw_intent) = engine.get_with_snapshot(&ik, &snap)? {
                 let intent = WriteIntentRecord::decode(&raw_intent)?;
-                if !matches!(intent.op, IntentOp::DirExistsFenceSet { .. })
-                    && intent.start_hlc <= snap.read_hlc()
-                {
+                if !intent.op.is_dir_exists_fence() && intent.start_hlc <= snap.read_hlc() {
                     drop(snap);
                     TxnRecoveryWorker::resolve_single_txn(
                         self.directory.as_ref(),
@@ -2337,7 +2335,7 @@ impl DistributedTxRouter {
             let intent_key = WriteIntentKey::new(key.to_vec()).encode();
             if let Some(raw) = engine.get_with_snapshot(&intent_key, &snap)? {
                 let intent = WriteIntentRecord::decode(&raw)?;
-                if !matches!(intent.op, IntentOp::DirExistsFenceSet { .. }) {
+                if !intent.op.is_dir_exists_fence() {
                     drop(snap);
                     TxnRecoveryWorker::resolve_single_txn(
                         self.directory.as_ref(),
@@ -2797,9 +2795,7 @@ impl DistributedTxRouter {
             let mut resolved_any = false;
             for (_, raw_i) in &intents {
                 let irec = WriteIntentRecord::decode(raw_i)?;
-                if !matches!(irec.op, IntentOp::DirExistsFenceSet { .. })
-                    && irec.start_hlc <= snap.read_hlc()
-                {
+                if !irec.op.is_dir_exists_fence() && irec.start_hlc <= snap.read_hlc() {
                     resolved_any = true;
                     TxnRecoveryWorker::resolve_single_txn(
                         self.directory.as_ref(),
