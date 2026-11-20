@@ -2,7 +2,7 @@
 
 [Overview](./README.md) · [Français](../fr/architecture.md) · [Deutsch](../de/architecture.md) · [日本語](../ja/architecture.md) · [简体中文](../zh/architecture.md)
 
-This page follows the code in `crates/`. `global-manager`, `cell-manager`, `be`, and `proxy` can run as separate processes. The directory is still one local file. The proxy forwards to one upstream and does not choose a cell. See [Operations](./operations.md#known-limitations).
+This page follows the code in `crates/`. `global-manager`, `cell-manager`, `be`, and `proxy` can run as separate processes. A bootstrap leader copies `GLOBAL_CELL_DIRECTORY` and a `CELL_MANAGER_STATE` snapshot into the lowest local shard's existing Raft log. `global-manager` still loads only a local file and does not open that group. The proxy forwards to one upstream and does not choose a cell. See [Operations](./operations.md#known-limitations).
 
 ## Process shape
 

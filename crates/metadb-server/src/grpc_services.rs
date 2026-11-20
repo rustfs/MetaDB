@@ -1872,8 +1872,43 @@ impl ControlPlaneService for MetaDbGrpcService {
             cluster_id,
             routes,
         };
-        match self.global_manager.commit_remote_cell(publication) {
-            Ok(_) => Ok(Response::new(RegisterCellResponse { error: None })),
+        if self
+            .global_manager
+            .all_cells()
+            .iter()
+            .any(|cell| cell.joined_existing())
+        {
+            let error = MetaDbError::ShardRoutingError(
+                "a joined replica does not publish GLOBAL_CELL_DIRECTORY; register the cell on the leader that bootstrapped the shard"
+                    .to_string(),
+            );
+            return Ok(Response::new(RegisterCellResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+            }));
+        }
+        if let Err(error) = self.global_manager.commit_remote_cell(publication) {
+            return Ok(Response::new(RegisterCellResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+            }));
+        }
+        let Some(cell) = self.global_manager.all_cells().into_iter().next() else {
+            return Ok(Response::new(RegisterCellResponse { error: None }));
+        };
+        match self
+            .global_manager
+            .publish_replicated_directory(cell.as_ref())
+            .await
+        {
+            Ok(true) => Ok(Response::new(RegisterCellResponse { error: None })),
+            Ok(false) => {
+                let error = MetaDbError::ShardRoutingError(
+                    "this process is not the leader of the shard that replicates GLOBAL_CELL_DIRECTORY; the local file was updated and the replicated snapshot was not"
+                        .to_string(),
+                );
+                Ok(Response::new(RegisterCellResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                }))
+            }
             Err(error) => Ok(Response::new(RegisterCellResponse {
                 error: Some(ErrorDetailProto::from(&error)),
             })),

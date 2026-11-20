@@ -201,6 +201,20 @@ pub enum TxRaftCmd {
     /// Appended after `Extend2pcLease` so that command's tag stays stable.
     /// Apply rechecks liveness, so a prepare ordered first keeps its capture.
     SweepOrphanLeasePreimages,
+    /// Cell directory and cell-manager snapshot, stored on this shard's existing log.
+    ///
+    /// Appended so earlier command tags stay stable. Apply rejects a lower sequence,
+    /// a different body at the same sequence, and a directory that omits a cell id
+    /// already stored. It does not forward client requests and does not allocate ids.
+    PublishControlPlane {
+        sequence: u64,
+        /// Strictly increasing non-zero cell ids. Must match `directory_body`.
+        directory_cell_ids: Vec<u64>,
+        /// `GLOBAL_CELL_DIRECTORY` body without its CRC trailer. Empty is no cells.
+        directory_body: Vec<u8>,
+        /// `CELL_MANAGER_STATE` body without its CRC trailer.
+        manager_body: Vec<u8>,
+    },
 }
 
 /// Longest a renewed cross-shard lease may reach past the transaction's `start_hlc`.
@@ -497,6 +511,59 @@ pub fn node_instance_key(node_id: u64) -> Vec<u8> {
     key
 }
 
+/// Key of the replicated cell-directory and cell-manager snapshot.
+///
+/// Prefix `0x0F` is outside the split copy range `[0x01, 0x08)` and is not a
+/// user-table key. `0x0E` is not used. The snapshot stays on the shard that
+/// committed it.
+pub const CONTROL_PLANE_STATE_KEY: &[u8] = &[0x0F];
+
+/// One committed publication of `GLOBAL_CELL_DIRECTORY` and `CELL_MANAGER_STATE`.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
+pub struct ReplicatedControlRecord {
+    pub sequence: u64,
+    pub directory_cell_ids: Vec<u64>,
+    pub directory_body: Vec<u8>,
+    pub manager_body: Vec<u8>,
+}
+
+/// Checks a publication before it is stored. Installed by the cell manager.
+pub type ControlPlaneValidator =
+    std::sync::Arc<dyn Fn(&ReplicatedControlRecord) -> Result<()> + Send + Sync>;
+
+/// Reads the snapshot committed on `engine`. A corrupt value is an error.
+pub fn read_replicated_control_record(
+    engine: &LifecycleStorageEngine,
+) -> Result<Option<ReplicatedControlRecord>> {
+    let read_at = HlcTimestamp::new(HlcTimestamp::MAX_PHYSICAL_MS, 0);
+    let Some(bytes) = engine.get(CONTROL_PLANE_STATE_KEY, read_at)? else {
+        return Ok(None);
+    };
+    decode_replicated_control_record(&bytes).map(Some)
+}
+
+pub fn decode_replicated_control_record(bytes: &[u8]) -> Result<ReplicatedControlRecord> {
+    wincode::config::deserialize_exact(bytes, wincode::config::DefaultConfig::default()).map_err(
+        |error| {
+            MetaDbError::CodecError(format!(
+                "replicated control-plane record is corrupt or inconsistent: {error}"
+            ))
+        },
+    )
+}
+
+fn strict_directory_cell_ids(ids: &[u64]) -> Result<Vec<u64>> {
+    if ids.contains(&0) || ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(MetaDbError::CodecError(
+            "replicated cell ids must be strictly increasing and non-zero; refusing to invent or drop a cell"
+                .to_string(),
+        ));
+    }
+    Ok(ids.to_vec())
+}
+
 /// Process-local copy of Raft-applied `(instance id, grpc address)` bindings.
 pub type SharedNodeInstanceBindings = Arc<std::sync::Mutex<BTreeMap<u64, (u128, String)>>>;
 
@@ -508,6 +575,8 @@ pub struct TxStateMachineHandler {
     outbox: Arc<ShardAuxOutbox>,
     /// Filled on apply, including replay, so every replica learns node-instance bindings.
     instance_bindings: std::sync::Mutex<Option<SharedNodeInstanceBindings>>,
+    /// Decodes directory and manager bodies. Set before the group starts so replay uses it.
+    control_plane_validator: std::sync::Mutex<Option<ControlPlaneValidator>>,
 }
 
 impl TxStateMachineHandler {
@@ -542,12 +611,18 @@ impl TxStateMachineHandler {
             attr_agg: Arc::new(ReplicatedAttrAggregator::new()),
             outbox: Arc::new(ShardAuxOutbox::new(shard_id, spill_threshold, watermarks)),
             instance_bindings: std::sync::Mutex::new(None),
+            control_plane_validator: std::sync::Mutex::new(None),
         }
     }
 
     /// Shares the cell's binding map. Set this before `ShardRaftGroup::start` so replay fills it.
     pub fn set_instance_bindings(&self, bindings: SharedNodeInstanceBindings) {
         *self.instance_bindings.lock().unwrap() = Some(bindings);
+    }
+
+    /// Validates directory and manager bytes during apply, including replay.
+    pub fn set_control_plane_validator(&self, validator: ControlPlaneValidator) {
+        *self.control_plane_validator.lock().unwrap() = Some(validator);
     }
 
     pub fn shard_id(&self) -> ShardId {
@@ -2405,7 +2480,104 @@ impl TxStateMachineHandler {
                     .record_entry_specs(raft_index, commit_hlc, vec![]);
                 Ok(TxRaftOutput::Unit)
             }
+            TxRaftCmd::PublishControlPlane {
+                sequence,
+                directory_cell_ids,
+                directory_body,
+                manager_body,
+            } => {
+                self.apply_publish_control_plane(
+                    engine,
+                    raft_index,
+                    commit_hlc,
+                    ReplicatedControlRecord {
+                        sequence,
+                        directory_cell_ids,
+                        directory_body,
+                        manager_body,
+                    },
+                )?;
+                self.outbox
+                    .record_entry_specs(raft_index, commit_hlc, vec![]);
+                Ok(TxRaftOutput::Unit)
+            }
         }
+    }
+
+    fn apply_publish_control_plane(
+        &self,
+        engine: &LifecycleStorageEngine,
+        raft_index: u64,
+        commit_hlc: HlcTimestamp,
+        mut record: ReplicatedControlRecord,
+    ) -> Result<()> {
+        if record.sequence == 0 {
+            return Err(MetaDbError::CodecError(
+                "control-plane sequence must be non-zero; refusing to invent a cell directory"
+                    .to_string(),
+            ));
+        }
+        if record.manager_body.is_empty() {
+            return Err(MetaDbError::CodecError(
+                "CELL_MANAGER_STATE publication is empty; refusing to drop membership".to_string(),
+            ));
+        }
+        record.directory_cell_ids = strict_directory_cell_ids(&record.directory_cell_ids)?;
+        let ReplicatedControlRecord {
+            sequence,
+            directory_cell_ids,
+            directory_body,
+            manager_body,
+        } = record;
+        let previous = match Self::read_latest_in_apply(engine, CONTROL_PLANE_STATE_KEY)? {
+            Some(bytes) => Some(decode_replicated_control_record(&bytes)?),
+            None => None,
+        };
+        if let Some(previous) = &previous {
+            if sequence < previous.sequence {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "control-plane sequence {sequence} is older than {}; refusing to drop replicated cells",
+                    previous.sequence
+                )));
+            }
+            if sequence == previous.sequence {
+                let same = previous.directory_cell_ids == directory_cell_ids
+                    && previous.directory_body == directory_body
+                    && previous.manager_body == manager_body;
+                if same {
+                    return Ok(());
+                }
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "control-plane sequence {sequence} conflicts with the stored directory and membership; the stored cells were kept"
+                )));
+            }
+            for cell_id in &previous.directory_cell_ids {
+                if !directory_cell_ids.contains(cell_id) {
+                    return Err(MetaDbError::ShardRoutingError(format!(
+                        "refusing to drop replicated cell {cell_id}"
+                    )));
+                }
+            }
+        }
+        let record = ReplicatedControlRecord {
+            sequence,
+            directory_cell_ids,
+            directory_body,
+            manager_body,
+        };
+        if let Some(validator) = self.control_plane_validator.lock().unwrap().clone() {
+            validator(&record)?;
+        }
+        let bytes = codec::serialize(&record).map_err(|error| {
+            MetaDbError::CodecError(format!("replicated control-plane record: {error}"))
+        })?;
+        engine.apply_committed_put(
+            CONTROL_PLANE_STATE_KEY.to_vec(),
+            bytes,
+            commit_hlc,
+            raft_index,
+        );
+        Ok(())
     }
 
     fn retained_dir_stats(
