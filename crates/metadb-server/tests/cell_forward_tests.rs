@@ -1,8 +1,9 @@
 //! Metadata and transaction calls follow the cell that owns the key.
 //! A shared id allocator on `global-manager` grants disjoint blocks.
 //!
-//! The directory file is still process-local. This is not leader transfer,
-//! not a jumbo file move, and not a heartbeat scheduler.
+//! A bootstrap leader also stores a directory snapshot on its lowest shard log.
+//! A `global-manager` with no shard group keeps only the local file.
+//! This is not leader transfer, not a jumbo file move, and not a heartbeat scheduler.
 
 use std::fs;
 

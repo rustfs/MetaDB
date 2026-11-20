@@ -76,7 +76,7 @@ As metadata grows past `shard_split_threshold_bytes`, `CellLocalManager` and `Po
 
 Stage 3 is a design target. The current binary does not deploy it.
 
-`metadbd` only runs `--role all-in-one`. `PersistentMetaDbCluster::open_and_serve` in `crates/metadb-server/src/lib.rs` rejects `be`, `proxy`, `cell-manager`, and `global-manager` before it listens. A second cell is a second all-in-one process with its own data directory, node id, and table range. `RegisterCell` stores that cell in the caller's `GLOBAL_CELL_DIRECTORY` after probing it. The caller does not forward keys, and the directory is not a Raft group. This is not a disaggregated deployment. Linux is the supported platform.
+`metadbd` only runs `--role all-in-one`. `PersistentMetaDbCluster::open_and_serve` in `crates/metadb-server/src/lib.rs` rejects `be`, `proxy`, `cell-manager`, and `global-manager` before it listens. A second cell is a second all-in-one process with its own data directory, node id, and table range. `RegisterCell` stores that cell in the caller's `GLOBAL_CELL_DIRECTORY` after probing it. A later request contained by that cell is forwarded to its endpoint. The directory file is not its own Raft group. A bootstrap leader also stores that directory and a `CELL_MANAGER_STATE` snapshot in the lowest local shard's existing Raft log. A joined replica does not publish a new snapshot. A `global-manager` with no shard group keeps only the local file. This is not a disaggregated deployment. Linux is the supported platform.
 
 A second `metadbd --role all-in-one` can join the **same** cell when `--join` or `--cell-manager` names the current leader and the data directory is fresh. That path is covered by `crates/metadb-server/tests/join_existing_group.rs`. The joiner is still an all-in-one process. It is not a role-trimmed backend, and the join does not create another cell. See [Operations](../../en/operations.md).
 
@@ -97,4 +97,4 @@ The table is the intended role split. This binary does not run those roles. Jumb
 | **Backend Storage (`BE`)** | `be` | Would host Multi-Raft shard groups and the LSM engine on NVMe hosts. |
 | **Stateless Proxy** | `proxy` | Would embed `MetaCache`, compile the 20 SQL templates, and coordinate cross-shard 2PC. |
 
-`metadb-ctl cell register` calls `RegisterCell`. Without `--start-key` and `--end-key` it sends `[01, 04)`, which overlaps a default cell and exits non-zero. With those keys it persists the cell only when the endpoint's routes cover that range. It does not forward keys.
+`metadb-ctl cell register` calls `RegisterCell`. Without `--start-key` and `--end-key` it sends `[01, 04)`, which overlaps a default cell and exits non-zero. With those keys it persists the cell only when the endpoint's routes cover that range. A later request contained by that cell is forwarded to the stored endpoint. A bootstrap leader also proposes the directory snapshot into the lowest local shard log.

@@ -929,6 +929,7 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "wincode",

@@ -1131,7 +1131,11 @@ impl PersistentMetaDbCluster {
                 .join(metadb_cluster::CELL_DIRECTORY_FILE),
         )?;
         if !join_fresh {
+            global_manager.align_directory_with_replication(&cell_manager)?;
             global_manager.install_local_cell(cell_manager.clone(), bound_addr.clone())?;
+            global_manager
+                .publish_replicated_directory(&cell_manager)
+                .await?;
         }
         let tx_router = Arc::new(
             DistributedTxRouter::new(config.node.node_id, clock.clone(), global_manager.clone())
@@ -1231,8 +1235,27 @@ impl PersistentMetaDbCluster {
                 return Err(error);
             }
             if let Err(error) = cluster
+                .cell_manager()
+                .reconcile_replicated_membership()
+                .and_then(|()| {
+                    cluster
+                        .global_manager
+                        .align_directory_with_replication(cluster.cell_manager())
+                })
+                .and_then(|()| {
+                    cluster
+                        .global_manager
+                        .install_local_cell(cluster.cell_manager().clone(), bound_addr.clone())
+                })
+            {
+                cluster.operability.fail();
+                let _ = cluster.shutdown_without_flush().await;
+                return Err(error);
+            }
+            if let Err(error) = cluster
                 .global_manager
-                .install_local_cell(cluster.cell_manager().clone(), bound_addr.clone())
+                .publish_replicated_directory(cluster.cell_manager())
+                .await
             {
                 cluster.operability.fail();
                 let _ = cluster.shutdown_without_flush().await;
