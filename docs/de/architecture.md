@@ -138,4 +138,4 @@ Split-Pläne liegen in `CELL_MANAGER_STATE`. Absturzpunkte, die `split_crash_rec
 | `TriggerShardSplit` | Erzwingt `maybe_split_or_isolate_shard` auf einem lokalen Shard |
 | `EnableDualModeSplit` | Setzt das lokale Routenflag. `split_name` in der Anfrage wird ignoriert |
 | `ScaleShardReplicas` | Ruft `scale_out_replicas` auf, wenn diese Zelle existiert und genug Knoten registriert sind |
-| `RegisterCell` | Liefert einen Anwendungsfehler. Dieser Prozess beherbergt weiter genau eine Zelle und speichert die angeforderte Zelle nicht |
+| `RegisterCell` | Stores a remote cell after its routes cover the requested range. This process does not forward those keys |

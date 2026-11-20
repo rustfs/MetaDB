@@ -20,7 +20,7 @@ MetaDB 是为 [RustFS](https://github.com/rustfs) 编写的纯 Rust 元数据引
 - 一个 gRPC 监听器，提供 `MetadataService`、`TransactionService`、`ControlPlaneService` 和 `RaftTransportService`
 - 每 250 ms 一次的后台循环，排空辅助出站队列、做 2PC 恢复、检查分裂策略，并对 Raft 日志做快照
 
-`ServerRole` 也会解析 `be`、`proxy`、`cell-manager` 和 `global-manager`。`open_and_serve` 拒绝除 `all-in-one` 以外的每个角色。空数据目录上的第二个 `metadbd` 若把 `[cluster] join`（或 `--join` / `--cell-manager`）指到当前 leader，会加入该单元已有的 Raft 组：leader 先把它加为 learner，再提升为 voter。已经有单元状态的目录会重新打开本地 Raft，不会再次加入。`RegisterCell` 返回应用错误，不增加单元；`metadb-ctl cell register` 以非零状态退出。未知且非零的 `cell_id` 上，`GetRoutes` 返回错误；`cell_id = 0` 仍列出全部缓存路由。
+`ServerRole` 也会解析 `be`、`proxy`、`cell-manager` 和 `global-manager`。`open_and_serve` 拒绝除 `all-in-one` 以外的每个角色。空数据目录上的第二个 `metadbd` 若把 `[cluster] join`（或 `--join` / `--cell-manager`）指到当前 leader，会加入该单元已有的 Raft 组：leader 先把它加为 learner，再提升为 voter。已经有单元状态的目录会重新打开本地 Raft，不会再次加入。`RegisterCell` stores a remote cell after its routes cover the requested range and does not forward keys. `metadb-ctl cell register` without a range still sends `[01, 04)` and exits non-zero against a default cell.未知且非零的 `cell_id` 上，`GetRoutes` 返回错误；`cell_id = 0` 仍列出全部缓存路由。
 
 分片分裂、双模式 `(PID, name)` 分裂和巨型路由标志确实在这一个进程里运行。把副本提升到三个投票者的代码在 `DurableCellManager::scale_out_replicas` 中，并由进程内 Raft 测试覆盖。这不是三个 `metadbd` 进程的部署。见 [运维](./operations.md)。
 

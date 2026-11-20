@@ -54,7 +54,7 @@
 
 ### `cell register --cell-id <u64> --endpoints <a,b,c>`
 
-调用 `RegisterCell`。服务器返回应用错误，不增加单元。`metadb-ctl` 以非零状态退出，不会打印 `Registered Cell`。不要把它当作联邦步骤。
+Calls `RegisterCell`. The server fsyncs `GLOBAL_CELL_DIRECTORY` only when the endpoint's routes cover the requested range exactly. Omitting the keys sends `[01, 04)`, which overlaps a default cell, and `metadb-ctl` exits non-zero. The caller does not forward keys.
 
 ### `sql <语句>`
 
@@ -89,7 +89,7 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 | `metadb_locality_compactions_total` | counter |
 | `metadb_min_raft_safe_purge_index` | gauge |
 
-没有 `metadb_raft_watermark_lag_entries` 序列。`metadb_cells_total` 统计本进程内注册的单元数，`open_and_serve` 把它设为 1。
+There is no `metadb_raft_watermark_lag_entries` series. `metadb_cells_total` counts rows in this process's `GLOBAL_CELL_DIRECTORY`, including a remote cell after `RegisterCell`. `metadb_shards_total` counts only local shards. A fresh process has one cell.
 
 ## 扩容
 
@@ -104,7 +104,7 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 
 1. `metadbd --role be`、`--role proxy`、`--role cell-manager` 和 `--role global-manager` 在 `open_and_serve` 中退出。子系统不会按角色裁剪，进程拒绝以这些名字启动它们。
 2. 第二个 `metadbd --role all-in-one` 在数据目录为空、且 `--join` 或 `--cell-manager` 指向当前 leader 时，会加入已有 Raft 组。leader 先追加一条空日志并做快照，再把加入者从 learner 提升为 voter。`--join` 必须打到该 leader。已经有 Raft 状态的目录会重新打开本地状态，并忽略新的 join 地址。节点号 2 到 32767 的全新分配器从该节点自己的 inode、file id 和 shard id 命名空间起步，因此不会重发节点 1 已经发出的 id。已经发过低位 id 的分配器文件不会被搬迁。已知 leader 的 follower 上，`Lookup`、列目录、目录统计、`GetDirPartitionStat`、配额读和二级索引读会转发到该 leader。不知道 leader 时仍返回 `NotLeader`。成员变更处于 joint 时，`GetRoutes` 报告已经应用的全部投票者、当前 leader 和应用后的 epoch。统一配置提交后，这些投票者和 `conf_ver` 与 Raft 一致。加入在 45 秒内重试暂时性错误，然后关闭监听和本地 Raft 组并返回错误。`metadbd` 结束是因为启动返回了这个错误。第一次失败本身不会中止进程。
-3. `metadb-ctl cell register` 不创建第二个单元。`open_and_serve` 只把本地单元注册到全局管理器。
+3. `metadb-ctl cell register` records a second cell only after that cell's routes cover the requested range. This process does not forward those keys. `open_and_serve` still starts one local cell.
 4. 测试 `T1`–`T6` 使用的内存路径 `MetaDbEngine::new_single_node` 可以把内存中的投票者计数加到 3。那个对象没有磁盘，也没有 Raft。它不是 `metadbd` 的扩容。
 
 `topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. Disaggregated roles and a second Cell are still not live deployments. Jumbo dedicated-node isolation remains a route flag, not a move of shards onto another machine.
@@ -134,7 +134,7 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 ## 已知限制
 
 - Role `all-in-one` only. `be`, `proxy`, `cell-manager`, and `global-manager` are rejected before listen.
-- 第二个 all-in-one 进程可以用 `[cluster] join` 加入同一个单元。这不会创建第二个单元。`RegisterCell` 返回错误。
+- A second all-in-one process can join the same cell with `[cluster] join`. That does not create a second cell. `RegisterCell` records a different cell only after its routes cover the requested range, and this process does not forward keys.
 - 未知且非零的 `cell_id` 上，`GetRoutes` 失败关闭。`StoreHeartbeat` 不会替换缓存路由。
 - 巨型隔离是路由标志加上从本地节点表选出的节点标识。它不会把其他分片从磁盘上赶走。
 - Registered-node liveness is fsynced in `CELL_CONTROL_PLANE`. `metadbd` persists its own record about every 3 seconds and sends it to the current leader when this process is not the leader. Descriptors on that RPC are annotations, not routes. The observation does not schedule placement. See [Scale control plane](../en/scale-control-plane-status.md).

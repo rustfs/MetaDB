@@ -83,6 +83,6 @@ An empty secret does not start the process. Loopback is not an implicit exceptio
 
 - Zuschneiden der Teilsysteme nach Rolle. Das Rollenfeld ist ein Zulassen/Ablehnen-Schalter, keine Funktionsmenge.
 - Peer-Listen, Wählermengen oder ein Join-Token. Die Membership beginnt als dieser eine Prozess. Weitere Peers erscheinen erst nach `RegisterNode` plus `ScaleShardReplicas`, und diese Peers müssen bereits Raft-Mitglieder sein, die `RaftTransportService` für dieselben Shard-Logs sprechen. Ein zweiter all-in-one-Prozess tut das nicht. Siehe [Betrieb](./operations.md).
-- Den Schlüsselbereich einer zweiten Zelle. `RegisterCell` liefert einen Fehler und speichert nichts. Ein zweiter all-in-one-Prozess mit leerem Verzeichnis tritt dem aktuellen Leader mit `[cluster] join` bei; das bleibt dieselbe Zelle.
+- An arbitrary key slice as a cell range. `cell_start_key` and `cell_end_key` must be a contiguous union of whole tables. `RegisterCell` stores a remote cell only after its routes cover that range. Join still joins the same cell and does not create a second one.
 - Locality-compaction on/off. `to_lsm_config` always enables it. Raft timers are the `[raft]` table; see [Operability](../en/operability.md).
 - Native TLS-Zertifikate. Ein TLS-Schlüssel in dieser Datei wird abgelehnt. Die Terminierung gehört in einen externen Proxy.

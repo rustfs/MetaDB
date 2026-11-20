@@ -7,7 +7,8 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use metadb_cluster::{
-    AllocIdKind, CompositeShardRoute, DurableGlobalManager, ShardHealthState, ShardSplitMode,
+    AllocIdKind, CompositeShardRoute, DurableGlobalManager, RemotePrecheck, RemotePublication,
+    ShardHealthState, ShardSplitMode,
 };
 use metadb_core::codec;
 use metadb_core::{
@@ -131,6 +132,9 @@ pub struct MetaDbGrpcService {
     global_manager: Arc<DurableGlobalManager>,
     tx_router: Arc<DistributedTxRouter>,
     proxy_router: Arc<StatelessProxyRouter>,
+    /// Bearer sent when this process probes another cell. Empty means the
+    /// process was allowed to start without a secret, so probes stay on loopback.
+    forward_secret: String,
 }
 
 impl MetaDbGrpcService {
@@ -143,7 +147,13 @@ impl MetaDbGrpcService {
             global_manager,
             tx_router,
             proxy_router,
+            forward_secret: String::new(),
         }
+    }
+
+    pub fn with_forward_secret(mut self, secret: String) -> Self {
+        self.forward_secret = secret;
+        self
     }
 
     fn server_hlc(&self) -> u64 {
@@ -1049,7 +1059,7 @@ impl ControlPlaneService for MetaDbGrpcService {
                 .map(|cell| cell.cluster_id())
                 .filter(|id| *id != 0)
                 .collect();
-            let cluster_id = if cluster_ids.len() == 1 {
+            let mut cluster_id = if cluster_ids.len() == 1 {
                 cluster_ids.into_iter().next().unwrap_or(0)
             } else {
                 0
@@ -1067,7 +1077,15 @@ impl ControlPlaneService for MetaDbGrpcService {
                     }
                 }
             }
+            for remote in self.global_manager.remote_publications() {
+                if cluster_id != 0 && remote.cluster_id != cluster_id {
+                    cluster_id = 0;
+                }
+                routes.extend(remote.routes);
+            }
             (routes, cluster_id)
+        } else if let Some(remote) = self.global_manager.remote_publication(req.cell_id) {
+            (remote.routes, remote.cluster_id)
         } else if let Some(cell) = self.global_manager.get_cell(req.cell_id) {
             let cluster_id = cell.cluster_id();
             match cell.routes_for_live_status() {
@@ -1326,13 +1344,124 @@ impl ControlPlaneService for MetaDbGrpcService {
         request: Request<RegisterCellRequest>,
     ) -> Result<Response<RegisterCellResponse>, Status> {
         let req = request.into_inner();
-        let e = MetaDbError::ShardRoutingError(format!(
-            "RegisterCell({}) is not implemented; this process hosts a single all-in-one cell and does not federate additional cells",
-            req.cell_id
-        ));
-        Ok(Response::new(RegisterCellResponse {
-            error: Some(ErrorDetailProto::from(&e)),
-        }))
+        let range = match CompositeKeyRange::new(req.start_key, req.end_key) {
+            Ok(range) => range,
+            Err(error) => {
+                return Ok(Response::new(RegisterCellResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                }));
+            }
+        };
+        let precheck = match self.global_manager.precheck_remote_cell(
+            req.cell_id,
+            &range,
+            &req.cell_manager_endpoints,
+        ) {
+            Ok(precheck) => precheck,
+            Err(error) => {
+                return Ok(Response::new(RegisterCellResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                }));
+            }
+        };
+        if self.forward_secret.trim().is_empty() {
+            for endpoint in &req.cell_manager_endpoints {
+                if !crate::config::is_literal_loopback_addr(endpoint) {
+                    let error = MetaDbError::ShardRoutingError(
+                        "unauthenticated RegisterCell only probes a literal loopback address. Set a shared secret before registering a non-loopback cell, or bind that cell to 127.0.0.0/8 or ::1. This process does not terminate TLS"
+                            .to_string(),
+                    );
+                    return Ok(Response::new(RegisterCellResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                    }));
+                }
+            }
+        }
+        let probed = self
+            .probe_cell_routes(req.cell_id, &req.cell_manager_endpoints)
+            .await;
+        let (cluster_id, routes) = match probed {
+            Ok(probed) => probed,
+            Err(error) => {
+                if precheck == RemotePrecheck::SameIdentity
+                    && error.to_string().contains("not reachable")
+                {
+                    return Ok(Response::new(RegisterCellResponse { error: None }));
+                }
+                return Ok(Response::new(RegisterCellResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                }));
+            }
+        };
+        let publication = RemotePublication {
+            cell_id: req.cell_id,
+            range,
+            endpoints: req.cell_manager_endpoints,
+            cluster_id,
+            routes,
+        };
+        match self.global_manager.commit_remote_cell(publication) {
+            Ok(_) => Ok(Response::new(RegisterCellResponse { error: None })),
+            Err(error) => Ok(Response::new(RegisterCellResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+            })),
+        }
+    }
+}
+
+impl MetaDbGrpcService {
+    async fn probe_cell_routes(
+        &self,
+        cell_id: u64,
+        endpoints: &[String],
+    ) -> std::result::Result<(u128, Vec<CompositeShardRoute>), MetaDbError> {
+        let Some(endpoint) = endpoints.first() else {
+            return Err(MetaDbError::ShardRoutingError(
+                "RegisterCell requires a cell manager endpoint".to_string(),
+            ));
+        };
+        let endpoint = crate::normalize_rpc_addr(endpoint);
+        if endpoint.starts_with("https://") {
+            return Err(MetaDbError::ShardRoutingError(
+                "RegisterCell does not accept an https endpoint; this process does not terminate TLS"
+                    .to_string(),
+            ));
+        }
+        let mut client = crate::control_plane_client(&endpoint, &self.forward_secret)
+            .await
+            .map_err(|error| {
+                MetaDbError::ShardRoutingError(format!(
+                    "cell {cell_id} manager at {endpoint} is not reachable: {error}"
+                ))
+            })?;
+        let listed = client
+            .get_routes(GetRoutesRequest { cell_id })
+            .await
+            .map_err(|error| {
+                MetaDbError::ShardRoutingError(format!(
+                    "cell {cell_id} manager at {endpoint} is not reachable: {error}"
+                ))
+            })?
+            .into_inner();
+        if let Some(error) = listed.error {
+            if !error.message.is_empty() || !error.error_kind.is_empty() {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "cell {cell_id} manager at {endpoint} did not publish routes: {}",
+                    error.message
+                )));
+            }
+        }
+        let cluster_id = metadb_proto::convert::decode_optional_u128_be(&listed.cluster_id)
+            .map_err(|error| {
+                MetaDbError::ShardRoutingError(format!(
+                    "cell {cell_id} cluster id is invalid: {error}"
+                ))
+            })?;
+        let mut routes = Vec::with_capacity(listed.shards.len());
+        for shard in listed.shards {
+            routes.push(composite_route_from_proto(shard)?);
+        }
+        Ok((cluster_id, routes))
     }
 }
 

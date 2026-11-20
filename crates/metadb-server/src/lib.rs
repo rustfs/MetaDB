@@ -146,9 +146,8 @@ use metadb_cluster::{
     ShardDescriptor,
 };
 use metadb_core::{
-    CompositeKeyRange, EntryType, FileId, HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId,
-    MetaDbError, MetaEntry, NodeId, QuotaRecord, Result, SecondaryIndexRecord, ShardId, UserId,
-    ROOT_INODE_ID,
+    EntryType, FileId, HlcTimestamp, HybridLogicalClock, InodeAttr, InodeId, MetaDbError,
+    MetaEntry, NodeId, QuotaRecord, Result, SecondaryIndexRecord, ShardId, UserId, ROOT_INODE_ID,
 };
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::control_plane_service_server::ControlPlaneServiceServer;
@@ -562,6 +561,7 @@ impl PersistentMetaDbCluster {
     /// the process registers with that leader and joins every shard Raft group before returning.
     pub async fn open_and_serve(config: ServerTomlConfig) -> Result<(Arc<Self>, String)> {
         metadb_cluster::node_id_in_ha_range(config.node.node_id)?;
+        let owned_range = config.configured_cell_range()?;
         if config.node.role != ServerRole::AllInOne {
             return Err(MetaDbError::CodecError(format!(
                 "server role {:?} is not implemented; only all-in-one runs a process. \
@@ -665,7 +665,7 @@ impl PersistentMetaDbCluster {
             )
             .await?
         } else {
-            DurableCellManager::open_or_bootstrap(
+            DurableCellManager::open_or_bootstrap_in_range(
                 config.node.cell_id,
                 &cell_dir,
                 host.clone(),
@@ -676,6 +676,7 @@ impl PersistentMetaDbCluster {
                 config.raft_options.clone(),
                 id_allocator.clone(),
                 meta_cache.clone(),
+                owned_range,
             )
             .await?
         };
@@ -685,7 +686,15 @@ impl PersistentMetaDbCluster {
             id_allocator,
             meta_cache,
         ));
-        global_manager.register_cell(CompositeKeyRange::all_user_tables(), cell_manager.clone());
+        global_manager.load_or_create_directory(
+            config
+                .node
+                .data_dir
+                .join(metadb_cluster::CELL_DIRECTORY_FILE),
+        )?;
+        if !join_fresh {
+            global_manager.install_local_cell(cell_manager.clone(), bound_addr.clone())?;
+        }
         let tx_router = Arc::new(
             DistributedTxRouter::new(config.node.node_id, clock.clone(), global_manager.clone())
                 .with_forward_secret(config.security.shared_secret.clone()),
@@ -719,7 +728,8 @@ impl PersistentMetaDbCluster {
             cluster.global_manager.clone(),
             cluster.tx_router.clone(),
             cluster.proxy_router.clone(),
-        );
+        )
+        .with_forward_secret(cluster.config.security.shared_secret.clone());
         let grpc_handle =
             spawn_grpc_server(listener, grpc_svc, shared_secret, raft_router, shutdown_rx);
         cluster.task_handles.lock().await.push(grpc_handle);
@@ -737,6 +747,14 @@ impl PersistentMetaDbCluster {
             if let Err(error) =
                 join_existing_raft_group(cluster.config(), cluster.cell_manager(), &bound_addr)
                     .await
+            {
+                cluster.operability.fail();
+                let _ = cluster.shutdown_without_flush().await;
+                return Err(error);
+            }
+            if let Err(error) = cluster
+                .global_manager
+                .install_local_cell(cluster.cell_manager.clone(), bound_addr.clone())
             {
                 cluster.operability.fail();
                 let _ = cluster.shutdown_without_flush().await;
@@ -1280,7 +1298,7 @@ async fn wait_until_accepting(addr: &str) {
     }
 }
 
-fn normalize_rpc_addr(addr: &str) -> String {
+pub(crate) fn normalize_rpc_addr(addr: &str) -> String {
     let addr = addr.trim();
     if addr.starts_with("http://") || addr.starts_with("https://") {
         addr.to_string()
@@ -1305,7 +1323,7 @@ fn join_failure_is_permanent(error: &MetaDbError) -> bool {
     matches!(error, MetaDbError::IdentityRejected(_))
 }
 
-async fn control_plane_client(
+pub(crate) async fn control_plane_client(
     addr: &str,
     secret: &str,
 ) -> Result<

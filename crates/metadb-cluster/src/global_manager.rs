@@ -1,15 +1,27 @@
 //! Top-tier `DurableGlobalManager` implementing `ShardDirectory` (`metadb-tx`) across Cells,
 //! `CompositeMetaCache` routing, `DurableIdAllocator`, and fenced `DirRenameLease`s.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
 
-use metadb_core::{CellId, CompositeKeyRange, HybridLogicalClock, InodeId, MetaDbError, Result};
+use metadb_core::{
+    CellId, CompositeKeyRange, HybridLogicalClock, InodeId, MetaDbError, NodeId, Result,
+};
 use metadb_tx::{DirRenameLease, RoutedShardHandle, ShardDirectory, MAX_2PC_LEASE_LIFETIME_MS};
 
+use crate::cell_directory::{
+    load_directory, precheck_remote, publication_from_probe, store_directory, union_route_range,
+    DirectoryCell, RemotePrecheck, RemotePublication,
+};
 use crate::cell_manager::DurableCellManager;
 use crate::id_allocator::DurableIdAllocator;
 use crate::meta_cache::CompositeMetaCache;
+
+struct CellDirectory {
+    path: Option<std::path::PathBuf>,
+    records: BTreeMap<CellId, DirectoryCell>,
+}
 
 /// Top-tier Two-Tier Control Plane manager (`GlobalManager` + `MetaCache` + `DurableIdAllocator`).
 pub struct DurableGlobalManager {
@@ -17,6 +29,7 @@ pub struct DurableGlobalManager {
     id_allocator: Arc<DurableIdAllocator>,
     meta_cache: Arc<CompositeMetaCache>,
     cells: RwLock<BTreeMap<CellId, (CompositeKeyRange, Arc<DurableCellManager>)>>,
+    directory: Mutex<CellDirectory>,
 }
 
 impl DurableGlobalManager {
@@ -30,7 +43,210 @@ impl DurableGlobalManager {
             id_allocator,
             meta_cache,
             cells: RwLock::new(BTreeMap::new()),
+            directory: Mutex::new(CellDirectory {
+                path: None,
+                records: BTreeMap::new(),
+            }),
         }
+    }
+
+    pub fn load_or_create_directory(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let records = if path.exists() {
+            load_directory(path)?
+        } else {
+            BTreeMap::new()
+        };
+        *self.directory.lock().unwrap() = CellDirectory {
+            path: Some(path.to_path_buf()),
+            records,
+        };
+        Ok(())
+    }
+
+    /// Publishes this process's cell into the durable directory and the local map.
+    ///
+    /// Remote rows already in the file are kept. A local range that overlaps one
+    /// of them, or that disagrees with the stored local range, refuses to start.
+    pub fn install_local_cell(
+        &self,
+        cell: Arc<DurableCellManager>,
+        endpoint: String,
+    ) -> Result<()> {
+        let endpoint = endpoint.trim().to_string();
+        if endpoint.is_empty() {
+            return Err(MetaDbError::ShardRoutingError(
+                "local cell endpoint is empty".to_string(),
+            ));
+        }
+        let routes = cell.list_routes();
+        let range = union_route_range(routes.iter().map(|route| &route.range))?;
+        let cluster_id = cell.cluster_id();
+        if cluster_id == 0 {
+            return Err(MetaDbError::ShardRoutingError(
+                "local cell has no cluster identity".to_string(),
+            ));
+        }
+        {
+            let mut directory = self.directory.lock().unwrap();
+            let Some(path) = directory.path.clone() else {
+                return Err(MetaDbError::ShardRoutingError(
+                    "cell directory is not loaded".to_string(),
+                ));
+            };
+            for record in directory.records.values() {
+                if record.cell_id == cell.cell_id() {
+                    if !record.local {
+                        return Err(MetaDbError::ShardRoutingError(format!(
+                            "cell {} is already a remote registration",
+                            cell.cell_id()
+                        )));
+                    }
+                    if record.range != range {
+                        return Err(MetaDbError::ShardRoutingError(
+                            "durable local cell range does not match this process's routes"
+                                .to_string(),
+                        ));
+                    }
+                    continue;
+                }
+                if record.range.overlaps(&range.start_key, &range.end_key) {
+                    return Err(MetaDbError::ShardRoutingError(format!(
+                        "local cell {} overlaps cell {}",
+                        cell.cell_id(),
+                        record.cell_id
+                    )));
+                }
+            }
+            let mut next = directory.records.clone();
+            next.insert(
+                cell.cell_id(),
+                DirectoryCell {
+                    cell_id: cell.cell_id(),
+                    range: range.clone(),
+                    endpoints: vec![endpoint],
+                    local: true,
+                    cluster_id,
+                    routes: Vec::new(),
+                },
+            );
+            store_directory(&path, &next)?;
+            directory.records = next;
+        }
+        self.register_cell(range, cell);
+        Ok(())
+    }
+
+    pub fn precheck_remote_cell(
+        &self,
+        cell_id: CellId,
+        range: &CompositeKeyRange,
+        endpoints: &[String],
+    ) -> Result<RemotePrecheck> {
+        let directory = self.directory.lock().unwrap();
+        if directory.path.is_none() {
+            return Err(MetaDbError::ShardRoutingError(
+                "cell directory is not loaded".to_string(),
+            ));
+        }
+        precheck_remote(&directory.records, cell_id, range, endpoints)
+    }
+
+    /// Stores a probed remote cell. `Ok(false)` means the stored publication
+    /// was already identical, so nothing was rewritten.
+    pub fn commit_remote_cell(&self, publication: RemotePublication) -> Result<bool> {
+        let mut directory = self.directory.lock().unwrap();
+        let Some(path) = directory.path.clone() else {
+            return Err(MetaDbError::ShardRoutingError(
+                "cell directory is not loaded".to_string(),
+            ));
+        };
+        let node_ids = self.node_ids_in_use_except(publication.cell_id, &directory.records);
+        let Some(stored) = publication_from_probe(&directory.records, publication, &node_ids)?
+        else {
+            return Ok(false);
+        };
+        let mut next = directory.records.clone();
+        next.insert(stored.cell_id, stored);
+        store_directory(&path, &next)?;
+        directory.records = next;
+        Ok(true)
+    }
+
+    pub fn remote_publication(&self, cell_id: CellId) -> Option<DirectoryCell> {
+        self.directory
+            .lock()
+            .unwrap()
+            .records
+            .get(&cell_id)
+            .filter(|record| !record.local)
+            .cloned()
+    }
+
+    pub fn remote_publications(&self) -> Vec<DirectoryCell> {
+        self.directory
+            .lock()
+            .unwrap()
+            .records
+            .values()
+            .filter(|record| !record.local)
+            .cloned()
+            .collect()
+    }
+
+    pub fn published_cell_count(&self) -> usize {
+        let directory = self.directory.lock().unwrap();
+        if directory.path.is_some() {
+            directory.records.len()
+        } else {
+            drop(directory);
+            self.cells.read().unwrap().len()
+        }
+    }
+
+    fn node_ids_in_use_except(
+        &self,
+        except_cell: CellId,
+        records: &BTreeMap<CellId, DirectoryCell>,
+    ) -> BTreeSet<NodeId> {
+        let mut ids = BTreeSet::new();
+        for cell in self.all_cells() {
+            if cell.cell_id() == except_cell {
+                continue;
+            }
+            for route in cell.list_routes() {
+                ids.extend(route.peers.keys().copied());
+            }
+        }
+        for record in records.values() {
+            if record.local || record.cell_id == except_cell {
+                continue;
+            }
+            for route in &record.routes {
+                ids.extend(route.peers.keys().copied());
+            }
+        }
+        ids
+    }
+
+    fn remote_owning_key(&self, key: &[u8]) -> Option<DirectoryCell> {
+        self.directory
+            .lock()
+            .unwrap()
+            .records
+            .values()
+            .find(|record| !record.local && record.range.contains_key(key))
+            .cloned()
+    }
+
+    fn remote_overlapping_range(&self, start: &[u8], end: &[u8]) -> Option<DirectoryCell> {
+        self.directory
+            .lock()
+            .unwrap()
+            .records
+            .values()
+            .find(|record| !record.local && record.range.overlaps(start, end))
+            .cloned()
     }
 
     pub fn id_allocator(&self) -> &Arc<DurableIdAllocator> {
@@ -77,6 +293,13 @@ impl DurableGlobalManager {
     }
 
     fn try_route_user_key(&self, user_key: &[u8]) -> Result<RoutedShardHandle> {
+        if let Some(owner) = self.remote_owning_key(user_key) {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "key is owned by cell {} at {}; this process does not forward requests to another cell",
+                owner.cell_id,
+                owner.endpoints.join(",")
+            )));
+        }
         let route = self.meta_cache.lookup_key(user_key).ok_or_else(|| {
             MetaDbError::ShardRoutingError("no published route covering key".to_string())
         })?;
@@ -107,6 +330,13 @@ impl DurableGlobalManager {
     ) -> Result<Vec<RoutedShardHandle>> {
         if start_user_key >= end_user_key {
             return Ok(Vec::new());
+        }
+        if let Some(owner) = self.remote_overlapping_range(start_user_key, end_user_key) {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "requested range overlaps cell {} at {}; this process does not forward and does not serve a partial range",
+                owner.cell_id,
+                owner.endpoints.join(",")
+            )));
         }
         let routes = self.meta_cache.lookup_range(start_user_key, end_user_key);
         let mut covered_until = start_user_key.to_vec();

@@ -227,9 +227,11 @@ async fn control_plane_does_not_pretend_missing_topology_ops_succeeded() {
         .await
         .unwrap()
         .into_inner();
-    let register_err = registered.error.expect("register_cell must not succeed");
+    let register_err = registered
+        .error
+        .expect("overlapping register_cell must not succeed");
     assert!(
-        register_err.message.contains("not implemented"),
+        register_err.message.contains("overlaps"),
         "{}",
         register_err.message
     );

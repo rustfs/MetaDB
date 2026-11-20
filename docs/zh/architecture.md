@@ -138,4 +138,4 @@ MVCC 版本在内存中保留 `storage.mvcc_retention_ms`（默认 5,000）。�
 | `TriggerShardSplit` | 在本地分片上强制 `maybe_split_or_isolate_shard` |
 | `EnableDualModeSplit` | 设置本地路由标志。请求中的 `split_name` 被忽略 |
 | `ScaleShardReplicas` | 若本单元存在且已注册节点足够，则调用 `scale_out_replicas` |
-| `RegisterCell` | 返回应用错误。本进程仍然只托管一个单元，不保存请求中的单元 |
+| `RegisterCell` | Stores a remote cell after its routes cover the requested range. This process does not forward those keys |

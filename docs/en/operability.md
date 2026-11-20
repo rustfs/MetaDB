@@ -88,7 +88,7 @@ These stay out of the probe on purpose. Treating them as ready would be a broade
 
 - The 250 ms `TxnRecoveryWorker` pass. Expired 2PC intents are not required to be drained before `/readyz` returns 200. The first pass runs after the phase flips to `serving`, and a failed pass is ignored by that loop.
 - Backup holds, online backup copies, and restore. Those are a separate operator path.
-- A second cell, Jumbo file movement, RDMA, and heartbeats. `StoreHeartbeat` still has no sender in `metadbd`.
+- Whether a remote cell in `GLOBAL_CELL_DIRECTORY` is reachable. `/readyz` answers for this process's local shards only. Jumbo file movement and RDMA are not readiness signals. Heartbeats stay a local liveness annotation and do not make a cell ready or scheduled.
 - Disk space, clock health, and "this node can reach a quorum right now" beyond the leader id OpenRaft has published. `leader_unknown` is the check this process can make without starting a proposal.
 - Per-shard series. Gauges below are counts. A shard id is not a label.
 
@@ -96,7 +96,7 @@ The shard gauges count flags independently. One group can increment both `metadb
 
 ## Metrics
 
-Existing series are unchanged: `metadb_cells_total`, `metadb_shards_total`, `metadb_in_memory_mvcc_writes_total`, `metadb_pruned_mvcc_versions_total`, `metadb_persistent_kv_writes_total`, `metadb_active_physical_tombstones`, `metadb_tombstones_traversed_on_scans_total`, `metadb_locality_compactions_total`, `metadb_min_raft_safe_purge_index`.
+Series names are unchanged: `metadb_cells_total`, `metadb_shards_total`, `metadb_in_memory_mvcc_writes_total`, `metadb_pruned_mvcc_versions_total`, `metadb_persistent_kv_writes_total`, `metadb_active_physical_tombstones`, `metadb_tombstones_traversed_on_scans_total`, `metadb_locality_compactions_total`, `metadb_min_raft_safe_purge_index`. `metadb_cells_total` counts directory rows, including a remote cell. `metadb_shards_total` stays local.
 
 Unlabeled gauges added for operators:
 

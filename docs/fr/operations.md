@@ -54,7 +54,7 @@ Appelle `ScaleShardReplicas`. Le serveur exige que `target_voters` entrées soie
 
 ### `cell register --cell-id <u64> --endpoints <a,b,c>`
 
-Appelle `RegisterCell`. Le serveur renvoie une erreur applicative et n'ajoute pas de cellule. `metadb-ctl` se termine avec un code non nul et n'imprime pas `Registered Cell`. Ne pas l'utiliser comme étape de fédération.
+Calls `RegisterCell`. The server fsyncs `GLOBAL_CELL_DIRECTORY` only when the endpoint's routes cover the requested range exactly. Omitting the keys sends `[01, 04)`, which overlaps a default cell, and `metadb-ctl` exits non-zero. The caller does not forward keys.
 
 ### `sql <énoncé>`
 
@@ -89,7 +89,7 @@ Jauges et compteurs de `render_prometheus_metrics` :
 | `metadb_locality_compactions_total` | counter |
 | `metadb_min_raft_safe_purge_index` | gauge |
 
-Il n'y a pas de série `metadb_raft_watermark_lag_entries`. `metadb_cells_total` compte les cellules enregistrées dans ce processus, ce que `open_and_serve` fixe à un.
+There is no `metadb_raft_watermark_lag_entries` series. `metadb_cells_total` counts rows in this process's `GLOBAL_CELL_DIRECTORY`, including a remote cell after `RegisterCell`. `metadb_shards_total` counts only local shards. A fresh process has one cell.
 
 ## Montée en charge
 
@@ -104,7 +104,7 @@ Ce qui ne fonctionne pas comme procédure d'exploitation :
 
 1. `metadbd --role be`, `--role proxy`, `--role cell-manager` et `--role global-manager` sortent dans `open_and_serve`. Les sous-systèmes ne sont pas découpés par rôle, et le processus refuse de les démarrer sous ces noms.
 2. Un second `metadbd --role all-in-one` rejoint un groupe existant lorsque `--join` ou `--cell-manager` nomme le leader courant et que le répertoire de données est vide. Le leader ajoute une entrée vide, prend un instantané, puis promeut le nouveau membre de learner à voter. `--join` doit atteindre ce leader. Un répertoire qui a déjà un état Raft le rouvre et ignore une nouvelle adresse de join. Un allocateur neuf pour les identifiants de nœud 2 à 32767 démarre dans l'espace de noms inode, file id et shard id de ce nœud, et ne réémet donc pas les identifiants déjà accordés par le nœud 1. Un fichier d'allocateur qui a déjà accordé de petits identifiants n'est pas déplacé. `Lookup`, le listage, la statistique de répertoire, `GetDirPartitionStat`, les lectures de quota et d'index secondaire qui atteignent un follower dont le leader est connu sont transmis à ce leader. Un follower qui ne connaît pas de leader renvoie encore `NotLeader`. Pendant une configuration jointe, `GetRoutes` rapporte chaque votant appliqué, le leader courant et l'époque appliquée. Après le commit de la configuration uniforme, ces votants et `conf_ver` correspondent à Raft. Un join qui n'aboutit pas réessaie les erreurs transitoires pendant 45 secondes, puis arrête les listeners et les groupes Raft locaux et renvoie l'erreur. `metadbd` se termine parce que le démarrage a renvoyé cette erreur. Le premier échec n'interrompt pas le processus à lui seul.
-3. `metadb-ctl cell register` ne crée pas une seconde cellule. `open_and_serve` n'enregistre que la cellule locale sur le gestionnaire global.
+3. `metadb-ctl cell register` records a second cell only after that cell's routes cover the requested range. This process does not forward those keys. `open_and_serve` still starts one local cell.
 4. Le chemin en mémoire `MetaDbEngine::new_single_node` utilisé par les tests `T1`–`T6` peut porter un compteur de votants en mémoire à 3. Cet objet n'a ni disque ni Raft. Ce n'est pas une montée en charge de `metadbd`.
 
 `topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. Disaggregated roles and a second Cell are still not live deployments. Jumbo dedicated-node isolation remains a route flag, not a move of shards onto another machine.
@@ -134,7 +134,7 @@ Les variantes sont définies dans `crates/metadb-core/src/error.rs`. Les méthod
 ## Limites connues
 
 - Role `all-in-one` only. `be`, `proxy`, `cell-manager`, and `global-manager` are rejected before listen.
-- Un second processus all-in-one peut rejoindre la même cellule avec `[cluster] join`. Cela ne crée pas une seconde cellule. `RegisterCell` renvoie une erreur.
+- A second all-in-one process can join the same cell with `[cluster] join`. That does not create a second cell. `RegisterCell` records a different cell only after its routes cover the requested range, and this process does not forward keys.
 - `GetRoutes` échoue fermé pour un `cell_id` non nul inconnu. `StoreHeartbeat` ne remplace pas les routes en cache.
 - L'isolation jumbo est un indicateur de route plus un identifiant de nœud choisi dans la table locale. Elle n'évince pas d'autres shards d'un disque.
 - Registered-node liveness is fsynced in `CELL_CONTROL_PLANE`. `metadbd` persists its own record about every 3 seconds and sends it to the current leader when this process is not the leader. Descriptors on that RPC are annotations, not routes. The observation does not schedule placement. See [Scale control plane](../en/scale-control-plane-status.md).

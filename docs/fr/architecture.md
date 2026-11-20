@@ -138,4 +138,4 @@ Les plans de découpage sont stockés dans `CELL_MANAGER_STATE`. Les points de p
 | `TriggerShardSplit` | Force `maybe_split_or_isolate_shard` sur un shard local |
 | `EnableDualModeSplit` | Pose l'indicateur de route local. `split_name` de la requête est ignoré |
 | `ScaleShardReplicas` | Appelle `scale_out_replicas` si cette cellule existe et si assez de nœuds sont enregistrés |
-| `RegisterCell` | Renvoie une erreur applicative. Ce processus héberge toujours une seule cellule et n'enregistre pas la cellule demandée |
+| `RegisterCell` | Stores a remote cell after its routes cover the requested range. This process does not forward those keys |

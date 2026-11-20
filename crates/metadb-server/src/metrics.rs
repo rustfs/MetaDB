@@ -71,7 +71,7 @@ fn count(gates: &[ShardGate], pred: impl Fn(&ShardGate) -> bool) -> u64 {
 pub fn collect_cluster_metrics(gm: &DurableGlobalManager) -> ClusterMetricsSnapshot {
     let cells = gm.all_cells();
     let mut snap = ClusterMetricsSnapshot {
-        cells_total: cells.len(),
+        cells_total: gm.published_cell_count(),
         ..Default::default()
     };
     let mut min_purge: Option<u64> = None;

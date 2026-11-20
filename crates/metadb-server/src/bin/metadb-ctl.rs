@@ -165,6 +165,12 @@ enum CellCmd {
         cell_id: u64,
         #[arg(long)]
         endpoints: String,
+        /// Inclusive hex start. With `--end-key`, this is the range the server must cover.
+        #[arg(long)]
+        start_key: Option<String>,
+        /// Exclusive hex end.
+        #[arg(long)]
+        end_key: Option<String>,
     },
 }
 
@@ -531,15 +537,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Command::Backup { sub } => run_backup(sub).await?,
         Command::Cell {
-            sub: CellCmd::Register { cell_id, endpoints },
+            sub:
+                CellCmd::Register {
+                    cell_id,
+                    endpoints,
+                    start_key,
+                    end_key,
+                },
         } => {
             let mut cp = open_cp(&url, &token).await?;
             let eps: Vec<String> = endpoints.split(',').map(|s| s.trim().to_string()).collect();
+            let (start_key, end_key) = match (start_key, end_key) {
+                (None, None) => (vec![0x01], vec![0x04]),
+                (Some(start), Some(end)) => (
+                    metadb_server::config::decode_hex_key(&start)?,
+                    metadb_server::config::decode_hex_key(&end)?,
+                ),
+                _ => {
+                    return Err(
+                        "cell register requires both --start-key and --end-key, or neither".into(),
+                    );
+                }
+            };
             let resp = cp
                 .register_cell(RegisterCellRequest {
                     cell_id,
-                    start_key: vec![0x01],
-                    end_key: vec![0x04],
+                    start_key,
+                    end_key,
                     cell_manager_endpoints: eps,
                 })
                 .await?

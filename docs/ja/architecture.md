@@ -138,4 +138,4 @@ MVCC の版は `storage.mvcc_retention_ms`（既定 5,000）のあいだメモ�
 | `TriggerShardSplit` | ローカルシャードで `maybe_split_or_isolate_shard` を強制する |
 | `EnableDualModeSplit` | ローカルのルートフラグを立てる。リクエストの `split_name` は無視される |
 | `ScaleShardReplicas` | このセルが存在し、登録ノードが足りるときに `scale_out_replicas` を呼ぶ |
-| `RegisterCell` | アプリケーションエラーを返す。このプロセスは引き続き 1 つのセルだけをホストし、要求されたセルは保存しない |
+| `RegisterCell` | Stores a remote cell after its routes cover the requested range. This process does not forward those keys |

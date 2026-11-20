@@ -54,7 +54,7 @@
 
 ### `cell register --cell-id <u64> --endpoints <a,b,c>`
 
-`RegisterCell` を呼びます。サーバはアプリケーションエラーを返し、セルを追加しません。`metadb-ctl` は非ゼロで終了し、`Registered Cell` を印字しません。連合の手順として使わないでください。
+Calls `RegisterCell`. The server fsyncs `GLOBAL_CELL_DIRECTORY` only when the endpoint's routes cover the requested range exactly. Omitting the keys sends `[01, 04)`, which overlaps a default cell, and `metadb-ctl` exits non-zero. The caller does not forward keys.
 
 ### `sql <文>`
 
@@ -89,7 +89,7 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 | `metadb_locality_compactions_total` | counter |
 | `metadb_min_raft_safe_purge_index` | gauge |
 
-`metadb_raft_watermark_lag_entries` という系列はありません。`metadb_cells_total` は、このプロセス内に登録されたセルを数えます。`open_and_serve` はそれを 1 にします。
+There is no `metadb_raft_watermark_lag_entries` series. `metadb_cells_total` counts rows in this process's `GLOBAL_CELL_DIRECTORY`, including a remote cell after `RegisterCell`. `metadb_shards_total` counts only local shards. A fresh process has one cell.
 
 ## スケールアウト
 
@@ -104,7 +104,7 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 
 1. `metadbd --role be`、`--role proxy`、`--role cell-manager`、`--role global-manager` は `open_and_serve` で終了します。サブシステムはロールで切り出されず、プロセスはそれらの名前で起動することを拒否します。
 2. 2 つ目の `metadbd --role all-in-one` は、データディレクトリが空で `--join` または `--cell-manager` が現在のリーダーを指すとき、既存の Raft グループに参加します。リーダーは空エントリを追記してスナップショットを取り、参加者を learner から voter へ昇格します。`--join` はそのリーダーに届く必要があります。すでに Raft 状態があるディレクトリはそれを開き直し、新しい join アドレスを無視します。ノード ID 2 から 32767 の新しいアロケータは、そのノード自身の inode、file id、shard id 名前空間から始まるため、ノード 1 が既に発行した ID を再発行しません。既に低い ID を発行したアロケータファイルは移し替えません。リーダーが分かっている follower への `Lookup`、ディレクトリ一覧、ディレクトリ統計、`GetDirPartitionStat`、クォータ読み取り、セカンダリインデックス読み取りは、そのリーダーへ転送します。リーダーが不明な follower は引き続き `NotLeader` を返します。メンバーシップが joint の間、`GetRoutes` は適用済みの全投票者、現在のリーダー、適用済み epoch を報告します。均一構成がコミットされた後、それらの投票者と `conf_ver` は Raft と一致します。参加は一時的なエラーを 45 秒間再試行し、その後リスナーとローカル Raft グループを止めてエラーを返します。`metadbd` が終わるのは、起動がそのエラーを返したためです。最初の失敗だけではプロセスを中断しません。
-3. `metadb-ctl cell register` は 2 つ目のセルを作りません。`open_and_serve` はグローバルマネージャへローカルセルだけを登録します。
+3. `metadb-ctl cell register` records a second cell only after that cell's routes cover the requested range. This process does not forward those keys. `open_and_serve` still starts one local cell.
 4. テスト `T1`–`T6` が使うメモリ内の `MetaDbEngine::new_single_node` は、メモリ上の投票者数を 3 に増やせます。そのオブジェクトにはディスクも Raft もありません。`metadbd` のスケールアウトではありません。
 
 `topology_distributed` still uses `DurableCellManager::scale_out_replicas` with localhost voters inside one OS process. `join_existing_group` starts real `metadbd` processes and joins them. The shared-secret case in that file opens two clusters inside the test process; it does not start two `metadbd` OS processes. Disaggregated roles and a second Cell are still not live deployments. Jumbo dedicated-node isolation remains a route flag, not a move of shards onto another machine.
@@ -134,7 +134,7 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 ## 既知の制限
 
 - Role `all-in-one` only. `be`, `proxy`, `cell-manager`, and `global-manager` are rejected before listen.
-- 2 つ目の all-in-one プロセスは `[cluster] join` で同じセルに参加できる。これは 2 つ目のセルを作らない。`RegisterCell` はエラーを返す。
+- A second all-in-one process can join the same cell with `[cluster] join`. That does not create a second cell. `RegisterCell` records a different cell only after its routes cover the requested range, and this process does not forward keys.
 - 未知で非ゼロの `cell_id` に対する `GetRoutes` は失敗して閉じる。`StoreHeartbeat` はキャッシュ済みルートを置き換えない。
 - ジャンボ隔離はルートフラグと、ローカルノード表から選んだノード ID である。他のシャードをディスクから追い出すことはしない。
 - Registered-node liveness is fsynced in `CELL_CONTROL_PLANE`. `metadbd` persists its own record about every 3 seconds and sends it to the current leader when this process is not the leader. Descriptors on that RPC are annotations, not routes. The observation does not schedule placement. See [Scale control plane](../en/scale-control-plane-status.md).

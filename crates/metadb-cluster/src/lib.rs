@@ -6,6 +6,7 @@
 //! - [`control_plane`]: Two-Tier Control Plane (`GlobalManager` + `CellLocalManager`) and
 //!   `MetaCache` shard routing cache for scaling to 100B–10T+ records across 1,000+ nodes.
 
+pub mod cell_directory;
 pub mod cell_manager;
 pub mod control_plane;
 pub mod control_plane_state;
@@ -18,6 +19,9 @@ pub mod meta_cache;
 pub mod shard;
 pub mod split_worker;
 
+pub use cell_directory::{
+    shards_covering, DirectoryCell, RemotePrecheck, RemotePublication, CELL_DIRECTORY_FILE,
+};
 pub use cell_manager::{
     join_scale_target, plan_membership_voters, CellDirectoryRole, DurableCellManager,
     SplitPlanRecord, SplitPlanState,
