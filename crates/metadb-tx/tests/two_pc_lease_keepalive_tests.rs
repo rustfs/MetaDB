@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use metadb_core::{
-    CompositeKeyRange, HlcTimestamp, HybridLogicalClock, InodeId, IntentOp, LeaseRenewReject,
+    CompositeKeyRange, HlcTimestamp, HybridLogicalClock, InodeId, LeaseRenewReject,
     MetaDbError, MetaKey, Result, ShardEpoch, TxnState, TxnStatusRecord, WriteIntentRecord,
     ROOT_INODE_ID, SYSTEM_PREFIX_TXN_RECORD, SYSTEM_PREFIX_WRITE_INTENT,
 };
@@ -436,14 +436,12 @@ fn keys_on(handler: &TxStateMachineHandler, keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
 fn holder_deadlines(records: &[WriteIntentRecord], txn_id: u128) -> Vec<u64> {
     let mut deadlines = Vec::new();
     for record in records {
-        match &record.op {
-            IntentOp::DirExistsFenceSet { holders } => {
-                if let Some((_, expire)) = holders.get(&txn_id) {
-                    deadlines.push(expire.physical_ms());
-                }
+        if let Some(holders) = record.resolved_fence_holders() {
+            if let Some(holder) = holders.get(&txn_id) {
+                deadlines.push(holder.expire_hlc.physical_ms());
             }
-            _ if record.txn_id == txn_id => deadlines.push(record.expire_hlc.physical_ms()),
-            _ => {}
+        } else if record.txn_id == txn_id {
+            deadlines.push(record.expire_hlc.physical_ms());
         }
     }
     deadlines
@@ -775,16 +773,15 @@ async fn lookup_and_rollback_remain_correct_past_default_mvcc_retention() {
         .get(&source_key, start_hlc)
         .expect("lease must extend MVCC retention for the prepared key");
     assert!(historical.is_some(), "pre-image must survive the 5s window");
-    let listed = cluster
-        .shard1
-        .engine()
-        .scan_range(
-            &MetaKey::encode_pid_prefix_start(100),
-            &MetaKey::encode_pid_prefix_end(100),
-            start_hlc,
-        )
-        .unwrap();
-    assert!(listed.iter().any(|(key, _)| key == &source_key));
+    let listed = cluster.shard1.engine().scan_range(
+        &MetaKey::encode_pid_prefix_start(100),
+        &MetaKey::encode_pid_prefix_end(100),
+        start_hlc,
+    );
+    assert!(
+        matches!(listed, Err(MetaDbError::TransactionTimeout { .. })),
+        "a range behind the flush watermark is unprovable, including keys the lease did not capture: {listed:?}"
+    );
 
     gate.release();
     let error = rename.await.unwrap().unwrap_err();

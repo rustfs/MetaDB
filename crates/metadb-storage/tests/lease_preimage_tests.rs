@@ -133,6 +133,131 @@ fn a_historical_point_read_without_a_capture_does_not_return_a_newer_collapsed_v
 }
 
 #[test]
+fn range_scan_behind_the_flush_watermark_does_not_invent_absent_or_newer_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(dir.path());
+    let kept = MetaKey::child(7, "kept.txt").encode();
+    let added = MetaKey::child(7, "added.txt").encode();
+    let removed = MetaKey::child(7, "removed.txt").encode();
+    let start = HlcTimestamp::new(1_000, 0);
+    let later = HlcTimestamp::new(3_000, 0);
+    engine.apply_committed_put(kept.clone(), b"kept".to_vec(), start, 1);
+    engine.mvcc().snapshot_registry().renew_lease_hold(
+        1,
+        start,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        &[kept.clone(), removed.clone()],
+        &[
+            (kept.clone(), start, MvccValue::Value(b"kept".to_vec())),
+            (removed.clone(), start, MvccValue::Tombstone),
+        ],
+    );
+    engine.apply_committed_put(removed.clone(), b"later-body".to_vec(), later, 2);
+    engine.apply_committed_put(added.clone(), b"new".to_vec(), later, 3);
+    flush(&engine, 3, later);
+
+    let scanned = engine.scan_range(
+        &MetaKey::encode_pid_prefix_start(7),
+        &MetaKey::encode_pid_prefix_end(7),
+        start,
+    );
+    assert!(
+        matches!(scanned, Err(MetaDbError::TransactionTimeout { .. })),
+        "the range must fail closed instead of showing added.txt or hiding removed.txt: {scanned:?}"
+    );
+    assert_eq!(
+        engine.get(&kept, start).unwrap().as_deref(),
+        Some(b"kept".as_slice())
+    );
+    assert_eq!(engine.get(&removed, start).unwrap(), None);
+    assert_eq!(
+        engine
+            .get(&added, HlcTimestamp::new(u64::MAX, 0))
+            .unwrap()
+            .as_deref(),
+        Some(b"new".as_slice())
+    );
+    assert_eq!(
+        engine
+            .get(&removed, HlcTimestamp::new(u64::MAX, 0))
+            .unwrap()
+            .as_deref(),
+        Some(b"later-body".as_slice()),
+        "a current read must not stay on the captured absence"
+    );
+    let latest = engine
+        .scan_range(
+            &MetaKey::encode_pid_prefix_start(7),
+            &MetaKey::encode_pid_prefix_end(7),
+            HlcTimestamp::new(u64::MAX, 0),
+        )
+        .unwrap();
+    assert!(latest.iter().any(|(key, _)| key == &added));
+    assert!(latest.iter().any(|(key, _)| key == &removed));
+}
+
+#[test]
+fn releasing_one_holder_keeps_the_other_capture_and_checkpoint_keeps_live_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(dir.path());
+    let key = MetaKey::child(7, "shared.txt").encode();
+    let start_a = HlcTimestamp::new(1_000, 0);
+    let start_b = HlcTimestamp::new(2_000, 0);
+    engine.apply_committed_put(key.clone(), b"a".to_vec(), start_a, 1);
+    engine.apply_committed_put(key.clone(), b"b".to_vec(), start_b, 2);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    engine.mvcc().snapshot_registry().renew_lease_hold(
+        1,
+        start_a,
+        until,
+        &[key.clone()],
+        &[(key.clone(), start_a, MvccValue::Value(b"a".to_vec()))],
+    );
+    engine.mvcc().snapshot_registry().renew_lease_hold(
+        2,
+        start_b,
+        until,
+        &[key.clone()],
+        &[(key.clone(), start_b, MvccValue::Value(b"b".to_vec()))],
+    );
+    engine.apply_committed_put(key.clone(), b"c".to_vec(), HlcTimestamp::new(3_000, 0), 3);
+    flush(&engine, 3, HlcTimestamp::new(3_000, 0));
+    engine.mvcc().snapshot_registry().release_lease_hold(1);
+    assert!(
+        matches!(
+            engine.get(&key, start_a).unwrap_err(),
+            MetaDbError::TransactionTimeout { .. }
+        ),
+        "releasing A must not keep serving A's capture, and must not substitute C"
+    );
+    assert_eq!(
+        engine.get(&key, start_b).unwrap().as_deref(),
+        Some(b"b".as_slice()),
+        "holder B must still be served after holder A is released"
+    );
+
+    let pin_b = lease_preimage_key(2, &key);
+    let checkpoint = dir.path().join("checkpoint");
+    engine.create_checkpoint(&checkpoint).unwrap();
+    let cache = Arc::new(ShardedBlockCache::new(4 * 1024 * 1024));
+    let restored = LifecycleStorageEngine::open_lsm_existing(
+        9,
+        &checkpoint,
+        cache,
+        LsmEngineConfig::default(),
+    )
+    .unwrap();
+    let raw = restored
+        .get(&pin_b, HlcTimestamp::new(u64::MAX, 0))
+        .unwrap()
+        .expect("checkpoint copies live 0x0D rows");
+    assert_eq!(
+        decode_lease_preimage(&pin_b, &raw).unwrap().3,
+        LeasePreimageValue::Value(b"b".to_vec())
+    );
+}
+
+#[test]
 fn releasing_the_hold_stops_serving_the_capture() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open(dir.path());

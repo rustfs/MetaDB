@@ -880,5 +880,12 @@ mod tests {
             &crate::codec::serialize(&insert).unwrap()[..4],
             &4u32.to_le_bytes()
         );
+        let fence_v2 = IntentOp::DirExistsFenceV2 {
+            holders: std::collections::BTreeMap::new(),
+        };
+        assert_eq!(
+            &crate::codec::serialize(&fence_v2).unwrap()[..4],
+            &5u32.to_le_bytes()
+        );
     }
 }

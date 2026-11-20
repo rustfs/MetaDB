@@ -270,11 +270,127 @@ impl HybridLogicalClock {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(1)
     }
+
+    /// Wall time suitable for a lease decision.
+    ///
+    /// `None` when the clock cannot be read, is the Unix epoch, or does not fit
+    /// in the 48-bit HLC physical field. The `1` fallback used by [`Self::wall_clock_ms`]
+    /// is not a lease observation.
+    pub fn try_wall_clock_ms() -> Option<u64> {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        observation_millis(millis)
+    }
+}
+
+/// Accepts a millisecond reading as a lease observation.
+///
+/// Zero and values above the 48-bit physical ceiling are refused. They must not
+/// become the historical `1 ms` fallback.
+pub fn observation_millis(millis: u128) -> Option<u64> {
+    if millis == 0 || millis > HlcTimestamp::MAX_PHYSICAL_MS as u128 {
+        None
+    } else {
+        Some(millis as u64)
+    }
+}
+
+/// Wall time that is not behind the last durable applied HLC by more than the
+/// allowed drift. A failed read, an overflow, or a rollback returns `None`.
+/// Callers must not serve or extend a lease from `None`.
+pub fn trusted_lease_observation(
+    last_applied: HlcTimestamp,
+    wall_ms: Option<u64>,
+) -> Option<HlcTimestamp> {
+    let wall = wall_ms?;
+    let floor = last_applied
+        .physical_ms()
+        .saturating_sub(DEFAULT_MAX_CLOCK_DRIFT_MS);
+    if wall < floor {
+        None
+    } else {
+        Some(HlcTimestamp::new(wall, 0))
+    }
+}
+
+/// `expire` is inside the lifetime cap measured from both `start` and `observed`.
+///
+/// A rolled-back `observed` (far behind `expire`) or a checked-add overflow is
+/// not a legal window. Equality with the cap is legal.
+pub fn lease_window_is_legal(
+    start: HlcTimestamp,
+    expire: HlcTimestamp,
+    observed: HlcTimestamp,
+    max_lifetime_ms: u64,
+) -> bool {
+    if expire < start || observed > expire {
+        return false;
+    }
+    let Some(from_start) = start.physical_ms().checked_add(max_lifetime_ms) else {
+        return false;
+    };
+    let Some(from_observed) = observed.physical_ms().checked_add(max_lifetime_ms) else {
+        return false;
+    };
+    expire.physical_ms() <= from_start && expire.physical_ms() <= from_observed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lease_observation_fails_closed_on_fallback_rollback_and_overflow() {
+        assert_eq!(observation_millis(0), None);
+        assert_eq!(observation_millis(1), Some(1));
+        assert_eq!(
+            observation_millis((HlcTimestamp::MAX_PHYSICAL_MS as u128) + 1),
+            None
+        );
+        assert!(HybridLogicalClock::try_wall_clock_ms().is_some_and(|ms| ms > 1));
+
+        let applied = HlcTimestamp::new(1_700_000_000_000, 0);
+        assert!(trusted_lease_observation(applied, None).is_none());
+        assert!(trusted_lease_observation(applied, Some(1)).is_none());
+        assert_eq!(
+            trusted_lease_observation(applied, Some(applied.physical_ms())),
+            Some(applied)
+        );
+        assert!(trusted_lease_observation(
+            HlcTimestamp::new(applied.physical_ms() + 10_000, 0),
+            Some(applied.physical_ms())
+        )
+        .is_none());
+
+        let start = HlcTimestamp::new(1_000, 0);
+        let observed = HlcTimestamp::new(1_500, 0);
+        assert!(lease_window_is_legal(
+            start,
+            HlcTimestamp::new(61_000, 0),
+            observed,
+            60_000
+        ));
+        assert!(!lease_window_is_legal(
+            start,
+            HlcTimestamp::new(61_001, 0),
+            observed,
+            60_000
+        ));
+        assert!(!lease_window_is_legal(
+            start,
+            HlcTimestamp::new(61_000, 0),
+            HlcTimestamp::new(1, 0),
+            60_000
+        ));
+        assert!(!lease_window_is_legal(
+            start,
+            HlcTimestamp::new(2_000, 0),
+            observed,
+            u64::MAX
+        ));
+    }
 
     #[test]
     fn test_hlc_monotonicity_overflow_and_drift_guard() {

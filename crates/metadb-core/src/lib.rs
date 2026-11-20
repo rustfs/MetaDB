@@ -18,7 +18,10 @@ pub use checksum::{
 };
 pub use epoch::{CellId, CompositeKeyRange, ShardEpoch, TxnId};
 pub use error::{LeaseRenewReject, MetaDbError, Result, RetryableConsensusKind};
-pub use hlc::{HlcTimestamp, HybridLogicalClock, DEFAULT_MAX_CLOCK_DRIFT_MS};
+pub use hlc::{
+    lease_window_is_legal, observation_millis, trusted_lease_observation, HlcTimestamp,
+    HybridLogicalClock, DEFAULT_MAX_CLOCK_DRIFT_MS,
+};
 pub use schema::{
     is_dir_inode_id, is_file_inode_id, make_file_inode_id, negate_accounted_size,
     proposal_payload_is_enveloped, saturating_add_i64, validate_dir_inode_id, validate_file_size,
@@ -32,9 +35,9 @@ pub use schema::{
 };
 pub use system_keys::{
     affinity_key_for_raw_entry, decode_lease_preimage, decode_origin_quota_cursor,
-    encode_lease_preimage, encode_origin_quota_cursor, lease_preimage_key, lease_preimage_prefix,
-    lease_preimage_prefix_end, AttrDeltaSpec, AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload,
-    DirShardDeltaKey, DirShardDeltaRecord, IntentOp, LeasePreimageValue, OriginQuotaCursorKey,
-    SpilledAuxOutboxKey, TxnRecordKey, TxnState, TxnStatusRecord, WriteIntentKey,
-    WriteIntentRecord,
+    encode_lease_preimage, encode_origin_quota_cursor, lease_preimage_blocks_split,
+    lease_preimage_key, lease_preimage_prefix, lease_preimage_prefix_end, AttrDeltaSpec,
+    AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, DirShardDeltaKey, DirShardDeltaRecord,
+    FenceHolder, IntentOp, LeasePreimageValue, OriginQuotaCursorKey, SpilledAuxOutboxKey,
+    TxnRecordKey, TxnState, TxnStatusRecord, WriteIntentKey, WriteIntentRecord,
 };

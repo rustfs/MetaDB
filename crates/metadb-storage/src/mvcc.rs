@@ -389,12 +389,6 @@ impl ActiveSnapshotRegistry {
         })
     }
 
-    /// Some open lease still needs reads at `read_hlc` (used by range scans).
-    pub fn lease_covers_read(&self, read_hlc: HlcTimestamp) -> bool {
-        self.lease_retain_floor()
-            .is_some_and(|floor| read_hlc.physical_ms() >= floor.physical_ms())
-    }
-
     pub fn register(
         &self,
         cut: ReadCut,
@@ -919,7 +913,10 @@ impl MemMvccStore {
     ) -> Result<BTreeMap<Vec<u8>, MvccValue>> {
         let guard = self.inner.read().unwrap();
         self.check_retention_window(&guard, read_hlc)?;
-        if read_hlc < guard.disk_flushed_max_hlc && !self.registry.lease_covers_read(read_hlc) {
+        // An unversioned SST cannot prove which keys in the range were absent,
+        // deleted, or written after `read_hlc`. A lease pin for one key does not
+        // make the rest of the range provable, so the scan fails closed.
+        if read_hlc < guard.disk_flushed_max_hlc {
             return Err(MetaDbError::TransactionTimeout {
                 snapshot_hlc: read_hlc.as_u64(),
                 oldest_retained_hlc: guard.disk_flushed_max_hlc.as_u64(),

@@ -184,6 +184,9 @@ pub enum IntentOp {
     /// Shared multi-transaction existence fence on `(dst_pid, "_attr_")` conflicting ONLY with `DeletingDir`.
     DirExistsFenceSet {
         /// Map from `txn_id` -> `(primary_key, expire_hlc)` for concurrent cross-shard `Rename`/`Mkdir`.
+        ///
+        /// This variant has no per-holder start. Only the record's own `txn_id` has a
+        /// start, and it is `WriteIntentRecord::start_hlc`. Other holders are unknown.
         holders: BTreeMap<TxnId, (Vec<u8>, HlcTimestamp)>,
     },
     /// Exclusive create. Prepare and commit both reject the intent when `user_key` already exists.
@@ -194,6 +197,78 @@ pub enum IntentOp {
         attr_deltas: Vec<AttrDeltaSpec>,
         aux_specs: Vec<AuxIntentSpec>,
     },
+    /// Shared fence that stores each holder's prepare `start_hlc`.
+    ///
+    /// Appended after `Insert` so the tags of `Put`, `Delete`, `DeletingDir`,
+    /// `DirExistsFenceSet`, and `Insert` stay stable. `start_hlc: None` is an
+    /// older holder whose start was not stored. It is not a timestamp to invent.
+    DirExistsFenceV2 {
+        holders: BTreeMap<TxnId, FenceHolder>,
+    },
+}
+
+/// One holder of a shared directory-existence fence.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, wincode::SchemaWrite, wincode::SchemaRead,
+)]
+pub struct FenceHolder {
+    pub primary_key: Vec<u8>,
+    pub expire_hlc: HlcTimestamp,
+    /// `None` means the start was not durable. Do not substitute `expire - 60s`.
+    pub start_hlc: Option<HlcTimestamp>,
+}
+
+impl IntentOp {
+    pub fn is_dir_exists_fence(&self) -> bool {
+        matches!(
+            self,
+            IntentOp::DirExistsFenceSet { .. } | IntentOp::DirExistsFenceV2 { .. }
+        )
+    }
+}
+
+impl WriteIntentRecord {
+    /// Fence holders with a start only where one was actually stored.
+    ///
+    /// For [`IntentOp::DirExistsFenceSet`], the record's own `txn_id` uses
+    /// `WriteIntentRecord::start_hlc`. Every other holder stays `None`.
+    pub fn resolved_fence_holders(&self) -> Option<BTreeMap<TxnId, FenceHolder>> {
+        match &self.op {
+            IntentOp::DirExistsFenceSet { holders } => Some(
+                holders
+                    .iter()
+                    .map(|(txn_id, (primary_key, expire_hlc))| {
+                        let start_hlc = (*txn_id == self.txn_id).then_some(self.start_hlc);
+                        (
+                            *txn_id,
+                            FenceHolder {
+                                primary_key: primary_key.clone(),
+                                expire_hlc: *expire_hlc,
+                                start_hlc,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            IntentOp::DirExistsFenceV2 { holders } => Some(holders.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// A live `0x0D` row blocks a split. A corrupt row is fatal. Absence is success.
+pub fn lease_preimage_blocks_split(storage_key: &[u8], raw: &[u8]) -> Result<()> {
+    if storage_key.first().copied() != Some(SYSTEM_PREFIX_LEASE_PREIMAGE) {
+        return Ok(());
+    }
+    match decode_lease_preimage(storage_key, raw) {
+        Some(_) => Err(MetaDbError::SplitDeferred(
+            "live 2PC lease pre-image must be cleared before fencing".to_string(),
+        )),
+        None => Err(MetaDbError::CodecError(
+            "corrupt 2PC lease pre-image blocks split".to_string(),
+        )),
+    }
 }
 
 /// Key of `WriteIntent`: `[0x05][target_user_key]`.
@@ -694,6 +769,52 @@ mod lease_preimage_codec_tests {
         assert!(decode_lease_preimage(&storage_key, &unknown).is_none());
         assert!(decode_lease_preimage(&[0x0D], &encoded).is_none());
         assert_eq!(lease_preimage_prefix_end(u128::MAX), vec![0x0E]);
+        let user_key = MetaKey::child(7, "kept.txt").encode();
+        let encoded_pin = encode_lease_preimage(
+            HlcTimestamp::new(1_000, 0),
+            &LeasePreimageValue::Value(b"v0".to_vec()),
+        );
+        assert!(lease_preimage_blocks_split(&storage_key, &encoded_pin).is_err());
+        assert!(lease_preimage_blocks_split(&storage_key, b"corrupt").is_err());
+        assert!(lease_preimage_blocks_split(&user_key, &encoded_pin).is_ok());
+    }
+
+    #[test]
+    fn old_fence_holders_do_not_receive_an_invented_start() {
+        let owner = 10u128;
+        let other = 11u128;
+        let record = WriteIntentRecord {
+            txn_id: owner,
+            primary_shard_hint: 1,
+            primary_key: b"primary".to_vec(),
+            start_hlc: HlcTimestamp::new(5_000, 0),
+            expire_hlc: HlcTimestamp::new(8_000, 0),
+            rename_fence_token: None,
+            op: IntentOp::DirExistsFenceSet {
+                holders: std::collections::BTreeMap::from([
+                    (owner, (b"primary".to_vec(), HlcTimestamp::new(8_000, 0))),
+                    (other, (b"other".to_vec(), HlcTimestamp::new(9_000, 0))),
+                ]),
+            },
+        };
+        let holders = record.resolved_fence_holders().unwrap();
+        assert_eq!(holders[&owner].start_hlc, Some(HlcTimestamp::new(5_000, 0)));
+        assert_eq!(holders[&other].start_hlc, None);
+        let upgraded = WriteIntentRecord {
+            op: IntentOp::DirExistsFenceV2 {
+                holders: holders.clone(),
+            },
+            ..record
+        };
+        let again = upgraded.resolved_fence_holders().unwrap();
+        assert_eq!(again[&other].start_hlc, None);
+        again[&owner].start_hlc.unwrap();
+        let encoded = upgraded.encode();
+        let decoded = WriteIntentRecord::decode(&encoded).unwrap();
+        assert_eq!(
+            decoded.resolved_fence_holders().unwrap()[&owner].start_hlc,
+            Some(HlcTimestamp::new(5_000, 0))
+        );
     }
 
     #[test]
