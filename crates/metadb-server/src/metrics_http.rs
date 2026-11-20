@@ -9,7 +9,6 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -64,27 +63,18 @@ async fn metrics_connection(
     shared_secret: String,
     security: &TransportSecurity,
 ) -> Result<(), hyper::Error> {
-    if security.is_plaintext() {
-        return serve_metrics(socket, cluster, shared_secret).await;
+    if !security.is_plaintext() {
+        tracing::error!("refusing metrics: TLS termination is not available");
+        return Ok(());
     }
-    let io = match security.accept_metrics(socket).await {
-        Ok(io) => io,
-        Err(error) => {
-            tracing::warn!(%error, "metrics tls handshake rejected");
-            return Ok(());
-        }
-    };
-    serve_metrics(io, cluster, shared_secret).await
+    serve_metrics(socket, cluster, shared_secret).await
 }
 
-async fn serve_metrics<S>(
-    socket: S,
+async fn serve_metrics(
+    socket: TcpStream,
     cluster: Weak<PersistentMetaDbCluster>,
     shared_secret: String,
-) -> Result<(), hyper::Error>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) -> Result<(), hyper::Error> {
     let service = service_fn(move |request: Request<Incoming>| {
         let cluster = cluster.clone();
         let shared_secret = shared_secret.clone();

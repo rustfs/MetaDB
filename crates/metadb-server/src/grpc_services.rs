@@ -135,9 +135,13 @@ pub struct MetaDbGrpcService {
     /// Bearer sent when this process probes another cell. Empty means the
     /// process was allowed to start without a secret, so probes stay on loopback.
     forward_secret: String,
-    /// TLS policy for those probes. Plaintext is the default. The certificate
-    /// principal is not a role; method RBAC is not installed.
+    /// Outbound control probes use this policy. Plaintext is the only mode that loads.
+    /// A certificate principal is not a role; method RBAC is not installed.
     transport_security: std::sync::Arc<metadb_security::TransportSecurity>,
+    /// `global-manager` publishes routes and does not mint ids or rename leases.
+    directory_only: bool,
+    /// `cell-manager` keeps its own cell and refuses to store a remote cell.
+    accepts_remote_cells: bool,
 }
 
 impl MetaDbGrpcService {
@@ -152,6 +156,8 @@ impl MetaDbGrpcService {
             proxy_router,
             forward_secret: String::new(),
             transport_security: std::sync::Arc::new(metadb_security::TransportSecurity::plaintext()),
+            directory_only: false,
+            accepts_remote_cells: true,
         }
     }
 
@@ -166,6 +172,22 @@ impl MetaDbGrpcService {
     ) -> Self {
         self.transport_security = security;
         self
+    }
+
+    pub fn with_directory_only(mut self, directory_only: bool) -> Self {
+        self.directory_only = directory_only;
+        self
+    }
+
+    pub fn with_remote_cell_registration(mut self, accepts_remote_cells: bool) -> Self {
+        self.accepts_remote_cells = accepts_remote_cells;
+        self
+    }
+
+    fn directory_only_error() -> MetaDbError {
+        MetaDbError::ShardRoutingError(
+            "global-manager does not allocate ids or rename leases".to_string(),
+        )
     }
 
     fn server_hlc(&self) -> u64 {
@@ -1134,6 +1156,14 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<AllocateIdBlockRequest>,
     ) -> Result<Response<AllocateIdBlockResponse>, Status> {
+        if self.directory_only {
+            let error = Self::directory_only_error();
+            return Ok(Response::new(AllocateIdBlockResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+                start_id: 0,
+                count: 0,
+            }));
+        }
         let req = request.into_inner();
         let kind = match req.id_kind {
             1 => AllocIdKind::FileInode,
@@ -1224,6 +1254,14 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<AcquireDirRenameLeaseRequest>,
     ) -> Result<Response<AcquireDirRenameLeaseResponse>, Status> {
+        if self.directory_only {
+            let error = Self::directory_only_error();
+            return Ok(Response::new(AcquireDirRenameLeaseResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+                rename_fence_token: 0,
+                expire_hlc: 0,
+            }));
+        }
         let req = request.into_inner();
         match self
             .global_manager
@@ -1247,6 +1285,12 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<ReleaseDirRenameLeaseRequest>,
     ) -> Result<Response<ReleaseDirRenameLeaseResponse>, Status> {
+        if self.directory_only {
+            let error = Self::directory_only_error();
+            return Ok(Response::new(ReleaseDirRenameLeaseResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+            }));
+        }
         let req = request.into_inner();
         match self
             .global_manager
@@ -1355,6 +1399,15 @@ impl ControlPlaneService for MetaDbGrpcService {
         &self,
         request: Request<RegisterCellRequest>,
     ) -> Result<Response<RegisterCellResponse>, Status> {
+        if !self.accepts_remote_cells {
+            let error = MetaDbError::ShardRoutingError(
+                "cell-manager does not store a remote cell; register it with the global-manager"
+                    .to_string(),
+            );
+            return Ok(Response::new(RegisterCellResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+            }));
+        }
         let req = request.into_inner();
         let range = match CompositeKeyRange::new(req.start_key, req.end_key) {
             Ok(range) => range,

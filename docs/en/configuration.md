@@ -9,8 +9,9 @@
 | Key | Default | Applied by `open_and_serve` |
 | :--- | :--- | :--- |
 | `node.node_id` | `1` | Yes. Raft node id and the bootstrap peer |
-| `node.cell_id` | `1` | Yes. Directory name `cell_<id>` and the only cell registered in this process |
-| `node.role` | `all-in-one` | Yes. Any other value returns an error |
+| `node.cell_id` | `1` | Yes. Directory name `cell_<id>` for a process that hosts a cell. `global-manager` does not create that directory |
+| `node.role` | `all-in-one` | Yes. `all-in-one`, `cell-manager`, and `global-manager` start. `be` and `proxy` return an error before listen |
+| `cluster.global_manager` | empty | Yes, only for `cell-manager`. `host:port` of a `global-manager`. Empty does not register. `all-in-one` refuses to start when this is set |
 | `node.data_dir` | `./metadb-data` | Yes |
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | Yes. Bind address |
 | `node.metrics_listen_addr` | unset | Yes, only when set. Separate TCP listener. A non-loopback address requires a non-empty secret |
@@ -27,7 +28,7 @@
 | `sharding.jumbo_dedicated_root` | empty | Yes. A real directory outside the data directory. Empty does not move files. A symlink, or a path inside the data directory, refuses startup. The copy stays on this machine |
 | `security.shared_secret` | `""` | Yes. Empty does not start a listener. A value with a non-whitespace character requires the same bearer on gRPC and the metrics listener. Whitespace-only is rejected |
 | `security.allow_unauthenticated` | `false` | Yes. Explicit loopback-only development opt-in. It does not allow a non-loopback bind, and it cannot be combined with a usable secret |
-| `security.tls.mode` | `off` | Yes. `off` is plaintext. `tls` and `mtls` terminate TLS 1.3 before a data directory is created. `mtls` also requires a client certificate |
+| `security.tls.mode` | `off` | Yes. `off` is plaintext. `tls` and `mtls` are refused before a data directory is created. This process does not terminate TLS |
 | `raft.heartbeat_interval_ms` | `150` | Yes, when each local Raft group starts. Not reloaded while the process runs |
 | `raft.election_timeout_min_ms` | `450` | Yes. Must be greater than the heartbeat and less than the maximum |
 | `raft.election_timeout_max_ms` | `900` | Yes. Must be greater than the minimum |
@@ -84,17 +85,15 @@ max_in_snapshot_log_to_keep = 0
 max_segment_bytes = 67108864
 ```
 
-Role strings are kebab-case: `all-in-one`, `be`, `proxy`, `cell-manager`, `global-manager`.
+Role strings are kebab-case: `all-in-one`, `be`, `proxy`, `cell-manager`, `global-manager`. `global-manager` loads `GLOBAL_CELL_DIRECTORY` and does not open `be/` or a cell Raft group. `cell-manager` opens one local cell and its Raft groups. When `cluster.global_manager` is set, it calls `RegisterCell` on that address after the listener accepts and shuts down if the call fails. `be` and `proxy` still return before listen. The directory file is not a Raft group.
 
 CLI flags override the file after it is parsed: `--node-id`, `--cell-id`, `--role`, `--listen`, `--data-dir`. `--cell-manager` is not a TOML field. It is only a `metadbd` flag.
 
 ## Security
 
-`[security.tls]` is the only TLS configuration. `mode = "off"` (the default, including when the table is omitted) keeps plaintext listeners. `mode = "tls"` or `mode = "mtls"` terminates TLS 1.3 in this process on the gRPC listener, the metrics listener, and outbound Raft, control, forward, and admin clients. The accepted keys are `mode`, `cert_file`, `key_file`, `ca_file`, and `server_name`. Any other TLS, SSL, or certificate key, including a key nested outside `[security.tls]`, fails parsing and does not fall open to plaintext.
+`[security.tls]` is the only TLS table. `mode = "off"` (the default, including when the table is omitted) keeps plaintext listeners. `mode = "tls"` or `mode = "mtls"` is refused before a data directory or listener is created. The certificate files are not opened. This process does not terminate TLS. The accepted keys are `mode`, `cert_file`, `key_file`, `ca_file`, and `server_name`. Any other TLS, SSL, or certificate key, including a key nested outside `[security.tls]`, fails parsing and does not fall open to plaintext.
 
-`cert_file` is a PEM chain (leaf first). `key_file` is a PEM PKCS#8 or SEC1 private key. `ca_file` is the only trust anchor; the system root store is not used. `server_name` is the exact DNS name or IP in that certificate and the listen host. A wildcard listen address is refused while TLS is on. `http://` is refused while TLS is on, and `https://` is refused while TLS is off. There is no setting that skips certificate or hostname verification. RSA keys are refused. The provider is pure Rust (`rustls-pure`); it has not had an external audit. This is not a production PKI acceptance.
-
-`mtls` requires a client certificate with a URI, DNS, or IP subject alternative name. That name is the authenticated principal. It is not a role. Method RBAC is not installed. See [transport security](../designs/transport_security.md).
+`http://` is the only scheme while mode is `off`. `https://` is refused. There is no skip-verify setting, no revocation check, and no credential rotation. Method RBAC is not installed. The provider and license blockers are in [transport security](../designs/transport_security.md).
 
 When `shared_secret` contains a non-whitespace character, `MetadataService`, `TransactionService`, `ControlPlaneService`, and `RaftTransportService` require `authorization` to equal `Bearer <shared_secret>` exactly. Every request on `metrics_listen_addr`, including `GET /metrics`, `GET /livez`, `GET /readyz`, and `GET /healthz`, requires the same `Authorization` header. A missing header, an empty bearer, a prefix, or a longer token is rejected. The failure body is `unauthorized` and is not Prometheus text. It does not echo the token. A whitespace-only secret does not take that exact-match path: metrics and probes return 401 even when `Authorization` is `Bearer` plus those same spaces. Raft peers send the same bearer when the secret is usable. `metadb-ctl --auth-token` (environment variable `METADB_AUTH_TOKEN`) and `metadbd --join` / `--cell-manager` send it. `metadb-ctl cluster status` calls `GetRoutes` and is covered by that interceptor. The client interceptor rejects a whitespace-only token instead of sending it.
 
@@ -116,7 +115,7 @@ Resource keys are ceilings for a backend this repository does not have. Setting 
 
 ## What you cannot configure
 
-- Per-role subsystem trimming. The role field is an allow/deny switch, not a feature set.
+- A remote `be` or a forwarding `proxy`. Those roles are rejected before listen. `cell-manager` still colocates its Raft groups. `global-manager` does not allocate ids, mint rename leases, or forward keys.
 - A voter list in TOML. The first process bootstraps alone. A later all-in-one process joins with `[cluster] join = "host:port"` (or `--join` / `--cell-manager`) pointing at the current leader, and only when its data directory does not already own a cell. The leader must be reached directly; a follower does not forward the membership change. That join is the same cell, not a second cell. See [Operations](./operations.md).
 - An arbitrary key slice as a cell range. `[cluster] cell_start_key` and `cell_end_key` are even-length hex and must be a contiguous union of the meta (`01`..`02`), quota (`02`..`03`), and secondary-index (`03`..`04`) tables. Empty means the whole user key space, which is the historical default. Join cannot be combined with those keys. The other process is not started by this file.
 - Locality-compaction on/off. `to_lsm_config` always enables it. Raft timers are the `[raft]` table; see [Operability](./operability.md).

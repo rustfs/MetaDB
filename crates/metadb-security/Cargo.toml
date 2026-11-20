@@ -1,46 +1,11 @@
 [package]
 name = "metadb-security"
-description = "TLS and mTLS transport security for MetaDB. Method RBAC is not installed here."
+description = "Transport security policy for MetaDB. TLS termination is refused; method RBAC is not installed."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[features]
-default = []
-# Ephemeral certificate minting for this crate's tests and the server transport tests.
-# The feature does not weaken verification and does not issue production credentials.
-testing = ["dep:ed25519-dalek", "dep:x509-cert", "dep:der", "dep:rand"]
-
 [dependencies]
-http = "1.5.0"
-hyper-util = { version = "0.1.21", features = ["tokio"] }
-rustls = { version = "0.23.46", default-features = false, features = ["std"] }
-rustls-pure = "0.15.5"
-tokio = { workspace = true }
-tokio-rustls = { version = "0.26.4", default-features = false }
 tonic = { workspace = true }
-tower = { version = "0.5.3", features = ["util"] }
-x509-parser = { version = "0.16.0", default-features = false }
-zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
-
-[dependencies.ed25519-dalek]
-version = "2.2.0"
-optional = true
-features = ["std", "pem", "pkcs8", "rand_core"]
-
-[dependencies.x509-cert]
-version = "0.2.5"
-optional = true
-default-features = false
-features = ["builder", "pem", "std"]
-
-[dependencies.der]
-version = "0.7"
-optional = true
-features = ["alloc", "derive", "oid", "pem"]
-
-[dependencies.rand]
-version = "0.8"
-optional = true

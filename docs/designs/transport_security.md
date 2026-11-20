@@ -1,83 +1,93 @@
 # Transport security and the RBAC boundary
 
-This note records what the TLS workstream implements and what it deliberately
-does not implement. It is not a production acceptance record and not a
-trillion-scale result.
+This note records a fail-closed result. It is not a production acceptance and
+not a trillion-scale result. This process does not terminate TLS.
 
-## What is implemented
+## What runs
 
-`metadb-security` terminates TLS 1.3 for this process. The crypto provider is
-`rustls-pure` (RustCrypto, no C, no assembly, no `ring`, no `aws-lc-rs`).
-RSA certificates are refused. The trust anchors are the PEM file in
-`[security.tls].ca_file`, not the public web PKI.
+`[security.tls].mode` defaults to `off`. That mode is plaintext. Every
+outbound client uses the same `TransportSecurity` value:
 
-`[security.tls].mode` is `off` (the default), `tls`, or `mtls`.
-
-- `off` keeps the existing plaintext listeners and the existing bearer rules.
-- `tls` presents this process's certificate and requires outbound clients to
-  verify the peer certificate and the dialed host name.
-- `mtls` does that and also requires a client certificate. The server checks
-  the client chain with rustls's WebPKI client verifier and requires a
-  subject alternative name. The authenticated principal is that name: a URI
-  SAN if one exists, otherwise a DNS SAN, otherwise an IP SAN. A wildcard DNS
-  name is not an identity.
-
-The same policy covers:
-
-- inbound gRPC (`MetadataService`, `TransactionService`, `ControlPlaneService`,
-  `RaftTransportService`)
-- inbound metrics and probes (`/metrics`, `/livez`, `/readyz`, `/healthz`)
-- outbound Raft and forwarded client RPCs
-- outbound control-plane probes, join, and heartbeats
+- Raft `ChannelPool`
+- leader forwarding
+- control-plane join, heartbeat, and `RegisterCell` probes
+- `cell-manager` publishing itself with `register_cell_with_global_manager`
 - `metadb-ctl` and the `metadbd` cell-manager client
 
-There is no configuration that disables certificate or hostname checks.
-`danger_accept_invalid_certs` and an accept-all verifier are not used.
-`http://` is refused while TLS is on. `https://` is refused while TLS is off.
-A wildcard listen address is refused while TLS is on, because it is not a
-certificate name. Incomplete or unreadable material is refused before a data
-directory is created and before a listener is bound.
+`prepare_url` refuses `https://` while mode is `off`, and refuses `http://`
+while mode is `tls` or `mtls`. There is no second dialer that can stay on
+plaintext after TLS was requested. `mode = "tls"` or `"mtls"` returns before
+`open_and_serve` creates a data directory or binds a socket. The certificate
+paths are not opened.
 
 The shared bearer is unchanged. An empty secret still refuses to serve unless
 `allow_unauthenticated = true` and every listener is a literal loopback IP.
-A whitespace-only secret is still refused. TLS does not replace that rule.
+A whitespace-only secret is still refused.
 
-Private key bytes are wiped after parsing and are not written into error
-strings. This crate does not mint production credentials. The `testing`
-feature mints ephemeral Ed25519 certificates for unit tests only.
+Method RBAC is not installed. `authorize_method` always returns an error, and
+the server does not call it. No peer certificate is parsed, so no
+`AuthenticatedPrincipal` is produced. The shared bearer is not a role.
 
-`rustls-pure` and the RustCrypto crates under it have not had an external
-security audit. That limit is part of this repository's status, not a claim
-that the handshake is unaudited production PKI.
+`metadb-transport` still rejects RDMA. TCP/gRPC remains the only carried
+transport. Backup nofollow and crash-safe copy behavior are unchanged.
+Readiness rules, including `directory_only` for `global-manager`, are
+unchanged.
 
-## What is not implemented: method RBAC
+## Why TLS is not linked
 
-`authorize_method` always returns an error. The server does not call it.
+The owner license allow list is Apache-2.0, MIT, BSD-3-Clause, Unicode-3.0,
+and Zlib. `deny.toml` has no license exceptions. Checked SPDX fields:
 
-An authenticated principal is not a role. The shared bearer is not a role
-either. A client that presents a valid certificate and the shared bearer can
-still call every RPC that the bearer already allowed, including control-plane
-methods. That is transport authentication, not least privilege per method.
+| Crate | Version | SPDX in `Cargo.toml` | Fits the allow list |
+| :--- | :--- | :--- | :--- |
+| `rustls` | 0.23.46 | `Apache-2.0 OR ISC OR MIT` | yes, via Apache-2.0 or MIT |
+| `rustls-webpki` | 0.103.17 | `ISC` | no |
+| `untrusted` | 0.9.0 | `ISC` | no |
+| `ring` | 0.17.14 | `Apache-2.0 AND ISC` | no. An ISC-only exception for other crates would not cover this AND expression. The crate also vendors C and assembly (`crypto/*.c`, `links = "ring_core_..."`). |
+| `aws-lc-rs` | current rustls default provider | Apache-2.0 for the Rust crate, implemented by AWS-LC C | forbidden by the no-C/C++ rule |
+| `rustls-pure` | 0.15.5 | `MIT` | the crate license fits, the stack does not |
 
-The scale stream owns process role separation (`be`, `proxy`, `cell-manager`,
-`global-manager`) and the control-plane shape. It should not open a second
-TLS stack and it should not relabel `[security].shared_secret` as a role.
-The integration point is:
+`rustls` 0.23 always depends on `rustls-webpki`, which always depends on
+`untrusted`. Any rustls build, with any crypto provider, needs those two ISC
+crates. That exception was not approved and is not in `deny.toml`.
 
-- read `AuthenticatedPrincipal` from `ConnectInfo<TlsConnectInfo>` on the
-  gRPC request, or `MetricsIo::principal` on a metrics connection
-- supply a method authorizer that allows each `(service, method)` only for
-  the principals that need it
-- replace `authorize_method` only when that table exists
+`rustls-pure` 0.15.5 was published on 2026-11-18 by a third party
+(`Gilfeather/rustls-pure`, previously inside Furnace). crates.io showed 1063
+downloads and 1 dependent. Its own README says it has had no outside security
+audit. Being pure Rust is not an audit. Its changelog records a transitive
+`crypto-bigint` timing issue (`RUSTSEC-2026-0387`, patched in `crypto-bigint`
+0.7.6). A version pin or a rename does not make this a production provider.
+It is not a dependency of this workspace.
 
-Until that authorizer is installed, method RBAC is outstanding work.
+The maintained rustls providers are `aws-lc-rs` and `ring`. Neither fits the
+current rules. No other mature pure-Rust TLS stack was found that verifies
+WebPKI chains without those dependencies. This tree does not implement its
+own cryptography.
 
-## What this change does not touch
+## Owner decision required before TLS can be implemented
 
-Backup copy rules, including nofollow and crash safety, are unchanged.
-Readiness status rules are unchanged; probes on a TLS listener still use the
-same bearer and the same `/readyz` body. 2PC lease renewal is unchanged. The
-transaction stream owns leases. This change only passes the transport policy
-into leader forwarding.
+Both of these have to be explicit. This change does not grant either.
 
-`metadb-transport` still rejects RDMA. TLS is not an RDMA path.
+1. Named license exceptions, not a blanket ISC allow: `rustls-webpki` (`ISC`)
+   and `untrusted` (`ISC`). If the chosen provider is `ring`, a separate
+   exception for `ring` (`Apache-2.0 AND ISC`) and an explicit acceptance of
+   its vendored C/assembly. `aws-lc-rs` instead requires accepting C FFI.
+2. A provider that is maintained and assessed. `rustls-pure` 0.15.5 is not
+   that provider.
+
+## Limits that are absent, not implied
+
+Because TLS is not terminated:
+
+- There is no CRL, OCSP, or stapled revocation check.
+- There is no credential rotation, reload, or expiry watch.
+- Private keys are not parsed. The earlier claim that PEM buffers were
+  zeroized did not cover `PrivateKeyDer::clone_key` copies. That code is
+  gone; there is no parsed key to wipe.
+- Hostname, chain, and EKU checks are not implemented here, and there is no
+  accept-all verifier. A future TLS implementation must do those checks. It
+  must not add a skip-verify flag.
+
+`global-manager` and `cell-manager` still run. `cell-manager` publishes to
+`cluster.global_manager` through `TransportSecurity`, the same object Raft
+and the other control clients use.

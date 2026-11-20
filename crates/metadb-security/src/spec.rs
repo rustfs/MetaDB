@@ -48,6 +48,12 @@ impl SecurityError {
             "RBAC is not installed. An authenticated certificate principal is not a role, and method authorization is not enforced. The scale stream's role separation must supply a method authorizer before least-privilege RBAC is active",
         )
     }
+
+    pub(crate) fn unavailable() -> Self {
+        Self::new(
+            "refusing to start: [security.tls] mode tls or mtls is not available. This process does not terminate TLS. No maintained pure-Rust TLS provider fits both the no-C/C++ rule and the license allow list. rustls-webpki 0.103 and untrusted 0.9 are SPDX ISC and have no owner exception. ring 0.17 is SPDX Apache-2.0 AND ISC and also vendors C. aws-lc-rs is C. rustls-pure 0.15.5 (published 2026-11-18, third-party, no external audit, crates.io dependents 1) is not linked. Certificate files are not opened. There is no revocation check and no credential rotation because TLS is not terminated. See docs/designs/transport_security.md",
+        )
+    }
 }
 
 impl std::fmt::Display for SecurityError {
@@ -58,7 +64,7 @@ impl std::fmt::Display for SecurityError {
 
 impl std::error::Error for SecurityError {}
 
-/// Validated TLS file paths and mode. File contents are checked by [`crate::TransportSecurity::load`].
+/// Validated TLS field shape. [`crate::TransportSecurity::load`] refuses `tls` and `mtls` without opening the files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsSpec {
     mode: TlsMode,
@@ -94,8 +100,8 @@ impl TlsSpec {
         Self::build(mode, cert_file, key_file, ca_file, server_name, false)
     }
 
-    /// Admin or other client. `server_name` is not used: the dialed host is the
-    /// name rustls checks on the peer certificate. There is no separate override.
+    /// Admin or other client. There is no separate name override. `tls` and
+    /// `mtls` still fail in `TransportSecurity::load` without opening files.
     pub fn from_client_fields(
         mode: &str,
         cert_file: &str,
@@ -190,22 +196,6 @@ impl TlsSpec {
             server_name,
             client_only,
         })
-    }
-
-    pub(crate) fn cert_file(&self) -> &std::path::Path {
-        &self.cert_file
-    }
-
-    pub(crate) fn key_file(&self) -> &std::path::Path {
-        &self.key_file
-    }
-
-    pub(crate) fn ca_file(&self) -> &std::path::Path {
-        &self.ca_file
-    }
-
-    pub(crate) fn client_only(&self) -> bool {
-        self.client_only
     }
 
     /// Scheme and host that match this mode. `http` is refused while TLS is on.

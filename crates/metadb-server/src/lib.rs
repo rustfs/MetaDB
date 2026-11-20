@@ -543,8 +543,10 @@ pub struct PersistentMetaDbCluster {
     config: ServerTomlConfig,
     clock: Arc<HybridLogicalClock>,
     id_buffer: Arc<LocalIdBuffer>,
-    host: Arc<ShardGroupHost>,
-    cell_manager: Arc<DurableCellManager>,
+    host: Option<Arc<ShardGroupHost>>,
+    cell_manager: Option<Arc<DurableCellManager>>,
+    /// `global-manager` publishes the cell directory and does not host Raft groups.
+    directory_only: bool,
     global_manager: Arc<DurableGlobalManager>,
     tx_router: Arc<DistributedTxRouter>,
     proxy_router: Arc<StatelessProxyRouter>,
@@ -553,6 +555,149 @@ pub struct PersistentMetaDbCluster {
     metrics_addr: OnceLock<String>,
     operability: Arc<operability::Operability>,
     transport_security: Arc<TransportSecurity>,
+}
+
+async fn serve_global_directory(
+    config: ServerTomlConfig,
+    listener: TcpListener,
+    bound_addr: String,
+    transport_security: Arc<TransportSecurity>,
+) -> Result<(Arc<PersistentMetaDbCluster>, String)> {
+    let clock = Arc::new(HybridLogicalClock::with_max_drift_ms(
+        config.clock.max_clock_drift_ms,
+    ));
+    let id_allocator = Arc::new(DurableIdAllocator::open_for_node(
+        config.node.data_dir.join("global_allocator"),
+        config.node.node_id,
+    )?);
+    let id_buffer = Arc::new(LocalIdBuffer::new(
+        id_allocator.clone(),
+        config.node.node_id,
+    ));
+    let meta_cache = Arc::new(CompositeMetaCache::new());
+    let global_manager = Arc::new(DurableGlobalManager::new(
+        clock.clone(),
+        id_allocator,
+        meta_cache,
+    ));
+    global_manager.load_or_create_directory(
+        config
+            .node
+            .data_dir
+            .join(metadb_cluster::CELL_DIRECTORY_FILE),
+    )?;
+    let tx_router = Arc::new(
+        DistributedTxRouter::new(config.node.node_id, clock.clone(), global_manager.clone())
+            .with_forward_secret(config.security.shared_secret.clone())
+            .with_transport_security(Arc::clone(&transport_security)),
+    );
+    let proxy_router = Arc::new(StatelessProxyRouter::new(tx_router.clone()));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let operability = operability::Operability::starting();
+    let cluster = Arc::new(PersistentMetaDbCluster {
+        config,
+        clock,
+        id_buffer,
+        host: None,
+        cell_manager: None,
+        directory_only: true,
+        global_manager,
+        tx_router,
+        proxy_router,
+        shutdown_tx,
+        task_handles: tokio::sync::Mutex::new(Vec::new()),
+        metrics_addr: OnceLock::new(),
+        operability,
+        transport_security: Arc::clone(&transport_security),
+    });
+    let shared_secret = cluster.config.security.shared_secret.clone();
+    let grpc_svc = MetaDbGrpcService::new(
+        cluster.global_manager.clone(),
+        cluster.tx_router.clone(),
+        cluster.proxy_router.clone(),
+    )
+    .with_forward_secret(shared_secret.clone())
+    .with_transport_security(Arc::clone(&transport_security))
+    .with_directory_only(true);
+    let grpc_handle = spawn_grpc_server(
+        listener,
+        grpc_svc,
+        shared_secret,
+        MultiRaftRouter::new(),
+        shutdown_rx,
+        Arc::clone(&transport_security),
+    );
+    cluster.task_handles.lock().await.push(grpc_handle);
+    if let Err(error) = spawn_metrics_listener(&cluster).await {
+        cluster.operability.fail();
+        let _ = cluster.shutdown_without_flush().await;
+        return Err(error);
+    }
+    cluster.operability.mark_startup_finished();
+    std::fs::write(
+        cluster.config().node.data_dir.join("GRPC_ADDR"),
+        &bound_addr,
+    )?;
+    Ok((cluster, bound_addr))
+}
+
+async fn register_cell_with_global_manager(
+    cluster: &PersistentMetaDbCluster,
+    global_addr: &str,
+    bound_addr: &str,
+) -> Result<()> {
+    let cell = cluster.cell_manager();
+    let routes = cell.list_routes();
+    if routes.is_empty() {
+        return Err(MetaDbError::ShardRoutingError(
+            "cell-manager has no local routes to publish".to_string(),
+        ));
+    }
+    let start_key = routes
+        .iter()
+        .map(|route| route.range.start_key.clone())
+        .min()
+        .expect("route");
+    let end_key = routes
+        .iter()
+        .map(|route| route.range.end_key.clone())
+        .max()
+        .expect("route");
+    wait_until_accepting(bound_addr).await;
+    let endpoint = cluster
+        .transport_security
+        .prepare_url(global_addr)
+        .map_err(|error| {
+            MetaDbError::ShardRoutingError(format!(
+                "global-manager address {global_addr} is not usable with the configured transport: {error}"
+            ))
+        })?;
+    let mut client = control_plane_client(
+        &endpoint,
+        &cluster.config.security.shared_secret,
+        &cluster.transport_security,
+    )
+    .await?;
+    let response = client
+        .register_cell(metadb_proto::RegisterCellRequest {
+            cell_id: cell.cell_id(),
+            start_key,
+            end_key,
+            cell_manager_endpoints: vec![bound_addr.to_string()],
+        })
+        .await
+        .map_err(|error| {
+            MetaDbError::ShardRoutingError(format!(
+                "global-manager at {endpoint} did not accept this cell: {error}"
+            ))
+        })?
+        .into_inner();
+    if let Some(error) = rpc_app_error(response.error) {
+        return Err(MetaDbError::ShardRoutingError(format!(
+            "global-manager at {endpoint} rejected this cell: {error}"
+        )));
+    }
+    Ok(())
 }
 
 impl PersistentMetaDbCluster {
@@ -576,13 +721,34 @@ impl PersistentMetaDbCluster {
         }
         metadb_cluster::node_id_in_ha_range(config.node.node_id)?;
         let owned_range = config.configured_cell_range()?;
-        if config.node.role != ServerRole::AllInOne {
-            return Err(MetaDbError::CodecError(format!(
-                "server role {:?} is not implemented; only all-in-one runs a process. \
-                 be, proxy, cell-manager, and global-manager are not role-trimmed and must not be treated as disaggregated deployments",
-                config.node.role
-            )));
+        match config.node.role {
+            ServerRole::Be | ServerRole::Proxy => {
+                return Err(MetaDbError::CodecError(format!(
+                    "server role {:?} is not implemented; there is no remote shard host and no forwarding router. only all-in-one, cell-manager, and global-manager run a process",
+                    config.node.role
+                )));
+            }
+            ServerRole::GlobalManager => {
+                if !config.cluster.join.trim().is_empty()
+                    || !config.cluster.global_manager.trim().is_empty()
+                    || owned_range.is_some()
+                    || !config.sharding.jumbo_dedicated_root.trim().is_empty()
+                {
+                    return Err(MetaDbError::CodecError(
+                        "global-manager stores the cell directory only; it does not join a shard, own a cell range, or place jumbo files"
+                            .to_string(),
+                    ));
+                }
+            }
+            ServerRole::AllInOne if !config.cluster.global_manager.trim().is_empty() => {
+                return Err(MetaDbError::CodecError(
+                    "all-in-one does not register with a separate global-manager; use role cell-manager"
+                        .to_string(),
+                ));
+            }
+            ServerRole::AllInOne | ServerRole::CellManager => {}
         }
+        let directory_only = config.node.role == ServerRole::GlobalManager;
         config.raft_options.validate()?;
         config.reject_unauthenticated_bind(&config.node.grpc_listen_addr)?;
         if let Some(metrics_addr) = &config.node.metrics_listen_addr {
@@ -602,10 +768,30 @@ impl PersistentMetaDbCluster {
                 .prepare_url(&config.cluster.join)
                 .map_err(security_startup_error)?;
         }
-        // Certificate bytes are checked before a data directory or listener exists.
+        if !config.cluster.global_manager.trim().is_empty() {
+            tls_spec
+                .prepare_url(&config.cluster.global_manager)
+                .map_err(security_startup_error)?;
+        }
+        // TLS mode is rejected here, before a data directory or listener exists.
+        // Certificate files are not opened.
         let transport_security =
             Arc::new(TransportSecurity::load(&tls_spec).map_err(security_startup_error)?);
         std::fs::create_dir_all(&config.node.data_dir)?;
+        if directory_only {
+            let shard_tree = config.node.data_dir.join("be");
+            let cell_state = config
+                .node
+                .data_dir
+                .join(format!("cell_{}", config.node.cell_id))
+                .join("CELL_MANAGER_STATE");
+            if shard_tree.exists() || cell_state.exists() {
+                return Err(MetaDbError::CodecError(
+                    "global-manager stores the cell directory only; this data directory already has shard or cell state"
+                        .to_string(),
+                ));
+            }
+        }
         let cell_dir = config
             .node
             .data_dir
@@ -646,6 +832,9 @@ impl PersistentMetaDbCluster {
         tls_spec
             .reject_listen_host(&bound_addr)
             .map_err(security_startup_error)?;
+        if directory_only {
+            return serve_global_directory(config, listener, bound_addr, transport_security).await;
+        }
 
         let clock = Arc::new(HybridLogicalClock::with_max_drift_ms(
             config.clock.max_clock_drift_ms,
@@ -753,8 +942,9 @@ impl PersistentMetaDbCluster {
             config,
             clock,
             id_buffer,
-            host,
-            cell_manager,
+            host: Some(host),
+            cell_manager: Some(cell_manager),
+            directory_only: false,
             global_manager,
             tx_router,
             proxy_router,
@@ -785,7 +975,8 @@ impl PersistentMetaDbCluster {
             cluster.proxy_router.clone(),
         )
         .with_forward_secret(cluster.config.security.shared_secret.clone())
-        .with_transport_security(Arc::clone(&transport_security));
+        .with_transport_security(Arc::clone(&transport_security))
+        .with_remote_cell_registration(cluster.config.node.role != ServerRole::CellManager);
         let grpc_handle = spawn_grpc_server(
             listener,
             grpc_svc,
@@ -820,7 +1011,7 @@ impl PersistentMetaDbCluster {
             }
             if let Err(error) = cluster
                 .global_manager
-                .install_local_cell(cluster.cell_manager.clone(), bound_addr.clone())
+                .install_local_cell(cluster.cell_manager().clone(), bound_addr.clone())
             {
                 cluster.operability.fail();
                 let _ = cluster.shutdown_without_flush().await;
@@ -836,6 +1027,18 @@ impl PersistentMetaDbCluster {
                 .tx_router()
                 .init_dir_attr(ROOT_INODE_ID, ROOT_INODE_ID, 0, 0o755)
                 .await;
+        }
+        if cluster.config.node.role == ServerRole::CellManager {
+            let global = cluster.config.cluster.global_manager.trim().to_string();
+            if !global.is_empty() {
+                if let Err(error) =
+                    register_cell_with_global_manager(&cluster, &global, &bound_addr).await
+                {
+                    cluster.operability.fail();
+                    let _ = cluster.shutdown_without_flush().await;
+                    return Err(error);
+                }
+            }
         }
         cluster.operability.mark_startup_finished();
         let raft = &cluster.config.raft_options;
@@ -897,7 +1100,9 @@ impl PersistentMetaDbCluster {
     }
 
     pub fn cell_manager(&self) -> &Arc<DurableCellManager> {
-        &self.cell_manager
+        self.cell_manager
+            .as_ref()
+            .expect("global-manager has no local cell")
     }
 
     pub fn global_manager(&self) -> &Arc<DurableGlobalManager> {
@@ -1003,11 +1208,11 @@ impl PersistentMetaDbCluster {
     }
 
     async fn publish_control_heartbeat_if_due(&self) -> Result<()> {
+        let Some(cell) = &self.cell_manager else {
+            return Ok(());
+        };
         let now = metadb_cluster::control_plane_state::unix_ms();
-        if self
-            .cell_manager
-            .local_heartbeat_is_fresh(now, HEARTBEAT_INTERVAL_MS)
-        {
+        if cell.local_heartbeat_is_fresh(now, HEARTBEAT_INTERVAL_MS) {
             return Ok(());
         }
         self.publish_control_heartbeat().await
@@ -1018,8 +1223,11 @@ impl PersistentMetaDbCluster {
     /// shard descriptors. A failed send does not roll the local sequence back: the
     /// next interval uses a new sequence, and a replay of this sequence is idempotent.
     pub async fn publish_control_heartbeat(&self) -> Result<()> {
-        let heartbeat = self.cell_manager.publish_local_heartbeat()?;
-        let leaders = self.cell_manager.remote_leader_addrs();
+        let Some(cell) = &self.cell_manager else {
+            return Ok(());
+        };
+        let heartbeat = cell.publish_local_heartbeat()?;
+        let leaders = cell.remote_leader_addrs();
         for addr in leaders {
             if let Err(error) = self.send_heartbeat_with_retry(&addr, &heartbeat).await {
                 tracing::warn!(%error, %addr, "leader did not accept the control heartbeat");
@@ -1056,14 +1264,14 @@ impl PersistentMetaDbCluster {
         .await?;
         let response = client
             .store_heartbeat(StoreHeartbeatRequest {
-                cell_id: self.cell_manager.cell_id(),
+                cell_id: self.cell_manager().cell_id(),
                 node_id: heartbeat.node_id,
                 disk_free_bytes: heartbeat.disk_free_bytes.unwrap_or(0),
                 disk_free_known: heartbeat.disk_free_bytes.is_some(),
                 monotonic_seq: heartbeat.seq,
                 shards: Vec::new(),
                 instance_id: {
-                    let instance = self.cell_manager.node_instance_id();
+                    let instance = self.cell_manager().node_instance_id();
                     if instance == 0 {
                         Vec::new()
                     } else {
@@ -1098,12 +1306,18 @@ impl PersistentMetaDbCluster {
     }
 
     pub fn readiness(&self) -> ReadinessReport {
-        evaluate_readiness(self.operability.phase(), &self.shard_gates())
+        operability::evaluate_process_readiness(
+            self.operability.phase(),
+            &self.shard_gates(),
+            self.directory_only,
+        )
     }
 
     fn shard_gates(&self) -> Vec<ShardGate> {
-        self.host
-            .all_groups()
+        let Some(host) = &self.host else {
+            return Vec::new();
+        };
+        host.all_groups()
             .iter()
             .map(|group| {
                 let view = group.serve_view();
@@ -1122,7 +1336,11 @@ impl PersistentMetaDbCluster {
 
     pub fn metrics_snapshot(&self) -> ClusterMetricsSnapshot {
         let gates = self.shard_gates();
-        let report = evaluate_readiness(self.operability.phase(), &gates);
+        let report = operability::evaluate_process_readiness(
+            self.operability.phase(),
+            &gates,
+            self.directory_only,
+        );
         let mut snap = collect_cluster_metrics(&self.global_manager);
         snap.apply_operability(&report, &gates, &self.config.raft_options);
         snap
@@ -1149,20 +1367,28 @@ impl PersistentMetaDbCluster {
         match tokio::time::timeout(Duration::from_secs(10), self.flush_all()).await {
             Ok(result) => result?,
             Err(_) => {
-                for group in self.host.all_groups() {
-                    group.state_machine().flush_to_lsm()?;
+                if let Some(host) = &self.host {
+                    for group in host.all_groups() {
+                        group.state_machine().flush_to_lsm()?;
+                    }
                 }
             }
         }
-        let result = self.host.shutdown_all().await;
+        let result = if let Some(host) = &self.host {
+            host.shutdown_all().await
+        } else {
+            Ok(())
+        };
         backup::unregister_runtime(&self.config.node.data_dir);
         result
     }
 
     /// Installs `gate` on every local Raft group so a test can park `client_write`.
     pub fn install_proposal_shutdown_gate(&self, gate: &Arc<ProposalShutdownGate>) {
-        for group in self.host.all_groups() {
-            group.set_proposal_shutdown_gate(Some(gate.clone()));
+        if let Some(host) = &self.host {
+            for group in host.all_groups() {
+                group.set_proposal_shutdown_gate(Some(gate.clone()));
+            }
         }
     }
 
@@ -1175,7 +1401,11 @@ impl PersistentMetaDbCluster {
     pub async fn shutdown_without_flush(&self) -> Result<()> {
         self.operability.begin_shutdown();
         self.stop_tasks().await;
-        let result = self.host.shutdown_all_no_flush().await;
+        let result = if let Some(host) = &self.host {
+            host.shutdown_all_no_flush().await
+        } else {
+            Ok(())
+        };
         backup::unregister_runtime(&self.config.node.data_dir);
         result
     }
@@ -1198,11 +1428,16 @@ impl PersistentMetaDbCluster {
 
     /// Copies a restorable image while a backup hold is active.
     pub fn create_backup(&self, destination: &Path) -> Result<backup::BackupSummary> {
-        let groups = self.host.all_groups();
+        let Some(host) = &self.host else {
+            return Err(MetaDbError::ShardRoutingError(
+                "global-manager has no shard files to back up".to_string(),
+            ));
+        };
+        let groups = host.all_groups();
         let mut raft_dirs = Vec::with_capacity(groups.len());
         let mut engines = Vec::with_capacity(groups.len());
         for group in &groups {
-            raft_dirs.push(self.host.shard_dir(group.shard_id()).join("raft"));
+            raft_dirs.push(host.shard_dir(group.shard_id()).join("raft"));
             engines.push(group.engine());
         }
         let shards: Vec<OnlineShard<'_>> = groups
@@ -1256,8 +1491,11 @@ impl PersistentMetaDbCluster {
 
     fn collect_backup_floors(&self) -> Result<Vec<backup::ShardHoldFloor>> {
         let mut by_id = std::collections::BTreeMap::new();
-        for group in self.host.all_groups() {
-            let raft_dir = self.host.shard_dir(group.shard_id()).join("raft");
+        let Some(host) = &self.host else {
+            return Ok(Vec::new());
+        };
+        for group in host.all_groups() {
+            let raft_dir = host.shard_dir(group.shard_id()).join("raft");
             by_id.insert(
                 group.shard_id(),
                 backup::floor_for_open_log(
@@ -1271,7 +1509,10 @@ impl PersistentMetaDbCluster {
             if by_id.contains_key(&shard_id) {
                 continue;
             }
-            let raft_dir = self.host.shard_dir(shard_id).join("raft");
+            let Some(host) = &self.host else {
+                continue;
+            };
+            let raft_dir = host.shard_dir(shard_id).join("raft");
             by_id.insert(shard_id, backup::disk_floor(shard_id, &raft_dir)?);
         }
         Ok(by_id.into_values().collect())
@@ -1361,53 +1602,14 @@ fn spawn_grpc_server(
                 MultiRaftTransportServer::new(raft_router),
                 auth,
             ));
-        if security.is_plaintext() {
-            let _ = router
-                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                    let _ = shutdown_rx.changed().await;
-                })
-                .await;
+        if !security.is_plaintext() {
+            tracing::error!("refusing to serve: TLS termination is not available");
             return;
         }
-        let (tx, rx) = tokio::sync::mpsc::channel::<
-            std::result::Result<metadb_security::TlsServerIo, std::io::Error>,
-        >(32);
-        let accept_security = Arc::clone(&security);
-        let mut accept_shutdown = shutdown_rx.clone();
-        let handshake_limit = Arc::new(tokio::sync::Semaphore::new(256));
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = accept_shutdown.changed() => break,
-                    accepted = listener.accept() => {
-                        let Ok((socket, _)) = accepted else { break };
-                        let Ok(permit) = handshake_limit.clone().acquire_owned().await else {
-                            break;
-                        };
-                        let accept_security = Arc::clone(&accept_security);
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            match accept_security.accept_grpc(socket).await {
-                                Ok(io) => {
-                                    let _ = tx.send(Ok(io)).await;
-                                }
-                                Err(error) => {
-                                    tracing::warn!(%error, "tls handshake rejected");
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-        });
         let _ = router
-            .serve_with_incoming_shutdown(
-                tokio_stream::wrappers::ReceiverStream::new(rx),
-                async move {
-                    let _ = shutdown_rx.changed().await;
-                },
-            )
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _ = shutdown_rx.changed().await;
+            })
             .await;
     })
 }

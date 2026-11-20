@@ -26,16 +26,7 @@ allow = [
     "Unicode-3.0",
     "Zlib",
 ]
-exceptions = [
-    # rustls verifies certificates with rustls-webpki. That crate and its
-    # parser `untrusted` are ISC. ISC is not in the allow list above. These
-    # exceptions are crate-specific. They do not allow every ISC crate, and
-    # they do not allow ring (Apache-2.0 AND ISC), which this workspace does
-    # not enable. There is no Apache-2.0 or MIT WebPKI verifier in the rustls
-    # 0.23 stack.
-    { allow = ["ISC"], name = "rustls-webpki" },
-    { allow = ["ISC"], name = "untrusted" },
-]
+exceptions = []
 
 [bans]
 multiple-versions = "warn"

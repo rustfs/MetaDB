@@ -40,7 +40,7 @@ shard_split_threshold_bytes = 4294967296 # 4 GiB
 allow_unauthenticated = true
 ```
 
-Rust 1.100.0 (`rust-toolchain.toml`). Only `all-in-one` starts. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` terminate TLS 1.3 in this process. See `docs/designs/transport_security.md`.
+Rust 1.100.0 (`rust-toolchain.toml`). Only `all-in-one` starts. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
 
 The `[security]` block above is the explicit loopback development opt-in. It is not a credential. `grpc_listen_addr` and `metrics_listen_addr` stay on the literal IP `127.0.0.1`. The hostname `localhost` is not accepted for `allow_unauthenticated`. An empty secret without that flag does not start the process.
 

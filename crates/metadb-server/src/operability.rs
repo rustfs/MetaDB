@@ -135,6 +135,16 @@ impl Operability {
 /// An empty shard list is not ready. A healthy shard list does not override
 /// `Starting`, `ShuttingDown`, or `Failed`.
 pub fn evaluate_readiness(phase: ProcessPhase, shards: &[ShardGate]) -> ReadinessReport {
+    evaluate_process_readiness(phase, shards, false)
+}
+
+/// `directory_only` is a `global-manager` with no local Raft groups.
+/// An empty shard list is still not ready for every other role.
+pub fn evaluate_process_readiness(
+    phase: ProcessPhase,
+    shards: &[ShardGate],
+    directory_only: bool,
+) -> ReadinessReport {
     let blocked = |reason: &'static str| ReadinessReport {
         live: phase != ProcessPhase::Failed,
         ready: false,
@@ -152,6 +162,14 @@ pub fn evaluate_readiness(phase: ProcessPhase, shards: &[ShardGate]) -> Readines
         ProcessPhase::Starting => blocked("starting"),
         ProcessPhase::Serving => {
             if shards.is_empty() {
+                if directory_only {
+                    return ReadinessReport {
+                        live: true,
+                        ready: true,
+                        phase,
+                        reason: "directory_only",
+                    };
+                }
                 return blocked("no_local_shards");
             }
             if shards.iter().any(|shard| shard.storage_unrecoverable) {
@@ -281,6 +299,9 @@ mod tests {
             evaluate_readiness(ProcessPhase::Serving, &[]).reason,
             "no_local_shards"
         );
+        let directory = evaluate_process_readiness(ProcessPhase::Serving, &[], true);
+        assert!(directory.ready);
+        assert_eq!(directory.reason, "directory_only");
     }
 
     #[test]

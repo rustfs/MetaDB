@@ -41,7 +41,6 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-metadb-security = { workspace = true, features = ["testing"] }
 wincode = { workspace = true }
 openraft = { workspace = true }
 metadb-core = { workspace = true }

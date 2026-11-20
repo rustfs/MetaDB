@@ -199,7 +199,7 @@ flowchart TD
   * `crates/metadb-server/tests/{integration_tests.rs, e2e_cluster_evolution_tests.rs}`
   * Documentation status updates across `Architecture.md`, `README.md`, and `docs/guides/{en,ja,fr,zh,de}/`
 * **Key Invariants**:
-  * **Single runnable role**: `metadbd --role all-in-one` runs `GlobalManager`, `CellLocalManager`, `MetaCache`, `Proxy`, and a `1-Voter` OpenRaft group in one process. `open_and_serve` rejects `global-manager`, `cell-manager`, `be`, and `proxy`. Those names are not a disaggregated deployment.
+  * **Runnable roles**: `all-in-one` still hosts the directory, one cell, and local Raft groups. `global-manager` hosts only `GLOBAL_CELL_DIRECTORY` and does not open Raft groups or mint ids. `cell-manager` hosts one cell and its local Raft groups and can `RegisterCell` itself with `cluster.global_manager`. `be` and `proxy` are still rejected. The directory file is not a Raft group, and the global process does not forward keys.
   * **Clean Lifecycle**: Graceful SIGINT/SIGTERM drain flushes active MemTables, persists `MANIFEST` and Raft state, and closes network listeners cleanly.
 * **Verification Commands**:
   * `cargo fmt --all -- --check`
@@ -210,4 +210,4 @@ flowchart TD
 
 ## 3. Security workstream (not a phase completion)
 
-TLS 1.3 and mTLS live in `metadb-security` and are described in [`designs/transport_security.md`](./designs/transport_security.md). The default mode remains plaintext so the bearer and loopback rules stay in force. Method RBAC is not installed. The scale stream owns role separation and should consume `AuthenticatedPrincipal` rather than opening another TLS stack or treating the shared bearer as a role. The transaction stream owns 2PC leases; transport security does not change lease renewal. This workstream is not a first-launch pass and not a trillion-scale acceptance.
+`metadb-security` is the single outbound transport policy, described in [`designs/transport_security.md`](./designs/transport_security.md). The default mode is plaintext. `tls` and `mtls` are refused before listen because no provider fits the no-C/C++ rule and the license allow list. Method RBAC is not installed. The scale stream owns role separation and must not treat the shared bearer as a role. The transaction stream owns 2PC leases. This workstream is not a first-launch pass and not a trillion-scale acceptance.

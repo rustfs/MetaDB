@@ -20,14 +20,14 @@ Root `Architecture.md` was left unchanged on purpose. Consolidating it with the 
 4. **Membership changes from this path keep a majority.** `jumbo_membership_change_allowed` refuses an empty set, a drop in fault tolerance (`(n-1)/2`), and a new set whose overlap is not a majority of the old set. The peer replacement keeps the same voter count and uses a node that is already a voter of some local shard. Another jumbo shard's dedicated node is not used as that spare. Operator `scale_out_replicas` / `remove_voter` is unchanged and can still shrink on purpose.
 5. **Automatic leadership transfer is disabled.** OpenRaft 0.10 `trigger().transfer_leader` marks the transfer and disables the leader lease before any peer answers. Older processes do not implement `RaftTransportService.TransferLeader`. This process cannot prove that capability without that lease-affecting call, and node registration is not proof. `reconcile_jumbo_placement` therefore does not call `trigger().transfer_leader`. The RPC handler remains so a peer that does send one is answered on the same bearer interceptor as `Vote`. A 3 second poll is not used. Pull request #38 (`f55cc6cf`) can set `election_timeout_max_ms` above 3 seconds; a poll that short would return while OpenRaft could still be rejecting writes. `transfer_poll_covers_election` records that comparison and does not enable the call. `committed_moves` does not gain `LeadershipTransferred` when the leader is already the dedicated node.
 
-`open_and_serve` still rejects every role except `all-in-one`. A second cell is a separate all-in-one process. `RegisterCell` fsyncs it into `GLOBAL_CELL_DIRECTORY` only after `GetRoutes` shows exact coverage. That file is not replicated, keys are not forwarded, and heartbeats do not schedule the cell. Automatic `transfer_leader` stays off. Linux is the supported platform.
+`global-manager` loads `GLOBAL_CELL_DIRECTORY` and does not open `be/` or a cell Raft group. `cell-manager` hosts one local cell and, when `cluster.global_manager` is set, publishes that cell after listen. `be` and `proxy` are still rejected before listen. `RegisterCell` fsyncs a row only after `GetRoutes` shows exact coverage. That file is not replicated, keys are not forwarded, and heartbeats do not schedule the cell. Automatic `transfer_leader` stays off. Linux is the supported platform.
 
 ## Implemented versus missing
 
 | Area | Evidence in this tree | Status |
 | :--- | :--- | :--- |
 | Multi-cell routing | `GLOBAL_CELL_DIRECTORY` records the local cell and a remote cell after a live `GetRoutes` covers the requested table range exactly. A partial cover, an overlap, or an unreachable first probe writes nothing. `GetRoutes` for an unknown non-zero `cell_id` fails closed. A key owned by a remote cell returns an error on this process. | **Partial.** One process serves one cell. The directory is not a Raft group and is not copied by backup. There is no forwarding and no shared inode allocator across cells. |
-| Role separation | `ServerRole` parses `be`, `proxy`, `cell-manager`, and `global-manager`. `open_and_serve` returns before listen for every role except `all-in-one` (`lib.rs`). | **Missing.** One process still hosts the global manager, the cell manager, the proxy, and the Raft groups. |
+| Role separation | `global-manager` serves the directory file only. `cell-manager` serves one local cell and can publish it. `be` and `proxy` still return before listen (`lib.rs`). | **Partial.** The cell process still colocates Raft. The directory is not a Raft group. There is no remote BE and no forwarding proxy. |
 | Jumbo detection flag | `JumboIsolationPlanner` and `maybe_split_or_isolate_shard` persist `ShardHealthState::JumboIsolated` in `CELL_MANAGER_STATE`. | **Present, and it is only a flag.** It does not move files. |
 | Jumbo leadership placement | `automatic_leadership_transfer_allowed` is false. The handler exists; maintenance does not call `trigger().transfer_leader`. | **Disabled.** Mixed-version capability is unknown. Registration is not a capability proof. |
 | Jumbo peer drain / file migration | Same-size replacement is planned and calls the existing learner promotion or `change_membership` only when a proven spare keeps fault tolerance. A configured `jumbo_dedicated_root` CRC-checks this process's own jumbo shard directory, renames `MOVE_LIVE` into place, then opens Raft there. A directory fsync failure after that rename keeps the dedicated copy and does not reopen the old directory. Restart after that record does not open the old directory and does not delete the dedicated copy. | **Partial.** The copy does not leave this machine. Peer replicas stay. Automatic transfer stays off. Uniform voter sets still have no spare, so membership drain stays blocked. |
@@ -44,7 +44,7 @@ Root `Architecture.md` was left unchanged on purpose. Consolidating it with the 
 These items block a scale gate. None of them is delivered by this change.
 
 1. **Shared cell map.** Each process has its own `GLOBAL_CELL_DIRECTORY`. Registering on process A does not make process B list A's cell. Clients must ask the process that stored the row. There is still no replicated global manager and no cross-cell forwarding. A second cell's node id must be disjoint from nodes already in the directory. Uncovered tables are not served.
-2. **Role separation.** `be`, `proxy`, `cell-manager`, and `global-manager` must each start only their own listeners and state. That work has to preserve the auth fail-closed rules owned by the auth/config workstream. This change does not trim subsystems.
+2. **Remote BE and forwarding proxy.** `global-manager` and `cell-manager` now start as separate processes. `be` and `proxy` still have no remote shard protocol and no request forwarder, so they stay rejected. The cell process still hosts its own Raft groups. Auth fail-closed rules are unchanged.
 3. **Jumbo file placement onto another machine.** This process can move its own jumbo directory onto `jumbo_dedicated_root`. Streaming a snapshot to a node that has not joined, and draining peer shards off a disk, are still missing. The safe replacement in this tree cannot fire on the uniform voter sets `scale_out_replicas` creates, because there is no spare voter. Adding a voter that has not joined is intentionally refused.
 4. **Safe automatic leadership transfer.** Still missing. It needs a capability check that does not disable the leader lease, then a wait of at least the configured `election_timeout_max_ms` (#38, head `f55cc6cf`, not merged here). Until that exists, maintenance must keep the action disabled.
 5. **Heartbeat as a scheduler.** Per-shard bytes, QPS, and disk free measured by this process, sent on a trusted channel, and used only as hints. The scheduler must keep using local Raft and LSM state for splits. Client descriptors must stay non-authoritative. A 3-second cell-wide heartbeat bus for tens of thousands of shards is not built.
@@ -54,13 +54,25 @@ These items block a scale gate. None of them is delivered by this change.
 9. **Docs outside this English set.** `docs/{fr,de,ja,zh}` still describe the previous heartbeat and jumbo behavior in places. Root `Architecture.md` section 12 still marks the control plane and jumbo isolation as implemented. Those updates belong to documentation consolidation.
 10. **Gates this page does not move.** No-ship stays in force. A first-ship gate is a separate bar from a scale gate (multi-cell, disaggregated roles, jumbo disk isolation, and a heartbeat bus that can carry a cell of 20k–30k shards). This increment is neither gate. CI workflows were not edited. The commands below were not run.
 
-## Main merge
+## Base
 
-Current `main` is `f9425f39fa241f44b1938909c35bc653b36de36f`, which contains #35 (explicit auth opt-in) and #38 (readiness probes and `[raft]` options). This branch merges that commit. It does not rebase. Empty secrets still refuse to serve unless `allow_unauthenticated` is set for a literal loopback IP. `/livez`, `/readyz`, and `/healthz` keep `classify_secret`. `[raft]` timers apply at group start. `TransferLeader` stays on the same bearer interceptor as `Vote`. Automatic leadership transfer stays disabled, so a configured election timeout is not raced by a 3 second transfer poll. `transfer_poll_covers_election` remains the check a future attempt would have to pass.
+This increment starts from `main` `1d77bb06069bdaf97aa924581373dbf422484349` (the local jumbo directory move). It does not rebase. Empty secrets still refuse to serve unless `allow_unauthenticated` is set for a literal loopback IP. Automatic leadership transfer stays disabled.
+
+## Validation for the role split
+
+These commands were executed on this increment. They are not a workspace run and they are not a CI result:
+
+- `cargo check -p metadb-server --tests --locked`
+- `cargo clippy -p metadb-server --all-targets --locked --no-deps -- -D warnings -A clippy::assertions_on_constants` (the landed `assert!(!metadb_transport::RDMA_BACKEND_IMPLEMENTED)` still fails that lint without the allow)
+- `cargo test -p metadb-server --test role_separation_tests --locked`
+- `cargo test -p metadb-server --test control_plane_claim_tests --locked -- disaggregated_roles_are_rejected_before_listen`
+- `cargo test -p metadb-server --test second_cell_tests --locked`
+
+`cargo test --workspace --locked` was not run. GitHub Actions was not enabled and was not waited on.
 
 ## Validation not run
 
-Do not read this file as a test report. The following were not executed while the change was written:
+Do not read the list below as a test report for this increment. The following were not executed:
 
 - `cargo test -p metadb-cluster --lib jumbo_placement`
 - `cargo test -p metadb-cluster --lib control_plane_state`

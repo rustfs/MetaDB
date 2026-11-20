@@ -2,21 +2,20 @@
 
 [Overview](./README.md) · [Français](../fr/architecture.md) · [Deutsch](../de/architecture.md) · [日本語](../ja/architecture.md) · [简体中文](../zh/architecture.md)
 
-This page follows the code in `crates/`. It does not describe a multi-process Cell deployment. That deployment is not implemented. See [Operations](./operations.md#known-limitations).
+This page follows the code in `crates/`. A `global-manager` process and a `cell-manager` process can run separately. The directory is still one local file, this process does not forward keys, and `be` / `proxy` do not start. See [Operations](./operations.md#known-limitations).
 
 ## Process shape
 
 `PersistentMetaDbCluster::open_and_serve` (`crates/metadb-server/src/lib.rs`):
 
-1. Rejects any `node.role` other than `all-in-one`.
+1. Rejects `be` and `proxy` before listen. `global-manager` refuses a join address, a cell range, a jumbo root, or a data directory that already has `be/` or `CELL_MANAGER_STATE`. `all-in-one` refuses `cluster.global_manager`.
 2. An empty `shared_secret` listens only when `allow_unauthenticated` is explicitly set, and only when every listener address is a literal loopback IP (`127.0.0.0/8` or `::1`). The hostname `localhost` is not accepted and is not resolved. A whitespace-only secret is rejected even when that flag is set. The flag does not permit a wildcard or any other address. The process then binds that same literal address (`grpc_listen_addr` defaults to `127.0.0.1:7800`; port `0` asks the OS for a port). After the socket is bound, the bound IP is checked again.
-3. Opens `DurableIdAllocator` at `<data_dir>/global_allocator`.
-4. Opens `ShardGroupHost` at `<data_dir>/be`.
-5. Opens or bootstraps `DurableCellManager` at `<data_dir>/cell_<cell_id>`.
-6. Registers that one cell on `DurableGlobalManager` for the key range `[0x01, 0x04)`.
-7. Ensures root directory inode `1` (`ROOT_INODE_ID`) has an attribute record.
-8. Serves four gRPC services on the same listener. All four take the same bearer interceptor. When `metrics_listen_addr` is set, `GET /metrics`, `GET /livez`, `GET /readyz`, and `GET /healthz` use `classify_secret`. A secret that contains a non-whitespace character rejects a missing or wrong bearer. A whitespace-only secret is 401 on those paths and does not match `Bearer` plus the same spaces. An empty secret listens only when `allow_unauthenticated` is set, and only for a literal loopback IP. The bound metrics address is checked again after that socket binds. `[security.tls]` defaults to `off`. `tls` and `mtls` terminate TLS 1.3 on that listener and on the metrics listener. Method RBAC is not installed.
-9. Spawns a maintenance task on a 250 ms interval.
+3. `global-manager` stops after loading `GLOBAL_CELL_DIRECTORY`. It does not open `ShardGroupHost`, does not bootstrap a cell, and does not run the 250 ms maintenance loop. `AllocateIdBlock` and the rename-lease RPCs return an application error. A key owned by a published cell returns `does not forward`. Readiness is `directory_only` when the process is serving and has no local shards. An empty shard list is still `no_local_shards` for every other role.
+4. `all-in-one` and `cell-manager` open `DurableIdAllocator` at `<data_dir>/global_allocator`, `ShardGroupHost` at `<data_dir>/be`, and `DurableCellManager` at `<data_dir>/cell_<cell_id>`.
+5. Those two roles register that one local cell on their own `DurableGlobalManager`. `cell-manager` does not accept a remote `RegisterCell`. When `cluster.global_manager` is set, it publishes its route union to that process after the listener accepts, using the same `TransportSecurity` dial as every other outbound client, and startup fails if that call fails.
+6. Ensures root directory inode `1` (`ROOT_INODE_ID`) has an attribute record on a process that hosts the meta shard.
+7. Serves four gRPC services on the same listener. All four take the same bearer interceptor. When `metrics_listen_addr` is set, `GET /metrics`, `GET /livez`, `GET /readyz`, and `GET /healthz` use `classify_secret`. A secret that contains a non-whitespace character rejects a missing or wrong bearer. A whitespace-only secret is 401 on those paths and does not match `Bearer` plus the same spaces. An empty secret listens only when `allow_unauthenticated` is set, and only for a literal loopback IP. The bound metrics address is checked again after that socket binds. This process does not terminate TLS. `[security.tls]` mode `tls` or `mtls` is refused before a data directory or listener is created. Method RBAC is not installed.
+8. `all-in-one` and `cell-manager` spawn a maintenance task on a 250 ms interval. `global-manager` does not.
 
 `metadbd` is a thin wrapper: it loads TOML, applies CLI overrides, calls `open_and_serve`, optionally calls `RegisterNode` on `--cell-manager`, and on Ctrl-C calls `shutdown`. Metrics, when configured, are served inside `open_and_serve`.
 
