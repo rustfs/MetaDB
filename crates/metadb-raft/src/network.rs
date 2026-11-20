@@ -483,7 +483,8 @@ impl RaftTransportService for MultiRaftTransportServer {
     }
 
     /// Same bearer interceptor as `Vote` and `AppendEntries`. This handler does not
-    /// decide to transfer; `DurableCellManager` does not call `trigger().transfer_leader`.
+    /// decide to transfer. `consider_automatic_leadership_transfer` does not call
+    /// `trigger().transfer_leader`.
     async fn transfer_leader(
         &self,
         request: Request<RaftRpcEnvelope>,
