@@ -1,6 +1,6 @@
 //! `be` hosts local Raft replicas and serves their metadata.
-//! `proxy` forwards metadata and transactions to one upstream.
-//! Neither process is a multi-cell router. The proxy does not host Raft.
+//! `proxy` does not host Raft. Without a cell directory it fails a metadata
+//! call closed. `GetRoutes` is still read from the configured upstream.
 
 use std::time::Instant;
 
@@ -61,7 +61,7 @@ async fn misconfigured_be_and_proxy_fail_before_listen() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn be_serves_local_shards_and_proxy_forwards_one_upstream() {
+async fn be_serves_local_shards_and_proxy_does_not_invent_a_placement() {
     let be_dir = tempdir().unwrap();
     let (be, be_addr) =
         PersistentMetaDbCluster::open_and_serve(loopback(be_dir.path(), ServerRole::Be))
@@ -140,23 +140,26 @@ async fn be_serves_local_shards_and_proxy_forwards_one_upstream() {
         .await
         .unwrap()
         .into_inner();
-    assert!(created.error.is_none(), "{:?}", created.error);
-    let found = proxy_meta
-        .lookup(LookupRequest {
-            header: None,
-            pid: ROOT_INODE_ID,
-            name: "via-proxy".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(found.error.is_none(), "{:?}", found.error);
-    assert!(found.found);
+    let created = created
+        .error
+        .expect("a proxy with no cell directory does not invent a placement")
+        .message;
+    assert!(
+        created.contains("cell directory is missing") && created.contains("invent a placement"),
+        "{created}"
+    );
+    assert!(
+        be.tx_router()
+            .lookup(ROOT_INODE_ID, "via-proxy")
+            .await
+            .unwrap()
+            .is_none(),
+        "the upstream must not receive an unplaced create"
+    );
     be.tx_router()
-        .lookup(ROOT_INODE_ID, "via-proxy")
+        .create_file(ROOT_INODE_ID, "kept", 101, 501, 7, 0o644, 0)
         .await
-        .unwrap()
-        .expect("the upstream stored the forwarded create");
+        .expect("the shard host still accepts a local create");
 
     let mut proxy_cp = ControlPlaneServiceClient::connect(format!("http://{proxy_addr}"))
         .await
@@ -168,6 +171,21 @@ async fn be_serves_local_shards_and_proxy_forwards_one_upstream() {
         .into_inner();
     assert!(forwarded.error.is_none(), "{:?}", forwarded.error);
     assert_eq!(forwarded.shards.len(), 1);
+    let allocated = proxy_cp
+        .allocate_id_block(AllocateIdBlockRequest {
+            request_uuid_be: Vec::new(),
+            id_kind: 1,
+            count: 1,
+            preferred_shard_id: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let allocated = allocated.error.expect("proxy does not mint ids").message;
+    assert!(
+        allocated.contains("does not serve this control-plane method"),
+        "{allocated}"
+    );
     let rejected = proxy_cp
         .register_cell(RegisterCellRequest {
             cell_id: 9,
@@ -178,10 +196,14 @@ async fn be_serves_local_shards_and_proxy_forwards_one_upstream() {
         .await
         .unwrap()
         .into_inner();
-    let rejected = rejected.error.expect("proxy control plane").message;
+    let rejected = rejected.error.expect("uncovered cell").message;
     assert!(
-        rejected.contains("does not host the control plane"),
+        rejected.contains("did not publish routes") || rejected.contains("not reachable"),
         "{rejected}"
+    );
+    assert!(
+        !proxy_dir.path().join("GLOBAL_CELL_DIRECTORY").exists(),
+        "a failed registration must not write the directory"
     );
 
     let mut raft = RaftTransportServiceClient::connect(format!("http://{proxy_addr}"))
@@ -210,7 +232,7 @@ async fn be_serves_local_shards_and_proxy_forwards_one_upstream() {
             .unwrap();
     reopened
         .tx_router()
-        .lookup(ROOT_INODE_ID, "via-proxy")
+        .lookup(ROOT_INODE_ID, "kept")
         .await
         .unwrap()
         .expect("restart opens the same shard files");
@@ -218,7 +240,7 @@ async fn be_serves_local_shards_and_proxy_forwards_one_upstream() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proxy_reports_a_dead_upstream_without_stopping() {
+async fn proxy_without_a_directory_fails_closed_and_stays_ready() {
     let dir = tempdir().unwrap();
     let mut cfg = loopback(dir.path(), ServerRole::Proxy);
     cfg.cluster.upstream = "127.0.0.1:1".into();
@@ -233,13 +255,21 @@ async fn proxy_reports_a_dead_upstream_without_stopping() {
             pid: ROOT_INODE_ID,
             name: "missing".into(),
         })
-        .await;
+        .await
+        .unwrap()
+        .into_inner();
     assert!(
         started.elapsed().as_secs() < 5,
-        "dead upstream hung the proxy"
+        "a missing directory hung the proxy"
     );
-    let status = failed.expect_err("dead upstream must fail the call");
-    assert!(status.to_string().contains("not reachable"), "{status}");
+    let status = failed
+        .error
+        .expect("missing directory fails closed")
+        .message;
+    assert!(
+        status.contains("cell directory is missing") && status.contains("invent a placement"),
+        "{status}"
+    );
     assert_eq!(proxy.readiness().reason, "proxy_gateway");
     assert!(proxy.readiness().ready);
     proxy.shutdown().await.unwrap();
