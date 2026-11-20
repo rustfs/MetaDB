@@ -81,7 +81,7 @@ A second `metadbd --role all-in-one` can join the **same** cell when `--join` or
 
 `100B – 10T+` is a design-model range: arithmetic for how a future multi-cell topology might be sized. It is not a record count this repository has stored. It is also not a Baidu production figure claimed as a result of `rustfs/MetaDB`. Baidu's published sizes, including the BOS2 figure of 1.848 trillion records in `arXiv:2610.32247v1`, are Baidu production metrics, not results of this repository.
 
-The table is the intended role split. This binary does not run those roles. Jumbo isolation in this tree is a route flag. It does not move peer shards onto a dedicated host.
+Die Tabelle ist die vorgesehene Rollenaufteilung. Dieses Binary startet diese Rollennamen bei gültiger Konfiguration. Es übernimmt nicht die disaggregierten Produktionsaufgaben der Tabelle: ein Cell-Manager, der Shards auf andere Maschinen legt, oder ein Global-Manager als eigene Raft-Gruppe. `proxy` wählt die registrierte Zelle, die einen Metadatenaufruf, `ExecuteSql` oder eine Transaktion mit Benutzerschlüssel enthält, und schließt sonst fehl. Diese Wahl ist kein Produktions-MetaCache aller Shards. Die Jumbo-Isolation ist in diesem Baum ein Routenflag. Sie verschiebt keine Peer-Shards auf einen eigenen Host.
 
 | Role | Design `--role` | Intended responsibility |
 | :--- | :--- | :--- |
@@ -90,4 +90,4 @@ The table is the intended role split. This binary does not run those roles. Jumb
 | **Backend Storage (`BE`)** | `be` | Would host Multi-Raft shard groups and the LSM engine on NVMe hosts. |
 | **Stateless Proxy** | `proxy` | Would embed `MetaCache`, compile the 20 SQL templates, and coordinate cross-shard 2PC. |
 
-`metadb-ctl cell register` calls `RegisterCell`. Without `--start-key` and `--end-key` it sends `[01, 04)`, which overlaps a default cell and exits non-zero. With those keys it persists the cell only when the endpoint's routes cover that range. It does not forward keys.
+`metadb-ctl cell register` ruft `RegisterCell` auf. Ohne `--start-key` und `--end-key` sendet es `[01, 04)`, das eine Standardzelle überlappt, und endet ungleich null. Mit diesen Schlüsseln bleibt die Zelle nur erhalten, wenn die Routen des Endpunkts diesen Bereich decken. Ein späterer Aufruf, den diese Zelle enthält, wird an den gespeicherten Endpunkt weitergeleitet.

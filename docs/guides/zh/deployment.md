@@ -89,7 +89,7 @@ A second `metadbd --role all-in-one` can join the **same** cell when `--join` or
 
 `100B – 10T+` is a design-model range: arithmetic for how a future multi-cell topology might be sized. It is not a record count this repository has stored. It is also not a Baidu production figure claimed as a result of `rustfs/MetaDB`. Baidu's published sizes, including the BOS2 figure of 1.848 trillion records in `arXiv:2610.32247v1`, are Baidu production metrics, not results of this repository.
 
-The table is the intended role split. This binary does not run those roles. Jumbo isolation in this tree is a route flag. It does not move peer shards onto a dedicated host.
+这张表是设想中的角色划分。配置有效时，这个二进制会启动这些角色名。它不做表里的拆分生产职责：单元管理器把分片放到其他机器上，或全局管理器自己成为 Raft 组。`proxy` 会选择包含元数据调用、`ExecuteSql` 或带用户键事务的已注册单元，否则失败关闭。这种选择不是覆盖全部分片的生产 MetaCache。本树里的巨型隔离是路由标志。它不会把对等分片移到专用主机上。
 
 | Role | Design `--role` | Intended responsibility |
 | :--- | :--- | :--- |
@@ -98,4 +98,4 @@ The table is the intended role split. This binary does not run those roles. Jumb
 | **Backend Storage (`BE`)** | `be` | Would host Multi-Raft shard groups and the LSM engine on NVMe hosts. |
 | **Stateless Proxy** | `proxy` | Would embed `MetaCache`, compile the 20 SQL templates, and coordinate cross-shard 2PC. |
 
-`metadb-ctl cell register` calls `RegisterCell`. Without `--start-key` and `--end-key` it sends `[01, 04)`, which overlaps a default cell and exits non-zero. With those keys it persists the cell only when the endpoint's routes cover that range. It does not forward keys.
+`metadb-ctl cell register` 调用 `RegisterCell`。没有 `--start-key` 和 `--end-key` 时它发送 `[01, 04)`，这会与默认单元重叠并以非零状态退出。带上这些键时，只有端点路由覆盖该范围才会保存该单元。此后被该单元包含的请求会转发到已保存的端点。
