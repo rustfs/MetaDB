@@ -980,6 +980,7 @@ dependencies = [
  "cap-primitives",
  "metadb-core",
  "metadb-proto",
+ "metadb-security",
  "metadb-storage",
  "openraft",
  "serde",
@@ -989,6 +990,13 @@ dependencies = [
  "tonic",
  "tracing",
  "wincode",
+]
+
+[[package]]
+name = "metadb-security"
+version = "0.1.0"
+dependencies = [
+ "tonic",
 ]
 
 [[package]]
@@ -1004,6 +1012,7 @@ dependencies = [
  "metadb-proto",
  "metadb-proxy",
  "metadb-raft",
+ "metadb-security",
  "metadb-storage",
  "metadb-transport",
  "metadb-tx",
@@ -1015,6 +1024,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "wincode",
@@ -1041,6 +1051,7 @@ dependencies = [
  "metadb-core",
  "metadb-proto",
  "metadb-raft",
+ "metadb-security",
  "metadb-storage",
  "serde",
  "tempfile",

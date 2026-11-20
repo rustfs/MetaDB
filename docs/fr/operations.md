@@ -34,7 +34,7 @@ Le client ouvre un nouveau canal gRPC par commande. Il ne parle pas `RaftTranspo
 
 ### `cluster status`
 
-Appelle `GetRoutes` avec `cell_id = 0`. Pour chaque shard il imprime `shard`, `cell`, `leader`, le nombre de votants, `epoch=(conf_ver, ver)`, `dual_mode` et `jumbo`. It then prints local `CELL_CONTROL_PLANE` placement rows (`phase`, `phase_code`, `dedicated_node`, `dominant_pid`, `moves`, attempt timestamps, `reason`) and `placement_automatic_transfer_enabled=false`. Those rows are not routes. A remote cell contributes no placement rows. It does not print disk free space, QPS, Raft watermarks, or `MOVE_STAGED` / `MOVE_LIVE`. The reconciler does not publish phase `recorded` and does not stamp `transfer_attempt_unix_ms`.
+Appelle `GetRoutes` avec `cell_id = 0`. Pour chaque shard il imprime `shard`, `cell`, `leader`, le nombre de votants, `epoch=(conf_ver, ver)`, `dual_mode` et `jumbo`. It then prints local `CELL_CONTROL_PLANE` placement rows (`phase`, `phase_code`, `dedicated_node`, `dominant_pid`, `moves`, attempt timestamps, `reason`) and `placement_automatic_transfer_enabled=false`. Those rows are not routes. A remote cell contributes no placement rows. It does not print disk free space, QPS, Raft watermarks, or `MOVE_STAGED` / `MOVE_LIVE`. The reconciler does not publish phase `recorded`. It does not stamp `transfer_attempt_unix_ms`. A new row stores 0. A later reconcile keeps a non-zero value already in the file.
 
 ### `shard list --cell-id <u64>`
 
@@ -42,7 +42,7 @@ Appelle `GetRoutes` pour cette cellule (utiliser `0` pour chaque route en cache)
 
 ### `shard split --shard-id <u64>`
 
-Appelle `TriggerShardSplit`, qui force un contrôle de découpage même si le shard est sous `shard_split_threshold_bytes`. Imprime `split_executed`, `child_shard_id`, et la phase de placement lorsqu'une ligne locale existe. `split_executed=false` signifie qu'aucun shard enfant n'a été créé (moins de deux clés, ou un candidat jumbo qui écrit une ligne de placement et laisse `split_executed=false`).
+Appelle `TriggerShardSplit`, qui force un contrôle de découpage même si le shard est sous `shard_split_threshold_bytes`. On success it prints `split_executed`, `child_shard_id`, and the placement fields. When no placement row exists, including an ordinary split, the line is `placement_phase=` and `placement_phase_code=0`. Code 0 is only that no-record case. Stored rows use codes 1–4. `split_executed=false` signifie qu'aucun shard enfant n'a été créé (moins de deux clés, ou un candidat jumbo qui écrit une ligne de placement et laisse `split_executed=false`).
 
 ### `shard enable-dual-mode --shard-id <u64> --pid <u64>`
 
@@ -73,7 +73,7 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 
 ## Métriques
 
-Définir `node.metrics_listen_addr` (par exemple `127.0.0.1:9100`). `open_and_serve` accepte les connexions TCP sur cette adresse. `GET /metrics` renvoie du texte Prometheus. Tout autre chemin renvoie 404, et toute autre méthode renvoie 405. Lorsque `[security].shared_secret` n'est pas vide, chaque requête sur cet écouteur doit envoyer `Authorization: Bearer <shared_secret>`. Un bearer absent, vide ou incorrect renvoie HTTP 401 et un corps qui n'est pas le texte des métriques, y compris une requête vers `/status`. An empty secret does not start the process on any address, including loopback, unless `allow_unauthenticated = true`. That flag is loopback-only and still refuses a wildcard or other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. This listener does not terminate TLS.
+Définir `node.metrics_listen_addr` (par exemple `127.0.0.1:9100`). `open_and_serve` accepte les connexions TCP sur cette adresse. `GET /metrics` renvoie du texte Prometheus. Tout autre chemin renvoie 404, et toute autre méthode renvoie 405. Lorsque `[security].shared_secret` n'est pas vide, chaque requête sur cet écouteur doit envoyer `Authorization: Bearer <shared_secret>`. Un bearer absent, vide ou incorrect renvoie HTTP 401 et un corps qui n'est pas le texte des métriques, y compris une requête vers `/status`. An empty secret does not start the process on any address, including loopback, unless `allow_unauthenticated = true`. That flag is loopback-only and still refuses a wildcard or other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
 
 Jauges et compteurs de `render_prometheus_metrics` :
 
@@ -95,7 +95,7 @@ Jauges et compteurs de `render_prometheus_metrics` :
 | `metadb_placement_phase_blocked` | gauge |
 | `metadb_placement_moves_leadership` | gauge |
 | `metadb_placement_moves_voter_replaced` | gauge |
-| `metadb_placement_rows_with_transfer_attempt` | gauge; the reconciler does not stamp this timestamp |
+| `metadb_placement_rows_with_transfer_attempt` | gauge; the reconciler does not stamp a new value and keeps one already in the file |
 | `metadb_placement_rows_with_replace_attempt` | gauge |
 | `metadb_placement_automatic_transfer_enabled` | gauge, 0 in this build |
 
@@ -148,7 +148,7 @@ Les variantes sont définies dans `crates/metadb-core/src/error.rs`. Les méthod
 - `GetRoutes` échoue fermé pour un `cell_id` non nul inconnu. `StoreHeartbeat` ne remplace pas les routes en cache.
 - L'isolation jumbo est un indicateur de route plus un identifiant de nœud choisi dans la table locale. Elle n'évince pas d'autres shards d'un disque.
 - Registered-node liveness is fsynced in `CELL_CONTROL_PLANE`. `metadbd` persists its own record about every 3 seconds and sends it to the current leader when this process is not the leader. Descriptors on that RPC are annotations, not routes. The observation does not schedule placement. See [Scale control plane](../en/scale-control-plane-status.md).
-- A secret that contains a non-whitespace character authenticates Raft, the other three gRPC services, and the metrics listener, including `/livez`, `/readyz`, and `/healthz`, with the same bearer. An empty secret does not start the process. `allow_unauthenticated = true` is the explicit exception for literal loopback IPs (`127.0.0.0/8` or `::1`) and still refuses a wildcard bind. The hostname `localhost` is not accepted for that exception. The bound socket is checked again after listen. A whitespace-only secret is rejected and is not compared as a bearer. A usable secret combined with the flag is rejected. The process does not terminate TLS.
+- A secret that contains a non-whitespace character authenticates Raft, the other three gRPC services, and the metrics listener, including `/livez`, `/readyz`, and `/healthz`, with the same bearer. An empty secret does not start the process. `allow_unauthenticated = true` is the explicit exception for literal loopback IPs (`127.0.0.0/8` or `::1`) and still refuses a wildcard bind. The hostname `localhost` is not accepted for that exception. The bound socket is checked again after listen. A whitespace-only secret is rejected and is not compared as a bearer. A usable secret combined with the flag is rejected. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
 - `memtable_size_bytes` scelle et vide le memtable actif. `max_imm_memtables` limite les tables immuables en file. `[raft]` timers and `max_segment_bytes` apply when a group starts. They are not reloaded from a changed file, and the segment size does not rewrite segments already on disk.
 - `metadb-ctl bench` pour `hotspot-create` et `bulk-ttl-delete` imprime des lignes JSON : un en-tête avec `bench_pid`, puis des rapports de phase avec attempted, succeeded, failed et des percentiles de latence. Le processus se termine en erreur si une opération demandée échoue. `--workload mixed` ou `--embedded` lance le harnais de stress dans le processus. `sql` imprime la réponse en JSON et se termine en erreur sur une erreur d'application.
 

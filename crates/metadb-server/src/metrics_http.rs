@@ -1,6 +1,6 @@
 //! Prometheus HTTP listener. Uses the same bearer as the gRPC services.
 
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use http_body_util::Full;
@@ -12,6 +12,8 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+
+use metadb_security::TransportSecurity;
 
 use crate::bearer_header_matches;
 use crate::classify_secret;
@@ -29,6 +31,7 @@ pub async fn serve(
     cluster: Weak<PersistentMetaDbCluster>,
     shared_secret: String,
     mut shutdown: watch::Receiver<bool>,
+    security: Arc<TransportSecurity>,
 ) {
     let mut connections = JoinSet::new();
     loop {
@@ -39,10 +42,11 @@ pub async fn serve(
                 let Ok((socket, _)) = accepted else { break; };
                 let cluster = cluster.clone();
                 let shared_secret = shared_secret.clone();
+                let security = Arc::clone(&security);
                 connections.spawn(async move {
                     let _ = tokio::time::timeout(
                         METRICS_IO_TIMEOUT,
-                        metrics_connection(socket, cluster, shared_secret),
+                        metrics_connection(socket, cluster, shared_secret, &security),
                     )
                     .await;
                 });
@@ -57,6 +61,19 @@ async fn metrics_connection(
     socket: TcpStream,
     cluster: Weak<PersistentMetaDbCluster>,
     shared_secret: String,
+    security: &TransportSecurity,
+) -> Result<(), hyper::Error> {
+    if !security.is_plaintext() {
+        tracing::error!("refusing metrics: TLS termination is not available");
+        return Ok(());
+    }
+    serve_metrics(socket, cluster, shared_secret).await
+}
+
+async fn serve_metrics(
+    socket: TcpStream,
+    cluster: Weak<PersistentMetaDbCluster>,
+    shared_secret: String,
 ) -> Result<(), hyper::Error> {
     let service = service_fn(move |request: Request<Incoming>| {
         let cluster = cluster.clone();
@@ -66,10 +83,20 @@ async fn metrics_connection(
                 .headers()
                 .get(hyper::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok());
+            let principal = request
+                .headers()
+                .get(metadb_security::PRINCIPAL_HEADER)
+                .and_then(|value| value.to_str().ok());
+            let credential = request
+                .headers()
+                .get(metadb_security::CREDENTIAL_HEADER)
+                .and_then(|value| value.to_str().ok());
             let (status, body, prometheus) = metrics_decision(
                 request.method(),
                 request.uri().path(),
                 authorization,
+                principal,
+                credential,
                 &cluster,
                 &shared_secret,
             );
@@ -111,6 +138,8 @@ fn metrics_decision(
     method: &Method,
     path: &str,
     authorization: Option<&str>,
+    principal: Option<&str>,
+    credential: Option<&str>,
     cluster: &Weak<PersistentMetaDbCluster>,
     shared_secret: &str,
 ) -> (StatusCode, String, bool) {
@@ -137,9 +166,47 @@ fn metrics_decision(
     let Some(cluster) = cluster.upgrade() else {
         return route_probe(path, None, "");
     };
+    if let Some(roles) = cluster.roles() {
+        let authenticated = roles
+            .authenticate(principal.unwrap_or(""), credential.unwrap_or(""))
+            .is_ok();
+        if !authenticated {
+            return (
+                StatusCode::FORBIDDEN,
+                "authorization denied\n".to_owned(),
+                false,
+            );
+        }
+        if let Some(method_name) = http_probe_method(path) {
+            if roles
+                .authorize(
+                    &metadb_security::AuthenticatedPrincipal::from_name(principal.unwrap_or("")),
+                    "metadb.http",
+                    method_name,
+                )
+                .is_err()
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "authorization denied\n".to_owned(),
+                    false,
+                );
+            }
+        }
+    }
     let report = cluster.readiness();
     let metrics = render_prometheus_metrics(&cluster.metrics_snapshot());
     route_probe(path, Some(&report), &metrics)
+}
+
+fn http_probe_method(path: &str) -> Option<&'static str> {
+    match path {
+        "/metrics" => Some("GetMetrics"),
+        "/livez" => Some("GetLivez"),
+        "/readyz" => Some("GetReadyz"),
+        "/healthz" => Some("GetHealthz"),
+        _ => None,
+    }
 }
 
 /// Routes an authenticated GET. `/metrics` stays 200 while the process is not
@@ -199,6 +266,8 @@ mod tests {
             &Method::GET,
             "/readyz",
             Some("Bearer wrong-token"),
+            None,
+            None,
             &Weak::new(),
             secret,
         );
@@ -212,6 +281,8 @@ mod tests {
             &Method::GET,
             "/healthz",
             Some(&format!("Bearer {secret}")),
+            None,
+            None,
             &Weak::new(),
             secret,
         );
@@ -261,8 +332,15 @@ mod tests {
         let exact = format!("Bearer {secret}");
         for path in ["/metrics", "/livez", "/readyz", "/healthz"] {
             for presented in [None, Some(exact.as_str()), Some("Bearer secret")] {
-                let (status, body, prometheus) =
-                    metrics_decision(&Method::GET, path, presented, &Weak::new(), secret);
+                let (status, body, prometheus) = metrics_decision(
+                    &Method::GET,
+                    path,
+                    presented,
+                    None,
+                    None,
+                    &Weak::new(),
+                    secret,
+                );
                 assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} {presented:?}");
                 assert_eq!(body, "unauthorized\n");
                 assert!(!prometheus);
@@ -316,7 +394,8 @@ mod tests {
             "{whitespace_err}"
         );
 
-        let (status, body, _) = metrics_decision(&Method::GET, "/readyz", None, &Weak::new(), "");
+        let (status, body, _) =
+            metrics_decision(&Method::GET, "/readyz", None, None, None, &Weak::new(), "");
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, "not live: unavailable\n");
         assert!(!body.contains("unauthorized"));

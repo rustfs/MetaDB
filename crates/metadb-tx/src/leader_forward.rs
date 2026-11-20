@@ -11,6 +11,7 @@ use metadb_core::{
 };
 use metadb_proto::transaction_service_client::TransactionServiceClient;
 use metadb_proto::{ErrorDetailProto, ForwardRouterRequest};
+use metadb_security::TransportSecurity;
 use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
@@ -138,6 +139,7 @@ pub enum ForwardedRouterOut {
 #[derive(Clone)]
 struct ForwardAuth {
     secret: String,
+    role: Option<metadb_security::RolePresentation>,
 }
 
 impl Interceptor for ForwardAuth {
@@ -150,6 +152,10 @@ impl Interceptor for ForwardAuth {
             })?;
             value.set_sensitive(true);
             request.metadata_mut().insert("authorization", value);
+        }
+        if let Some(role) = &self.role {
+            role.apply_metadata(request.metadata_mut())
+                .map_err(|_| Status::internal("RBAC principal headers could not be attached"))?;
         }
         request.metadata_mut().insert(
             "x-metadb-forwarded",
@@ -171,6 +177,8 @@ pub async fn forward_op(
     addr: &str,
     op: &ForwardedRouterOp,
     deadline: tokio::time::Instant,
+    security: &TransportSecurity,
+    role: Option<&metadb_security::RolePresentation>,
 ) -> Result<ForwardedRouterOut> {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
@@ -178,16 +186,14 @@ pub async fn forward_op(
             "forwarded read exceeded the routing deadline".to_string(),
         ));
     }
-    let url = if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
-    } else {
-        format!("http://{addr}")
-    };
+    let url = security.prepare_url(addr).map_err(|error| {
+        MetaDbError::RpcError(format!("invalid leader address {addr}: {error}"))
+    })?;
     let endpoint = Endpoint::from_shared(url.clone())
         .map_err(|error| MetaDbError::RpcError(format!("invalid leader address {url}: {error}")))?
         .connect_timeout(remaining.min(Duration::from_secs(3)))
         .timeout(remaining);
-    let channel: Channel = match tokio::time::timeout(remaining, endpoint.connect()).await {
+    let channel: Channel = match tokio::time::timeout(remaining, security.connect(endpoint)).await {
         Ok(channel) => channel.map_err(|error| {
             MetaDbError::RpcError(format!("connect to leader {url} failed: {error}"))
         })?,
@@ -201,6 +207,7 @@ pub async fn forward_op(
         channel,
         ForwardAuth {
             secret: secret.to_string(),
+            role: role.cloned(),
         },
     );
     let payload =

@@ -34,7 +34,7 @@
 
 ### `cluster status`
 
-`cell_id = 0` で `GetRoutes` を呼びます。各シャードについて `shard`、`cell`、`leader`、投票者数、`epoch=(conf_ver, ver)`、`dual_mode`、`jumbo` を印字します。It then prints local `CELL_CONTROL_PLANE` placement rows (`phase`, `phase_code`, `dedicated_node`, `dominant_pid`, `moves`, attempt timestamps, `reason`) and `placement_automatic_transfer_enabled=false`. Those rows are not routes. A remote cell contributes no placement rows. It does not print disk free space, QPS, Raft watermarks, or `MOVE_STAGED` / `MOVE_LIVE`. The reconciler does not publish phase `recorded` and does not stamp `transfer_attempt_unix_ms`.
+`cell_id = 0` で `GetRoutes` を呼びます。各シャードについて `shard`、`cell`、`leader`、投票者数、`epoch=(conf_ver, ver)`、`dual_mode`、`jumbo` を印字します。It then prints local `CELL_CONTROL_PLANE` placement rows (`phase`, `phase_code`, `dedicated_node`, `dominant_pid`, `moves`, attempt timestamps, `reason`) and `placement_automatic_transfer_enabled=false`. Those rows are not routes. A remote cell contributes no placement rows. It does not print disk free space, QPS, Raft watermarks, or `MOVE_STAGED` / `MOVE_LIVE`. The reconciler does not publish phase `recorded`. It does not stamp `transfer_attempt_unix_ms`. A new row stores 0. A later reconcile keeps a non-zero value already in the file.
 
 ### `shard list --cell-id <u64>`
 
@@ -42,7 +42,7 @@
 
 ### `shard split --shard-id <u64>`
 
-`TriggerShardSplit` を呼び、シャードが `shard_split_threshold_bytes` 未満でも分割検査を強制します。`split_executed`、`child_shard_id`、およびローカル placement 行があるときの phase を印字します。`split_executed=false` は子シャードを作らなかったことを意味します（キーが 2 つ未満、またはジャンボ候補が placement 行を書いても `split_executed=false` のまま）。
+`TriggerShardSplit` を呼び、シャードが `shard_split_threshold_bytes` 未満でも分割検査を強制します。On success it prints `split_executed`, `child_shard_id`, and the placement fields. When no placement row exists, including an ordinary split, the line is `placement_phase=` and `placement_phase_code=0`. Code 0 is only that no-record case. Stored rows use codes 1–4. `split_executed=false` は子シャードを作らなかったことを意味します（キーが 2 つ未満、またはジャンボ候補が placement 行を書いても `split_executed=false` のまま）。
 
 ### `shard enable-dual-mode --shard-id <u64> --pid <u64>`
 
@@ -73,7 +73,7 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 
 ## メトリクス
 
-`node.metrics_listen_addr` を設定します（例: `127.0.0.1:9100`）。`open_and_serve` がそのアドレスで TCP 接続を受けます。`GET /metrics` は Prometheus テキストを返します。他のパスは 404、他のメソッドは 405 です。`[security].shared_secret` が空でないとき、このリスナーのすべての要求は `Authorization: Bearer <shared_secret>` を送らなければなりません。欠落、空、または誤ったベアラは HTTP 401 を返し、本体はメトリクス本文ではありません。`/status` への要求も同じです。An empty secret does not start the process on any address, including loopback, unless `allow_unauthenticated = true`. That flag is loopback-only and still refuses a wildcard or other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. This listener does not terminate TLS.
+`node.metrics_listen_addr` を設定します（例: `127.0.0.1:9100`）。`open_and_serve` がそのアドレスで TCP 接続を受けます。`GET /metrics` は Prometheus テキストを返します。他のパスは 404、他のメソッドは 405 です。`[security].shared_secret` が空でないとき、このリスナーのすべての要求は `Authorization: Bearer <shared_secret>` を送らなければなりません。欠落、空、または誤ったベアラは HTTP 401 を返し、本体はメトリクス本文ではありません。`/status` への要求も同じです。An empty secret does not start the process on any address, including loopback, unless `allow_unauthenticated = true`. That flag is loopback-only and still refuses a wildcard or other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
 
 `render_prometheus_metrics` のゲージとカウンタ:
 
@@ -95,7 +95,7 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 | `metadb_placement_phase_blocked` | gauge |
 | `metadb_placement_moves_leadership` | gauge |
 | `metadb_placement_moves_voter_replaced` | gauge |
-| `metadb_placement_rows_with_transfer_attempt` | gauge; the reconciler does not stamp this timestamp |
+| `metadb_placement_rows_with_transfer_attempt` | gauge; the reconciler does not stamp a new value and keeps one already in the file |
 | `metadb_placement_rows_with_replace_attempt` | gauge |
 | `metadb_placement_automatic_transfer_enabled` | gauge, 0 in this build |
 
@@ -148,7 +148,7 @@ There is no `metadb_raft_watermark_lag_entries` series and no per-shard placemen
 - 未知で非ゼロの `cell_id` に対する `GetRoutes` は失敗して閉じる。`StoreHeartbeat` はキャッシュ済みルートを置き換えない。
 - ジャンボ隔離はルートフラグと、ローカルノード表から選んだノード ID である。他のシャードをディスクから追い出すことはしない。
 - Registered-node liveness is fsynced in `CELL_CONTROL_PLANE`. `metadbd` persists its own record about every 3 seconds and sends it to the current leader when this process is not the leader. Descriptors on that RPC are annotations, not routes. The observation does not schedule placement. See [Scale control plane](../en/scale-control-plane-status.md).
-- A secret that contains a non-whitespace character authenticates Raft, the other three gRPC services, and the metrics listener, including `/livez`, `/readyz`, and `/healthz`, with the same bearer. An empty secret does not start the process. `allow_unauthenticated = true` is the explicit exception for literal loopback IPs (`127.0.0.0/8` or `::1`) and still refuses a wildcard bind. The hostname `localhost` is not accepted for that exception. The bound socket is checked again after listen. A whitespace-only secret is rejected and is not compared as a bearer. A usable secret combined with the flag is rejected. The process does not terminate TLS.
+- A secret that contains a non-whitespace character authenticates Raft, the other three gRPC services, and the metrics listener, including `/livez`, `/readyz`, and `/healthz`, with the same bearer. An empty secret does not start the process. `allow_unauthenticated = true` is the explicit exception for literal loopback IPs (`127.0.0.0/8` or `::1`) and still refuses a wildcard bind. The hostname `localhost` is not accepted for that exception. The bound socket is checked again after listen. A whitespace-only secret is rejected and is not compared as a bearer. A usable secret combined with the flag is rejected. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
 - `memtable_size_bytes` はアクティブな memtable を封印してフラッシュする。`max_imm_memtables` はキューに積まれた不変テーブルの数を抑える。`[raft]` timers and `max_segment_bytes` apply when a group starts. They are not reloaded from a changed file, and the segment size does not rewrite segments already on disk.
 - `hotspot-create` と `bulk-ttl-delete` の `metadb-ctl bench` は JSON 行を印字する。`bench_pid` を含むヘッダのあと、attempted、succeeded、failed とレイテンシのパーセンタイルを持つフェーズ報告が続く。要求した操作がすべて成功しない限り、プロセスは非ゼロで終了する。`--workload mixed` または `--embedded` はプロセス内のストレステストを実行する。`sql` は応答を JSON で印字し、アプリケーションエラーでは非ゼロで終了する。
 

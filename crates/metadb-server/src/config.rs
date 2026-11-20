@@ -11,6 +11,7 @@ use metadb_core::{
     CellId, CompositeKeyRange, MetaDbError, NodeId, Result, DEFAULT_MAX_CLOCK_DRIFT_MS,
 };
 use metadb_raft::RaftNodeOptions;
+use metadb_security::TlsSpec;
 use metadb_storage::{LsmEngineConfig, DEFAULT_MVCC_RETENTION_MS};
 use metadb_transport::{
     check_transport_key, PolicyFields, StartupResolution, TransportPolicy,
@@ -106,12 +107,13 @@ impl Default for StorageSection {
     }
 }
 
-/// Application-level bearer auth. This process does not terminate TLS.
+/// Application-level bearer auth, plus optional TLS material.
 ///
 /// An empty `shared_secret` does not start a listener. Loopback development
 /// without credentials requires `allow_unauthenticated = true`, and that flag
 /// still refuses every non-loopback bind. A whitespace-only secret is rejected.
-/// A non-empty secret requires the same bearer on gRPC and metrics.
+/// A non-empty secret requires the same bearer on gRPC and metrics. TLS does
+/// not replace that rule and does not assign roles.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecuritySection {
@@ -124,6 +126,102 @@ pub struct SecuritySection {
     /// Default is `false`. Setting this does not allow `0.0.0.0`, `::`, or any
     /// other non-loopback address. It cannot be combined with a usable secret.
     pub allow_unauthenticated: bool,
+    /// TLS 1.3 material. Omitted or `mode = "off"` keeps plaintext.
+    /// `tls` and `mtls` are refused before a listener exists.
+    pub tls: TlsSection,
+    /// Installed method grants. Absent means method RBAC is not installed.
+    /// Present means every gRPC method and probe is denied unless a grant lists it.
+    pub rbac: Option<RbacSection>,
+}
+
+/// `[security.rbac]`. The shared bearer is not one of these credentials.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RbacSection {
+    /// Principal this process presents on outbound RPCs.
+    pub local_principal: String,
+    pub grants: Vec<RbacGrantConfig>,
+}
+
+impl Default for RbacSection {
+    fn default() -> Self {
+        Self {
+            local_principal: String::new(),
+            grants: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for RbacSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RbacSection")
+            .field("local_principal", &self.local_principal)
+            .field("grants", &self.grants)
+            .finish()
+    }
+}
+
+/// One principal. Debug output does not include `credential`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RbacGrantConfig {
+    pub principal: String,
+    pub credential: String,
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+impl std::fmt::Debug for RbacGrantConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RbacGrantConfig")
+            .field("principal", &self.principal)
+            .field("allow", &self.allow)
+            .finish()
+    }
+}
+
+/// `[security.tls]`. Only these five keys are accepted.
+///
+/// `mode = "off"` is plaintext. `tls` verifies server certificates. `mtls`
+/// also requires and checks client certificates. Certificate bytes are not
+/// stored in this struct; [`TlsSection::to_spec`] only checks the field shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsSection {
+    /// `off`, `tls`, or `mtls`.
+    pub mode: String,
+    /// PEM certificate chain for this process, leaf first.
+    pub cert_file: String,
+    /// PEM PKCS#8 or SEC1 private key for `cert_file`.
+    pub key_file: String,
+    /// PEM trust anchors used to verify peers. Not the system root store.
+    pub ca_file: String,
+    /// Exact DNS name or IP in this process's certificate and listen address.
+    pub server_name: String,
+}
+
+impl Default for TlsSection {
+    fn default() -> Self {
+        Self {
+            mode: "off".to_string(),
+            cert_file: String::new(),
+            key_file: String::new(),
+            ca_file: String::new(),
+            server_name: String::new(),
+        }
+    }
+}
+
+impl TlsSection {
+    pub fn to_spec(&self) -> Result<TlsSpec> {
+        TlsSpec::from_fields(
+            &self.mode,
+            &self.cert_file,
+            &self.key_file,
+            &self.ca_file,
+            &self.server_name,
+        )
+        .map_err(|error| MetaDbError::CodecError(error.to_string()))
+    }
 }
 
 impl SecuritySection {
@@ -237,6 +335,7 @@ impl ServerTomlConfig {
         let parsed = ServerTomlConfig::deserialize(value)
             .map_err(|e| MetaDbError::CodecError(format!("invalid TOML config: {e}")))?;
         // Timer checks only. This does not read or rewrite [security].
+        parsed.security.tls.to_spec()?;
         parsed.raft_options.validate()?;
         // Required RDMA fails here, before a listener exists. Prefer-RDMA resolves
         // to an explicit TCP/gRPC fallback and is checked again at startup.
@@ -353,10 +452,10 @@ pub fn decode_hex_key(text: &str) -> Result<Vec<u8>> {
 /// Literal loopback after an optional `http://` prefix. Hostnames are not loopback.
 pub fn is_literal_loopback_addr(addr: &str) -> bool {
     let addr = addr.trim();
-    let addr = addr.strip_prefix("http://").unwrap_or(addr);
-    if addr.starts_with("https://") {
-        return false;
-    }
+    let addr = addr
+        .strip_prefix("https://")
+        .or_else(|| addr.strip_prefix("http://"))
+        .unwrap_or(addr);
     is_loopback_bind(addr)
 }
 
@@ -419,7 +518,7 @@ fn reject_unauthenticated_bind(addr: &str, security: &SecuritySection) -> Result
         return Ok(());
     }
     Err(MetaDbError::CodecError(format!(
-        "refusing to serve unauthenticated listener {addr}; allow_unauthenticated is loopback-only. A wildcard or other non-loopback bind requires a non-empty [security].shared_secret. This process does not terminate TLS"
+        "refusing to serve unauthenticated listener {addr}; allow_unauthenticated is loopback-only. A wildcard or other non-loopback bind requires a non-empty [security].shared_secret. TLS mode does not replace this rule"
     )))
 }
 
@@ -504,7 +603,7 @@ fn is_secret_key(key: &str) -> bool {
 fn security_key_error(key: &str) -> MetaDbError {
     if is_tls_key(key) {
         MetaDbError::CodecError(format!(
-            "refusing to start: `{key}` is not a supported TLS setting. This process does not terminate TLS and will not serve plaintext while a TLS option is present. Terminate TLS in an external proxy, then remove `{key}`"
+            "refusing to start: `{key}` is not a supported TLS setting. TLS is configured only by [security.tls] (mode, cert_file, key_file, ca_file, server_name). An unrecognized TLS option does not fall open to plaintext"
         ))
     } else {
         MetaDbError::CodecError(format!(
@@ -526,6 +625,14 @@ fn reject_unsupported_security_keys(value: &toml::Value) -> Result<()> {
             ));
         };
         for (key, child) in table {
+            if key == "tls" {
+                reject_tls_table(child)?;
+                continue;
+            }
+            if key == "rbac" {
+                reject_rbac_table(child)?;
+                continue;
+            }
             if key != "shared_secret" && key != "allow_unauthenticated" {
                 return Err(security_key_error(key));
             }
@@ -545,7 +652,111 @@ fn reject_unsupported_security_keys(value: &toml::Value) -> Result<()> {
     Ok(())
 }
 
-/// Rejects secret and TLS keys anywhere except the direct `[security].shared_secret` field.
+const TLS_TABLE_KEYS: &[&str] = &["mode", "cert_file", "key_file", "ca_file", "server_name"];
+
+fn reject_rbac_table(value: &toml::Value) -> Result<()> {
+    let Some(table) = value.as_table() else {
+        return Err(MetaDbError::CodecError(
+            "refusing to start: [security.rbac] must be a table".to_string(),
+        ));
+    };
+    for (key, child) in table {
+        match key.as_str() {
+            "local_principal" => {
+                if !child.is_str() {
+                    return Err(MetaDbError::CodecError(
+                        "refusing to start: [security.rbac].local_principal must be a string"
+                            .to_string(),
+                    ));
+                }
+            }
+            "grants" => reject_rbac_grants(child)?,
+            _ => {
+                return Err(MetaDbError::CodecError(format!(
+                    "refusing to start: unrecognized [security.rbac] key `{key}`. The accepted keys are local_principal and grants"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_rbac_grants(value: &toml::Value) -> Result<()> {
+    let Some(items) = value.as_array() else {
+        return Err(MetaDbError::CodecError(
+            "refusing to start: [security.rbac].grants must be an array of tables".to_string(),
+        ));
+    };
+    for item in items {
+        let Some(table) = item.as_table() else {
+            return Err(MetaDbError::CodecError(
+                "refusing to start: each [[security.rbac.grants]] entry must be a table"
+                    .to_string(),
+            ));
+        };
+        for (key, child) in table {
+            match key.as_str() {
+                "principal" => {
+                    if !child.is_str() {
+                        return Err(MetaDbError::CodecError(
+                            "refusing to start: [security.rbac.grants].principal must be a string"
+                                .to_string(),
+                        ));
+                    }
+                }
+                "credential" => {
+                    if !child.is_str() {
+                        return Err(MetaDbError::CodecError(
+                            "refusing to start: [security.rbac.grants].credential must be a string"
+                                .to_string(),
+                        ));
+                    }
+                }
+                "allow" => {
+                    let Some(entries) = child.as_array() else {
+                        return Err(MetaDbError::CodecError(
+                            "refusing to start: [security.rbac.grants].allow must be an array of strings".to_string(),
+                        ));
+                    };
+                    if entries.iter().any(|entry| !entry.is_str()) {
+                        return Err(MetaDbError::CodecError(
+                            "refusing to start: [security.rbac.grants].allow entries must be strings"
+                                .to_string(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(MetaDbError::CodecError(format!(
+                        "refusing to start: unrecognized RBAC grant key `{key}`"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_tls_table(value: &toml::Value) -> Result<()> {
+    let Some(table) = value.as_table() else {
+        return Err(MetaDbError::CodecError(
+            "refusing to start: [security.tls] must be a table. The accepted keys are mode, cert_file, key_file, ca_file, and server_name".to_string(),
+        ));
+    };
+    for (key, child) in table {
+        if !TLS_TABLE_KEYS.contains(&key.as_str()) {
+            return Err(security_key_error(key));
+        }
+        if !child.is_str() {
+            return Err(MetaDbError::CodecError(format!(
+                "refusing to start: [security.tls].{key} must be a string"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects secret and TLS keys anywhere except `[security].shared_secret` and
+/// the exact `[security.tls]` keys.
 /// Tables and arrays are walked, including `[node.transport]` and `[[listeners]]`.
 fn reject_nested_security_keys(value: &toml::Value) -> Result<()> {
     match value {
@@ -708,7 +919,10 @@ mod tests {
             "#,
         );
         let tls_err = tls.unwrap_err().to_string();
-        assert!(tls_err.contains("does not terminate TLS"), "{tls_err}");
+        assert!(
+            tls_err.contains("does not fall open to plaintext"),
+            "{tls_err}"
+        );
 
         let misplaced = ServerTomlConfig::from_toml_str(
             r#"
@@ -730,7 +944,7 @@ mod tests {
         assert!(section
             .unwrap_err()
             .to_string()
-            .contains("does not terminate TLS"));
+            .contains("does not fall open to plaintext"));
 
         let nested = ServerTomlConfig::from_toml_str(
             r#"
@@ -744,7 +958,7 @@ mod tests {
         );
         let nested_err = nested.unwrap_err().to_string();
         assert!(
-            nested_err.contains("does not terminate TLS"),
+            nested_err.contains("does not fall open to plaintext"),
             "{nested_err}"
         );
 
@@ -758,7 +972,7 @@ mod tests {
         );
         let listeners_err = listeners.unwrap_err().to_string();
         assert!(
-            listeners_err.contains("does not terminate TLS"),
+            listeners_err.contains("does not fall open to plaintext"),
             "{listeners_err}"
         );
 

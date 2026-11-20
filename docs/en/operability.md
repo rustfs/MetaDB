@@ -20,7 +20,7 @@ The metrics listener uses `classify_secret`, the same classification as gRPC. Th
 - `WhitespaceOnly`: the secret is spaces or other whitespace and contains no other character. `/metrics`, `/livez`, `/readyz`, and `/healthz` return HTTP 401. That includes a request whose `Authorization` value is exactly `Bearer` plus the same whitespace. Startup rejects this secret even when `allow_unauthenticated` is set. The probe does not compare it as a configured bearer.
 - `Configured`: the secret contains a non-whitespace character. `Authorization` must equal `Bearer <shared_secret>` exactly. A missing, empty, or different value is HTTP 401.
 
-`allow_unauthenticated` still refuses a wildcard or any other non-loopback address. This listener does not terminate TLS.
+`allow_unauthenticated` still refuses a wildcard or any other non-loopback address. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
 
 Only `GET` is accepted. Any other method is HTTP 405. The route is the URI path, so a query string does not select another check and cannot ask for a dump. `GET /readyz?verbose=1` is the same probe as `GET /readyz`. There is no POST, no reload, and no shutdown URL. The probes are not a management API.
 
@@ -125,7 +125,7 @@ Unlabeled gauges added for operators:
 | `metadb_placement_phase_blocked` | Rows where a required move was refused |
 | `metadb_placement_moves_leadership` | Stored `LeadershipTransferred` entries. Maintenance does not append one |
 | `metadb_placement_moves_voter_replaced` | Stored `VoterReplaced` entries |
-| `metadb_placement_rows_with_transfer_attempt` | Rows with a non-zero transfer-attempt timestamp. The reconciler does not write that timestamp |
+| `metadb_placement_rows_with_transfer_attempt` | Rows with a non-zero transfer-attempt timestamp. The reconciler does not stamp a new value. It keeps one already stored in the file |
 | `metadb_placement_rows_with_replace_attempt` | Rows with a non-zero replace-attempt timestamp |
 | `metadb_placement_automatic_transfer_enabled` | 1 only when this build calls `transfer_leader`. This build is 0 |
 

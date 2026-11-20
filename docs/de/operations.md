@@ -34,7 +34,7 @@ Der Client öffnet je Befehl einen neuen gRPC-Kanal. Er spricht nicht `RaftTrans
 
 ### `cluster status`
 
-Ruft `GetRoutes` mit `cell_id = 0` auf. Je Shard druckt es `shard`, `cell`, `leader`, Wählerzahl, `epoch=(conf_ver, ver)`, `dual_mode` und `jumbo`. It then prints local `CELL_CONTROL_PLANE` placement rows (`phase`, `phase_code`, `dedicated_node`, `dominant_pid`, `moves`, attempt timestamps, `reason`) and `placement_automatic_transfer_enabled=false`. Those rows are not routes. A remote cell contributes no placement rows. It does not print disk free space, QPS, Raft watermarks, or `MOVE_STAGED` / `MOVE_LIVE`. The reconciler does not publish phase `recorded` and does not stamp `transfer_attempt_unix_ms`.
+Ruft `GetRoutes` mit `cell_id = 0` auf. Je Shard druckt es `shard`, `cell`, `leader`, Wählerzahl, `epoch=(conf_ver, ver)`, `dual_mode` und `jumbo`. It then prints local `CELL_CONTROL_PLANE` placement rows (`phase`, `phase_code`, `dedicated_node`, `dominant_pid`, `moves`, attempt timestamps, `reason`) and `placement_automatic_transfer_enabled=false`. Those rows are not routes. A remote cell contributes no placement rows. It does not print disk free space, QPS, Raft watermarks, or `MOVE_STAGED` / `MOVE_LIVE`. The reconciler does not publish phase `recorded`. It does not stamp `transfer_attempt_unix_ms`. A new row stores 0. A later reconcile keeps a non-zero value already in the file.
 
 ### `shard list --cell-id <u64>`
 
@@ -42,7 +42,7 @@ Ruft `GetRoutes` für diese Zelle auf (`0` für jede gecachte Route). Druckt `sh
 
 ### `shard split --shard-id <u64>`
 
-Ruft `TriggerShardSplit` auf, das eine Split-Prüfung erzwingt, auch wenn der Shard unter `shard_split_threshold_bytes` liegt. Druckt `split_executed`, `child_shard_id`, and the placement phase when a local row exists. `split_executed=false` heißt, der Worker hat kein Kind erzeugt (zum Beispiel weniger als zwei Schlüssel, oder ein Jumbo-Kandidat, der eine Placement-Zeile schreibt und trotzdem `split_executed=false` lässt).
+Ruft `TriggerShardSplit` auf, das eine Split-Prüfung erzwingt, auch wenn der Shard unter `shard_split_threshold_bytes` liegt. On success it prints `split_executed`, `child_shard_id`, and the placement fields. When no placement row exists, including an ordinary split, the line is `placement_phase=` and `placement_phase_code=0`. Code 0 is only that no-record case. Stored rows use codes 1–4. `split_executed=false` heißt, der Worker hat kein Kind erzeugt (zum Beispiel weniger als zwei Schlüssel, oder ein Jumbo-Kandidat, der eine Placement-Zeile schreibt und trotzdem `split_executed=false` lässt).
 
 ### `shard enable-dual-mode --shard-id <u64> --pid <u64>`
 
@@ -73,7 +73,7 @@ The separate prefix-load harness (100 prefixes × 10,000 creates, then 100,000 `
 
 ## Metriken
 
-`node.metrics_listen_addr` setzen (zum Beispiel `127.0.0.1:9100`). `open_and_serve` nimmt auf dieser Adresse TCP-Verbindungen an. `GET /metrics` liefert Prometheus-Text. Jeder andere Pfad liefert 404, jede andere Methode 405. Wenn `[security].shared_secret` nicht leer ist, muss jede Anfrage auf diesem Listener `Authorization: Bearer <shared_secret>` senden. Ein fehlender, leerer oder falscher Bearer liefert HTTP 401 und einen Rumpf, der nicht der Metriktext ist, auch für `/status`. An empty secret does not start the process on any address, including loopback, unless `allow_unauthenticated = true`. That flag is loopback-only and still refuses a wildcard or other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. This listener does not terminate TLS.
+`node.metrics_listen_addr` setzen (zum Beispiel `127.0.0.1:9100`). `open_and_serve` nimmt auf dieser Adresse TCP-Verbindungen an. `GET /metrics` liefert Prometheus-Text. Jeder andere Pfad liefert 404, jede andere Methode 405. Wenn `[security].shared_secret` nicht leer ist, muss jede Anfrage auf diesem Listener `Authorization: Bearer <shared_secret>` senden. Ein fehlender, leerer oder falscher Bearer liefert HTTP 401 und einen Rumpf, der nicht der Metriktext ist, auch für `/status`. An empty secret does not start the process on any address, including loopback, unless `allow_unauthenticated = true`. That flag is loopback-only and still refuses a wildcard or other non-loopback address. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
 
 Gauges und Counter aus `render_prometheus_metrics`:
 
@@ -95,7 +95,7 @@ Gauges und Counter aus `render_prometheus_metrics`:
 | `metadb_placement_phase_blocked` | gauge |
 | `metadb_placement_moves_leadership` | gauge |
 | `metadb_placement_moves_voter_replaced` | gauge |
-| `metadb_placement_rows_with_transfer_attempt` | gauge; the reconciler does not stamp this timestamp |
+| `metadb_placement_rows_with_transfer_attempt` | gauge; the reconciler does not stamp a new value and keeps one already in the file |
 | `metadb_placement_rows_with_replace_attempt` | gauge |
 | `metadb_placement_automatic_transfer_enabled` | gauge, 0 in this build |
 
@@ -148,7 +148,7 @@ Die Varianten sind in `crates/metadb-core/src/error.rs` definiert. gRPC-Methoden
 - `GetRoutes` scheitert geschlossen bei einer unbekannten `cell_id` ungleich null. `StoreHeartbeat` ersetzt zwischengespeicherte Routen nicht.
 - Jumbo-Isolation ist ein Routenflag plus eine Knotenkennung aus der lokalen Knotentabelle. Sie verdrängt andere Shards nicht von einer Platte.
 - Registered-node liveness is fsynced in `CELL_CONTROL_PLANE`. `metadbd` persists its own record about every 3 seconds and sends it to the current leader when this process is not the leader. Descriptors on that RPC are annotations, not routes. The observation does not schedule placement. See [Scale control plane](../en/scale-control-plane-status.md).
-- A secret that contains a non-whitespace character authenticates Raft, the other three gRPC services, and the metrics listener, including `/livez`, `/readyz`, and `/healthz`, with the same bearer. An empty secret does not start the process. `allow_unauthenticated = true` is the explicit exception for literal loopback IPs (`127.0.0.0/8` or `::1`) and still refuses a wildcard bind. The hostname `localhost` is not accepted for that exception. The bound socket is checked again after listen. A whitespace-only secret is rejected and is not compared as a bearer. A usable secret combined with the flag is rejected. The process does not terminate TLS.
+- A secret that contains a non-whitespace character authenticates Raft, the other three gRPC services, and the metrics listener, including `/livez`, `/readyz`, and `/healthz`, with the same bearer. An empty secret does not start the process. `allow_unauthenticated = true` is the explicit exception for literal loopback IPs (`127.0.0.0/8` or `::1`) and still refuses a wildcard bind. The hostname `localhost` is not accepted for that exception. The bound socket is checked again after listen. A whitespace-only secret is rejected and is not compared as a bearer. A usable secret combined with the flag is rejected. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
 - `memtable_size_bytes` versiegelt die aktive Memtable und schreibt sie aus. `max_imm_memtables` begrenzt die eingereihten unveränderlichen Tabellen. `[raft]` timers and `max_segment_bytes` apply when a group starts. They are not reloaded from a changed file, and the segment size does not rewrite segments already on disk.
 - `metadb-ctl bench` für `hotspot-create` und `bulk-ttl-delete` druckt JSON-Zeilen: einen Kopf mit `bench_pid`, dann Phasenberichte mit attempted, succeeded, failed und Latenzperzentilen. Der Prozess endet mit einem Fehler, wenn nicht jede angeforderte Operation gelingt. `--workload mixed` oder `--embedded` startet den prozessinternen Stress-Harness. `sql` druckt die Antwort als JSON und endet bei einem Anwendungsfehler mit einem Fehlerstatus.
 

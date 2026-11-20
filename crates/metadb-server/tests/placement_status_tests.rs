@@ -178,5 +178,26 @@ async fn placement_rows_show_up_on_ctl_and_metrics_without_claiming_a_split() {
         "{split_text}"
     );
 
+    let plain_shard = routes
+        .iter()
+        .map(|route| route.shard_id)
+        .find(|shard_id| *shard_id != leader_shard && *shard_id != blocked_shard)
+        .expect("a bootstrap shard with no placement row");
+    let plain = ctl(
+        &address,
+        &["shard", "split", "--shard-id", &plain_shard.to_string()],
+    );
+    let plain_text = String::from_utf8(plain.stdout).unwrap();
+    assert!(
+        plain.status.success(),
+        "stdout={plain_text} stderr={}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(
+        plain_text.contains("placement_phase= placement_phase_code=0"),
+        "{plain_text}"
+    );
+    assert!(plain_text.contains("split_executed=false"), "{plain_text}");
+
     cluster.shutdown().await.unwrap();
 }

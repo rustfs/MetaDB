@@ -15,7 +15,7 @@ Diese Seite folgt dem Code in `crates/`. Sie beschreibt keinen Mehrprozess-Zelle
 5. Öffnet oder bootstrapt `DurableCellManager` unter `<data_dir>/cell_<cell_id>`.
 6. Registriert diese eine Zelle bei `DurableGlobalManager` für den Schlüsselbereich `[0x01, 0x04)`.
 7. Stellt sicher, dass Wurzel-Inode `1` (`ROOT_INODE_ID`) einen Attributsatz hat.
-8. Serves four gRPC services on one listener. All four use the same bearer interceptor. When `metrics_listen_addr` is set, `GET /metrics` on that address requires the same secret. A non-empty secret rejects a missing or wrong bearer. An empty secret does not listen unless `allow_unauthenticated = true`, and that flag is loopback-only. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. This process does not terminate TLS.
+8. Serves four gRPC services on one listener. All four use the same bearer interceptor. When `metrics_listen_addr` is set, `GET /metrics` on that address requires the same secret. A non-empty secret rejects a missing or wrong bearer. An empty secret does not listen unless `allow_unauthenticated = true`, and that flag is loopback-only. A whitespace-only secret is rejected even with the flag. A usable secret combined with the flag is rejected. When `[security.tls].mode` is `off`, listeners are plaintext. `tls` and `mtls` are refused before listen. This process does not terminate TLS. See `docs/designs/transport_security.md`.
 9. Startet eine Wartungsaufgabe im Abstand von 250 ms.
 
 `metadbd` ist eine dünne Hülle: Es lädt TOML, wendet CLI-Überschreibungen an, ruft `open_and_serve` auf, ruft optional `RegisterNode` an `--cell-manager` auf und ruft bei Strg-C `shutdown` auf. Metriken werden, wenn konfiguriert, in `open_and_serve` bedient.

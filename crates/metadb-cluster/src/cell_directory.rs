@@ -386,11 +386,12 @@ fn normalize_endpoints(endpoints: &[String]) -> Result<Vec<String>> {
                 "RegisterCell endpoint is empty".to_string(),
             ));
         }
-        if endpoint.starts_with("https://") {
-            return Err(MetaDbError::ShardRoutingError(
-                "RegisterCell does not accept an https endpoint; this process does not terminate TLS"
-                    .to_string(),
-            ));
+        if let Some((scheme, _)) = endpoint.split_once("://") {
+            if scheme != "http" && scheme != "https" {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "RegisterCell endpoint scheme {scheme} is not http or https"
+                )));
+            }
         }
         if out.iter().any(|existing: &String| existing == endpoint) {
             return Err(MetaDbError::ShardRoutingError(format!(

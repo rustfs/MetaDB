@@ -16,5 +16,6 @@ This directory contains the living design specifications and adversarial zero-co
 | [`review_report.md`](./review_report.md) | Adversarial Audit (`Review & Resolve`) | Independent zero-context Goldfish subagent review findings and specification resolutions. | Phase 0 design review, not a launch pass |
 | [`../README.md`](../README.md) | Multilingual Usage Hub | User and operator documentation index across English (`en`), Japanese (`ja`), French (`fr`), Simplified Chinese (`zh`), and German (`de`). | Phase 0 Active |
 | [`rdma_transport.md`](./rdma_transport.md) | Transport policy increment | Capability negotiation and fail-closed RDMA rejection. TCP/gRPC remains the only carried transport. No RDMA backend is implemented. | Policy only |
+| [`transport_security.md`](./transport_security.md) | Transport security increment | TLS 1.3 and mTLS for gRPC, metrics, Raft, control, and admin clients. Method RBAC is explicitly not installed. | Crate-tested foundation, not a launch pass |
 
 The [codec dependency analysis](codec_dependencies.md) records CRC and serialization dependency selection, storage-format compatibility, and review coverage.

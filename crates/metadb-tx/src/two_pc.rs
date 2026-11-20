@@ -454,6 +454,8 @@ pub struct DistributedTxRouter {
     /// Hard cap past `start_hlc`. Defaults to [`MAX_2PC_LEASE_LIFETIME_MS`].
     max_lease_lifetime_ms: u64,
     forward_secret: String,
+    role: Option<metadb_security::RolePresentation>,
+    transport_security: std::sync::Arc<metadb_security::TransportSecurity>,
     pre_prepare_hold: Duration,
     post_prepare_gate: Option<Arc<TwoPcPrepareGate>>,
     abandon_after_prepare_gate: bool,
@@ -474,6 +476,8 @@ impl DistributedTxRouter {
             ttl_ms: DEFAULT_2PC_TTL_MS,
             max_lease_lifetime_ms: MAX_2PC_LEASE_LIFETIME_MS,
             forward_secret: String::new(),
+            role: None,
+            transport_security: std::sync::Arc::new(metadb_security::TransportSecurity::plaintext()),
             pre_prepare_hold: Duration::ZERO,
             post_prepare_gate: None,
             abandon_after_prepare_gate: false,
@@ -526,6 +530,26 @@ impl DistributedTxRouter {
 
     pub fn with_forward_secret(mut self, secret: impl Into<String>) -> Self {
         self.forward_secret = secret.into();
+        self
+    }
+
+    /// Outbound leader forwarding presents this principal when RBAC is installed.
+    pub fn with_role_presentation(
+        mut self,
+        role: Option<metadb_security::RolePresentation>,
+    ) -> Self {
+        self.role = role;
+        self
+    }
+
+    /// Outbound leader forwarding uses this TLS policy. The default is plaintext.
+    ///
+    /// The policy is not a role and does not change 2PC lease renewal.
+    pub fn with_transport_security(
+        mut self,
+        security: std::sync::Arc<metadb_security::TransportSecurity>,
+    ) -> Self {
+        self.transport_security = security;
         self
     }
 
@@ -1931,7 +1955,16 @@ impl DistributedTxRouter {
             let Some(addr) = self.directory.raft_peer_addr(shard_id, leader) else {
                 return Err(last);
             };
-            match forward_op(&self.forward_secret, &addr, op, deadline).await {
+            match forward_op(
+                &self.forward_secret,
+                &addr,
+                op,
+                deadline,
+                &self.transport_security,
+                self.role.as_ref(),
+            )
+            .await
+            {
                 Ok(out) => return decode(out),
                 Err(MetaDbError::NotLeader {
                     shard_id: next_shard,

@@ -12,6 +12,7 @@ metadb-core = { workspace = true }
 metadb-proto = { workspace = true }
 metadb-storage = { workspace = true }
 metadb-raft = { workspace = true }
+metadb-security = { workspace = true }
 wincode = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
