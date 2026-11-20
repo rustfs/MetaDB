@@ -18,6 +18,7 @@ pub mod jumbo_files;
 pub mod jumbo_placement;
 pub mod meta_cache;
 pub mod shard;
+pub mod shared_id_allocator;
 pub mod split_worker;
 
 pub use cell_directory::{
@@ -32,7 +33,7 @@ pub use control_plane_state::{
     heartbeat_is_scheduling_truth, StoredHeartbeat, StoredPlacement, HEARTBEAT_INTERVAL_MS,
     MAX_HEARTBEAT_SEQ_ADVANCE,
 };
-pub use global_manager::DurableGlobalManager;
+pub use global_manager::{CellPlacement, DurableGlobalManager};
 pub use id_allocator::{
     AllocIdKind, DurableIdAllocator, LocalIdBuffer, CELL_DIR_AFFINITY_BLOCK_SIZE,
     CELL_FILE_ID_BLOCK_SIZE, GLOBAL_ID_BLOCK_SIZE, GLOBAL_SHARD_ID_BLOCK_SIZE,
@@ -50,4 +51,5 @@ pub use shard::{
     PolicyShardSplitter, RaftMemberRole, RaftMembership, ShardDescriptor, ShardHealthState,
     ShardSplitMode,
 };
+pub use shared_id_allocator::SharedIdAllocator;
 pub use split_worker::{RaftShardSplitWorker, SplitCandidate, SplitCrashPoint};

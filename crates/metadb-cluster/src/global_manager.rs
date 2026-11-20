@@ -23,6 +23,20 @@ struct CellDirectory {
     records: BTreeMap<CellId, DirectoryCell>,
 }
 
+/// Which process should apply a metadata or transaction request.
+///
+/// `Local` is not a claim that this process owns the key. It means no
+/// registered remote cell contains it. The local router still fails closed
+/// when this process has no shard for that key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CellPlacement {
+    Local,
+    Remote {
+        cell_id: CellId,
+        endpoints: Vec<String>,
+    },
+}
+
 /// Top-tier Two-Tier Control Plane manager (`GlobalManager` + `MetaCache` + `DurableIdAllocator`).
 pub struct DurableGlobalManager {
     clock: Arc<HybridLogicalClock>,
@@ -249,6 +263,99 @@ impl DurableGlobalManager {
             .cloned()
     }
 
+    /// Where a set of user keys must be applied.
+    ///
+    /// `Local` means no registered remote cell contains any of the keys. The
+    /// caller serves them on this process. `Remote` means one registered remote
+    /// cell contains every key. A mix of cells, or a mix of a remote cell and a
+    /// key it does not contain, is an error. This method does not dial anyone
+    /// and does not write.
+    pub fn placement_for_keys(&self, keys: &[&[u8]]) -> Result<CellPlacement> {
+        let mut owner: Option<DirectoryCell> = None;
+        for key in keys {
+            if let Some(found) = self.remote_owning_key(key) {
+                if let Some(existing) = &owner {
+                    if existing.cell_id != found.cell_id {
+                        return Err(MetaDbError::ShardRoutingError(
+                            "request keys are owned by more than one remote cell; this process will not apply any of them locally"
+                                .to_string(),
+                        ));
+                    }
+                } else {
+                    owner = Some(found);
+                }
+            }
+        }
+        let Some(owner) = owner else {
+            return Ok(CellPlacement::Local);
+        };
+        for key in keys {
+            if !owner.range.contains_key(key) {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "request is split between this process and cell {} at {}; this process will not apply a partial request locally",
+                    owner.cell_id,
+                    owner.endpoints.join(",")
+                )));
+            }
+        }
+        if owner.endpoints.is_empty() {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "cell {} has no endpoint; this process will not apply the request locally",
+                owner.cell_id
+            )));
+        }
+        Ok(CellPlacement::Remote {
+            cell_id: owner.cell_id,
+            endpoints: owner.endpoints,
+        })
+    }
+
+    /// Where a half-open user-key range must be applied.
+    ///
+    /// A remote cell that overlaps the range but does not contain it is an
+    /// error. The caller must not serve the uncovered part locally.
+    pub fn placement_for_range(&self, start: &[u8], end: &[u8]) -> Result<CellPlacement> {
+        if start >= end {
+            return Ok(CellPlacement::Local);
+        }
+        let mut owner: Option<DirectoryCell> = None;
+        let records = self.directory.lock().unwrap().records.clone();
+        for record in records.values() {
+            if record.local || !record.range.overlaps(start, end) {
+                continue;
+            }
+            if owner.is_some() {
+                return Err(MetaDbError::ShardRoutingError(
+                    "requested range overlaps more than one remote cell; this process will not apply any of it locally"
+                        .to_string(),
+                ));
+            }
+            owner = Some(record.clone());
+        }
+        let Some(owner) = owner else {
+            return Ok(CellPlacement::Local);
+        };
+        let contained =
+            start >= owner.range.start_key.as_slice() && end <= owner.range.end_key.as_slice();
+        if !contained {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "requested range overlaps cell {} at {} and is not contained by that cell; this process will not apply a partial range locally",
+                owner.cell_id,
+                owner.endpoints.join(",")
+            )));
+        }
+        if owner.endpoints.is_empty() {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "cell {} has no endpoint; this process will not apply the request locally",
+                owner.cell_id
+            )));
+        }
+        Ok(CellPlacement::Remote {
+            cell_id: owner.cell_id,
+            endpoints: owner.endpoints,
+        })
+    }
+
     pub fn id_allocator(&self) -> &Arc<DurableIdAllocator> {
         &self.id_allocator
     }
@@ -295,7 +402,7 @@ impl DurableGlobalManager {
     fn try_route_user_key(&self, user_key: &[u8]) -> Result<RoutedShardHandle> {
         if let Some(owner) = self.remote_owning_key(user_key) {
             return Err(MetaDbError::ShardRoutingError(format!(
-                "key is owned by cell {} at {}; this process does not forward requests to another cell",
+                "key is owned by cell {} at {}; this process will not apply that key on a local shard",
                 owner.cell_id,
                 owner.endpoints.join(",")
             )));
@@ -333,7 +440,7 @@ impl DurableGlobalManager {
         }
         if let Some(owner) = self.remote_overlapping_range(start_user_key, end_user_key) {
             return Err(MetaDbError::ShardRoutingError(format!(
-                "requested range overlaps cell {} at {}; this process does not forward and does not serve a partial range",
+                "requested range overlaps cell {} at {}; this process will not apply a partial range on a local shard",
                 owner.cell_id,
                 owner.endpoints.join(",")
             )));

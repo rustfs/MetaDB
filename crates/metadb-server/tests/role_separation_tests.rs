@@ -1,13 +1,14 @@
-//! `global-manager` serves only the cell directory. `cell-manager` hosts one
-//! local cell and can publish it. `be` and `proxy` are covered in
-//! `be_proxy_tests`. The directory file is not a Raft group, and the global
-//! process does not forward a key or mint an id.
+//! `global-manager` serves the cell directory and a shared id allocator. It
+//! does not host Raft. `cell-manager` hosts one local cell and can publish it.
+//! `be` and `proxy` are covered in `be_proxy_tests`. The directory file is not
+//! a Raft group. A metadata call whose key is owned by a published cell is
+//! forwarded; the in-process router still refuses to apply that key locally.
 
 use metadb_core::ROOT_INODE_ID;
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::metadata_service_client::MetadataServiceClient;
 use metadb_proto::{
-    AllocateIdBlockRequest, CreateFileRequest, GetRoutesRequest, RegisterCellRequest,
+    AllocateIdBlockRequest, CreateFileRequest, GetRoutesRequest, LookupRequest, RegisterCellRequest,
 };
 use metadb_server::{PersistentMetaDbCluster, ServerRole, ServerTomlConfig};
 use tempfile::tempdir;
@@ -94,14 +95,14 @@ async fn global_manager_publishes_a_cell_and_does_not_host_shards() {
     assert_eq!(global.metrics_snapshot().cells_total, 1);
     assert_eq!(global.metrics_snapshot().shards_total, 0);
 
-    let forwarded = global
+    let local_refusal = global
         .tx_router()
         .dirstat(ROOT_INODE_ID)
         .await
-        .expect_err("the directory process does not forward");
+        .expect_err("the in-process router does not apply a remote key locally");
     assert!(
-        forwarded.to_string().contains("does not forward"),
-        "{forwarded}"
+        local_refusal.to_string().contains("will not apply"),
+        "{local_refusal}"
     );
     let mut meta = MetadataServiceClient::connect(format!("http://{global_addr}"))
         .await
@@ -120,21 +121,57 @@ async fn global_manager_publishes_a_cell_and_does_not_host_shards() {
         .await
         .unwrap()
         .into_inner();
-    let created = created.error.expect("create stays on the cell").message;
-    assert!(created.contains("does not forward"), "{created}");
+    assert!(
+        created.error.is_none(),
+        "create is forwarded to the published cell: {:?}",
+        created.error
+    );
+    let mut cell_meta = MetadataServiceClient::connect(format!("http://{cell_addr}"))
+        .await
+        .unwrap();
+    let found = cell_meta
+        .lookup(LookupRequest {
+            header: None,
+            pid: ROOT_INODE_ID,
+            name: "not-here".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(found.error.is_none(), "{:?}", found.error);
+    assert!(found.found, "the forwarded create landed on the cell");
+    assert_eq!(global.metrics_snapshot().shards_total, 0);
 
     let allocated = global_cp
         .allocate_id_block(AllocateIdBlockRequest {
             request_uuid_be: Vec::new(),
-            id_kind: 1,
-            count: 1,
+            id_kind: 3,
+            count: 4,
             preferred_shard_id: 0,
         })
         .await
         .unwrap()
         .into_inner();
-    let allocated = allocated.error.expect("no id minting").message;
-    assert!(allocated.contains("does not allocate"), "{allocated}");
+    assert!(allocated.error.is_none(), "{:?}", allocated.error);
+    let allocated_again = global_cp
+        .allocate_id_block(AllocateIdBlockRequest {
+            request_uuid_be: Vec::new(),
+            id_kind: 3,
+            count: 4,
+            preferred_shard_id: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        allocated_again.error.is_none(),
+        "{:?}",
+        allocated_again.error
+    );
+    assert_eq!(
+        allocated_again.start_id,
+        allocated.start_id + allocated.count
+    );
 
     let mut cell_cp = ControlPlaneServiceClient::connect(format!("http://{cell_addr}"))
         .await
@@ -174,6 +211,22 @@ async fn global_manager_publishes_a_cell_and_does_not_host_shards() {
     assert!(again.error.is_none(), "{:?}", again.error);
     assert_eq!(again.shards.len(), 1);
     assert_eq!(reopened.metrics_snapshot().shards_total, 0);
+    let resumed = reopened_cp
+        .allocate_id_block(AllocateIdBlockRequest {
+            request_uuid_be: Vec::new(),
+            id_kind: 3,
+            count: 4,
+            preferred_shard_id: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resumed.error.is_none(), "{:?}", resumed.error);
+    assert_eq!(
+        resumed.start_id,
+        allocated_again.start_id + allocated_again.count,
+        "restart must not reissue a granted block"
+    );
 
     reopened.shutdown().await.unwrap();
     cell.shutdown().await.unwrap();
