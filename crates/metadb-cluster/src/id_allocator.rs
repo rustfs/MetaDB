@@ -422,8 +422,10 @@ impl DurableIdAllocator {
     /// Acquires a monotonic fenced `DirRenameLease` (`Resolution B13`), rejecting concurrent leases
     /// until the active lease is released or expired.
     ///
-    /// `max_lifetime_ms` is the hard cap measured from this grant. Renewal can push
-    /// `expire_hlc` forward, but not past `now + max_lifetime_ms`.
+    /// `max_lifetime_ms` is the hard cap measured from this grant. A requested TTL
+    /// above that cap is rejected and does not change the allocator. The granted
+    /// TTL is still at least 100 ms, and renewal cannot move `expire_hlc` past
+    /// `now + max(max_lifetime_ms, 100)`.
     pub fn acquire_dir_rename_lease(
         &self,
         now_hlc: HlcTimestamp,
@@ -439,13 +441,21 @@ impl DurableIdAllocator {
                 ));
             }
         }
+        // The granted TTL is at least 100 ms, so the cap has to allow that floor.
+        // A caller-supplied TTL must not raise the cap. Reject it before any
+        // token or deadline is persisted.
+        let cap = max_lifetime_ms.max(100);
         let ttl = ttl_ms.max(100);
-        let lifetime = max_lifetime_ms.max(ttl);
+        if ttl > cap {
+            return Err(MetaDbError::LeaseRenewRejected(
+                LeaseRenewReject::RenameTtlExceedsCap,
+            ));
+        }
         let expire_ms = now_hlc
             .physical_ms()
             .checked_add(ttl)
             .ok_or_else(|| MetaDbError::StorageIoError("rename lease TTL overflow".to_string()))?;
-        let deadline_ms = now_hlc.physical_ms().checked_add(lifetime).ok_or_else(|| {
+        let deadline_ms = now_hlc.physical_ms().checked_add(cap).ok_or_else(|| {
             MetaDbError::StorageIoError("rename lease lifetime overflow".to_string())
         })?;
         let mut next = guard.clone();

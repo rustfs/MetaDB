@@ -45,6 +45,12 @@ pub const SYSTEM_PREFIX_TXN_RECORD: u8 = 0x06;
 pub const SYSTEM_PREFIX_SPILLED_AUX_OUTBOX: u8 = 0x07;
 /// Per-origin-shard last emitted quota cursor. Stays on the origin shard across splits.
 pub const SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR: u8 = 0x08;
+/// Value of a prepared user key at that transaction's `start_hlc`.
+///
+/// `[0x0D][txn_id: 16B BE][user_key]`. Written into the same L0 flush as the
+/// collapsed user key. It is not a field of `WriteIntentRecord` or `TxnStatusRecord`.
+/// `0x09` through `0x0C` are node-identity and proposal-receipt keys.
+pub const SYSTEM_PREFIX_LEASE_PREIMAGE: u8 = 0x0D;
 
 /// Prefix of a replicated write that carries a proposal id.
 pub const PROPOSAL_ENVELOPE_MAGIC: &[u8] = b"MDBP0001";

@@ -8,6 +8,8 @@
 //! - `0x08`: `OriginQuotaCursor` (`[0x08][uid: 8B BE]`), retained after the task is acknowledged
 //! - `0x0A`: committed write-proposal receipt (`[0x0A][proposal_id: 16B BE]`). A receipt is
 //!   deleted once a later committed HLC is more than 10 minutes ahead of the receipt's HLC.
+//! - `0x0D`: 2PC lease pre-image (`[0x0D][txn_id: 16B BE][user_key]`). The value is the
+//!   prepared key at `start_hlc`, version 1 plus CRC32C. It is dropped when that lease ends.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,8 +21,9 @@ use crate::error::{MetaDbError, Result};
 use crate::hlc::HlcTimestamp;
 use crate::schema::{
     FileId, InodeId, MetaKey, ShardId, UserId, SYSTEM_PREFIX_DIR_SHARD_DELTA,
-    SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR, SYSTEM_PREFIX_SPILLED_AUX_OUTBOX, SYSTEM_PREFIX_TXN_RECORD,
-    SYSTEM_PREFIX_WRITE_INTENT, TABLE_PREFIX_META, TABLE_PREFIX_SECONDARY_INDEX,
+    SYSTEM_PREFIX_LEASE_PREIMAGE, SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR,
+    SYSTEM_PREFIX_SPILLED_AUX_OUTBOX, SYSTEM_PREFIX_TXN_RECORD, SYSTEM_PREFIX_WRITE_INTENT,
+    TABLE_PREFIX_META, TABLE_PREFIX_SECONDARY_INDEX,
 };
 
 const SYSTEM_CODEC_V1: u8 = 1;
@@ -522,6 +525,89 @@ impl AuxOutboxEntry {
     }
 }
 
+const LEASE_PREIMAGE_CODEC_V1: u8 = 1;
+const LEASE_PREIMAGE_TOMBSTONE: u8 = 0;
+const LEASE_PREIMAGE_VALUE: u8 = 1;
+
+/// Bytes captured for one prepared user key. Not part of `WriteIntentRecord`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeasePreimageValue {
+    Tombstone,
+    Value(Vec<u8>),
+}
+
+/// `[0x0D][txn_id: 16B BE][user_key]`.
+pub fn lease_preimage_key(txn_id: u128, user_key: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17 + user_key.len());
+    key.extend_from_slice(&lease_preimage_prefix(txn_id));
+    key.extend_from_slice(user_key);
+    key
+}
+
+/// Inclusive lower bound for every pre-image of `txn_id`.
+pub fn lease_preimage_prefix(txn_id: u128) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(SYSTEM_PREFIX_LEASE_PREIMAGE);
+    key.extend_from_slice(&txn_id.to_be_bytes());
+    key
+}
+
+/// Exclusive upper bound for every pre-image of `txn_id`.
+pub fn lease_preimage_prefix_end(txn_id: u128) -> Vec<u8> {
+    match txn_id.checked_add(1) {
+        Some(next) => lease_preimage_prefix(next),
+        None => vec![SYSTEM_PREFIX_LEASE_PREIMAGE.saturating_add(1)],
+    }
+}
+
+fn split_lease_preimage_key(storage_key: &[u8]) -> Option<(u128, Vec<u8>)> {
+    if storage_key.len() < 17 || storage_key[0] != SYSTEM_PREFIX_LEASE_PREIMAGE {
+        return None;
+    }
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&storage_key[1..17]);
+    Some((u128::from_be_bytes(id), storage_key[17..].to_vec()))
+}
+
+/// Version 1 body is `version || hlc u64 BE || tag || payload`, then a CRC32C trailer.
+///
+/// A corrupt, truncated, or unknown-version record returns `None`. Callers skip it.
+pub fn encode_lease_preimage(hlc: HlcTimestamp, value: &LeasePreimageValue) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(LEASE_PREIMAGE_CODEC_V1);
+    out.extend_from_slice(&hlc.as_u64().to_be_bytes());
+    match value {
+        LeasePreimageValue::Tombstone => out.push(LEASE_PREIMAGE_TOMBSTONE),
+        LeasePreimageValue::Value(bytes) => {
+            out.push(LEASE_PREIMAGE_VALUE);
+            out.extend_from_slice(bytes);
+        }
+    }
+    append_crc32c_be(&mut out);
+    out
+}
+
+/// Returns `None` for a bad key, a bad checksum, a short body, or an unknown version.
+pub fn decode_lease_preimage(
+    storage_key: &[u8],
+    raw: &[u8],
+) -> Option<(u128, Vec<u8>, HlcTimestamp, LeasePreimageValue)> {
+    let (txn_id, user_key) = split_lease_preimage_key(storage_key)?;
+    let body = verify_crc32c_be(raw, "LeasePreimage").ok()?;
+    if body.len() < 10 || body[0] != LEASE_PREIMAGE_CODEC_V1 {
+        return None;
+    }
+    let mut hlc_bytes = [0u8; 8];
+    hlc_bytes.copy_from_slice(&body[1..9]);
+    let hlc = HlcTimestamp(u64::from_be_bytes(hlc_bytes));
+    let value = match body[9] {
+        LEASE_PREIMAGE_TOMBSTONE if body.len() == 10 => LeasePreimageValue::Tombstone,
+        LEASE_PREIMAGE_VALUE => LeasePreimageValue::Value(body[10..].to_vec()),
+        _ => return None,
+    };
+    Some((txn_id, user_key, hlc, value))
+}
+
 /// Computes the logical `affinity_key` in `[0x01, 0x04)` used to partition shard entries
 /// during `ExecuteSplit` (`sharding_and_control_plane.md` §5.3):
 /// - `0x01..=0x03`: `Some(raw_key)`
@@ -554,9 +640,92 @@ pub fn affinity_key_for_raw_entry(raw_key: &[u8], raw_value: &[u8]) -> Result<Op
             Ok(Some(rec.primary_key))
         }
         SYSTEM_PREFIX_SPILLED_AUX_OUTBOX | SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR => Ok(None),
+        SYSTEM_PREFIX_LEASE_PREIMAGE => {
+            let (_, user_key) = split_lease_preimage_key(raw_key).ok_or_else(|| {
+                MetaDbError::CodecError("invalid lease pre-image key".to_string())
+            })?;
+            Ok(Some(user_key))
+        }
         other => Err(MetaDbError::CodecError(format!(
             "unknown keyspace prefix 0x{:02x}",
             other
         ))),
+    }
+}
+
+#[cfg(test)]
+mod lease_preimage_codec_tests {
+    use super::*;
+
+    #[test]
+    fn version_one_preimage_roundtrip_and_corrupt_records_are_rejected() {
+        let user_key = MetaKey::child(7, "kept.txt").encode();
+        let storage_key = lease_preimage_key(99, &user_key);
+        let encoded = encode_lease_preimage(
+            HlcTimestamp::new(1_000, 4),
+            &LeasePreimageValue::Value(b"v0".to_vec()),
+        );
+        let (txn_id, decoded_key, hlc, value) =
+            decode_lease_preimage(&storage_key, &encoded).unwrap();
+        assert_eq!(txn_id, 99);
+        assert_eq!(decoded_key, user_key);
+        assert_eq!(hlc, HlcTimestamp::new(1_000, 4));
+        assert_eq!(value, LeasePreimageValue::Value(b"v0".to_vec()));
+        assert_eq!(
+            affinity_key_for_raw_entry(&storage_key, &encoded).unwrap(),
+            Some(decoded_key)
+        );
+
+        let tombstone =
+            encode_lease_preimage(HlcTimestamp::new(1_000, 0), &LeasePreimageValue::Tombstone);
+        assert_eq!(
+            decode_lease_preimage(&storage_key, &tombstone).unwrap().3,
+            LeasePreimageValue::Tombstone
+        );
+
+        let mut corrupt = encoded.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+        assert!(decode_lease_preimage(&storage_key, &corrupt).is_none());
+        assert!(decode_lease_preimage(&storage_key, &encoded[..encoded.len() - 1]).is_none());
+        let mut unknown = encoded.clone();
+        unknown[0] = 2;
+        // The checksum covers the version byte, so this is also a checksum failure.
+        assert!(decode_lease_preimage(&storage_key, &unknown).is_none());
+        assert!(decode_lease_preimage(&[0x0D], &encoded).is_none());
+        assert_eq!(lease_preimage_prefix_end(u128::MAX), vec![0x0E]);
+    }
+
+    #[test]
+    fn legacy_intent_and_txn_records_do_not_carry_a_preimage_field() {
+        let intent = WriteIntentRecord {
+            txn_id: 1,
+            primary_shard_hint: 1,
+            primary_key: b"primary".to_vec(),
+            start_hlc: HlcTimestamp::new(10, 0),
+            expire_hlc: HlcTimestamp::new(20, 0),
+            rename_fence_token: None,
+            op: IntentOp::Delete {
+                attr_deltas: Vec::new(),
+                aux_specs: Vec::new(),
+            },
+        };
+        let encoded = intent.encode();
+        assert_eq!(encoded[0], 1, "WriteIntentRecord stays codec v1");
+        assert_eq!(WriteIntentRecord::decode(&encoded).unwrap(), intent);
+
+        let txn = TxnStatusRecord {
+            txn_id: 1,
+            primary_key: b"primary".to_vec(),
+            participant_keys: vec![b"primary".to_vec()],
+            pending_ack_keys: BTreeSet::new(),
+            start_hlc: HlcTimestamp::new(10, 0),
+            expire_hlc: HlcTimestamp::new(20, 0),
+            rename_fence_token: Some(3),
+            state: TxnState::Pending,
+        };
+        let encoded = txn.encode();
+        assert_eq!(encoded[0], 1, "TxnStatusRecord stays codec v1");
+        assert_eq!(TxnStatusRecord::decode(&encoded).unwrap(), txn);
     }
 }

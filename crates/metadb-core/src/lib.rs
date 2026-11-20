@@ -26,13 +26,15 @@ pub use schema::{
     MetaKey, NodeId, QuotaKey, QuotaRecord, SecondaryIndexKey, SecondaryIndexRecord, ShardId,
     UserId, ATTR_ENTRY_NAME, FILE_INODE_TAG_BIT, INODE_ATTR_ENCODED_LEN, MAX_USER_NAME_BYTES,
     PROPOSAL_ENVELOPE_MAGIC, ROOT_INODE_ID, SYSTEM_PREFIX_DIR_SHARD_DELTA,
-    SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR, SYSTEM_PREFIX_SPILLED_AUX_OUTBOX, SYSTEM_PREFIX_TXN_RECORD,
-    SYSTEM_PREFIX_WRITE_INTENT, TABLE_PREFIX_META, TABLE_PREFIX_QUOTA,
-    TABLE_PREFIX_SECONDARY_INDEX,
+    SYSTEM_PREFIX_LEASE_PREIMAGE, SYSTEM_PREFIX_QUOTA_ORIGIN_CURSOR,
+    SYSTEM_PREFIX_SPILLED_AUX_OUTBOX, SYSTEM_PREFIX_TXN_RECORD, SYSTEM_PREFIX_WRITE_INTENT,
+    TABLE_PREFIX_META, TABLE_PREFIX_QUOTA, TABLE_PREFIX_SECONDARY_INDEX,
 };
 pub use system_keys::{
-    affinity_key_for_raw_entry, decode_origin_quota_cursor, encode_origin_quota_cursor,
-    AttrDeltaSpec, AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, DirShardDeltaKey,
-    DirShardDeltaRecord, IntentOp, OriginQuotaCursorKey, SpilledAuxOutboxKey, TxnRecordKey,
-    TxnState, TxnStatusRecord, WriteIntentKey, WriteIntentRecord,
+    affinity_key_for_raw_entry, decode_lease_preimage, decode_origin_quota_cursor,
+    encode_lease_preimage, encode_origin_quota_cursor, lease_preimage_key, lease_preimage_prefix,
+    lease_preimage_prefix_end, AttrDeltaSpec, AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload,
+    DirShardDeltaKey, DirShardDeltaRecord, IntentOp, LeasePreimageValue, OriginQuotaCursorKey,
+    SpilledAuxOutboxKey, TxnRecordKey, TxnState, TxnStatusRecord, WriteIntentKey,
+    WriteIntentRecord,
 };
