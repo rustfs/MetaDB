@@ -4,7 +4,7 @@
 
 MetaDB uses a WAL-less LSM storage engine and OpenRaft state machine for persistent all-in-one deployments. Multi-node Raft is exercised by integration tests; the disaggregated and multi-Cell daemon topology remains a design target.
 
-> **Implementation Status**: Persistent LSM, Raft replication, local shard splitting, and all-in-one gRPC/CLI operations have regression coverage. Only `all-in-one` starts a daemon. Other roles and remote Cell registration are rejected. See [correctness and compatibility notes](../../designs/correctness_hardening.md) before upgrading.
+> **Implementation Status**: Persistent LSM, Raft replication, local shard splitting, and gRPC/CLI operations have regression coverage. `all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` start when that role's configuration is valid. An illegal combination fails before listen. Remote cell registration is stored after the endpoint's routes cover the requested range. This is not a disaggregated production deployment. See [correctness and compatibility notes](../../designs/correctness_hardening.md) before upgrading.
 
 ---
 
@@ -45,7 +45,7 @@ allow_unauthenticated = true
 
 ### Launching Standalone Node
 
-Rust **1.100.0** is pinned in `rust-toolchain.toml`. Only `--role all-in-one` starts a process. `be`, `proxy`, `cell-manager`, and `global-manager` are parsed but rejected: this binary does not trim subsystems by role.
+Rust **1.100.0** is pinned in `rust-toolchain.toml`. `--role all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` start a process when the configuration is valid. An illegal combination fails before listen. An unknown role string is `unsupported --role` from `metadbd` and does not reach `open_and_serve`. This is not a disaggregated production deployment.
 
 ```bash
 metadbd --config /etc/metadb/standalone.toml

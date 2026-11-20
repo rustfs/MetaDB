@@ -157,7 +157,7 @@ Variants are defined in `crates/metadb-core/src/error.rs`. gRPC methods usually 
 | `ConsensusError` | Not enough registered nodes, learner catch-up timeout (10 s), a membership change that cannot be planned yet, or a Raft storage or stopped-node failure |
 | `SqlParseError` | Statement is not one of the 20 templates |
 
-`CodecError` is also the type used for the unimplemented-role rejection and for bad TOML.
+`CodecError` is the type used for an illegal role combination and for bad TOML. `be`, `proxy`, `cell-manager`, and `global-manager` are not that rejection: they start when the configuration is valid. An unknown `--role` string returns `unsupported --role` from `metadbd` before `open_and_serve`.
 
 ## Known limitations
 

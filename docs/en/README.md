@@ -12,7 +12,7 @@ The workspace version is `0.1.0` (Apache-2.0). The Rust toolchain is pinned to *
 
 ## What one process actually runs
 
-`metadbd` and `PersistentMetaDbCluster::open_and_serve` start a single **all-in-one** process:
+The default `metadbd` process is **all-in-one**. `be`, `proxy`, `cell-manager`, and `global-manager` also start when their configuration is valid. An all-in-one process has:
 
 - one data directory
 - one cell (`node.cell_id`, default `1`)
