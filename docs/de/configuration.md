@@ -12,7 +12,7 @@ A key fails parsing when its normalized form (lowercase, hyphens become undersco
 | :--- | :--- | :--- |
 | `node.node_id` | `1` | Ja. Raft-Knotenkennung und Bootstrap-Peer |
 | `node.cell_id` | `1` | Ja. Verzeichnisname `cell_<id>` und die einzige in diesem Prozess registrierte Zelle |
-| `node.role` | `all-in-one` | Ja. Jeder andere Wert liefert einen Fehler |
+| `node.role` | `all-in-one` | Yes. `all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` start when that role's configuration is valid. An illegal combination fails before listen. An unknown `--role` returns `unsupported --role` from `metadbd`, not an unimplemented-role `CodecError` |
 | `node.data_dir` | `./metadb-data` | Ja |
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | Ja. Bind-Adresse |
 | `node.metrics_listen_addr` | nicht gesetzt | Applied only when set. Separate TCP listener. An empty secret does not listen unless `allow_unauthenticated = true`, and that flag is loopback-only |
@@ -81,7 +81,7 @@ An empty secret does not start the process. Loopback is not an implicit exceptio
 
 ## Was sich nicht konfigurieren lässt
 
-- Zuschneiden der Teilsysteme nach Rolle. Das Rollenfeld ist ein Zulassen/Ablehnen-Schalter, keine Funktionsmenge.
+- Trimming every role except `all-in-one` out of the process. `be`, `proxy`, `cell-manager`, and `global-manager` start when that role's configuration is valid. An illegal combination fails before listen. This is not a disaggregated production deployment and not a production MetaCache of every shard.
 - Peer-Listen, Wählermengen oder ein Join-Token. Die Membership beginnt als dieser eine Prozess. Weitere Peers erscheinen erst nach `RegisterNode` plus `ScaleShardReplicas`, und diese Peers müssen bereits Raft-Mitglieder sein, die `RaftTransportService` für dieselben Shard-Logs sprechen. Ein zweiter all-in-one-Prozess tut das nicht. Siehe [Betrieb](./operations.md).
 - An arbitrary key slice as a cell range. `cell_start_key` and `cell_end_key` must be a contiguous union of whole tables. `RegisterCell` stores a remote cell only after its routes cover that range. Join still joins the same cell and does not create a second one.
 - Locality-compaction on/off. `to_lsm_config` always enables it. Raft timers are the `[raft]` table; see [Operability](../en/operability.md).

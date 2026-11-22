@@ -2,13 +2,13 @@
 
 [Überblick](./README.md) · [English](../en/architecture.md) · [Français](../fr/architecture.md) · [日本語](../ja/architecture.md) · [简体中文](../zh/architecture.md)
 
-Diese Seite folgt dem Code in `crates/`. Sie beschreibt keinen Mehrprozess-Zelleneinsatz. Dieser Einsatz ist nicht implementiert. Siehe [Betrieb](./operations.md#bekannte-grenzen).
+This page follows the code in `crates/`. `global-manager`, `cell-manager`, `be`, and `proxy` can run as separate processes when that role's configuration is valid. `validate_role_topology` rejects an illegal combination before listen. An unknown `--role` returns `unsupported --role` from `metadbd`, not an unimplemented-role `CodecError`. This is not a disaggregated production deployment. Siehe [Betrieb](./operations.md#bekannte-grenzen).
 
 ## Prozessform
 
 `PersistentMetaDbCluster::open_and_serve` (`crates/metadb-server/src/lib.rs`):
 
-1. Weist jedes `node.role` außer `all-in-one` zurück.
+1. `be`, `proxy`, `cell-manager`, and `global-manager` start on a valid config. `be` hosts local Raft replicas and refuses `cluster.global_manager` or `cluster.upstream`. `proxy` requires one `cluster.upstream`, refuses join, a cell range, a jumbo root, and https, and does not open Raft. `global-manager` refuses a join address, a cell range, a jumbo root, an upstream, or a data directory that already has `be/` or `CELL_MANAGER_STATE`. `all-in-one` refuses `cluster.global_manager` and `cluster.upstream`. Invalid combinations return before the process binds. Opening `ShardGroupHost` and `DurableCellManager`, registering the local cell, ensuring the root inode, and the 250 ms maintenance loop below are the `all-in-one`, `cell-manager`, and `be` path. `proxy` and `global-manager` do not open those Raft groups. `global-manager` does not run that loop.
 2. An empty `shared_secret` does not start the process unless `allow_unauthenticated = true`, and that flag is loopback-only. A whitespace-only secret is rejected even with the flag. A usable secret plus the flag is rejected. A wildcard or other non-loopback address cannot use the opt-in. It then binds `node.grpc_listen_addr` (default `127.0.0.1:7800`; `127.0.0.1:0` asks the OS for a port).
 3. Öffnet `DurableIdAllocator` unter `<data_dir>/global_allocator`.
 4. Öffnet `ShardGroupHost` unter `<data_dir>/be`.
@@ -74,7 +74,7 @@ Ein Metadatenaufruf kommt entweder über den eingebetteten `DistributedTxRouter`
 
 `metadb-ctl sql` sendet `ExecuteSql` mit leerer Parameterliste, die Anweisung muss also Literale statt `?` verwenden.
 
-Das Routing nutzt `CompositeMetaCache`. Bei einem Fehltreffer oder einer Epoch-Abweichung wird der Cache aus der lokalen Zelle aufgefrischt und der Aufruf gegen die lokale Shard-Gruppe wiederholt. `DurableGlobalManager::route_user_key` sucht einen **lokalen** Shard-Handle. Es leitet die Nutzeranfrage nicht an einen anderen Prozess weiter.
+Das Routing nutzt `CompositeMetaCache`. Bei einem Fehltreffer oder einer Epoch-Abweichung wird der Cache aus der lokalen Zelle aufgefrischt und der Aufruf gegen die lokale Shard-Gruppe wiederholt. `DurableGlobalManager::route_user_key` sucht einen **lokalen** Shard-Handle. Es leitet die Nutzeranfrage nicht an einen anderen Prozess weiter. The gRPC metadata and transaction handlers forward a request contained by one registered remote cell to that cell's endpoint before calling the local router. `route_user_key` still refuses a local handle for that key. This is not a production MetaCache of every shard.
 
 ## Speicher
 
@@ -138,4 +138,4 @@ Split-Pläne liegen in `CELL_MANAGER_STATE`. Absturzpunkte, die `split_crash_rec
 | `TriggerShardSplit` | Erzwingt `maybe_split_or_isolate_shard` auf einem lokalen Shard |
 | `EnableDualModeSplit` | Setzt das lokale Routenflag. `split_name` in der Anfrage wird ignoriert |
 | `ScaleShardReplicas` | Ruft `scale_out_replicas` auf, wenn diese Zelle existiert und genug Knoten registriert sind |
-| `RegisterCell` | Stores a remote cell after its routes cover the requested range. This process does not forward those keys |
+| `RegisterCell` | Stores a remote cell after its routes cover the requested range. A later metadata or transaction request contained by that cell is forwarded to its endpoint. Join does not create a second cell. A bootstrap leader also proposes that directory and a `CELL_MANAGER_STATE` snapshot into the lowest local shard log. A `global-manager` with no shard group keeps only the local file |

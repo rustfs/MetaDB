@@ -37,12 +37,12 @@ Options de `metadbd` (`crates/metadb-server/src/bin/metadbd.rs`) :
 | `--config <chemin>` | Charge le TOML. Sans elle, `ServerTomlConfig::default()` est utilisé |
 | `--node-id <u64>` | Remplace `node.node_id` |
 | `--cell-id <u64>` | Remplace `node.cell_id` |
-| `--role <nom>` | `all-in-one`, `be`, `proxy`, `cell-manager` ou `global-manager`. Seul `all-in-one` continue |
+| `--role <nom>` | `all-in-one`, `be`, `proxy`, `cell-manager`, or `global-manager`. A valid config starts that role. An unknown name returns `unsupported --role` from `metadbd` |
 | `--listen <hôte:port>` | Remplace `node.grpc_listen_addr` |
 | `--data-dir <chemin>` | Remplace `node.data_dir` |
 | `--cell-manager <hôte:port>` | Une fois le processus démarré, appelle `RegisterNode` sur ce point de terminaison |
 
-Tout rôle autre que `all-in-one` échoue avant la liaison de l'écouteur, avec `server role ... is not implemented; only all-in-one runs a process`.
+`open_and_serve` starts `all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` when that role's configuration is valid. `validate_role_topology` rejects an illegal combination before `TcpListener::bind`. An unknown `--role` returns `unsupported --role` from `metadbd` (`crates/metadb-server/src/bin/metadbd.rs`) and does not reach `open_and_serve`. It is not an unimplemented-role `CodecError`. This is not a disaggregated production deployment.
 
 `metadbd` with no config file uses an empty `shared_secret` and `allow_unauthenticated = false`, so that process does not start. The file below is the explicit loopback development opt-in. It is not a credential. Bind only a literal loopback IP (`127.0.0.1`). The hostname `localhost` is not accepted for this flag. Do not use it on a non-loopback address.
 

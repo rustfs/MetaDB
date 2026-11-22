@@ -12,7 +12,7 @@ La version de l'espace de travail est `0.1.0` (Apache-2.0). La chaîne d'outils 
 
 ## Ce qu'un processus exécute réellement
 
-`metadbd` et `PersistentMetaDbCluster::open_and_serve` démarrent un seul processus **all-in-one** :
+The default `metadbd` process is **all-in-one**. `be`, `proxy`, `cell-manager`, and `global-manager` also start when their configuration is valid. An all-in-one process has:
 
 - un répertoire de données
 - une cellule (`node.cell_id`, valeur par défaut `1`)
@@ -20,7 +20,7 @@ La version de l'espace de travail est `0.1.0` (Apache-2.0). La chaîne d'outils 
 - un écouteur gRPC qui sert `MetadataService`, `TransactionService`, `ControlPlaneService` et `RaftTransportService`
 - une boucle d'arrière-plan toutes les 250 ms qui vide les files auxiliaires, reprend les transactions 2PC, vérifie la politique de découpage et prend des instantanés des journaux Raft
 
-`ServerRole` accepte aussi l'analyse de `be`, `proxy`, `cell-manager` et `global-manager`. `open_and_serve` rejette tout rôle autre que `all-in-one`. Un second `metadbd` au répertoire vide, avec `[cluster] join` (ou `--join` / `--cell-manager`) pointé sur le leader courant, rejoint les groupes Raft de cette cellule : le leader l'ajoute comme learner puis le promeut voter. Un répertoire qui a déjà un état de cellule rouvre le Raft local et ne rejoint pas à nouveau. `RegisterCell` stores a remote cell after its routes cover the requested range and does not forward keys. `metadb-ctl cell register` without a range still sends `[01, 04)` and exits non-zero against a default cell. `GetRoutes` pour un `cell_id` non nul inconnu renvoie une erreur. `cell_id = 0` liste encore toutes les routes en cache.
+`ServerRole` accepte aussi l'analyse de `be`, `proxy`, `cell-manager` et `global-manager`. `open_and_serve` starts those roles when that role's configuration is valid. An illegal combination fails before listen. An unknown `--role` returns `unsupported --role` from `metadbd`, not an unimplemented-role `CodecError`. Un second `metadbd` au répertoire vide, avec `[cluster] join` (ou `--join` / `--cell-manager`) pointé sur le leader courant, rejoint les groupes Raft de cette cellule : le leader l'ajoute comme learner puis le promeut voter. Un répertoire qui a déjà un état de cellule rouvre le Raft local et ne rejoint pas à nouveau. `RegisterCell` stores a remote cell after its routes cover the requested range. A later request contained by that cell is forwarded. Join does not create a second cell. `metadb-ctl cell register` without a range still sends `[01, 04)` and exits non-zero against a default cell. `GetRoutes` pour un `cell_id` non nul inconnu renvoie une erreur. `cell_id = 0` liste encore toutes les routes en cache.
 
 Les découpages de shards, les découpages `(PID, name)` en mode double et les indicateurs de route jumbo s'exécutent bien dans ce processus unique. La promotion de répliques à trois votants est implémentée sur `DurableCellManager::scale_out_replicas` et couverte par des tests Raft dans un seul processus. Ce n'est pas un déploiement de trois processus `metadbd`. Voir [Exploitation](./operations.md).
 

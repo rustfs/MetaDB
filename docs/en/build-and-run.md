@@ -37,12 +37,12 @@ Debug builds use `cargo build -p metadb-server --bins` and write the same names 
 | `--config <path>` | Load TOML. Without it, `ServerTomlConfig::default()` is used |
 | `--node-id <u64>` | Overrides `node.node_id` |
 | `--cell-id <u64>` | Overrides `node.cell_id` |
-| `--role <name>` | `all-in-one`, `be`, `proxy`, `cell-manager`, or `global-manager`. Only `all-in-one` proceeds |
+| `--role <name>` | `all-in-one`, `be`, `proxy`, `cell-manager`, or `global-manager`. A valid config starts that role. An unknown name returns `unsupported --role` from `metadbd` |
 | `--listen <host:port>` | Overrides `node.grpc_listen_addr` |
 | `--data-dir <path>` | Overrides `node.data_dir` |
 | `--cell-manager <host:port>` | After the process is up, calls `RegisterNode` on that endpoint |
 
-Any role other than `all-in-one` fails before the listener is bound, with `server role ... is not implemented; only all-in-one runs a process`.
+`open_and_serve` starts `all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` when that role's configuration is valid. `validate_role_topology` rejects an illegal combination before `TcpListener::bind`. An unknown `--role` returns `unsupported --role` from `metadbd` (`crates/metadb-server/src/bin/metadbd.rs`) and does not reach `open_and_serve`. It is not an unimplemented-role `CodecError`. This is not a disaggregated production deployment.
 
 Example, loopback only. `metadbd` with no config file uses an empty `shared_secret` and `allow_unauthenticated = false`, so that process does not start. The file below is the explicit loopback opt-in. It is not a credential. Do not use it on a non-loopback address.
 
