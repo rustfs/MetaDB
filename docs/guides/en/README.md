@@ -34,7 +34,7 @@ Each status cell uses one label: **design claim**, **crate-tested**, or **multi-
 | `PID`-boundary split & `DualMode` route flag | **crate-tested**. Epoch-fenced PID split is covered in-process. `enable_dual_mode_split` persists a route flag and does not itself copy keys. | `metadb-cluster` |
 | Jumbo isolation (dedicated host) | **design claim**. Jumbo isolation in this tree is a route flag plus a node id chosen from the local node map. With one node, the flag names this process. Files stay on this host. Peer shards stay on their current host. | `metadb-cluster` |
 | 20 Parameterized SQL Templates | **crate-tested**. `sql_templates_tests` covers all 20 templates. | `metadb-proxy` |
-| `metadbd` Server Daemon & `metadb-ctl` CLI | **crate-tested**. The all-in-one binaries live in `crates/metadb-server/src/bin/`. `open_and_serve` accepts only `all-in-one`. | `metadb-server` |
+| `metadbd` Server Daemon & `metadb-ctl` CLI | **crate-tested**. The binaries live in `crates/metadb-server/src/bin/`. `open_and_serve` starts `all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` when that role's configuration is valid. An illegal combination fails before listen. An unknown `--role` returns `unsupported --role` from `metadbd`, not an unimplemented-role `CodecError`. This is not a disaggregated production deployment. | `metadb-server` |
 
 ---
 

@@ -2,13 +2,13 @@
 
 [概要](./README.md) · [English](../en/architecture.md) · [Français](../fr/architecture.md) · [Deutsch](../de/architecture.md) · [简体中文](../zh/architecture.md)
 
-このページは `crates/` のコードに従います。複数プロセスのセル配備は説明しません。その配備は実装されていません。 [運用](./operations.md#既知の制限) を参照してください。
+This page follows the code in `crates/`. `global-manager`, `cell-manager`, `be`, and `proxy` can run as separate processes when that role's configuration is valid. `validate_role_topology` rejects an illegal combination before listen. An unknown `--role` returns `unsupported --role` from `metadbd`, not an unimplemented-role `CodecError`. This is not a disaggregated production deployment. [運用](./operations.md#既知の制限) を参照してください。
 
 ## プロセスの形
 
 `PersistentMetaDbCluster::open_and_serve`（`crates/metadb-server/src/lib.rs`）は次を行います。
 
-1. `all-in-one` 以外の `node.role` を拒否する。
+1. `be`, `proxy`, `cell-manager`, and `global-manager` start on a valid config. `be` hosts local Raft replicas and refuses `cluster.global_manager` or `cluster.upstream`. `proxy` requires one `cluster.upstream`, refuses join, a cell range, a jumbo root, and https, and does not open Raft. `global-manager` refuses a join address, a cell range, a jumbo root, an upstream, or a data directory that already has `be/` or `CELL_MANAGER_STATE`. `all-in-one` refuses `cluster.global_manager` and `cluster.upstream`. Invalid combinations return before the process binds. Opening `ShardGroupHost` and `DurableCellManager`, registering the local cell, ensuring the root inode, and the 250 ms maintenance loop below are the `all-in-one`, `cell-manager`, and `be` path. `proxy` and `global-manager` do not open those Raft groups. `global-manager` does not run that loop.
 2. An empty `shared_secret` does not start the process unless `allow_unauthenticated = true`, and that flag is loopback-only. A whitespace-only secret is rejected even with the flag. A usable secret plus the flag is rejected. A wildcard or other non-loopback address cannot use the opt-in. It then binds `node.grpc_listen_addr` (default `127.0.0.1:7800`; `127.0.0.1:0` asks the OS for a port).
 3. `<data_dir>/global_allocator` で `DurableIdAllocator` を開く。
 4. `<data_dir>/be` で `ShardGroupHost` を開く。
@@ -74,7 +74,7 @@
 
 `metadb-ctl sql` はパラメータリストが空の `ExecuteSql` を送るので、文は `?` ではなくリテラルを使います。
 
-ルーティングは `CompositeMetaCache` を使います。ミスまたはエポック不一致のときは、ローカルセルからキャッシュを更新し、ローカルのシャードグループに対して再試行します。`DurableGlobalManager::route_user_key` は **ローカル** のシャードハンドルを探します。ユーザリクエストを別プロセスへ転送しません。
+ルーティングは `CompositeMetaCache` を使います。ミスまたはエポック不一致のときは、ローカルセルからキャッシュを更新し、ローカルのシャードグループに対して再試行します。`DurableGlobalManager::route_user_key` は **ローカル** のシャードハンドルを探します。ユーザリクエストを別プロセスへ転送しません。 The gRPC metadata and transaction handlers forward a request contained by one registered remote cell to that cell's endpoint before calling the local router. `route_user_key` still refuses a local handle for that key. This is not a production MetaCache of every shard.
 
 ## ストレージ
 
@@ -138,4 +138,4 @@ MVCC の版は `storage.mvcc_retention_ms`（既定 5,000）のあいだメモ�
 | `TriggerShardSplit` | ローカルシャードで `maybe_split_or_isolate_shard` を強制する |
 | `EnableDualModeSplit` | ローカルのルートフラグを立てる。リクエストの `split_name` は無視される |
 | `ScaleShardReplicas` | このセルが存在し、登録ノードが足りるときに `scale_out_replicas` を呼ぶ |
-| `RegisterCell` | Stores a remote cell after its routes cover the requested range. This process does not forward those keys |
+| `RegisterCell` | Stores a remote cell after its routes cover the requested range. A later metadata or transaction request contained by that cell is forwarded to its endpoint. Join does not create a second cell. A bootstrap leader also proposes that directory and a `CELL_MANAGER_STATE` snapshot into the lowest local shard log. A `global-manager` with no shard group keeps only the local file |

@@ -12,7 +12,7 @@ A key fails parsing when its normalized form (lowercase, hyphens become undersco
 | :--- | :--- | :--- |
 | `node.node_id` | `1` | する。Raft ノード ID とブートストラップのピア |
 | `node.cell_id` | `1` | する。ディレクトリ名 `cell_<id>` と、このプロセスが登録する唯一のセル |
-| `node.role` | `all-in-one` | する。それ以外の値はエラー |
+| `node.role` | `all-in-one` | Yes. `all-in-one`, `be`, `proxy`, `cell-manager`, and `global-manager` start when that role's configuration is valid. An illegal combination fails before listen. An unknown `--role` returns `unsupported --role` from `metadbd`, not an unimplemented-role `CodecError` |
 | `node.data_dir` | `./metadb-data` | する |
 | `node.grpc_listen_addr` | `127.0.0.1:7800` | する。バインドアドレス |
 | `node.metrics_listen_addr` | 未設定 | Applied only when set. Separate TCP listener. An empty secret does not listen unless `allow_unauthenticated = true`, and that flag is loopback-only |
@@ -81,7 +81,7 @@ An empty secret does not start the process. Loopback is not an implicit exceptio
 
 ## 設定できないもの
 
-- ロールごとのサブシステム切り出し。ロール項目は許可と拒否のスイッチであり、機能セットではありません。
+- Trimming every role except `all-in-one` out of the process. `be`, `proxy`, `cell-manager`, and `global-manager` start when that role's configuration is valid. An illegal combination fails before listen. This is not a disaggregated production deployment and not a production MetaCache of every shard.
 - ピア一覧、投票者集合、参加トークン。メンバーシップはこのプロセス 1 つから始まります。追加のピアは `RegisterNode` と `ScaleShardReplicas` のあとでのみ現れ、そのピアは同じシャードログに対してすでに `RaftTransportService` を話す Raft メンバーでなければなりません。2 つ目の all-in-one プロセスはそれをしません。 [運用](./operations.md) を参照してください。
 - An arbitrary key slice as a cell range. `cell_start_key` and `cell_end_key` must be a contiguous union of whole tables. `RegisterCell` stores a remote cell only after its routes cover that range. Join still joins the same cell and does not create a second one.
 - Locality-compaction on/off. `to_lsm_config` always enables it. Raft timers are the `[raft]` table; see [Operability](../en/operability.md).

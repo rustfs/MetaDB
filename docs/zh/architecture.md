@@ -2,13 +2,13 @@
 
 [概览](./README.md) · [English](../en/architecture.md) · [Français](../fr/architecture.md) · [Deutsch](../de/architecture.md) · [日本語](../ja/architecture.md)
 
-本页跟随 `crates/` 里的代码。它不描述多进程单元部署。那种部署没有实现。见 [运维](./operations.md#已知限制)。
+This page follows the code in `crates/`. `global-manager`, `cell-manager`, `be`, and `proxy` can run as separate processes when that role's configuration is valid. `validate_role_topology` rejects an illegal combination before listen. An unknown `--role` returns `unsupported --role` from `metadbd`, not an unimplemented-role `CodecError`. This is not a disaggregated production deployment. 见 [运维](./operations.md#已知限制)。
 
 ## 进程形态
 
 `PersistentMetaDbCluster::open_and_serve`（`crates/metadb-server/src/lib.rs`）：
 
-1. 拒绝除 `all-in-one` 以外的任何 `node.role`。
+1. `be`, `proxy`, `cell-manager`, and `global-manager` start on a valid config. `be` hosts local Raft replicas and refuses `cluster.global_manager` or `cluster.upstream`. `proxy` requires one `cluster.upstream`, refuses join, a cell range, a jumbo root, and https, and does not open Raft. `global-manager` refuses a join address, a cell range, a jumbo root, an upstream, or a data directory that already has `be/` or `CELL_MANAGER_STATE`. `all-in-one` refuses `cluster.global_manager` and `cluster.upstream`. Invalid combinations return before the process binds. Opening `ShardGroupHost` and `DurableCellManager`, registering the local cell, ensuring the root inode, and the 250 ms maintenance loop below are the `all-in-one`, `cell-manager`, and `be` path. `proxy` and `global-manager` do not open those Raft groups. `global-manager` does not run that loop.
 2. An empty `shared_secret` does not start the process unless `allow_unauthenticated = true`, and that flag is loopback-only. A whitespace-only secret is rejected even with the flag. A usable secret plus the flag is rejected. A wildcard or other non-loopback address cannot use the opt-in. It then binds `node.grpc_listen_addr` (default `127.0.0.1:7800`; `127.0.0.1:0` asks the OS for a port).
 3. 在 `<data_dir>/global_allocator` 打开 `DurableIdAllocator`。
 4. 在 `<data_dir>/be` 打开 `ShardGroupHost`。
@@ -74,7 +74,7 @@
 
 `metadb-ctl sql` 发送参数列表为空的 `ExecuteSql`，因此语句必须使用字面量而不是 `?`。
 
-路由使用 `CompositeMetaCache`。未命中或纪元不匹配时，从本地单元刷新缓存，并对本地分片组重试。`DurableGlobalManager::route_user_key` 查找 **本地** 分片句柄。它不把用户请求转发到另一个进程。
+路由使用 `CompositeMetaCache`。未命中或纪元不匹配时，从本地单元刷新缓存，并对本地分片组重试。`DurableGlobalManager::route_user_key` 查找 **本地** 分片句柄。它不把用户请求转发到另一个进程。 The gRPC metadata and transaction handlers forward a request contained by one registered remote cell to that cell's endpoint before calling the local router. `route_user_key` still refuses a local handle for that key. This is not a production MetaCache of every shard.
 
 ## 存储
 
@@ -138,4 +138,4 @@ MVCC 版本在内存中保留 `storage.mvcc_retention_ms`（默认 5,000）。�
 | `TriggerShardSplit` | 在本地分片上强制 `maybe_split_or_isolate_shard` |
 | `EnableDualModeSplit` | 设置本地路由标志。请求中的 `split_name` 被忽略 |
 | `ScaleShardReplicas` | 若本单元存在且已注册节点足够，则调用 `scale_out_replicas` |
-| `RegisterCell` | Stores a remote cell after its routes cover the requested range. This process does not forward those keys |
+| `RegisterCell` | Stores a remote cell after its routes cover the requested range. A later metadata or transaction request contained by that cell is forwarded to its endpoint. Join does not create a second cell. A bootstrap leader also proposes that directory and a `CELL_MANAGER_STATE` snapshot into the lowest local shard log. A `global-manager` with no shard group keeps only the local file |
