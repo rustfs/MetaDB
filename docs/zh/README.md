@@ -17,12 +17,10 @@ The default `metadbd` process is **all-in-one**. `be`, `proxy`, `cell-manager`, 
 - 一个数据目录
 - 一个单元（`node.cell_id`，默认 `1`）
 - 每个分片一个 OpenRaft 投票者（就是这个进程）
-- 一个 gRPC 监听器，提供 `MetadataService`、`TransactionService`、`ControlPlaneService` 和 `RaftTransportService`
-- 每 250 ms 一次的后台循环，排空辅助出站队列、做 2PC 恢复、检查分裂策略，并对 Raft 日志做快照
+- 一个 gRPC 监听器，提供 `MetadataService`、`TransactionService`、`ControlPlaneService`、`RaftTransportService` 与标准 `grpc.health.v1.Health`（`Check` / `Watch`）
+- 每 250 ms 一次的后台循环，排空辅助出站队列（含跨 Cell `GrpcRemoteAuxSink` `ApplyAuxBatch` 投递）、执行 2PC 恢复、检查分裂策略，并对 Raft 日志做快照（启动时在 `/readyz` 返回 200 前会先完成首轮本地 Leader 分片的 2PC 恢复扫描）
 
-`ServerRole` 也会解析 `be`、`proxy`、`cell-manager` 和 `global-manager`。`open_and_serve` starts those roles when that role's configuration is valid. An illegal combination fails before listen. An unknown `--role` returns `unsupported --role` from `metadbd`, not an unimplemented-role `CodecError`.空数据目录上的第二个 `metadbd` 若把 `[cluster] join`（或 `--join` / `--cell-manager`）指到当前 leader，会加入该单元已有的 Raft 组：leader 先把它加为 learner，再提升为 voter。已经有单元状态的目录会重新打开本地 Raft，不会再次加入。`RegisterCell` stores a remote cell after its routes cover the requested range. A later request contained by that cell is forwarded. Join does not create a second cell. `metadb-ctl cell register` without a range still sends `[01, 04)` and exits non-zero against a default cell.未知且非零的 `cell_id` 上，`GetRoutes` 返回错误；`cell_id = 0` 仍列出全部缓存路由。
-
-分片分裂、双模式 `(PID, name)` 分裂和巨型路由标志确实在这一个进程里运行。把副本提升到三个投票者的代码在 `DurableCellManager::scale_out_replicas` 中，并由进程内 Raft 测试覆盖。这不是三个 `metadbd` 进程的部署。见 [运维](./operations.md)。
+`ServerRole` 支持 `all-in-one`、`be`、`proxy`、`cell-manager` 和 `global-manager`。单副本与 3 副本在线 `PID` 边界分裂、双模式 `(PID, name)` 分裂、基于 `ProbeTransferLeader` 预检的安全领导权转移、3 个真实 `metadbd` 操作系统进程的高可用分裂与故障切换演练（`three_process_ha_rehearsal`），以及 4 角色存算/控制分离跨 Cell 端到端测试（`disaggregated_four_role_e2e`）均已在仓库测试中覆盖。见 [运维](./operations.md)。
 
 ## 文档地图
 

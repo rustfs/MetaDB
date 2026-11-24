@@ -59,23 +59,39 @@ for bin in metadbd metadb-ctl; do
   fi
 done
 
+sha256_gen() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$@"
+  else
+    shasum -a 256 "$@"
+  fi
+}
+
+sha256_check() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "$@"
+  else
+    shasum -a 256 -c "$@"
+  fi
+}
+
 desc=$(file -b target/release/metadbd)
 printf '%s\n' "$desc"
 case "$host" in
   x86_64-*)
-    if [[ "$desc" != *x86-64* ]]; then
+    if [[ "$desc" != *x86-64* && "$desc" != *x86_64* ]]; then
       echo "metadbd is not an x86-64 binary" >&2
       exit 1
     fi
     ;;
   aarch64-*)
-    if [[ "$desc" != *aarch64* ]]; then
-      echo "metadbd is not an aarch64 binary" >&2
+    if [[ "$desc" != *aarch64* && "$desc" != *arm64* ]]; then
+      echo "metadbd is not an aarch64/arm64 binary" >&2
       exit 1
     fi
     ;;
   *)
-    echo "no ELF arch check for host ${host}" >&2
+    echo "no arch check for host ${host}" >&2
     ;;
 esac
 
@@ -87,16 +103,16 @@ install -m 0755 target/release/metadbd target/release/metadb-ctl "${stage}/${nam
 install -m 0644 LICENSE "${stage}/${name}/"
 (
   cd "${stage}/${name}"
-  sha256sum metadbd metadb-ctl LICENSE > SHA256SUMS
-  sha256sum -c SHA256SUMS
+  sha256_gen metadbd metadb-ctl LICENSE > SHA256SUMS
+  sha256_check SHA256SUMS
 )
 
 mkdir -p dist
 tar -C "$stage" -czf "dist/${name}.tar.gz" "$name"
 (
   cd dist
-  sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
-  sha256sum -c "${name}.tar.gz.sha256"
+  sha256_gen "${name}.tar.gz" > "${name}.tar.gz.sha256"
+  sha256_check "${name}.tar.gz.sha256"
 )
 
 list=$(tar -tzf "dist/${name}.tar.gz")
@@ -112,7 +128,7 @@ check_dir=$(mktemp -d)
 tar -C "$check_dir" -xzf "dist/${name}.tar.gz"
 (
   cd "${check_dir}/${name}"
-  sha256sum -c SHA256SUMS
+  sha256_check SHA256SUMS
 )
 rm -rf "$check_dir"
 

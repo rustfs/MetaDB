@@ -25,7 +25,10 @@ pub mod version_set;
 
 pub use backend::{InMemoryBackend, LsmStorageBackend, PersistentEntry, StorageBackend};
 pub use cache::ShardedBlockCache;
-pub use compaction::{CompactionStats, LocalityCompactor};
+pub use compaction::{
+    CompactionStats, LeveledCompactor, LocalityCompactor, DEFAULT_L1_MAX_BYTES,
+    DEFAULT_L2_MAX_BYTES,
+};
 pub use engine::{
     FlushIdentity, LifecycleStorageEngine, LsmEngineConfig, ScanControl, StorageMetrics,
 };

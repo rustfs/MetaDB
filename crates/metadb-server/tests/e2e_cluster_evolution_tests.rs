@@ -50,7 +50,7 @@ locality_tombstone_ratio = 0.50
 
 [sharding]
 bootstrap_table_shards = true
-shard_split_threshold_bytes = 2048
+shard_split_threshold_bytes = 65536
 
 [security]
 allow_unauthenticated = true

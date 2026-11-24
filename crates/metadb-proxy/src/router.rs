@@ -96,13 +96,18 @@ impl StatelessProxyRouter {
                 name_prefix,
                 limit,
             } => {
-                let (entries, next_cursor) = self
+                let page = self
                     .tx_router
-                    .listdir_paginated(pid, after_name.as_deref(), name_prefix.as_deref(), limit)
+                    .listdir_with_stats(
+                        pid,
+                        after_name.as_deref(),
+                        name_prefix.as_deref(),
+                        Some(limit),
+                    )
                     .await?;
                 Ok(ProxySqlResult::Entries {
-                    entries,
-                    next_cursor,
+                    entries: page.entries,
+                    next_cursor: page.next_cursor,
                 })
             }
             MetadataSqlCommand::SetAttr { pid, name, patch } => Ok(ProxySqlResult::Entry(
@@ -129,7 +134,9 @@ impl StatelessProxyRouter {
                     .await?,
             ))),
             MetadataSqlCommand::ListQuotas { start_uid, limit } => Ok(ProxySqlResult::Quotas(
-                self.tx_router.list_quotas(start_uid, limit).await?,
+                self.tx_router
+                    .list_quotas_with_limit(start_uid, Some(limit))
+                    .await?,
             )),
             MetadataSqlCommand::GetSecondaryIndex { fid } => Ok(ProxySqlResult::SecondaryIndex(
                 self.tx_router.get_secondary_index(fid).await?,
@@ -137,7 +144,7 @@ impl StatelessProxyRouter {
             MetadataSqlCommand::ScanSecondaryIndex { after_fid, limit } => {
                 Ok(ProxySqlResult::SecondaryIndices(
                     self.tx_router
-                        .scan_secondary_index(after_fid, limit)
+                        .scan_secondary_index_with_limit(after_fid, Some(limit))
                         .await?,
                 ))
             }

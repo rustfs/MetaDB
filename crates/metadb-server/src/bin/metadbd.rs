@@ -35,17 +35,34 @@ struct Cli {
     #[arg(long)]
     listen: Option<String>,
 
+    /// Override Prometheus HTTP metrics/probes listen address (`host:port`).
+    #[arg(long)]
+    metrics_listen: Option<String>,
+
     /// Override data directory.
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Optional cell manager endpoint. For `all-in-one`, this is the Raft leader to join.
+    /// Optional cell manager endpoint. For `all-in-one`, acts as `--join` fallback if `--join` is unset;
+    /// for `be`, registers this spare/backend node with the cell manager without immediately joining as a voter.
     #[arg(long)]
     cell_manager: Option<String>,
 
     /// gRPC address of an existing cell leader. A fresh data directory joins that Raft group.
     #[arg(long)]
     join: Option<String>,
+
+    /// Override `[cluster].global_manager` (`host:port`) for `cell-manager`.
+    #[arg(long)]
+    global_manager: Option<String>,
+
+    /// Override `[cluster].upstream` (`host:port`) for `proxy`.
+    #[arg(long)]
+    upstream: Option<String>,
+
+    /// Reject any unrecognized top-level or section keys in the TOML configuration file.
+    #[arg(long)]
+    strict_config: bool,
 }
 
 #[tokio::main]
@@ -59,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
     let mut cfg = match &cli.config {
+        Some(p) if cli.strict_config => ServerTomlConfig::from_toml_file_strict(p)?,
         Some(p) => ServerTomlConfig::from_toml_file(p)?,
         None => ServerTomlConfig::default(),
     };
@@ -84,11 +102,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(listen) = cli.listen {
         cfg.node.grpc_listen_addr = listen;
     }
+    if let Some(metrics_listen) = cli.metrics_listen {
+        cfg.node.metrics_listen_addr = Some(metrics_listen);
+    }
     if let Some(dd) = cli.data_dir {
         cfg.node.data_dir = dd;
     }
-    if let Some(join) = cli.join.clone().or(cli.cell_manager.clone()) {
+    if let Some(gm) = cli.global_manager {
+        cfg.cluster.global_manager = gm;
+    }
+    if let Some(upstream) = cli.upstream {
+        cfg.cluster.upstream = upstream;
+    }
+    if let Some(join) = cli.join.clone() {
         cfg.cluster.join = join;
+    } else if cfg.node.role == ServerRole::AllInOne {
+        if let Some(cm) = cli.cell_manager.clone() {
+            cfg.cluster.join = cm;
+        }
     }
     let cell_manager_ep = if cfg.cluster.join.is_empty() {
         cli.cell_manager.clone()

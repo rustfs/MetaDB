@@ -46,21 +46,21 @@ Calls `GetRoutes` for that cell (use `0` for every cached route). Prints `shard`
 
 Calls `TriggerShardSplit`, which forces a split check even when the shard is under `shard_split_threshold_bytes`. On success it always prints `split_executed`, `child_shard_id`, `placement_phase`, `placement_phase_code`, `placement_shard`, `dedicated_node`, `dominant_pid`, `move_count`, and `placement_automatic_transfer_enabled`. When `placement` is absent, including an ordinary split that has no placement row, that line is `placement_phase=` and `placement_phase_code=0`. Code 0 is only that no-record case. A stored row uses codes 1–4. `split_executed=false` means the worker did not create a child. That includes fewer than two keys and a jumbo candidate, which writes a placement row and still leaves `split_executed=false`. A placement line is not a split and is not a file move. An application error exits non-zero and does not print the line.
 
-### `shard enable-dual-mode --shard-id <u64> --pid <u64>`
+### `shard enable-dual-mode --shard-id <u64> --pid <u64> [--split-name <name>]`
 
-Calls `EnableDualModeSplit`. The CLI sends an empty `split_name`. The server stores `dual_mode_pid` and does not split immediately.
+Calls `EnableDualModeSplit`. Stores `dual_mode_pid` (and optional `split_name` hint) for the next split of that shard.
 
-### `raft scale-replicas --cell-id <u64> --target-voters <u32>`
+### `raft scale-replicas --cell-id <u64> --target-voters <u32> [--ensure-node-id <u64>]`
 
-Calls `ScaleShardReplicas`. The server requires `target_voters` entries already present in that cell's node map. A fresh all-in-one cell has one node, so `--target-voters 3` returns a consensus error of the form `need 3 registered nodes in cell <id>, have 1`. On success it prints how many local shards were passed to the membership change.
+Calls `ScaleShardReplicas`. Requires `target_voters` entries already present in that cell's node map. Also supports `raft transfer-leader --shard-id <u64> --target-node-id <u64>` (preflighted via `ProbeTransferLeader`), `raft remove-voter --cell-id <u64> --node-id <u64>`, `raft register-node --cell-id <u64> --node-id <u64> --grpc-addr <host:port>`, and `cluster health [--service <name>]` (`grpc.health.v1.Health/Check`).
 
 ### `cell register --cell-id <u64> --endpoints <a,b,c> [--start-key <hex> --end-key <hex>]`
 
 Calls `RegisterCell` on this process's cell directory. The server probes the first endpoint's `GetRoutes` for that cell and fsyncs `GLOBAL_CELL_DIRECTORY` only when those routes tile `[start-key, end-key)` exactly. A gap, an overlap with a cell already in the directory, an `https://` endpoint, or an unreachable manager on the first attempt returns an error and writes nothing. Omitting both keys sends `[01, 04)`, which overlaps a default cell and is rejected. An empty secret still requires `allow_unauthenticated` and a literal loopback endpoint. The stored routes are the probed snapshot. An identical retry keeps that snapshot when the peer is down and does not refresh it. When this process bootstrapped the cell and is the leader of its lowest local shard, it also proposes that directory and the current `CELL_MANAGER_STATE` snapshot into that shard's existing Raft log. A second voter of the same shard can read the snapshot after apply. A joined replica does not publish one. A `global-manager` with no shard group still has only its local file. The directory file is not itself a Raft group. A later metadata or transaction request contained by that cell is forwarded to the stored endpoint. Heartbeats do not update the route snapshot and do not publish the Raft snapshot. See [Scale control plane](./scale-control-plane-status.md).
 
-### `sql <statement>`
+### `sql <statement> [--param <u64:n|i64:n|str:text>...]`
 
-Calls `ExecuteSql` with no bind parameters. The statement must be one of the 20 templates in [Architecture](./architecture.md), with literals instead of `?`.
+Calls `ExecuteSql` with inline literals or repeatable `--param` positional `?` bind arguments. The statement must be one of the 20 templates in [Architecture](./architecture.md).
 
 ```bash
 metadb-ctl --endpoint 127.0.0.1:7800 sql \
@@ -115,7 +115,10 @@ Gauges and counters from `render_prometheus_metrics`:
 | `metadb_placement_moves_voter_replaced` | gauge, stored `VoterReplaced` entries |
 | `metadb_placement_rows_with_transfer_attempt` | gauge, rows whose transfer-attempt timestamp is non-zero. The reconciler does not stamp a new value and keeps one already in the file |
 | `metadb_placement_rows_with_replace_attempt` | gauge, rows whose replace-attempt timestamp is non-zero |
-| `metadb_placement_automatic_transfer_enabled` | gauge, 1 only if this build calls `transfer_leader`; this build is 0 |
+| `metadb_placement_automatic_transfer_enabled` | gauge, 1 when `[sharding].enable_automatic_leadership_transfer = true` (default 0) |
+| `metadb_raft_watermark_lag_entries` | gauge, sum of `last_applied - safe_purge_index` across local shards |
+| `metadb_jumbo_file_moves_live` | gauge, local shards running from a `MOVE_LIVE` dedicated jumbo directory |
+| `metadb_heartbeat_live_nodes` | gauge, nodes with a fresh measured heartbeat hint on local cell managers |
 
 There is no `metadb_raft_watermark_lag_entries` series and no per-shard label. Placement gauges are counts of this process's `CELL_CONTROL_PLANE` rows. A shard id, a node id, a path, and a blocked reason are not labels and are not values. There is no series for `MOVE_STAGED`, `MOVE_LIVE`, disk free space, or bytes copied onto another machine. `metadb_cells_total` counts rows in this process's `GLOBAL_CELL_DIRECTORY`, including a remote cell after `RegisterCell`. `metadb_shards_total` still counts only local shards. A fresh process has one cell. `metadb_process_phase 1` does not by itself mean `metadb_ready 1`. `metadb_placement_phase_leader_on_dedicated` does not mean the route flag is `JumboIsolated` and does not mean files moved.
 

@@ -10,6 +10,7 @@ use metadb_core::{MetaDbError, Result, ShardId};
 
 use crate::block::BlockEntryValue;
 use crate::cache::ShardedBlockCache;
+use crate::compaction::LeveledCompactor;
 use crate::manifest::{DurableShardCheckpoint, ManifestLog, VersionEdit};
 use crate::sstable::{sst_file_name, sync_dir, SstFileMeta, SstableBuilder, SstableReader};
 use crate::version_set::{MergedCursor, Version, NUM_LSM_LEVELS};
@@ -94,6 +95,9 @@ pub trait StorageBackend: Send + Sync {
 
     /// Records physical tombstones traversed during a foreground scan.
     fn record_scanned_tombstones(&self, count: u64);
+
+    /// Approximate byte size of persisted entries in $O(\text{files})$ without reading SSTable blocks.
+    fn approximate_persistent_bytes(&self) -> usize;
 }
 
 struct LsmState {
@@ -113,12 +117,17 @@ pub struct LsmStorageBackend {
     block_cache: Arc<ShardedBlockCache>,
     bloom_bits_per_key: usize,
     l0_compaction_trigger: usize,
+    leveled_compactor: LeveledCompactor,
     active_version: RwLock<Arc<Version>>,
     state: Mutex<LsmState>,
     compaction_lock: Mutex<()>,
 }
 
 impl LsmStorageBackend {
+    pub fn with_leveled_compactor(mut self, leveled_compactor: LeveledCompactor) -> Self {
+        self.leveled_compactor = leveled_compactor;
+        self
+    }
     pub fn open(
         shard_id: ShardId,
         lsm_dir: impl AsRef<Path>,
@@ -203,6 +212,7 @@ impl LsmStorageBackend {
             block_cache,
             bloom_bits_per_key: bloom_bits_per_key.max(4),
             l0_compaction_trigger: DEFAULT_L0_COMPACTION_TRIGGER,
+            leveled_compactor: LeveledCompactor::default(),
             active_version: RwLock::new(version),
             state: Mutex::new(LsmState {
                 next_file_id: recovered.next_file_id,
@@ -220,23 +230,205 @@ impl LsmStorageBackend {
         &self.lsm_dir
     }
 
+    fn maybe_rotate_manifest(st: &mut LsmState, arc_v: &Arc<Version>) -> Result<()> {
+        if st.edits_since_rotation >= 64 {
+            let snap_edit = VersionEdit {
+                next_file_id: Some(st.next_file_id),
+                next_flush_generation: Some(st.next_flush_generation),
+                checkpoint: Some(arc_v.checkpoint.clone()),
+                deleted_files: vec![],
+                added_files: arc_v.all_metas(),
+            };
+            st.manifest.rotate(&snap_edit)?;
+            st.edits_since_rotation = 0;
+        }
+        Ok(())
+    }
+
     fn maybe_compact_l0(&self) -> Result<()> {
         let v = self.current_version();
-        if v.levels[0].len() < self.l0_compaction_trigger {
+        if v.levels[0].len() >= self.l0_compaction_trigger {
+            let min_key = v.levels[0]
+                .iter()
+                .map(|r| r.meta().min_key.clone())
+                .min()
+                .unwrap();
+            let mut max_end = v.levels[0]
+                .iter()
+                .map(|r| r.meta().max_key.clone())
+                .max()
+                .unwrap();
+            max_end.push(0x00);
+            let _ = self.compact_range(&min_key, &max_end)?;
+        }
+        self.maybe_compact_levels()?;
+        Ok(())
+    }
+
+    /// Promotes `L1 -> L2` and `L2 -> L3` when cumulative SSTable bytes in a level exceed its target budget.
+    pub fn maybe_compact_levels(&self) -> Result<()> {
+        for src_level in [1usize, 2usize] {
+            let Some(max_bytes) = self.leveled_compactor.max_bytes_for_level(src_level) else {
+                continue;
+            };
+            let v = self.current_version();
+            let level_bytes: u64 = v.levels[src_level].iter().map(|r| r.meta().file_size).sum();
+            if level_bytes > max_bytes && !v.levels[src_level].is_empty() {
+                self.promote_level(src_level, src_level + 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn promote_level(&self, src_level: usize, dst_level: usize) -> Result<()> {
+        let _comp_guard = self.compaction_lock.lock().unwrap();
+        let base_version = self.current_version();
+        if base_version.levels[src_level].is_empty() || dst_level >= NUM_LSM_LEVELS {
             return Ok(());
         }
-        let min_key = v.levels[0]
+        let Some(max_bytes) = self.leveled_compactor.max_bytes_for_level(src_level) else {
+            return Ok(());
+        };
+        let level_bytes: u64 = base_version.levels[src_level]
             .iter()
-            .map(|r| r.meta().min_key.clone())
-            .min()
-            .unwrap();
-        let mut max_end = v.levels[0]
+            .map(|r| r.meta().file_size)
+            .sum();
+        if level_bytes <= max_bytes {
+            return Ok(());
+        }
+
+        // Pick oldest file in `src_level` (lowest `file_id`) and merge with overlapping files in `dst_level`.
+        let seed = base_version.levels[src_level]
             .iter()
-            .map(|r| r.meta().max_key.clone())
-            .max()
-            .unwrap();
-        max_end.push(0x00);
-        let _ = self.compact_range(&min_key, &max_end)?;
+            .min_by_key(|r| r.meta().file_id)
+            .unwrap()
+            .clone();
+        let mut union_min = seed.meta().min_key.clone();
+        let mut union_max = seed.meta().max_key.clone();
+        let mut dst_inputs: Vec<Arc<SstableReader>> = Vec::new();
+        for sst in &base_version.levels[dst_level] {
+            if sst.meta().max_key >= union_min && sst.meta().min_key <= union_max {
+                union_min = union_min.min(sst.meta().min_key.clone());
+                union_max = union_max.max(sst.meta().max_key.clone());
+                dst_inputs.push(sst.clone());
+            }
+        }
+        let mut src_inputs: Vec<Arc<SstableReader>> = Vec::new();
+        for sst in &base_version.levels[src_level] {
+            if sst.meta().max_key >= union_min && sst.meta().min_key <= union_max {
+                src_inputs.push(sst.clone());
+            }
+        }
+        src_inputs.sort_by(|a, b| a.meta().min_key.cmp(&b.meta().min_key));
+        dst_inputs.sort_by(|a, b| a.meta().min_key.cmp(&b.meta().min_key));
+
+        let mut max_raft_idx = 0u64;
+        let mut max_hlc = metadb_core::HlcTimestamp::ZERO;
+        let mut readers = Vec::with_capacity(src_inputs.len() + dst_inputs.len());
+        for sst in src_inputs.iter().chain(dst_inputs.iter()) {
+            max_raft_idx = max_raft_idx.max(sst.meta().max_raft_index);
+            max_hlc = max_hlc.max(sst.meta().max_hlc);
+            readers.push(sst.clone());
+        }
+        let mut cursor = MergedCursor::open(readers, &[], None)?;
+
+        let mut new_metas = Vec::new();
+        let mut new_readers = Vec::new();
+        let mut chunk = Vec::new();
+        let mut chunk_bytes = 0usize;
+
+        let write_chunk =
+            |items: &[(Vec<u8>, BlockEntryValue)]| -> Result<(SstFileMeta, Arc<SstableReader>)> {
+                let (fid, fgen) = {
+                    let mut st = self.state.lock().unwrap();
+                    let fid = st.next_file_id;
+                    st.next_file_id += 1;
+                    let fgen = st.next_flush_generation;
+                    st.next_flush_generation += 1;
+                    (fid, fgen)
+                };
+                let meta = SstableBuilder::new(dst_level as u8, fid, fgen, max_raft_idx, max_hlc)
+                    .with_bloom_bits(self.bloom_bits_per_key)
+                    .write_to_dir(&self.lsm_dir, items)?;
+                let reader = Arc::new(SstableReader::open(
+                    self.shard_id,
+                    self.lsm_dir.join(sst_file_name(fid)),
+                    self.block_cache.clone(),
+                )?);
+                Ok((meta, reader))
+            };
+
+        while let Some((k, v)) = cursor.next_owned()? {
+            let emitted = match v {
+                BlockEntryValue::Value(bytes) => Some(BlockEntryValue::Value(bytes)),
+                BlockEntryValue::PhysicalTombstone => {
+                    if !base_version.has_overlap_above(dst_level, &k) {
+                        None
+                    } else {
+                        Some(BlockEntryValue::PhysicalTombstone)
+                    }
+                }
+            };
+            let Some(value) = emitted else {
+                continue;
+            };
+            let sz = k.len()
+                + match &value {
+                    BlockEntryValue::Value(bytes) => bytes.len(),
+                    BlockEntryValue::PhysicalTombstone => 0,
+                }
+                + 16;
+            chunk.push((k, value));
+            chunk_bytes += sz;
+            if chunk_bytes >= TARGET_L1_SST_BYTES {
+                let (meta, reader) = write_chunk(&chunk)?;
+                new_metas.push(meta);
+                new_readers.push(reader);
+                chunk.clear();
+                chunk_bytes = 0;
+            }
+        }
+        if !chunk.is_empty() {
+            let (meta, reader) = write_chunk(&chunk)?;
+            new_metas.push(meta);
+            new_readers.push(reader);
+        }
+
+        let mut participating_set = HashSet::new();
+        for r in &src_inputs {
+            participating_set.insert((src_level as u8, r.meta().file_id));
+        }
+        for r in &dst_inputs {
+            participating_set.insert((dst_level as u8, r.meta().file_id));
+        }
+        let deleted_files: Vec<(u8, u64)> = participating_set.iter().copied().collect();
+        let deleted_ids: Vec<u64> = deleted_files.iter().map(|&(_, id)| id).collect();
+
+        {
+            let mut st = self.state.lock().unwrap();
+            let edit = VersionEdit {
+                next_file_id: Some(st.next_file_id),
+                next_flush_generation: Some(st.next_flush_generation),
+                checkpoint: None,
+                deleted_files,
+                added_files: new_metas,
+            };
+            st.manifest.append(&edit)?;
+            st.edits_since_rotation += 1;
+
+            let mut v_guard = self.active_version.write().unwrap();
+            let mut next_v = (**v_guard).clone();
+            for (lvl_idx, lvl) in next_v.levels.iter_mut().enumerate() {
+                lvl.retain(|r| !participating_set.contains(&(lvl_idx as u8, r.meta().file_id)));
+            }
+            next_v.levels[dst_level].extend(new_readers);
+            Version::normalize_levels(&mut next_v.levels);
+            let arc_v = Arc::new(next_v);
+            *v_guard = arc_v.clone();
+            Self::maybe_rotate_manifest(&mut st, &arc_v)?;
+        }
+
+        self.cleanup_unreferenced_ssts(&deleted_ids);
         Ok(())
     }
 
@@ -352,18 +544,7 @@ impl StorageBackend for LsmStorageBackend {
             next_v.checkpoint = checkpoint;
             let arc_v = Arc::new(next_v);
             *v_guard = arc_v.clone();
-
-            if st.edits_since_rotation >= 64 {
-                let snap_edit = VersionEdit {
-                    next_file_id: Some(st.next_file_id),
-                    next_flush_generation: Some(st.next_flush_generation),
-                    checkpoint: Some(arc_v.checkpoint.clone()),
-                    deleted_files: vec![],
-                    added_files: arc_v.all_metas(),
-                };
-                st.manifest.rotate(&snap_edit)?;
-                st.edits_since_rotation = 0;
-            }
+            Self::maybe_rotate_manifest(&mut st, &arc_v)?;
             arc_v
         };
 
@@ -381,11 +562,13 @@ impl StorageBackend for LsmStorageBackend {
             added_files: vec![],
         };
         st.manifest.append(&edit)?;
+        st.edits_since_rotation += 1;
         let mut v_guard = self.active_version.write().unwrap();
         let mut next_v = (**v_guard).clone();
         next_v.checkpoint = checkpoint;
         let arc_v = Arc::new(next_v);
         *v_guard = arc_v.clone();
+        Self::maybe_rotate_manifest(&mut st, &arc_v)?;
         Ok(arc_v)
     }
 
@@ -579,6 +762,7 @@ impl StorageBackend for LsmStorageBackend {
                 added_files: new_metas,
             };
             st.manifest.append(&edit)?;
+            st.edits_since_rotation += 1;
 
             let mut v_guard = self.active_version.write().unwrap();
             let mut next_v = (**v_guard).clone();
@@ -587,10 +771,14 @@ impl StorageBackend for LsmStorageBackend {
             }
             next_v.levels[target_level].extend(new_readers);
             Version::normalize_levels(&mut next_v.levels);
-            *v_guard = Arc::new(next_v);
+            let arc_v = Arc::new(next_v);
+            *v_guard = arc_v.clone();
+            Self::maybe_rotate_manifest(&mut st, &arc_v)?;
         }
 
         self.cleanup_unreferenced_ssts(&deleted_ids);
+        drop(_comp_guard);
+        self.maybe_compact_levels()?;
         Ok(purged_tombstones)
     }
 
@@ -654,6 +842,15 @@ impl StorageBackend for LsmStorageBackend {
         if count > 0 {
             self.state.lock().unwrap().tombstones_traversed += count;
         }
+    }
+
+    fn approximate_persistent_bytes(&self) -> usize {
+        let v = self.current_version();
+        v.levels
+            .iter()
+            .flat_map(|lvl| lvl.iter())
+            .map(|sst| sst.meta().file_size as usize)
+            .fold(0usize, usize::saturating_add)
     }
 }
 
@@ -803,13 +1000,29 @@ impl StorageBackend for InMemoryBackend {
 
     fn create_checkpoint(&self, dest_dir: &Path) -> Result<DurableShardCheckpoint> {
         fs::create_dir_all(dest_dir)?;
-        let cp = self.current_version().checkpoint.clone();
+        let (cp, block_entries) = {
+            let guard = self.inner.read().unwrap();
+            let cp = guard.version.checkpoint.clone();
+            let items: Vec<(Vec<u8>, BlockEntryValue)> = guard
+                .entries
+                .iter()
+                .map(|(k, v)| (k.clone(), BlockEntryValue::from(v.clone())))
+                .collect();
+            (cp, items)
+        };
+        let (next_file_id, next_flush_generation, added_files) = if block_entries.is_empty() {
+            (1, 1, vec![])
+        } else {
+            let meta = SstableBuilder::new(1, 1, 1, cp.flushed_raft_index, cp.flushed_max_hlc)
+                .write_to_dir(dest_dir, &block_entries)?;
+            (2, 2, vec![meta])
+        };
         let edit = VersionEdit {
-            next_file_id: Some(1),
-            next_flush_generation: Some(1),
+            next_file_id: Some(next_file_id),
+            next_flush_generation: Some(next_flush_generation),
             checkpoint: Some(cp.clone()),
             deleted_files: vec![],
-            added_files: vec![],
+            added_files,
         };
         ManifestLog::write_standalone_checkpoint(dest_dir, &edit)?;
         Ok(cp)
@@ -833,5 +1046,17 @@ impl StorageBackend for InMemoryBackend {
         if count > 0 {
             self.inner.write().unwrap().tombstones_traversed += count;
         }
+    }
+
+    fn approximate_persistent_bytes(&self) -> usize {
+        let guard = self.inner.read().unwrap();
+        guard
+            .entries
+            .iter()
+            .filter_map(|(k, v)| match v {
+                PersistentEntry::Value(bytes) => Some(k.len() + bytes.len()),
+                PersistentEntry::PhysicalTombstone => None,
+            })
+            .fold(0usize, usize::saturating_add)
     }
 }

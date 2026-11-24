@@ -6,6 +6,7 @@ use std::io;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use openraft::async_runtime::watch::WatchReceiver;
 use openraft::entry::RaftEntry;
 use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
@@ -22,9 +23,14 @@ use tonic::{Request, Response, Status, Streaming};
 
 use metadb_core::codec;
 use metadb_core::{MetaDbError, ShardId};
+use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::raft_transport_service_client::RaftTransportServiceClient;
 use metadb_proto::raft_transport_service_server::RaftTransportService;
-use metadb_proto::{RaftRpcEnvelope, RaftRpcReply, SnapshotChunkRequest, SnapshotChunkResponse};
+use metadb_proto::{
+    CloseRemovedShardRequest, OpenJoiningShardRequest, ProbeTransferLeaderRequest,
+    ProbeTransferLeaderResponse, RaftRpcEnvelope, RaftRpcReply, SnapshotChunkRequest,
+    SnapshotChunkResponse,
+};
 use metadb_security::TransportSecurity;
 
 use crate::state_machine::ShardStateMachine;
@@ -98,6 +104,22 @@ impl MultiRaftRouter {
     }
 }
 
+/// In-process hook allowing `DurableCellManager` peers in single-process tests (where
+/// `ControlPlaneServiceServer` is not mounted) to open joining split/spare shards and GC
+/// drained replicas directly, while multi-process deployments dial `ControlPlaneService` over gRPC.
+#[tonic::async_trait]
+pub trait LocalShardControlHook: Send + Sync {
+    async fn open_joining_shard(
+        &self,
+        req: OpenJoiningShardRequest,
+    ) -> std::result::Result<(), MetaDbError>;
+
+    async fn close_removed_shard(
+        &self,
+        req: CloseRemovedShardRequest,
+    ) -> std::result::Result<(), MetaDbError>;
+}
+
 /// Shared gRPC channel pool across Multi-Raft instances on the same host.
 #[derive(Clone, Default)]
 pub struct ChannelPool {
@@ -105,9 +127,15 @@ pub struct ChannelPool {
     shared_secret: Arc<RwLock<Option<String>>>,
     security: Arc<RwLock<TransportSecurity>>,
     role: Arc<RwLock<Option<metadb_security::RolePresentation>>>,
+    local_control_hooks: Arc<RwLock<HashMap<String, Arc<dyn LocalShardControlHook>>>>,
 }
 
 impl ChannelPool {
+    /// Registers an in-process control-plane hook for `addr` (used by in-process multi-voter tests).
+    pub fn register_local_control_hook(&self, addr: String, hook: Arc<dyn LocalShardControlHook>) {
+        self.local_control_hooks.write().unwrap().insert(addr, hook);
+    }
+
     /// Configures authentication for all Raft clients sharing this pool.
     pub fn set_shared_secret(&self, secret: Option<String>) {
         *self.shared_secret.write().unwrap() = secret.filter(|s| !s.trim().is_empty());
@@ -195,6 +223,97 @@ impl ChannelPool {
         }
         codec::deserialize(&reply.bincode_payload)
             .map_err(|error| MetaDbError::CodecError(error.to_string()))?
+    }
+
+    /// Non-destructive pre-flight check verifying a target peer hosts `shard_id`, is an active
+    /// voter, supports the leadership-transfer protocol, and has applied through `min_matched_index`.
+    pub async fn probe_transfer_leader(
+        &self,
+        addr: &str,
+        shard_id: ShardId,
+        target_node_id: u64,
+        min_matched_index: u64,
+    ) -> std::result::Result<ProbeTransferLeaderResponse, MetaDbError> {
+        let channel = self.connect(addr).await.map_err(|error| {
+            MetaDbError::RpcError(format!("connect to transfer target {addr} failed: {error}"))
+        })?;
+        let mut client = RaftTransportServiceClient::new(channel);
+        let reply = client
+            .probe_transfer_leader(
+                self.authenticate(Request::new(ProbeTransferLeaderRequest {
+                    shard_id,
+                    target_node_id,
+                    min_matched_index,
+                }))
+                .map_err(|error| MetaDbError::RpcError(error.to_string()))?,
+            )
+            .await
+            .map_err(|error| {
+                MetaDbError::RpcError(format!("probe_transfer_leader to {addr} failed: {error}"))
+            })?
+            .into_inner();
+        Ok(reply)
+    }
+
+    /// Instructs a peer BE node (`addr`) to open an uninitialized joining replica for a split
+    /// child shard or spare-voter onboarding before `ConfChangeOrchestrator::add_learners_and_promote_voters`.
+    pub async fn open_joining_shard(
+        &self,
+        addr: &str,
+        req: OpenJoiningShardRequest,
+    ) -> std::result::Result<(), MetaDbError> {
+        let local_hook = self.local_control_hooks.read().unwrap().get(addr).cloned();
+        if let Some(hook) = local_hook {
+            return hook.open_joining_shard(req).await;
+        }
+        let channel = self.connect(addr).await.map_err(|error| {
+            MetaDbError::RpcError(format!("connect to peer {addr} failed: {error}"))
+        })?;
+        let mut client = ControlPlaneServiceClient::new(channel);
+        let reply = client
+            .open_joining_shard(
+                self.authenticate(Request::new(req))
+                    .map_err(|error| MetaDbError::RpcError(error.to_string()))?,
+            )
+            .await
+            .map_err(|error| {
+                MetaDbError::RpcError(format!("open_joining_shard to {addr} failed: {error}"))
+            })?
+            .into_inner();
+        if let Some(err) = reply.error {
+            return Err(MetaDbError::from(err));
+        }
+        Ok(())
+    }
+
+    /// Instructs a drained peer BE node (`addr`) to stop and optionally delete a removed shard replica.
+    pub async fn close_removed_shard(
+        &self,
+        addr: &str,
+        req: CloseRemovedShardRequest,
+    ) -> std::result::Result<(), MetaDbError> {
+        let local_hook = self.local_control_hooks.read().unwrap().get(addr).cloned();
+        if let Some(hook) = local_hook {
+            return hook.close_removed_shard(req).await;
+        }
+        let channel = self.connect(addr).await.map_err(|error| {
+            MetaDbError::RpcError(format!("connect to peer {addr} failed: {error}"))
+        })?;
+        let mut client = ControlPlaneServiceClient::new(channel);
+        let reply = client
+            .close_removed_shard(
+                self.authenticate(Request::new(req))
+                    .map_err(|error| MetaDbError::RpcError(error.to_string()))?,
+            )
+            .await
+            .map_err(|error| {
+                MetaDbError::RpcError(format!("close_removed_shard to {addr} failed: {error}"))
+            })?
+            .into_inner();
+        if let Some(err) = reply.error {
+            return Err(MetaDbError::from(err));
+        }
+        Ok(())
     }
 }
 
@@ -647,5 +766,60 @@ impl RaftTransportService for MultiRaftTransportServer {
                 error_message: error.to_string(),
             })),
         }
+    }
+
+    async fn probe_transfer_leader(
+        &self,
+        request: Request<ProbeTransferLeaderRequest>,
+    ) -> Result<Response<ProbeTransferLeaderResponse>, Status> {
+        let req = request.into_inner();
+        let Some(raft) = self.router.get_group(req.shard_id) else {
+            return Ok(Response::new(ProbeTransferLeaderResponse {
+                eligible: false,
+                last_applied_index: 0,
+                reason: "unknown_shard".to_string(),
+            }));
+        };
+        let metrics_rx = raft.metrics();
+        let metrics = metrics_rx.borrow_watched().clone();
+        if metrics.running_state.is_err() {
+            return Ok(Response::new(ProbeTransferLeaderResponse {
+                eligible: false,
+                last_applied_index: 0,
+                reason: "raft_stopped".to_string(),
+            }));
+        }
+        let last_applied_index = metrics.last_applied.map(|id| id.index).unwrap_or(0);
+        if req.target_node_id != 0 && metrics.id != req.target_node_id {
+            return Ok(Response::new(ProbeTransferLeaderResponse {
+                eligible: false,
+                last_applied_index,
+                reason: "node_id_mismatch".to_string(),
+            }));
+        }
+        let is_voter = metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .any(|id| id == metrics.id);
+        if !is_voter {
+            return Ok(Response::new(ProbeTransferLeaderResponse {
+                eligible: false,
+                last_applied_index,
+                reason: "not_voter".to_string(),
+            }));
+        }
+        if last_applied_index < req.min_matched_index {
+            return Ok(Response::new(ProbeTransferLeaderResponse {
+                eligible: false,
+                last_applied_index,
+                reason: "follower_lagging".to_string(),
+            }));
+        }
+        Ok(Response::new(ProbeTransferLeaderResponse {
+            eligible: true,
+            last_applied_index,
+            reason: "ready".to_string(),
+        }))
     }
 }

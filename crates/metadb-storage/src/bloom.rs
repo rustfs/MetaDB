@@ -20,7 +20,7 @@ impl BloomFilter {
         let bpk = bits_per_key.max(4);
         let total_bits = (keys.len().saturating_mul(bpk)).max(512);
         let byte_len = total_bits.div_ceil(8);
-        let bit_len = (byte_len * 8) as u32;
+        let bit_len = (byte_len as u64) * 8;
         let k_probes = DEFAULT_BLOOM_PROBES;
 
         let mut buf = vec![0u8; byte_len];
@@ -29,7 +29,7 @@ impl BloomFilter {
             let delta = h1.rotate_right(17);
             let mut h = h1;
             for _ in 0..k_probes {
-                let bit_pos = (h % bit_len) as usize;
+                let bit_pos = ((h as u64) % bit_len) as usize;
                 buf[bit_pos / 8] |= 1u8 << (bit_pos % 8);
                 h = h.wrapping_add(delta);
             }
@@ -63,7 +63,7 @@ impl BloomFilter {
     /// Returns `true` if `key` may exist in the SSTable (`false` guarantees absence).
     #[inline]
     pub fn may_contain(&self, key: &[u8]) -> bool {
-        let bit_len = (self.bits.len() * 8) as u32;
+        let bit_len = (self.bits.len() as u64) * 8;
         if bit_len == 0 {
             return true;
         }
@@ -71,7 +71,7 @@ impl BloomFilter {
         let delta = h1.rotate_right(17);
         let mut h = h1;
         for _ in 0..self.k_probes {
-            let bit_pos = (h % bit_len) as usize;
+            let bit_pos = ((h as u64) % bit_len) as usize;
             if (self.bits[bit_pos / 8] & (1u8 << (bit_pos % 8))) == 0 {
                 return false;
             }

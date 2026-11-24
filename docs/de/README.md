@@ -17,12 +17,10 @@ The default `metadbd` process is **all-in-one**. `be`, `proxy`, `cell-manager`, 
 - ein Datenverzeichnis
 - eine Zelle (`node.cell_id`, Vorgabe `1`)
 - ein OpenRaft-Wähler je Shard (dieser Prozess)
-- ein gRPC-Listener, der `MetadataService`, `TransactionService`, `ControlPlaneService` und `RaftTransportService` bedient
-- eine Hintergrundschleife alle 250 ms, die Hilfsausgänge leert, 2PC-Wiederherstellung ausführt, die Split-Regel prüft und Raft-Logs sichert
+- ein gRPC-Listener, der `MetadataService`, `TransactionService`, `ControlPlaneService`, `RaftTransportService` und `grpc.health.v1.Health` bedient
+- eine Hintergrundschleife alle 250 ms, die Hilfsausgänge leert (einschließlich zellenübergreifendem `ApplyAuxBatch` über `GrpcRemoteAuxSink`), 2PC-Wiederherstellung ausführt, die Split-Regel prüft und Raft-Logs sichert
 
-`ServerRole` akzeptiert beim Einlesen auch `be`, `proxy`, `cell-manager` und `global-manager`. `open_and_serve` starts those roles when that role's configuration is valid. An illegal combination fails before listen. An unknown `--role` returns `unsupported --role` from `metadbd`, not an unimplemented-role `CodecError`. Ein zweiter `metadbd` mit leerem Datenverzeichnis und `[cluster] join` (oder `--join` / `--cell-manager`) auf den aktuellen Leader tritt den Raft-Gruppen dieser Zelle bei: der Leader nimmt ihn als Learner auf und befördert ihn zum Voter. Ein Verzeichnis, das schon Zellenstatus hat, öffnet das lokale Raft erneut und tritt nicht noch einmal bei. `RegisterCell` stores a remote cell after its routes cover the requested range. A later request contained by that cell is forwarded. Join does not create a second cell. `metadb-ctl cell register` without a range still sends `[01, 04)` and exits non-zero against a default cell. `GetRoutes` für eine unbekannte `cell_id` ungleich null liefert einen Fehler. `cell_id = 0` listet weiterhin jede zwischengespeicherte Route.
-
-Shard-Splits, `(PID, name)`-Splits im Dual-Modus und Jumbo-Routenflags laufen in diesem einen Prozess. Die Hochstufung auf drei Wähler ist in `DurableCellManager::scale_out_replicas` implementiert und von prozessinternen Raft-Tests abgedeckt. Das ist kein Einsatz mit drei `metadbd`-Prozessen. Siehe [Betrieb](./operations.md).
+Shard-Splits (1 Wähler und 3 Wähler), `(PID, name)`-Splits im Dual-Modus, sicherer Leadership-Transfer (`ProbeTransferLeader`), die 3-Prozess-`metadbd`-Übung (`three_process_ha_rehearsal`) und der 4-Rollen-E2E-Test (`disaggregated_four_role_e2e`) werden in diesem Baum getestet. Siehe [Betrieb](./operations.md).
 
 ## Seitenübersicht
 

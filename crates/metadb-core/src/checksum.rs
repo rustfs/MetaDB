@@ -8,6 +8,36 @@ pub fn checksum_crc32c(data: &[u8]) -> u32 {
     crc_fast::crc32_iscsi(data)
 }
 
+/// Incremental streaming Castagnoli CRC32C hasher for chunked file I/O.
+pub struct Crc32cHasher {
+    digest: crc_fast::Digest,
+}
+
+impl Default for Crc32cHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Crc32cHasher {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            digest: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi),
+        }
+    }
+
+    #[inline]
+    pub fn update(&mut self, chunk: &[u8]) {
+        self.digest.update(chunk);
+    }
+
+    #[inline]
+    pub fn finalize(&self) -> u32 {
+        self.digest.finalize() as u32
+    }
+}
+
 /// Appends a 4-byte big-endian CRC32C trailer computed over the current contents of `buf`.
 #[inline]
 pub fn append_crc32c_be(buf: &mut Vec<u8>) {

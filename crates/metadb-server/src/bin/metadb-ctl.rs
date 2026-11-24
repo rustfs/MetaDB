@@ -5,11 +5,16 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
+use metadb_proto::health::health_check_response::ServingStatus;
+use metadb_proto::health::health_client::HealthClient;
+use metadb_proto::health::HealthCheckRequest;
 use metadb_proto::metadata_service_client::MetadataServiceClient;
+use metadb_proto::sql_param_value;
 use metadb_proto::{
     AllocateIdBlockRequest, CreateFileRequest, EnableDualModeSplitRequest, ErrorDetailProto,
     ExecuteSqlRequest, GetRoutesRequest, GetRoutesResponse, ListDirRequest, MkdirRequest,
-    PlacementMoveProto, PlacementRecordProto, RegisterCellRequest, ScaleShardReplicasRequest,
+    PlacementMoveProto, PlacementRecordProto, RegisterCellRequest, RegisterNodeRequest,
+    RemoveShardVoterRequest, ScaleShardReplicasRequest, SqlParamValue, TransferShardLeaderRequest,
     TriggerShardSplitRequest, TriggerShardSplitResponse, UnlinkRequest,
 };
 
@@ -80,7 +85,12 @@ enum Command {
         sub: CellCmd,
     },
     /// Execute one of the 20 metadata SQL templates.
-    Sql { query: String },
+    Sql {
+        query: String,
+        /// Positional `$1..$N` parameters (`u64:<n>`, `i64:<n>`, or `str:<text>`).
+        #[arg(long = "param")]
+        params: Vec<String>,
+    },
     /// Take, release, create, or restore a single-node backup.
     Backup {
         #[command(subcommand)]
@@ -121,6 +131,10 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum ClusterCmd {
     Status,
+    Health {
+        #[arg(long, default_value = "")]
+        service: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,6 +152,8 @@ enum ShardCmd {
         shard_id: u64,
         #[arg(long)]
         pid: u64,
+        #[arg(long, default_value = "")]
+        split_name: String,
     },
 }
 
@@ -148,6 +164,28 @@ enum RaftCmd {
         cell_id: u64,
         #[arg(long)]
         target_voters: u32,
+        #[arg(long, default_value_t = 0)]
+        ensure_node_id: u64,
+    },
+    TransferLeader {
+        #[arg(long)]
+        shard_id: u64,
+        #[arg(long)]
+        target_node_id: u64,
+    },
+    RemoveVoter {
+        #[arg(long)]
+        cell_id: u64,
+        #[arg(long)]
+        node_id: u64,
+    },
+    RegisterNode {
+        #[arg(long)]
+        cell_id: u64,
+        #[arg(long)]
+        node_id: u64,
+        #[arg(long)]
+        grpc_addr: String,
     },
 }
 
@@ -280,9 +318,34 @@ fn client_security(cli: &Cli) -> Result<metadb_security::TransportSecurity, Stri
         .as_ref()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
-    let spec = metadb_security::TlsSpec::from_client_fields(&mode, &cert, &key, &ca)
+    let spec = metadb_security::TlsSpec::from_client_fields(mode, &cert, &key, &ca)
         .map_err(|error| error.to_string())?;
     metadb_security::TransportSecurity::load(&spec).map_err(|error| error.to_string())
+}
+
+fn parse_sql_param_flag(raw: &str) -> Result<SqlParamValue, String> {
+    let Some((ty, val)) = raw.split_once(':') else {
+        return Err(format!(
+            "invalid --param '{raw}': expected 'u64:<n>', 'i64:<n>', or 'str:<text>'"
+        ));
+    };
+    let kind = match ty {
+        "u64" => sql_param_value::Kind::U64Val(
+            val.parse::<u64>()
+                .map_err(|e| format!("invalid u64 --param '{raw}': {e}"))?,
+        ),
+        "i64" => sql_param_value::Kind::I64Val(
+            val.parse::<i64>()
+                .map_err(|e| format!("invalid i64 --param '{raw}': {e}"))?,
+        ),
+        "str" => sql_param_value::Kind::StrVal(val.to_string()),
+        other => {
+            return Err(format!(
+                "unsupported --param type '{other}': expected 'u64', 'i64', or 'str'"
+            ))
+        }
+    };
+    Ok(SqlParamValue { kind: Some(kind) })
 }
 
 async fn run_embedded_bench(
@@ -510,7 +573,7 @@ fn print_split(resp: &TriggerShardSplitResponse) {
 }
 
 fn format_placement(placement: &PlacementRecordProto) -> String {
-    format!(
+    let mut base = format!(
         "placement cell={} shard={} phase={} phase_code={} dedicated_node={} dominant_pid={} move_count={} moves={} transfer_attempt_unix_ms={} replace_attempt_unix_ms={} updated_unix_ms={} reason={}",
         placement.cell_id,
         placement.shard_id,
@@ -524,7 +587,19 @@ fn format_placement(placement: &PlacementRecordProto) -> String {
         placement.last_replace_attempt_unix_ms,
         placement.updated_unix_ms,
         placement.blocked_reason
-    )
+    );
+    if (!placement.jumbo_move_phase.is_empty() && placement.jumbo_move_phase != "none")
+        || placement.jumbo_remote_handoff
+        || placement.jumbo_spare_drained
+    {
+        base.push_str(&format!(
+            " jumbo_move_phase={} jumbo_remote_handoff={} jumbo_spare_drained={}",
+            placement.jumbo_move_phase,
+            placement.jumbo_remote_handoff,
+            placement.jumbo_spare_drained
+        ));
+    }
+    base
 }
 
 fn format_moves(moves: &[PlacementMoveProto]) -> String {
@@ -598,6 +673,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             print_placements(&resp);
         }
+        Command::Cluster {
+            sub: ClusterCmd::Health { service },
+        } => {
+            let endpoint = tonic::transport::Endpoint::from_shared(url.to_string())?;
+            let channel = security.connect(endpoint).await?;
+            let mut hc = HealthClient::with_interceptor(channel, auth);
+            let resp = hc.check(HealthCheckRequest { service }).await?.into_inner();
+            let status_name = match ServingStatus::try_from(resp.status) {
+                Ok(ServingStatus::Serving) => "SERVING",
+                Ok(ServingStatus::NotServing) => "NOT_SERVING",
+                Ok(ServingStatus::ServiceUnknown) => "SERVICE_UNKNOWN",
+                _ => "UNKNOWN",
+            };
+            println!("health status={status_name} reason={}", resp.reason);
+            if resp.status != ServingStatus::Serving as i32 {
+                return Err(format!("health check returned {status_name}: {}", resp.reason).into());
+            }
+        }
         Command::Shard { sub } => {
             let mut cp = open_cp(&security, &url, auth.clone()).await?;
             match sub {
@@ -626,12 +719,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     print_split(&resp);
                 }
-                ShardCmd::EnableDualMode { shard_id, pid } => {
+                ShardCmd::EnableDualMode {
+                    shard_id,
+                    pid,
+                    split_name,
+                } => {
                     let resp = cp
                         .enable_dual_mode_split(EnableDualModeSplitRequest {
                             shard_id,
                             dominant_pid: pid,
-                            split_name: String::new(),
+                            split_name,
                         })
                         .await?
                         .into_inner();
@@ -645,29 +742,88 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         }
-        Command::Raft {
-            sub:
+        Command::Raft { sub } => {
+            let mut cp = open_cp(&security, &url, auth.clone()).await?;
+            match sub {
                 RaftCmd::ScaleReplicas {
                     cell_id,
                     target_voters,
-                },
-        } => {
-            let mut cp = open_cp(&security, &url, auth.clone()).await?;
-            let resp = cp
-                .scale_shard_replicas(ScaleShardReplicasRequest {
+                    ensure_node_id,
+                } => {
+                    let resp = cp
+                        .scale_shard_replicas(ScaleShardReplicasRequest {
+                            cell_id,
+                            target_voters,
+                            ensure_node_id,
+                        })
+                        .await?
+                        .into_inner();
+                    if let Some(err) = resp.error {
+                        return Err(application_error("scale_replicas", &err));
+                    }
+                    println!(
+                        "Upgraded {} shard(s) to {}-Voter",
+                        resp.upgraded_shards, target_voters
+                    );
+                }
+                RaftCmd::TransferLeader {
+                    shard_id,
+                    target_node_id,
+                } => {
+                    let resp = cp
+                        .transfer_shard_leader(TransferShardLeaderRequest {
+                            shard_id,
+                            target_node_id,
+                        })
+                        .await?
+                        .into_inner();
+                    if let Some(err) = resp.error {
+                        return Err(application_error("transfer_leader", &err));
+                    }
+                    println!(
+                        "transferred={} shard={} leader_node_id={}",
+                        resp.transferred, shard_id, resp.leader_node_id
+                    );
+                }
+                RaftCmd::RemoveVoter { cell_id, node_id } => {
+                    let resp = cp
+                        .remove_shard_voter(RemoveShardVoterRequest {
+                            cell_id,
+                            remove_node_id: node_id,
+                        })
+                        .await?
+                        .into_inner();
+                    if let Some(err) = resp.error {
+                        return Err(application_error("remove_voter", &err));
+                    }
+                    println!(
+                        "Removed voter {} across {} shard(s) in cell {}",
+                        node_id, resp.updated_shards, cell_id
+                    );
+                }
+                RaftCmd::RegisterNode {
                     cell_id,
-                    target_voters,
-                    ensure_node_id: 0,
-                })
-                .await?
-                .into_inner();
-            if let Some(err) = resp.error {
-                return Err(application_error("scale_replicas", &err));
+                    node_id,
+                    grpc_addr,
+                } => {
+                    let resp = cp
+                        .register_node(RegisterNodeRequest {
+                            cell_id,
+                            node_id,
+                            grpc_addr: grpc_addr.clone(),
+                            instance_id: Vec::new(),
+                        })
+                        .await?
+                        .into_inner();
+                    if let Some(err) = resp.error {
+                        return Err(application_error("register_node", &err));
+                    }
+                    println!(
+                        "Registered node {} ({}) in cell {}",
+                        node_id, grpc_addr, cell_id
+                    );
+                }
             }
-            println!(
-                "Upgraded {} shard(s) to {}-Voter",
-                resp.upgraded_shards, target_voters
-            );
         }
         Command::Backup { sub } => run_backup(sub).await?,
         Command::Cell {
@@ -707,12 +863,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             println!("Registered Cell {}", cell_id);
         }
-        Command::Sql { query } => {
+        Command::Sql { query, params } => {
+            let mut parsed_params = Vec::with_capacity(params.len());
+            for raw in &params {
+                parsed_params.push(parse_sql_param_flag(raw)?);
+            }
             let mut meta = open_meta(&security, &url, auth.clone()).await?;
             let resp = meta
                 .execute_sql(ExecuteSqlRequest {
                     sql: query,
-                    params: vec![],
+                    params: parsed_params,
                     caller_hlc: 0,
                 })
                 .await?

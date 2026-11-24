@@ -90,6 +90,8 @@ pub enum FaultTemplate {
     UnflushedRestart,
     /// After a seeded number of mutation-kind steps, flush, purge, shut down, and reopen.
     FlushPurgeRestart,
+    /// After a seeded number of mutation-kind steps, trigger a forced PID split, flush, shut down, and reopen.
+    SplitFlushRestart,
 }
 
 /// One CI workload. The step list is produced by [`plan_schedule`], not stored here.
@@ -138,6 +140,14 @@ pub fn ci_workloads() -> &'static [WorkloadSpec] {
             steps: 12,
             fault: FaultTemplate::FlushPurgeRestart,
         },
+        WorkloadSpec {
+            id: "metadata_setattr_cross_rename_split_restart",
+            layer: ExecutionLayer::SingleProcessPersistent,
+            summary: "Seeded create, setattr size update, cross-directory rename, online PID-boundary split, flush, and persistent reopen.",
+            dir_count: 3,
+            steps: 18,
+            fault: FaultTemplate::SplitFlushRestart,
+        },
     ]
 }
 
@@ -182,6 +192,8 @@ pub enum StepKind {
     Create,
     Unlink,
     Rename,
+    SetAttrSize,
+    CrossDirRename,
     Lookup,
     List,
     Stat,
@@ -193,6 +205,8 @@ impl StepKind {
             Self::Create => "create",
             Self::Unlink => "unlink",
             Self::Rename => "rename",
+            Self::SetAttrSize => "setattr-size",
+            Self::CrossDirRename => "cross-dir-rename",
             Self::Lookup => "lookup",
             Self::List => "list",
             Self::Stat => "stat",
@@ -204,7 +218,10 @@ impl StepKind {
     /// The clock is a property of the script, so the fault index does not depend
     /// on the engine.
     pub fn is_mutation(self) -> bool {
-        matches!(self, Self::Create | Self::Unlink | Self::Rename)
+        matches!(
+            self,
+            Self::Create | Self::Unlink | Self::Rename | Self::SetAttrSize | Self::CrossDirRename
+        )
     }
 
     fn from_roll(roll: u32) -> Self {
@@ -214,6 +231,19 @@ impl StepKind {
             4 => Self::Rename,
             5 => Self::Lookup,
             6 => Self::List,
+            _ => Self::Stat,
+        }
+    }
+
+    fn from_extended_roll(roll: u32) -> Self {
+        match roll % 10 {
+            0..=2 => Self::Create,
+            3 => Self::SetAttrSize,
+            4 => Self::CrossDirRename,
+            5 => Self::Unlink,
+            6 => Self::Rename,
+            7 => Self::Lookup,
+            8 => Self::List,
             _ => Self::Stat,
         }
     }
@@ -235,6 +265,7 @@ pub enum ScriptedFault {
     ClientOmission { step_index: u32 },
     UnflushedRestart { after_mutation_steps: u32 },
     FlushPurgeRestart { after_mutation_steps: u32 },
+    SplitFlushRestart { after_mutation_steps: u32 },
 }
 
 impl ScriptedFault {
@@ -248,6 +279,9 @@ impl ScriptedFault {
             Self::FlushPurgeRestart {
                 after_mutation_steps,
             } => format!("flush-purge-restart after_mutation_steps={after_mutation_steps}"),
+            Self::SplitFlushRestart {
+                after_mutation_steps,
+            } => format!("split-flush-restart after_mutation_steps={after_mutation_steps}"),
         }
     }
 }
@@ -313,8 +347,13 @@ pub fn plan_schedule(spec: &WorkloadSpec, seed: u64) -> Schedule {
     );
     let mut rng = SimRng::new(seed);
     let mut steps = Vec::with_capacity(spec.steps as usize);
+    let extended = spec.id == "metadata_setattr_cross_rename_split_restart";
     for _ in 0..spec.steps {
-        let kind = StepKind::from_roll(rng.gen_range(8));
+        let kind = if extended {
+            StepKind::from_extended_roll(rng.gen_range(10))
+        } else {
+            StepKind::from_roll(rng.gen_range(8))
+        };
         let dir_slot = rng.gen_range(spec.dir_count);
         steps.push(PlannedStep {
             index: 0,
@@ -346,6 +385,9 @@ pub fn plan_schedule(spec: &WorkloadSpec, seed: u64) -> Schedule {
             after_mutation_steps: restart_after(&mut rng, &steps),
         },
         FaultTemplate::FlushPurgeRestart => ScriptedFault::FlushPurgeRestart {
+            after_mutation_steps: restart_after(&mut rng, &steps),
+        },
+        FaultTemplate::SplitFlushRestart => ScriptedFault::SplitFlushRestart {
             after_mutation_steps: restart_after(&mut rng, &steps),
         },
     };
@@ -423,6 +465,17 @@ enum PlannedAction {
         from: String,
         to: String,
     },
+    SetAttrSize {
+        slot: usize,
+        name: String,
+        new_size: i64,
+    },
+    CrossDirRename {
+        src_slot: usize,
+        dst_slot: usize,
+        from: String,
+        to: String,
+    },
     LookupPresent {
         slot: usize,
         name: String,
@@ -443,7 +496,11 @@ impl PlannedAction {
     fn is_acked_mutation(&self) -> bool {
         matches!(
             self,
-            Self::Create { .. } | Self::Unlink { .. } | Self::Rename { .. }
+            Self::Create { .. }
+                | Self::Unlink { .. }
+                | Self::Rename { .. }
+                | Self::SetAttrSize { .. }
+                | Self::CrossDirRename { .. }
         )
     }
 
@@ -453,6 +510,17 @@ impl PlannedAction {
             Self::Create { slot, name, .. } => format!("create slot={slot} name={name}"),
             Self::Unlink { slot, name } => format!("unlink slot={slot} name={name}"),
             Self::Rename { slot, from, to } => format!("rename slot={slot} {from}->{to}"),
+            Self::SetAttrSize {
+                slot,
+                name,
+                new_size,
+            } => format!("setattr slot={slot} name={name} size={new_size}"),
+            Self::CrossDirRename {
+                src_slot,
+                dst_slot,
+                from,
+                to,
+            } => format!("cross-rename {src_slot}:{from}->{dst_slot}:{to}"),
             Self::LookupPresent { slot, name, size } => {
                 format!("lookup slot={slot} name={name} size={size}")
             }
@@ -552,6 +620,27 @@ fn decide(model: &mut NamespaceModel, step: &PlannedStep) -> PlannedAction {
             }
             None => PlannedAction::Stat { slot },
         },
+        StepKind::SetAttrSize => match first_file(model, slot) {
+            Some((name, cur_size)) => PlannedAction::SetAttrSize {
+                slot,
+                name,
+                new_size: cur_size.saturating_add(64),
+            },
+            None => PlannedAction::Stat { slot },
+        },
+        StepKind::CrossDirRename => match first_file(model, slot) {
+            Some((from, _)) if model.dirs.len() > 1 => {
+                let dst_slot = (slot + 1) % model.dirs.len();
+                let (to, _) = alloc_name(model, 'x');
+                PlannedAction::CrossDirRename {
+                    src_slot: slot,
+                    dst_slot,
+                    from,
+                    to,
+                }
+            }
+            _ => PlannedAction::Stat { slot },
+        },
         StepKind::Lookup => match first_file(model, slot) {
             Some((name, size)) => PlannedAction::LookupPresent { slot, name, size },
             None => PlannedAction::LookupAbsent { slot },
@@ -572,6 +661,27 @@ fn commit(model: &mut NamespaceModel, action: &PlannedAction) {
         PlannedAction::Rename { slot, from, to } => {
             let size = model.dirs[*slot].files.remove(from).unwrap_or(FILE_BYTES);
             model.dirs[*slot].files.insert(to.clone(), size);
+        }
+        PlannedAction::SetAttrSize {
+            slot,
+            name,
+            new_size,
+        } => {
+            if let Some(entry) = model.dirs[*slot].files.get_mut(name) {
+                *entry = *new_size;
+            }
+        }
+        PlannedAction::CrossDirRename {
+            src_slot,
+            dst_slot,
+            from,
+            to,
+        } => {
+            let size = model.dirs[*src_slot]
+                .files
+                .remove(from)
+                .unwrap_or(FILE_BYTES);
+            model.dirs[*dst_slot].files.insert(to.clone(), size);
         }
         _ => {}
     }
@@ -853,6 +963,37 @@ fn apply_in_memory(
                 .map(|_| ())
                 .map_err(|err| err.to_string())
         }
+        PlannedAction::SetAttrSize {
+            slot,
+            name,
+            new_size,
+        } => {
+            let pid = pid_of(model, *slot)?;
+            engine
+                .setattr(
+                    pid,
+                    name,
+                    metadb_tx::SetAttrPatch {
+                        size_bytes: Some(*new_size),
+                        ..Default::default()
+                    },
+                )
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        }
+        PlannedAction::CrossDirRename {
+            src_slot,
+            dst_slot,
+            from,
+            to,
+        } => {
+            let src_pid = pid_of(model, *src_slot)?;
+            let dst_pid = pid_of(model, *dst_slot)?;
+            engine
+                .rename(src_pid, from, dst_pid, to)
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        }
         PlannedAction::LookupPresent { slot, name, size } => {
             let pid = pid_of(model, *slot)?;
             match engine.lookup(pid, name).map_err(|err| err.to_string())? {
@@ -1031,7 +1172,9 @@ pub async fn run_persistent(
     if !restarted
         && matches!(
             schedule.fault,
-            ScriptedFault::UnflushedRestart { .. } | ScriptedFault::FlushPurgeRestart { .. }
+            ScriptedFault::UnflushedRestart { .. }
+                | ScriptedFault::FlushPurgeRestart { .. }
+                | ScriptedFault::SplitFlushRestart { .. }
         )
     {
         note(
@@ -1050,6 +1193,7 @@ pub async fn run_persistent(
 enum RestartKind {
     Unflushed,
     FlushPurge,
+    SplitFlush,
 }
 
 impl RestartKind {
@@ -1057,6 +1201,7 @@ impl RestartKind {
         match self {
             Self::Unflushed => "unflushed",
             Self::FlushPurge => "flush-purge",
+            Self::SplitFlush => "split-flush",
         }
     }
 }
@@ -1072,6 +1217,9 @@ fn restart_due(fault: &ScriptedFault, mutation_steps: u32, restarted: bool) -> O
         ScriptedFault::FlushPurgeRestart {
             after_mutation_steps,
         } if mutation_steps == after_mutation_steps => Some(RestartKind::FlushPurge),
+        ScriptedFault::SplitFlushRestart {
+            after_mutation_steps,
+        } if mutation_steps == after_mutation_steps => Some(RestartKind::SplitFlush),
         _ => None,
     }
 }
@@ -1094,6 +1242,20 @@ async fn restart_process(
                 Err(message)
             }
         },
+        RestartKind::SplitFlush => {
+            let _ = cluster
+                .cell_manager()
+                .maybe_split_or_isolate_shard(1, true)
+                .await;
+            match cluster.flush_all().await {
+                Ok(()) => cluster.shutdown().await.map_err(|err| err.to_string()),
+                Err(err) => {
+                    let message = err.to_string();
+                    let _ = cluster.shutdown_without_flush().await;
+                    Err(message)
+                }
+            }
+        }
     };
     // Drop the open cluster before the next `open_and_serve` so the LSM lock is released.
     drop(cluster);
@@ -1194,6 +1356,37 @@ async fn apply_persistent(
         PlannedAction::Rename { slot, from, to } => {
             let pid = pid_of(model, *slot)?;
             tx.rename(pid, from, pid, to, false)
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        }
+        PlannedAction::SetAttrSize {
+            slot,
+            name,
+            new_size,
+        } => {
+            let pid = pid_of(model, *slot)?;
+            tx.setattr(
+                pid,
+                name,
+                metadb_tx::SetAttrPatch {
+                    size_bytes: Some(*new_size),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+        }
+        PlannedAction::CrossDirRename {
+            src_slot,
+            dst_slot,
+            from,
+            to,
+        } => {
+            let src_pid = pid_of(model, *src_slot)?;
+            let dst_pid = pid_of(model, *dst_slot)?;
+            tx.rename(src_pid, from, dst_pid, to, false)
                 .await
                 .map(|_| ())
                 .map_err(|err| err.to_string())

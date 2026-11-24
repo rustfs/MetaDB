@@ -159,6 +159,8 @@ impl AsyncAttrAggregator {
                 engine.put(attr_key, attr.encode(), flush_hlc);
                 flushed_dirs += 1;
                 queue.clear();
+            } else {
+                queue.clear();
             }
         }
 

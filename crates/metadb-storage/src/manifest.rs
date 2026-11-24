@@ -390,7 +390,8 @@ impl ManifestLog {
             // else may belong to an existing database or interrupted rotation;
             // never overwrite it or run orphan cleanup without its CURRENT.
             for entry in fs::read_dir(lsm_dir)? {
-                if entry?.file_name() != "LOCK" {
+                let name = entry?.file_name();
+                if name != "LOCK" && name != ".DS_Store" {
                     return Err(MetaDbError::ManifestCorrupted(
                         "CURRENT is missing from a nonempty database directory".to_string(),
                     ));

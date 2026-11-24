@@ -122,6 +122,14 @@ impl CompositeKeyRange {
                 "invalid CompositeKeyRange: require non-empty start_key < end_key".to_string(),
             ));
         }
+        if start_key.as_slice() < [TABLE_PREFIX_META].as_slice()
+            || end_key.as_slice() > [TABLE_PREFIX_SECONDARY_INDEX + 1].as_slice()
+        {
+            return Err(MetaDbError::ShardRoutingError(
+                "invalid CompositeKeyRange: user key intervals must lie within [0x01, 0x04)"
+                    .to_string(),
+            ));
+        }
         Ok(Self { start_key, end_key })
     }
 

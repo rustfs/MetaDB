@@ -166,13 +166,19 @@ use metadb_core::{
 };
 use metadb_proto::control_plane_service_client::ControlPlaneServiceClient;
 use metadb_proto::control_plane_service_server::ControlPlaneServiceServer;
+use metadb_proto::health::health_check_response::ServingStatus;
+use metadb_proto::health::health_server::{Health, HealthServer};
+use metadb_proto::health::{HealthCheckRequest, HealthCheckResponse};
 use metadb_proto::metadata_service_server::MetadataServiceServer;
 use metadb_proto::raft_transport_service_server::{
     RaftTransportService, RaftTransportServiceServer,
 };
+use metadb_proto::transaction_service_client::TransactionServiceClient;
 use metadb_proto::transaction_service_server::TransactionServiceServer;
 use metadb_proto::{
-    GetRoutesRequest, RegisterNodeRequest, ScaleShardReplicasRequest, StoreHeartbeatRequest,
+    ApplyAuxBatchRequest, GetRoutesRequest, ProbeTransferLeaderRequest,
+    ProbeTransferLeaderResponse, RegisterNodeRequest, RequestRoutingHeader,
+    ScaleShardReplicasRequest, StoreHeartbeatRequest,
 };
 use metadb_proto::{RaftRpcEnvelope, RaftRpcReply, SnapshotChunkRequest, SnapshotChunkResponse};
 use metadb_proxy::{MetadataSqlCommand, SqlTemplateParser, StatelessProxyRouter};
@@ -184,7 +190,7 @@ use metadb_storage::mvcc::DEFAULT_MVCC_RETENTION_MS;
 use metadb_storage::{LifecycleStorageEngine, ShardedBlockCache};
 use metadb_tx::{
     AsyncAttrAggregator, AsyncAuxiliarySink, AuxDispatcher, DistributedTxRouter, PushdownExecutor,
-    TwoPhaseCommitCoordinator, TxnRecoveryWorker,
+    RemoteAuxBatchSink, TwoPhaseCommitCoordinator, TxnRecoveryWorker,
 };
 
 pub use config::{ServerRole, ServerTomlConfig};
@@ -363,6 +369,18 @@ impl MetaDbEngine {
         self.pushdown.unlink(&storage, pid, name, hlc)
     }
 
+    /// Updates attributes on `(pid, name)` via single-shard pushdown.
+    pub fn setattr(
+        &self,
+        pid: InodeId,
+        name: &str,
+        patch: metadb_tx::SetAttrPatch,
+    ) -> Result<MetaEntry> {
+        let hlc = self.clock.now();
+        let (_, _, storage) = self.global_manager.route_pid(pid)?;
+        self.pushdown.setattr(&storage, pid, name, patch, hlc)
+    }
+
     /// Removes an empty directory `(pid, name)` after verifying zero live children exist.
     pub fn rmdir(&self, pid: InodeId, name: &str) -> Result<InodeAttr> {
         let hlc = self.clock.now();
@@ -498,6 +516,9 @@ impl MetaDbEngine {
             } => Ok(SqlQueryResult::Entry(
                 self.rename(src_pid, &src_name, dst_pid, &dst_name)?,
             )),
+            MetadataSqlCommand::SetAttr { pid, name, patch } => {
+                Ok(SqlQueryResult::Entry(self.setattr(pid, &name, patch)?))
+            }
             other => Err(metadb_core::MetaDbError::SqlParseError(format!(
                 "use async ClusterEngine / StatelessProxyRouter for template {:?}",
                 other
@@ -653,6 +674,7 @@ async fn serve_global_directory(
         grpc_svc,
         shared_secret,
         RaftIngress::Groups(MultiRaftTransportServer::new(MultiRaftRouter::new())),
+        Arc::downgrade(&cluster),
         shutdown_rx,
         Arc::clone(&transport_security),
         roles,
@@ -908,6 +930,7 @@ async fn serve_proxy(
         grpc_svc,
         shared_secret,
         RaftIngress::Proxy,
+        Arc::downgrade(&cluster),
         shutdown_rx,
         transport_security,
         roles,
@@ -986,7 +1009,6 @@ impl PersistentMetaDbCluster {
         if config.node.role == ServerRole::Proxy {
             return serve_proxy(config, transport_security, roles).await;
         }
-        std::fs::create_dir_all(&config.node.data_dir)?;
         if directory_only {
             let shard_tree = config.node.data_dir.join("be");
             let cell_state = config
@@ -1041,6 +1063,7 @@ impl PersistentMetaDbCluster {
         tls_spec
             .reject_listen_host(&bound_addr)
             .map_err(security_startup_error)?;
+        std::fs::create_dir_all(&config.node.data_dir)?;
         if directory_only {
             return serve_global_directory(config, listener, bound_addr, transport_security, roles)
                 .await;
@@ -1126,6 +1149,9 @@ impl PersistentMetaDbCluster {
             )
             .await?
         };
+        cell_manager.set_automatic_leadership_transfer_enabled(
+            config.sharding.enable_automatic_leadership_transfer,
+        );
 
         let global_manager = Arc::new(DurableGlobalManager::new(
             clock.clone(),
@@ -1213,6 +1239,7 @@ impl PersistentMetaDbCluster {
             grpc_svc,
             shared_secret,
             RaftIngress::Groups(MultiRaftTransportServer::new(raft_router)),
+            Arc::downgrade(&cluster),
             shutdown_rx,
             Arc::clone(&transport_security),
             roles,
@@ -1272,7 +1299,17 @@ impl PersistentMetaDbCluster {
         }
 
         // A joined replica already has the root directory in the replicated state machine.
-        if !cluster.cell_manager().joined_existing()
+        // Only initialize `ROOT_INODE_ID` if this cell actually hosts the root directory keyspace;
+        // otherwise `dirstat`/`init_dir_attr` would burn 2 * `ROUTE_RETRY_TIMEOUT` (60s) on a
+        // non-MetaTable cell (such as a QuotaTable or SecondaryIndexTable cell).
+        let root_attr_key = metadb_core::MetaKey::dir_attr(ROOT_INODE_ID).encode();
+        let owns_root_dir = cluster
+            .cell_manager()
+            .list_routes()
+            .iter()
+            .any(|r| r.range.contains_key(&root_attr_key));
+        if owns_root_dir
+            && !cluster.cell_manager().joined_existing()
             && cluster.tx_router().dirstat(ROOT_INODE_ID).await.is_err()
         {
             let _ = cluster
@@ -1289,6 +1326,20 @@ impl PersistentMetaDbCluster {
                     cluster.operability.fail();
                     let _ = cluster.shutdown_without_flush().await;
                     return Err(error);
+                }
+            }
+        }
+        // Run an initial 2PC recovery pass on shards already led by this node before marking `/readyz`.
+        for cell in cluster.global_manager.all_cells() {
+            for (_, grp, handler) in cell.local_shard_handles() {
+                if grp.current_leader() == Some(cluster.config.node.node_id) {
+                    let _ = TxnRecoveryWorker::run_recovery_pass_on_shard(
+                        &grp,
+                        &handler,
+                        cluster.global_manager.as_ref(),
+                        &cluster.clock,
+                    )
+                    .await;
                 }
             }
         }
@@ -1420,13 +1471,21 @@ impl PersistentMetaDbCluster {
         // Operator backup jobs and pending holds are latched on this loop so a
         // `metadb-ctl` process can ask the running server to copy under its log lock.
         let _ = self.poll_backup_requests();
+        let remote_sink = GrpcRemoteAuxSink {
+            global_manager: self.global_manager.clone(),
+            global_manager_addr: self.config.cluster.global_manager.trim().to_string(),
+            secret: self.config.security.shared_secret.clone(),
+            security: Arc::clone(&self.transport_security),
+            role: self.roles().map(|r| r.local().clone()),
+        };
         for cell in self.global_manager.all_cells() {
             for (_, grp, handler) in cell.local_shard_handles() {
-                let _ = AuxDispatcher::drain_shard_outbox(
+                let _ = AuxDispatcher::drain_shard_outbox_with_remote_sink(
                     &grp,
                     &handler,
                     self.global_manager.as_ref(),
                     &self.clock,
+                    Some(&remote_sink),
                 )
                 .await;
                 let _ = TxnRecoveryWorker::run_recovery_pass_on_shard(
@@ -1469,13 +1528,10 @@ impl PersistentMetaDbCluster {
             tracing::warn!(%error, "control heartbeat was not published");
         }
         if let Some(cell) = &self.cell_manager {
-            // Hints are computed here and not applied. This does not call
-            // transfer_leader, move a Jumbo shard, change membership, or
-            // replicate the cell directory. The leadership gate does not read
-            // the hint. It refuses while automatic transfer is disabled and
-            // does not call `trigger().transfer_leader`.
+            // Hints are computed here. By default automatic leadership transfer stays
+            // disabled unless explicitly opted in via `set_automatic_leadership_transfer_enabled(true)`.
             cell.observe_liveness_hints();
-            cell.consider_automatic_leadership_transfer();
+            cell.consider_automatic_leadership_transfer_async().await;
         }
         Ok(())
     }
@@ -1672,6 +1728,7 @@ impl PersistentMetaDbCluster {
         } else {
             Ok(())
         };
+        let _ = std::fs::remove_file(self.config.node.data_dir.join("GRPC_ADDR"));
         backup::unregister_runtime(&self.config.node.data_dir);
         result
     }
@@ -1699,6 +1756,7 @@ impl PersistentMetaDbCluster {
         } else {
             Ok(())
         };
+        let _ = std::fs::remove_file(self.config.node.data_dir.join("GRPC_ADDR"));
         backup::unregister_runtime(&self.config.node.data_dir);
         result
     }
@@ -1719,6 +1777,22 @@ impl PersistentMetaDbCluster {
         backup::release_hold(&self.config.node.data_dir)
     }
 
+    fn effective_shard_raft_dir(
+        &self,
+        host: &ShardGroupHost,
+        shard_id: ShardId,
+    ) -> std::path::PathBuf {
+        let dedicated = self.config.sharding.jumbo_dedicated_root.trim();
+        if !dedicated.is_empty() {
+            if let Ok(Some(live_dir)) =
+                metadb_cluster::jumbo_files::load_live_dir(Path::new(dedicated), shard_id)
+            {
+                return live_dir.join("raft");
+            }
+        }
+        host.shard_dir(shard_id).join("raft")
+    }
+
     /// Copies a restorable image while a backup hold is active.
     pub fn create_backup(&self, destination: &Path) -> Result<backup::BackupSummary> {
         let Some(host) = &self.host else {
@@ -1730,7 +1804,7 @@ impl PersistentMetaDbCluster {
         let mut raft_dirs = Vec::with_capacity(groups.len());
         let mut engines = Vec::with_capacity(groups.len());
         for group in &groups {
-            raft_dirs.push(host.shard_dir(group.shard_id()).join("raft"));
+            raft_dirs.push(self.effective_shard_raft_dir(host, group.shard_id()));
             engines.push(group.engine());
         }
         let shards: Vec<OnlineShard<'_>> = groups
@@ -1788,7 +1862,7 @@ impl PersistentMetaDbCluster {
             return Ok(Vec::new());
         };
         for group in host.all_groups() {
-            let raft_dir = host.shard_dir(group.shard_id()).join("raft");
+            let raft_dir = self.effective_shard_raft_dir(host, group.shard_id());
             by_id.insert(
                 group.shard_id(),
                 backup::floor_for_open_log(
@@ -1805,7 +1879,7 @@ impl PersistentMetaDbCluster {
             let Some(host) = &self.host else {
                 continue;
             };
-            let raft_dir = host.shard_dir(shard_id).join("raft");
+            let raft_dir = self.effective_shard_raft_dir(host, shard_id);
             by_id.insert(shard_id, backup::disk_floor(shard_id, &raft_dir)?);
         }
         Ok(by_id.into_values().collect())
@@ -1927,6 +2001,20 @@ impl RaftTransportService for RaftIngress {
             Self::Proxy => Ok(Response::new(proxy_raft_reply())),
         }
     }
+
+    async fn probe_transfer_leader(
+        &self,
+        request: Request<ProbeTransferLeaderRequest>,
+    ) -> std::result::Result<Response<ProbeTransferLeaderResponse>, Status> {
+        match self {
+            Self::Groups(server) => server.probe_transfer_leader(request).await,
+            Self::Proxy => Ok(Response::new(ProbeTransferLeaderResponse {
+                eligible: false,
+                last_applied_index: 0,
+                reason: PROXY_RAFT_REJECTION.to_string(),
+            })),
+        }
+    }
 }
 
 fn proxy_raft_reply() -> RaftRpcReply {
@@ -1936,16 +2024,271 @@ fn proxy_raft_reply() -> RaftRpcReply {
     }
 }
 
+struct GrpcRemoteAuxSink {
+    global_manager: Arc<DurableGlobalManager>,
+    global_manager_addr: String,
+    secret: String,
+    security: Arc<TransportSecurity>,
+    role: Option<RolePresentation>,
+}
+
+impl GrpcRemoteAuxSink {
+    async fn resolve_target_endpoints(&self, target_key: &[u8]) -> Result<Vec<String>> {
+        if let Ok(metadb_cluster::CellPlacement::Remote { endpoints, .. }) =
+            self.global_manager.placement_for_keys(&[target_key])
+        {
+            if !endpoints.is_empty() {
+                return Ok(endpoints);
+            }
+        }
+        if !self.global_manager_addr.is_empty() {
+            let mut cp = control_plane_client(
+                &self.global_manager_addr,
+                &self.secret,
+                &self.security,
+                self.role.as_ref(),
+            )
+            .await?;
+            let resp = cp
+                .get_routes(GetRoutesRequest { cell_id: 0 })
+                .await
+                .map_err(|e| {
+                    MetaDbError::ShardRoutingError(format!(
+                        "remote aux get_routes at {}: {e}",
+                        self.global_manager_addr
+                    ))
+                })?
+                .into_inner();
+            if let Some(err) = rpc_app_error(resp.error) {
+                return Err(err);
+            }
+            for shard in resp.shards {
+                if target_key >= shard.start_key.as_slice()
+                    && (shard.end_key.is_empty() || target_key < shard.end_key.as_slice())
+                {
+                    let mut addrs = Vec::new();
+                    if shard.leader_node_id != 0 {
+                        if let Some(p) = shard
+                            .peers
+                            .iter()
+                            .find(|p| p.node_id == shard.leader_node_id)
+                        {
+                            addrs.push(p.grpc_addr.clone());
+                        }
+                    }
+                    for peer in shard.peers {
+                        if peer.is_voter && !addrs.contains(&peer.grpc_addr) {
+                            addrs.push(peer.grpc_addr);
+                        }
+                    }
+                    if !addrs.is_empty() {
+                        return Ok(addrs);
+                    }
+                }
+            }
+        }
+        Err(MetaDbError::ShardRoutingError(
+            "no remote cell endpoint found for auxiliary target key".to_string(),
+        ))
+    }
+}
+
+#[tonic::async_trait]
+impl RemoteAuxBatchSink for GrpcRemoteAuxSink {
+    async fn dispatch_remote_aux_batch(
+        &self,
+        target_key: &[u8],
+        entries: Vec<metadb_core::AuxOutboxEntry>,
+    ) -> Result<()> {
+        let endpoints = self.resolve_target_endpoints(target_key).await?;
+        let mut encoded = Vec::with_capacity(entries.len());
+        let origin_shard_id = entries.first().map(|e| e.origin_shard_id).unwrap_or(0);
+        for entry in &entries {
+            encoded.push(entry.encode());
+        }
+        let mut last_err = None;
+        for addr in endpoints {
+            let url = match self.security.prepare_url(&addr) {
+                Ok(u) => u,
+                Err(e) => {
+                    last_err = Some(MetaDbError::ShardRoutingError(e.to_string()));
+                    continue;
+                }
+            };
+            let ep = match Endpoint::from_shared(url) {
+                Ok(ep) => ep
+                    .connect_timeout(Duration::from_secs(3))
+                    .timeout(Duration::from_secs(10)),
+                Err(e) => {
+                    last_err = Some(MetaDbError::ShardRoutingError(e.to_string()));
+                    continue;
+                }
+            };
+            let channel = match self.security.connect(ep).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    last_err = Some(MetaDbError::ShardRoutingError(e.to_string()));
+                    continue;
+                }
+            };
+            let mut auth = BearerAuthClient::new(&self.secret);
+            if let Some(role) = &self.role {
+                auth = auth.with_role(role.clone());
+            }
+            let mut client = TransactionServiceClient::with_interceptor(channel, auth);
+            let mut req = Request::new(ApplyAuxBatchRequest {
+                header: Some(RequestRoutingHeader {
+                    shard_id: 0,
+                    expected_epoch: None,
+                    caller_hlc: 0,
+                }),
+                origin_shard_id,
+                encoded_outbox_entries: encoded.clone(),
+            });
+            req.metadata_mut().insert(
+                "x-metadb-cell-forwarded",
+                tonic::metadata::MetadataValue::from_static("1"),
+            );
+            match client.apply_aux_batch(req).await {
+                Ok(resp) => {
+                    if let Some(err) = rpc_app_error(resp.into_inner().error) {
+                        last_err = Some(err);
+                    } else {
+                        return Ok(());
+                    }
+                }
+                Err(status) => {
+                    last_err = Some(MetaDbError::ConsensusError(status.to_string()));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            MetaDbError::ShardRoutingError("remote ApplyAuxBatch failed".to_string())
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct MetaDbHealthService {
+    cluster: std::sync::Weak<PersistentMetaDbCluster>,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+impl MetaDbHealthService {
+    fn known_service(service: &str) -> bool {
+        matches!(
+            service,
+            "" | "metadb.v1.MetadataService"
+                | "metadb.v1.TransactionService"
+                | "metadb.v1.ControlPlaneService"
+                | "metadb.v1.RaftTransportService"
+                | "grpc.health.v1.Health"
+        )
+    }
+
+    fn current_response(&self, service: &str) -> Option<HealthCheckResponse> {
+        if !Self::known_service(service) {
+            return None;
+        }
+        let Some(cluster) = self.cluster.upgrade() else {
+            return Some(HealthCheckResponse {
+                status: ServingStatus::NotServing as i32,
+                reason: "shutting_down".to_string(),
+            });
+        };
+        let report = cluster.readiness();
+        if report.ready {
+            Some(HealthCheckResponse {
+                status: ServingStatus::Serving as i32,
+                reason: String::new(),
+            })
+        } else {
+            Some(HealthCheckResponse {
+                status: ServingStatus::NotServing as i32,
+                reason: report.reason.to_string(),
+            })
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl Health for MetaDbHealthService {
+    async fn check(
+        &self,
+        request: Request<HealthCheckRequest>,
+    ) -> std::result::Result<Response<HealthCheckResponse>, Status> {
+        let svc = request.into_inner().service;
+        match self.current_response(&svc) {
+            Some(resp) => Ok(Response::new(resp)),
+            None => Err(Status::not_found(format!("unknown service: {svc}"))),
+        }
+    }
+
+    type WatchStream =
+        tokio_stream::wrappers::ReceiverStream<std::result::Result<HealthCheckResponse, Status>>;
+
+    async fn watch(
+        &self,
+        request: Request<HealthCheckRequest>,
+    ) -> std::result::Result<Response<Self::WatchStream>, Status> {
+        let svc = request.into_inner().service;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let this = self.clone();
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        tokio::spawn(async move {
+            let initial = this.current_response(&svc).unwrap_or(HealthCheckResponse {
+                status: ServingStatus::ServiceUnknown as i32,
+                reason: "service_unknown".to_string(),
+            });
+            let mut last = (initial.status, initial.reason.clone());
+            if tx.send(Ok(initial)).await.is_err() {
+                return;
+            }
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                let next = this.current_response(&svc).unwrap_or(HealthCheckResponse {
+                    status: ServingStatus::ServiceUnknown as i32,
+                    reason: "service_unknown".to_string(),
+                });
+                let pair = (next.status, next.reason.clone());
+                if pair != last {
+                    last = pair;
+                    if tx.send(Ok(next)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_grpc_server(
     listener: TcpListener,
     grpc_svc: MetaDbGrpcService,
     shared_secret: String,
     raft: RaftIngress,
+    cluster: std::sync::Weak<PersistentMetaDbCluster>,
     mut shutdown_rx: watch::Receiver<bool>,
     security: Arc<TransportSecurity>,
     roles: Option<Arc<InstalledRoles>>,
 ) -> tokio::task::JoinHandle<()> {
     let auth = BearerAuth::new(shared_secret.clone());
+    let health_svc = MetaDbHealthService {
+        cluster,
+        shutdown_rx: shutdown_rx.clone(),
+    };
+    let mut drain_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         let router = Server::builder()
             .layer(rbac_layer::RbacLayer::new(shared_secret.clone(), roles))
@@ -1961,16 +2304,27 @@ fn spawn_grpc_server(
                 grpc_svc,
                 auth.clone(),
             ))
-            .add_service(RaftTransportServiceServer::with_interceptor(raft, auth));
+            .add_service(RaftTransportServiceServer::with_interceptor(
+                raft,
+                auth.clone(),
+            ))
+            .add_service(HealthServer::with_interceptor(health_svc, auth));
         if !security.is_plaintext() {
             tracing::error!("refusing to serve: TLS termination is not available");
             return;
         }
-        let _ = router
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+        let serve_fut =
+            router.serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                 let _ = shutdown_rx.changed().await;
-            })
-            .await;
+            });
+        tokio::pin!(serve_fut);
+        tokio::select! {
+            _ = &mut serve_fut => {}
+            _ = async {
+                let _ = drain_rx.changed().await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            } => {}
+        }
     })
 }
 

@@ -15,6 +15,7 @@ pub mod system_keys;
 
 pub use checksum::{
     append_crc32c_be, append_crc32c_le, checksum_crc32c, verify_crc32c_be, verify_crc32c_le,
+    Crc32cHasher,
 };
 pub use epoch::{CellId, CompositeKeyRange, ShardEpoch, TxnId};
 pub use error::{LeaseRenewReject, MetaDbError, Result, RetryableConsensusKind};
@@ -37,10 +38,10 @@ pub use schema::{
 };
 pub use system_keys::{
     affinity_key_for_raw_entry, decode_lease_preimage, decode_origin_quota_cursor,
-    encode_lease_preimage, encode_origin_quota_cursor, lease_preimage_blocks_split,
-    lease_preimage_is_orphan, lease_preimage_key, lease_preimage_prefix, lease_preimage_prefix_end,
-    AttrDeltaSpec, AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, DirShardDeltaKey,
-    DirShardDeltaRecord, FenceHolder, IntentOp, LeasePreimageValue, OriginQuotaCursorKey,
-    SpilledAuxOutboxKey, TxnRecordKey, TxnState, TxnStatusRecord, WriteIntentKey,
-    WriteIntentRecord,
+    decode_origin_quota_cursor_pair, encode_lease_preimage, encode_origin_quota_cursor,
+    encode_origin_quota_cursor_pair, lease_preimage_blocks_split, lease_preimage_is_orphan,
+    lease_preimage_key, lease_preimage_prefix, lease_preimage_prefix_end, AttrDeltaSpec,
+    AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, DirShardDeltaKey, DirShardDeltaRecord,
+    FenceHolder, IntentOp, LeasePreimageValue, OriginQuotaCursorKey, SpilledAuxOutboxKey,
+    TxnRecordKey, TxnState, TxnStatusRecord, WriteIntentKey, WriteIntentRecord,
 };

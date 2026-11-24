@@ -52,6 +52,8 @@ pub struct DurableGlobalManager {
     meta_cache: Arc<CompositeMetaCache>,
     cells: RwLock<BTreeMap<CellId, (CompositeKeyRange, Arc<DurableCellManager>)>>,
     directory: Mutex<CellDirectory>,
+    /// Crash-safe pre-allocated `(next_seq, remaining)` cursor for 2PC transaction IDs.
+    txn_id_cursor: Mutex<(u64, u64)>,
 }
 
 impl DurableGlobalManager {
@@ -70,6 +72,7 @@ impl DurableGlobalManager {
                 records: BTreeMap::new(),
                 loaded_from_file: false,
             }),
+            txn_id_cursor: Mutex::new((0, 0)),
         }
     }
 
@@ -570,11 +573,24 @@ fn directory_cell_matches(stored: &DirectoryCell, replicated: &DirectoryCell) ->
 #[tonic::async_trait]
 impl ShardDirectory for DurableGlobalManager {
     fn allocate_txn_id(&self, coordinator_node_id: u64) -> Result<metadb_core::TxnId> {
-        // Share the persisted sequence with FileId grants. Gaps in that sequence
-        // are harmless; resetting a process-local counter can alias live 2PC records.
-        let (seq, _) =
-            self.id_allocator
-                .allocate_block(0, crate::id_allocator::AllocIdKind::FileId, 1)?;
+        // Lease blocks of 256 durable sequences from the persisted FileId space so
+        // 255 out of 256 2PC transactions avoid an allocator fsync while preserving
+        // strict Write-Before-Grant crash uniqueness.
+        const TXN_ID_BLOCK_SIZE: u64 = 256;
+        let mut cursor = self.txn_id_cursor.lock().unwrap();
+        if cursor.1 == 0 {
+            let (start, count) = self.id_allocator.allocate_block(
+                0,
+                crate::id_allocator::AllocIdKind::FileId,
+                TXN_ID_BLOCK_SIZE,
+            )?;
+            *cursor = (start, count);
+        }
+        let seq = cursor.0;
+        cursor.1 -= 1;
+        if cursor.1 > 0 {
+            cursor.0 = cursor.0.saturating_add(1);
+        }
         Ok(((coordinator_node_id as u128) << 64) | seq as u128)
     }
 

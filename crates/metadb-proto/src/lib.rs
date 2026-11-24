@@ -5,6 +5,10 @@ pub mod v1 {
     tonic::include_proto!("metadb.v1");
 }
 
+pub mod health {
+    tonic::include_proto!("grpc.health.v1");
+}
+
 pub mod convert;
 
 pub use v1::*;

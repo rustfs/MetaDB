@@ -52,6 +52,12 @@ pub struct ClusterMetricsSnapshot {
     pub placement_rows_with_replace_attempt: u64,
     /// 1 only when this build calls `transfer_leader`. This build reports 0.
     pub placement_automatic_transfer_enabled: u64,
+    /// Total unpurged Raft log entries between `last_applied` and `safe_purge_index` across local shards.
+    pub raft_watermark_lag_entries: u64,
+    /// Local shards currently running from a `MOVE_LIVE` dedicated jumbo disk directory.
+    pub jumbo_file_moves_live: u64,
+    /// Nodes with a fresh measured heartbeat hint on local cell managers.
+    pub heartbeat_live_nodes: u64,
 }
 
 impl ClusterMetricsSnapshot {
@@ -91,8 +97,11 @@ pub fn collect_cluster_metrics(gm: &DurableGlobalManager) -> ClusterMetricsSnaps
         ..Default::default()
     };
     let mut min_purge: Option<u64> = None;
+    let mut any_cell_auto_transfer = false;
 
     for cell in cells {
+        any_cell_auto_transfer |= cell.automatic_leadership_transfer_enabled();
+        snap.heartbeat_live_nodes += cell.live_heartbeat_node_count();
         let handles = cell.local_shard_handles();
         snap.shards_total += handles.len();
         for (_, grp, _) in handles {
@@ -104,6 +113,11 @@ pub fn collect_cluster_metrics(gm: &DurableGlobalManager) -> ClusterMetricsSnaps
             snap.tombstones_traversed_on_scans_total += m.tombstones_traversed_on_scans;
             snap.locality_compactions_total += m.compaction_stats.localized_compactions_triggered;
             let p = grp.watermarks().safe_purge_index();
+            let last_applied = grp.last_applied_index();
+            snap.raft_watermark_lag_entries += last_applied.saturating_sub(p);
+            if cell.jumbo_move_phase_name(grp.shard_id()) == "live" {
+                snap.jumbo_file_moves_live += 1;
+            }
             min_purge = Some(min_purge.map_or(p, |cur| cur.min(p)));
         }
         for placement in cell.stored_placements() {
@@ -133,7 +147,8 @@ pub fn collect_cluster_metrics(gm: &DurableGlobalManager) -> ClusterMetricsSnaps
         }
     }
     snap.min_raft_safe_purge_index = min_purge.unwrap_or(0);
-    snap.placement_automatic_transfer_enabled = u64::from(automatic_leadership_transfer_allowed());
+    snap.placement_automatic_transfer_enabled =
+        u64::from(automatic_leadership_transfer_allowed() || any_cell_auto_transfer);
     snap
 }
 
@@ -210,6 +225,12 @@ pub fn render_prometheus_metrics(m: &ClusterMetricsSnapshot) -> String {
             "metadb_placement_rows_with_replace_attempt {}\n",
             "# TYPE metadb_placement_automatic_transfer_enabled gauge\n",
             "metadb_placement_automatic_transfer_enabled {}\n",
+            "# TYPE metadb_raft_watermark_lag_entries gauge\n",
+            "metadb_raft_watermark_lag_entries {}\n",
+            "# TYPE metadb_jumbo_file_moves_live gauge\n",
+            "metadb_jumbo_file_moves_live {}\n",
+            "# TYPE metadb_heartbeat_live_nodes gauge\n",
+            "metadb_heartbeat_live_nodes {}\n",
         ),
         m.cells_total,
         m.shards_total,
@@ -246,6 +267,9 @@ pub fn render_prometheus_metrics(m: &ClusterMetricsSnapshot) -> String {
         m.placement_rows_with_transfer_attempt,
         m.placement_rows_with_replace_attempt,
         m.placement_automatic_transfer_enabled,
+        m.raft_watermark_lag_entries,
+        m.jumbo_file_moves_live,
+        m.heartbeat_live_nodes,
     )
 }
 

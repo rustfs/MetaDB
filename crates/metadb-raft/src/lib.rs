@@ -20,7 +20,8 @@ pub use group_host::{
 };
 pub use log_store::SegmentedRaftLogStore;
 pub use network::{
-    ChannelPool, MetaDbRaft, MultiRaftRouter, MultiRaftTransportServer, TonicRaftNetworkFactory,
+    ChannelPool, LocalShardControlHook, MetaDbRaft, MultiRaftRouter, MultiRaftTransportServer,
+    TonicRaftNetworkFactory,
 };
 pub use read_index::{ReadIndexBatcher, ReadToken};
 pub use state_machine::{BasicKvApplyHandler, ShardApplyHandler, ShardStateMachine};

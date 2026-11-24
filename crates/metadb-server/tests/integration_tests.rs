@@ -629,12 +629,18 @@ fn prepare_req(
     primary_key: Vec<u8>,
     intent_user_key: Vec<u8>,
 ) -> Prepare2pcRequest {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let start_hlc = HlcTimestamp::new(now_ms, 0);
+    let expire_hlc = HlcTimestamp::new(now_ms + 3_000, 0);
     let record = WriteIntentRecord {
         txn_id,
         primary_shard_hint: 1,
         primary_key: primary_key.clone(),
-        start_hlc: HlcTimestamp::ZERO,
-        expire_hlc: HlcTimestamp(u64::MAX),
+        start_hlc,
+        expire_hlc,
         rename_fence_token: None,
         op: IntentOp::Put {
             value: b"prepared".to_vec(),
@@ -652,8 +658,8 @@ fn prepare_req(
         is_primary: false,
         primary_key: primary_key.clone(),
         all_participant_keys: vec![primary_key, intent_user_key.clone()],
-        start_hlc: 0,
-        expire_hlc: u64::MAX,
+        start_hlc: start_hlc.0,
+        expire_hlc: expire_hlc.0,
         has_rename_fence_token: false,
         rename_fence_token: 0,
         encoded_intent_keys: vec![WriteIntentKey::new(intent_user_key.clone()).encode()],

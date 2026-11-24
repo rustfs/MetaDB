@@ -225,7 +225,7 @@ fn pre_read(dest: &Path, files: &[MovedFile]) -> Result<()> {
 }
 
 fn settle_copied_files(dest: &Path, files: &mut [MovedFile]) -> Result<()> {
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::thread::sleep(std::time::Duration::from_millis(20));
     for _ in 0..25 {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let mut changed = false;

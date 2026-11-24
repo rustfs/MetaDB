@@ -96,6 +96,7 @@ impl TryFrom<InodeAttrProto> for InodeAttr {
             MetaDbError::CodecError(format!("entry_type out of u8 range: {}", p.entry_type))
         })?;
         let entry_type = EntryType::from_u8(raw_type)?;
+        crate::convert::validate_non_negative_size(p.size_bytes)?;
         Ok(Self {
             inode_id: p.inode_id,
             parent_pid: p.parent_pid,
@@ -164,6 +165,10 @@ impl From<&QuotaRecord> for QuotaRecordProto {
     }
 }
 
+fn validate_non_negative_size(size_bytes: i64) -> Result<()> {
+    metadb_core::validate_file_size(size_bytes)
+}
+
 impl TryFrom<QuotaRecordProto> for QuotaRecord {
     type Error = MetaDbError;
 
@@ -176,7 +181,15 @@ impl TryFrom<QuotaRecordProto> for QuotaRecord {
                     c.task_ordinal
                 ))
             })?;
-            applied_by_shard.insert(c.origin_shard_id, (c.raft_index, ord));
+            if applied_by_shard
+                .insert(c.origin_shard_id, (c.raft_index, ord))
+                .is_some()
+            {
+                return Err(MetaDbError::CodecError(format!(
+                    "duplicate origin_shard_id {} in QuotaRecordProto",
+                    c.origin_shard_id
+                )));
+            }
         }
         Ok(Self {
             uid: p.uid,
@@ -272,6 +285,22 @@ impl From<&MetaDbError> for ErrorDetailProto {
                 leader_hint,
             } => Self {
                 error_kind: "NotLeader".to_string(),
+                message: err.to_string(),
+                shard_id: *shard_id,
+                expected_epoch: None,
+                actual_epoch: None,
+                updated_descriptor: None,
+                split_child_hint: None,
+                has_leader_hint: leader_hint.is_some(),
+                leader_hint: leader_hint.unwrap_or(0),
+                serialized_core_error,
+            },
+            MetaDbError::RetryableConsensus {
+                shard_id,
+                leader_hint,
+                ..
+            } => Self {
+                error_kind: "RetryableConsensus".to_string(),
                 message: err.to_string(),
                 shard_id: *shard_id,
                 expected_epoch: None,

@@ -401,6 +401,7 @@ async fn recover(cluster: &Cluster) {
     .unwrap();
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn propose_extend(
     group: &ShardRaftGroup,
     clock: &HybridLogicalClock,
@@ -452,7 +453,9 @@ fn holder_deadlines(records: &[WriteIntentRecord], txn_id: u128) -> Vec<u64> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn progressing_rename_commits_past_the_initial_three_second_ttl() {
     assert_eq!(DEFAULT_2PC_TTL_MS, 3_000);
-    assert!(MAX_2PC_LEASE_LIFETIME_MS >= 30_000);
+    const {
+        assert!(MAX_2PC_LEASE_LIFETIME_MS >= 30_000);
+    }
 
     let dir = tempdir().unwrap();
     let cluster = boot_cluster(dir.path()).await;

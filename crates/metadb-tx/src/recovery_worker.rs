@@ -16,6 +16,17 @@ use metadb_raft::ShardRaftGroup;
 use crate::state_machine_impl::{TxRaftCmd, TxStateMachineHandler};
 use crate::two_pc::ShardDirectory;
 
+/// Remote sink for cross-cell `ApplyAuxBatch` delivery when `QuotaTable` or `SecondaryIndexTable`
+/// resides on a different cell from the origin `MetaTable` shard.
+#[tonic::async_trait]
+pub trait RemoteAuxBatchSink: Send + Sync {
+    async fn dispatch_remote_aux_batch(
+        &self,
+        target_key: &[u8],
+        entries: Vec<AuxOutboxEntry>,
+    ) -> Result<()>;
+}
+
 /// Drains un-acknowledged `ShardAuxOutbox` entries in strict FIFO `(origin_raft_index, task_ordinal)`
 /// order per destination shard and commits `TxRaftCmd::AckAuxTasks` upon durable ACK.
 pub struct AuxDispatcher;
@@ -27,6 +38,23 @@ impl AuxDispatcher {
         directory: &dyn ShardDirectory,
         clock: &HybridLogicalClock,
     ) -> Result<usize> {
+        Self::drain_shard_outbox_with_remote_sink(
+            origin_group,
+            origin_handler,
+            directory,
+            clock,
+            None,
+        )
+        .await
+    }
+
+    pub async fn drain_shard_outbox_with_remote_sink(
+        origin_group: &ShardRaftGroup,
+        origin_handler: &TxStateMachineHandler,
+        directory: &dyn ShardDirectory,
+        clock: &HybridLogicalClock,
+        remote_sink: Option<&dyn RemoteAuxBatchSink>,
+    ) -> Result<usize> {
         let pending = origin_handler.outbox().pending_entries();
         if pending.is_empty() {
             return Ok(0);
@@ -37,6 +65,7 @@ impl AuxDispatcher {
             ShardId,
             (ShardEpoch, Arc<ShardRaftGroup>, Vec<AuxOutboxEntry>),
         > = BTreeMap::new();
+        let mut remote_by_prefix: BTreeMap<u8, (Vec<u8>, Vec<AuxOutboxEntry>)> = BTreeMap::new();
 
         for entry in pending {
             let target_key = match &entry.payload {
@@ -45,12 +74,27 @@ impl AuxDispatcher {
                     SecondaryIndexKey { fid: *fid }.encode()
                 }
             };
-            let (ep, grp, _) = directory.route_user_key(&target_key)?;
-            by_target
-                .entry(grp.shard_id())
-                .or_insert_with(|| (ep, grp, Vec::new()))
-                .2
-                .push(entry);
+            match directory.route_user_key(&target_key) {
+                Ok((ep, grp, _)) => {
+                    by_target
+                        .entry(grp.shard_id())
+                        .or_insert_with(|| (ep, grp, Vec::new()))
+                        .2
+                        .push(entry);
+                }
+                Err(err) => {
+                    if remote_sink.is_some() {
+                        let pfx = target_key.first().copied().unwrap_or(0);
+                        remote_by_prefix
+                            .entry(pfx)
+                            .or_insert_with(|| (target_key, Vec::new()))
+                            .1
+                            .push(entry);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
         }
 
         let mut acked_keys: Vec<(u64, u16)> = Vec::new();
@@ -67,6 +111,22 @@ impl AuxDispatcher {
                 .is_ok()
             {
                 acked_keys.extend(ids);
+            }
+        }
+
+        if let Some(sink) = remote_sink {
+            for (_, (representative_key, batch)) in remote_by_prefix {
+                let ids: Vec<(u64, u16)> = batch
+                    .iter()
+                    .map(|e| (e.origin_raft_index, e.task_ordinal))
+                    .collect();
+                if sink
+                    .dispatch_remote_aux_batch(&representative_key, batch)
+                    .await
+                    .is_ok()
+                {
+                    acked_keys.extend(ids);
+                }
             }
         }
 
@@ -246,8 +306,8 @@ impl TxnRecoveryWorker {
         }
 
         for (ik_bytes, iv_bytes) in &intent_rows {
-            let uk = WriteIntentKey::decode(&ik_bytes)?.target_user_key;
-            let irec = WriteIntentRecord::decode(&iv_bytes)?;
+            let uk = WriteIntentKey::decode(ik_bytes)?.target_user_key;
+            let irec = WriteIntentRecord::decode(iv_bytes)?;
             if let Some(holders) = irec.resolved_fence_holders() {
                 for (tid, holder) in holders {
                     let over_cap = holder.start_hlc.is_some_and(|start| {

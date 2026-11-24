@@ -215,6 +215,14 @@ pub enum TxRaftCmd {
         /// `CELL_MANAGER_STATE` body without its CRC trailer.
         manager_body: Vec<u8>,
     },
+    /// Updates `[0x04][dir_id]` (`DirShardDeltaRecord`) metadata on non-anchor sub-shards
+    /// after a cross-shard directory `SetAttr` or `Rename`. Appended so earlier tags stay stable.
+    SyncDirShardDeltaMeta {
+        dir_id: InodeId,
+        parent_pid: InodeId,
+        uid: UserId,
+        mode: u32,
+    },
 }
 
 /// Longest a renewed cross-shard lease may reach past the transaction's `start_hlc`.
@@ -418,8 +426,9 @@ fn maintain_proposal_receipts(
             Ok(ScanControl::Continue)
         }
     })?;
-    let cursor = engine
-        .get_with_snapshot(PROPOSAL_SWEEP_CURSOR, &snap)?
+    let cursor_opt = engine.get_with_snapshot(PROPOSAL_SWEEP_CURSOR, &snap)?;
+    let cursor = cursor_opt
+        .clone()
         .unwrap_or_else(|| vec![PROPOSAL_RECEIPT_PREFIX]);
     let mut legacy = Vec::new();
     let mut sweep_finished = true;
@@ -475,12 +484,16 @@ fn maintain_proposal_receipts(
     if next_cursor.is_empty() {
         next_cursor = vec![PROPOSAL_RECEIPT_PREFIX];
     }
-    engine.apply_committed_put(
-        PROPOSAL_SWEEP_CURSOR.to_vec(),
-        next_cursor,
-        commit_hlc,
-        raft_index,
-    );
+    if cursor_opt.as_deref() != Some(next_cursor.as_slice())
+        && !(cursor_opt.is_none() && next_cursor == [PROPOSAL_RECEIPT_PREFIX])
+    {
+        engine.apply_committed_put(
+            PROPOSAL_SWEEP_CURSOR.to_vec(),
+            next_cursor,
+            commit_hlc,
+            raft_index,
+        );
+    }
     Ok(())
 }
 
@@ -1303,7 +1316,8 @@ impl TxStateMachineHandler {
                 if let Some(fid) = attr.fid {
                     aux.push(AuxIntentSpec::IndexDelete { fid });
                 }
-                self.outbox.record_entry_specs(raft_index, commit_hlc, aux);
+                self.outbox
+                    .record_entry_specs_with_reconstructability(raft_index, commit_hlc, aux, false);
                 Ok(TxRaftOutput::Attr(attr))
             }
             TxRaftCmd::RmdirSingleShard { pid, name } => {
@@ -1358,7 +1372,7 @@ impl TxStateMachineHandler {
                 engine.apply_committed_delete(dir_attr_bytes, commit_hlc, raft_index);
                 self.attr_agg
                     .record_delta(pid, raft_index, commit_hlc, -1, 0);
-                self.outbox.record_entry_specs(
+                self.outbox.record_entry_specs_with_reconstructability(
                     raft_index,
                     commit_hlc,
                     vec![AuxIntentSpec::QuotaDelta {
@@ -1366,6 +1380,7 @@ impl TxStateMachineHandler {
                         delta_bytes: 0,
                         delta_inodes: -1,
                     }],
+                    false,
                 );
                 Ok(TxRaftOutput::Attr(dentry_attr))
             }
@@ -1460,7 +1475,8 @@ impl TxStateMachineHandler {
                         });
                     }
                 }
-                self.outbox.record_entry_specs(raft_index, commit_hlc, aux);
+                self.outbox
+                    .record_entry_specs_with_reconstructability(raft_index, commit_hlc, aux, false);
                 Ok(TxRaftOutput::Entry(MetaEntry {
                     key: child_key,
                     attr,
@@ -1509,11 +1525,18 @@ impl TxStateMachineHandler {
                 // Cycle check if moving a directory inside the single shard (`Resolution B13`).
                 // Fail closed on deep chains; a 1024-step cap used to allow the rename.
                 if src_attr.entry_type == EntryType::Directory && src_pid != dst_pid {
+                    let local_range = self.key_range();
                     RenameCycleWalker::new(src_attr.inode_id, dst_pid).walk(|cursor| {
                         let anc_key = MetaKey::dir_attr(cursor).encode();
+                        if !local_range.contains_key(&anc_key) {
+                            return Err(MetaDbError::ShardRoutingError(
+                                "directory rename ancestor chain crosses shard boundary; fenced 2PC required"
+                                    .to_string(),
+                            ));
+                        }
                         match Self::read_latest_in_apply(engine, &anc_key)? {
                             Some(anc_raw) => Ok(Some(InodeAttr::decode(&anc_raw)?.parent_pid)),
-                            None => Ok(None),
+                            None => Err(MetaDbError::DirectoryNotFound(cursor)),
                         }
                     })?;
                 }
@@ -1631,8 +1654,12 @@ impl TxStateMachineHandler {
                         create_time: src_attr.create_time,
                     });
                 }
-                self.outbox
-                    .record_entry_specs(raft_index, commit_hlc, aux_specs);
+                if aux_specs.is_empty() && self.outbox.pending_count() > 0 {
+                    self.outbox.set_force_spill_next_seal();
+                }
+                self.outbox.record_entry_specs_with_reconstructability(
+                    raft_index, commit_hlc, aux_specs, false,
+                );
                 Ok(TxRaftOutput::Entry(MetaEntry {
                     key: dst_key,
                     attr: src_attr,
@@ -2020,6 +2047,12 @@ impl TxStateMachineHandler {
                             attr_deltas,
                             aux_specs,
                         } => {
+                            if user_key.first().copied() == Some(metadb_core::TABLE_PREFIX_META) {
+                                let mk = MetaKey::decode(&user_key)?;
+                                if !mk.is_attr_key() {
+                                    self.verify_parent_dir_ready(engine, mk.pid)?;
+                                }
+                            }
                             if let Some(ex) = &existing_intent {
                                 if ex.txn_id != txn_id {
                                     return Err(MetaDbError::WriteIntentConflict {
@@ -2048,6 +2081,14 @@ impl TxStateMachineHandler {
                             encoded_writes.push((intent_raw_key, rec.encode()));
                         }
                         other_op => {
+                            if matches!(other_op, IntentOp::Put { .. })
+                                && user_key.first().copied() == Some(metadb_core::TABLE_PREFIX_META)
+                            {
+                                let mk = MetaKey::decode(&user_key)?;
+                                if !mk.is_attr_key() {
+                                    self.verify_parent_dir_ready(engine, mk.pid)?;
+                                }
+                            }
                             if let Some(ex) = existing_intent {
                                 if ex.txn_id != txn_id {
                                     return Err(MetaDbError::WriteIntentConflict {
@@ -2135,20 +2176,31 @@ impl TxStateMachineHandler {
                     TxnState::Pending => {}
                 }
 
+                let final_commit_hlc = tx_commit_hlc.max(commit_hlc);
+                let local_range = self.key_range();
+
                 // Resolution B13: Verify lease / expiry fence at Commit!
                 if rename_fence_token != txn_rec.rename_fence_token
-                    || (rename_fence_token.is_some() && tx_commit_hlc > txn_rec.expire_hlc)
+                    || (rename_fence_token.is_some() && final_commit_hlc > txn_rec.expire_hlc)
                 {
+                    for uk in txn_rec.participant_keys.clone() {
+                        if local_range.contains_key(&uk) {
+                            self.abort_intent_for_key(engine, txn_id, &uk, raft_index, commit_hlc)?;
+                        }
+                    }
                     txn_rec.state = TxnState::Aborted;
-                    engine.apply_committed_put(tk, txn_rec.encode(), commit_hlc, raft_index);
+                    if txn_rec.pending_ack_keys.is_empty() {
+                        engine.apply_committed_delete(tk, commit_hlc, raft_index);
+                    } else {
+                        engine.apply_committed_put(tk, txn_rec.encode(), commit_hlc, raft_index);
+                    }
+                    self.outbox
+                        .record_entry_specs(raft_index, commit_hlc, vec![]);
                     self.release_lease_hold(engine, txn_id, raft_index, commit_hlc);
                     return Err(MetaDbError::TransactionAborted(
                         "DirRenameLease expired or fence token mismatch at commit".to_string(),
                     ));
                 }
-
-                let final_commit_hlc = tx_commit_hlc.max(commit_hlc);
-                let local_range = self.key_range();
                 let local_keys: Vec<Vec<u8>> = txn_rec
                     .participant_keys
                     .iter()
@@ -2177,8 +2229,15 @@ impl TxStateMachineHandler {
                     engine.apply_committed_put(tk, txn_rec.encode(), final_commit_hlc, raft_index);
                 }
 
-                self.outbox
-                    .record_entry_specs(raft_index, final_commit_hlc, aux_specs);
+                if aux_specs.is_empty() && self.outbox.pending_count() > 0 {
+                    self.outbox.set_force_spill_next_seal();
+                }
+                self.outbox.record_entry_specs_with_reconstructability(
+                    raft_index,
+                    final_commit_hlc,
+                    aux_specs,
+                    false,
+                );
                 self.release_lease_hold(engine, txn_id, raft_index, final_commit_hlc);
                 Ok(TxRaftOutput::Committed {
                     commit_hlc: final_commit_hlc,
@@ -2207,8 +2266,15 @@ impl TxStateMachineHandler {
                         any_applied = true;
                     }
                 }
-                self.outbox
-                    .record_entry_specs(raft_index, tx_commit_hlc, aux_specs);
+                if aux_specs.is_empty() && self.outbox.pending_count() > 0 {
+                    self.outbox.set_force_spill_next_seal();
+                }
+                self.outbox.record_entry_specs_with_reconstructability(
+                    raft_index,
+                    tx_commit_hlc,
+                    aux_specs,
+                    false,
+                );
                 if !self.shard_still_has_txn_intent(engine, txn_id)? {
                     self.release_lease_hold(engine, txn_id, raft_index, commit_hlc);
                 }
@@ -2510,6 +2576,25 @@ impl TxStateMachineHandler {
                     .record_entry_specs(raft_index, commit_hlc, vec![]);
                 Ok(TxRaftOutput::Unit)
             }
+            TxRaftCmd::SyncDirShardDeltaMeta {
+                dir_id,
+                parent_pid,
+                uid,
+                mode,
+            } => {
+                let dk = DirShardDeltaKey { pid: dir_id }.encode();
+                if let Some(raw_sub) = Self::read_latest_in_apply(engine, &dk)? {
+                    let mut sub = DirShardDeltaRecord::decode(&raw_sub)?;
+                    sub.parent_pid = parent_pid;
+                    sub.uid = uid;
+                    sub.mode = mode;
+                    sub.modify_time = sub.modify_time.max(commit_hlc);
+                    engine.apply_committed_put(dk.to_vec(), sub.encode(), commit_hlc, raft_index);
+                }
+                self.outbox
+                    .record_entry_specs(raft_index, commit_hlc, vec![]);
+                Ok(TxRaftOutput::Unit)
+            }
         }
     }
 
@@ -2626,6 +2711,7 @@ impl TxStateMachineHandler {
     /// `observed` is the replicated apply timestamp or a trusted wall observation.
     /// A failed clock read is not passed here. An illegal window installs nothing,
     /// so a rolled-back timestamp cannot stretch the hold out to the cap.
+    #[allow(clippy::too_many_arguments)]
     fn install_lease_hold(
         &self,
         engine: &LifecycleStorageEngine,
@@ -3340,5 +3426,93 @@ impl ShardApplyHandler for TxStateMachineHandler {
             engine,
         );
         self.rehydrate_lease_holds(engine);
+    }
+
+    fn recover_unspilled_aux_from_log(
+        &self,
+        entries: &[(u64, MetaDbRaftRequest)],
+        checkpoint: &DurableShardCheckpoint,
+        engine: &LifecycleStorageEngine,
+    ) {
+        let Ok(snap) = engine.acquire_linearizable_snapshot(checkpoint.flushed_raft_index) else {
+            return;
+        };
+        for (idx, req) in entries {
+            if *idx <= checkpoint.contiguous_aux_acked_index || *idx > checkpoint.flushed_raft_index
+            {
+                continue;
+            }
+            let Ok((_, cmd)) = decode_proposed_command(&req.payload) else {
+                continue;
+            };
+            match cmd {
+                TxRaftCmd::CreateFile {
+                    pid,
+                    name,
+                    fid,
+                    uid,
+                    size_bytes,
+                    ..
+                } => {
+                    let child_bytes = MetaKey::child(pid, &name).encode();
+                    let applied = engine
+                        .get_with_snapshot(&child_bytes, &snap)
+                        .ok()
+                        .flatten()
+                        .and_then(|raw| InodeAttr::decode(&raw).ok())
+                        .is_some_and(|attr| attr.fid == Some(fid) && attr.create_time == req.hlc);
+                    if !applied {
+                        continue;
+                    }
+                    self.outbox.recover_unspilled_entry_specs(
+                        *idx,
+                        req.hlc,
+                        vec![
+                            AuxIntentSpec::QuotaDelta {
+                                uid,
+                                delta_bytes: size_bytes,
+                                delta_inodes: 1,
+                            },
+                            AuxIntentSpec::IndexUpsert {
+                                fid,
+                                pid,
+                                name,
+                                create_time: req.hlc,
+                            },
+                        ],
+                    );
+                }
+                TxRaftCmd::MkdirSingleShard {
+                    pid,
+                    name,
+                    new_dir_id,
+                    uid,
+                    ..
+                } => {
+                    let child_bytes = MetaKey::child(pid, &name).encode();
+                    let applied = engine
+                        .get_with_snapshot(&child_bytes, &snap)
+                        .ok()
+                        .flatten()
+                        .and_then(|raw| InodeAttr::decode(&raw).ok())
+                        .is_some_and(|attr| {
+                            attr.inode_id == new_dir_id && attr.create_time == req.hlc
+                        });
+                    if !applied {
+                        continue;
+                    }
+                    self.outbox.recover_unspilled_entry_specs(
+                        *idx,
+                        req.hlc,
+                        vec![AuxIntentSpec::QuotaDelta {
+                            uid,
+                            delta_bytes: 0,
+                            delta_inodes: 1,
+                        }],
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 }

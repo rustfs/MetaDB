@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use metadb_core::{
-    decode_origin_quota_cursor, encode_origin_quota_cursor, saturating_add_i64, AuxIntentSpec,
-    AuxOutboxEntry, AuxTaskPayload, DirShardDeltaKey, DirShardDeltaRecord, HlcTimestamp, InodeAttr,
-    InodeId, MetaKey, OriginQuotaCursorKey, Result, ShardId, SpilledAuxOutboxKey, UserId,
+    decode_origin_quota_cursor_pair, encode_origin_quota_cursor_pair, saturating_add_i64,
+    AuxIntentSpec, AuxOutboxEntry, AuxTaskPayload, DirShardDeltaKey, DirShardDeltaRecord,
+    HlcTimestamp, InodeAttr, InodeId, MetaKey, OriginQuotaCursorKey, Result, ShardId,
+    SpilledAuxOutboxKey, UserId,
 };
 use metadb_raft::ShardWatermarkTracker;
 use metadb_storage::{LifecycleStorageEngine, MvccValue, SnapshotGuard, ViewAtRaftIndex};
@@ -194,6 +195,7 @@ impl ReplicatedAttrAggregator {
             if let Some(raw_attr) = view_at_m.get(&attr_key)? {
                 let mut attr = InodeAttr::decode(&raw_attr)?;
                 let mut changed = false;
+                let mut max_folded_hlc = HlcTimestamp::ZERO;
                 let baseline = attr.applied_lsn;
                 for d in queue {
                     if d.raft_index > baseline && d.raft_index <= sealed_raft_index {
@@ -208,12 +210,13 @@ impl ReplicatedAttrAggregator {
                         if d.hlc > attr.modify_time {
                             attr.modify_time = d.hlc;
                         }
+                        max_folded_hlc = max_folded_hlc.max(d.hlc);
                         attr.applied_lsn = d.raft_index;
                         changed = true;
                     }
                 }
                 if changed {
-                    out.push((attr_key, attr.modify_time, MvccValue::Value(attr.encode())));
+                    out.push((attr_key, max_folded_hlc, MvccValue::Value(attr.encode())));
                 }
                 continue;
             }
@@ -223,6 +226,7 @@ impl ReplicatedAttrAggregator {
             if let Some(raw_sub) = view_at_m.get(&shard_delta_key)? {
                 let mut sub = DirShardDeltaRecord::decode(&raw_sub)?;
                 let mut changed = false;
+                let mut max_folded_hlc = HlcTimestamp::ZERO;
                 let baseline = sub.applied_raft_index;
                 for d in queue {
                     if d.raft_index > baseline && d.raft_index <= sealed_raft_index {
@@ -237,6 +241,7 @@ impl ReplicatedAttrAggregator {
                         if d.hlc > sub.modify_time {
                             sub.modify_time = d.hlc;
                         }
+                        max_folded_hlc = max_folded_hlc.max(d.hlc);
                         sub.applied_raft_index = d.raft_index;
                         changed = true;
                     }
@@ -244,7 +249,7 @@ impl ReplicatedAttrAggregator {
                 if changed {
                     out.push((
                         shard_delta_key,
-                        sub.modify_time,
+                        max_folded_hlc,
                         MvccValue::Value(sub.encode()),
                     ));
                 }
@@ -287,11 +292,13 @@ struct TrackedOutboxTask {
     entry: AuxOutboxEntry,
     sealed_at_index: Option<u64>,
     durable_spilled: bool,
+    reconstructable_from_log: bool,
 }
 
 struct OutboxInner {
     tasks: BTreeMap<(u64, u16), TrackedOutboxTask>,
     last_uid_cursor: BTreeMap<UserId, (u64, u16)>,
+    acked_uid_cursor: BTreeMap<UserId, (u64, u16)>,
     contiguous_acked_index: u64,
     max_observed_raft_index: u64,
     last_durable_seal_index: u64,
@@ -352,6 +359,7 @@ impl ShardAuxOutbox {
             inner: RwLock::new(OutboxInner {
                 tasks: BTreeMap::new(),
                 last_uid_cursor: BTreeMap::new(),
+                acked_uid_cursor: BTreeMap::new(),
                 contiguous_acked_index: 0,
                 max_observed_raft_index: 0,
                 last_durable_seal_index: 0,
@@ -375,12 +383,26 @@ impl ShardAuxOutbox {
         hlc: HlcTimestamp,
         specs: Vec<AuxIntentSpec>,
     ) {
+        self.record_entry_specs_with_reconstructability(raft_index, hlc, specs, true);
+    }
+
+    /// Records auxiliary specs with an explicit `reconstructable_from_log` flag.
+    /// Tasks whose pre-image attributes are overwritten/deleted on L0 seal (`reconstructable_from_log = false`)
+    /// automatically spill into `[0x07]` when a memtable seal occurs before acknowledgment.
+    pub fn record_entry_specs_with_reconstructability(
+        &self,
+        raft_index: u64,
+        hlc: HlcTimestamp,
+        specs: Vec<AuxIntentSpec>,
+        reconstructable_from_log: bool,
+    ) {
         let mut guard = self.inner.write().unwrap();
         guard.max_observed_raft_index = guard.max_observed_raft_index.max(raft_index);
 
         if specs.is_empty() {
             if guard.tasks.is_empty() {
                 guard.contiguous_acked_index = raft_index;
+                self.watermarks.advance_contiguous_aux_acked(raft_index);
                 self.watermarks.advance_aux_outbox_durable(raft_index);
             }
             return;
@@ -432,6 +454,7 @@ impl ShardAuxOutbox {
                     entry,
                     sealed_at_index: None,
                     durable_spilled: false,
+                    reconstructable_from_log,
                 },
             );
         }
@@ -440,7 +463,8 @@ impl ShardAuxOutbox {
     /// Writes each quota cursor emitted by `raft_index` to `[0x08][uid]`.
     ///
     /// Acknowledged `[0x07]` tasks are deleted, so rehydrate cannot recover the predecessor
-    /// from the spill alone.
+    /// from the spill alone. Persists `(latest_cursor, acked_cursor)` (`V2`) so unspilled
+    /// `.raftlog` reconstruction preserves the durable acknowledged baseline after L0 folding.
     pub fn persist_quota_cursors(
         &self,
         engine: &LifecycleStorageEngine,
@@ -458,9 +482,10 @@ impl ShardAuxOutbox {
                 .iter()
                 .filter(|(_, (idx, _))| *idx == raft_index)
                 .map(|(&uid, &(idx, ord))| {
+                    let acked = guard.acked_uid_cursor.get(&uid).copied().unwrap_or((0, 0));
                     (
                         OriginQuotaCursorKey { uid }.encode().to_vec(),
-                        encode_origin_quota_cursor(idx, ord),
+                        encode_origin_quota_cursor_pair((idx, ord), acked),
                     )
                 })
                 .collect()
@@ -471,7 +496,8 @@ impl ShardAuxOutbox {
     }
 
     /// Spills un-acked tasks `<= sealed_raft_index` into `[0x07][origin_raft_index][task_ordinal]`
-    /// whenever `force_spill_next_seal` is set OR unspilled task count `>= spill_threshold`.
+    /// whenever `force_spill_next_seal` is set, any non-reconstructable task is pending,
+    /// OR unspilled task count `>= spill_threshold`.
     pub fn spill_into_seal_batch(
         &self,
         sealed_raft_index: u64,
@@ -480,13 +506,18 @@ impl ShardAuxOutbox {
         let force = self.force_spill_next_seal.swap(false, Ordering::AcqRel);
         let mut guard = self.inner.write().unwrap();
 
-        let unspilled_count = guard
-            .tasks
-            .iter()
-            .filter(|(&(idx, _), t)| idx <= sealed_raft_index && !t.durable_spilled)
-            .count();
+        let mut unspilled_count = 0usize;
+        let mut has_non_reconstructable = false;
+        for (&(idx, _), t) in &guard.tasks {
+            if idx <= sealed_raft_index && !t.durable_spilled {
+                unspilled_count += 1;
+                if !t.reconstructable_from_log {
+                    has_non_reconstructable = true;
+                }
+            }
+        }
 
-        if !force && unspilled_count < self.spill_threshold {
+        if !force && !has_non_reconstructable && unspilled_count < self.spill_threshold {
             return Vec::new();
         }
 
@@ -535,14 +566,19 @@ impl ShardAuxOutbox {
         acked_keys: &[(u64, u16)],
         engine: &LifecycleStorageEngine,
     ) -> u64 {
-        // Collect deletions under the outbox lock, then write them after releasing it.
-        // A size-triggered flush takes this same lock from `spill_into_seal_batch`.
-        let (deletes, acked) = {
+        // Collect deletions and acked cursor updates under the outbox lock, then write them after
+        // releasing it. A size-triggered flush takes this same lock from `spill_into_seal_batch`.
+        let (deletes, cursor_updates, acked) = {
             let mut guard = self.inner.write().unwrap();
             guard.max_observed_raft_index = guard.max_observed_raft_index.max(raft_index);
             let mut deletes = Vec::new();
+            let mut touched_uids = std::collections::BTreeSet::new();
             for &(idx, ord) in acked_keys {
                 let delete_spill = if let Some(removed) = guard.tasks.remove(&(idx, ord)) {
+                    if let AuxTaskPayload::QuotaDelta { uid, .. } = &removed.entry.payload {
+                        bump_uid_cursor(&mut guard.acked_uid_cursor, *uid, (idx, ord));
+                        touched_uids.insert(*uid);
+                    }
                     removed.durable_spilled || removed.sealed_at_index.is_some()
                 } else {
                     // Idempotent delete in case `[0x07]` existed from prior snapshot/recovery.
@@ -552,13 +588,33 @@ impl ShardAuxOutbox {
                     deletes.push(SpilledAuxOutboxKey::new(idx, ord).encode().to_vec());
                 }
             }
+            let cursor_updates: Vec<(Vec<u8>, Vec<u8>)> = touched_uids
+                .into_iter()
+                .map(|uid| {
+                    let acked_cur = guard.acked_uid_cursor.get(&uid).copied().unwrap_or((0, 0));
+                    let latest_cur = guard
+                        .last_uid_cursor
+                        .get(&uid)
+                        .copied()
+                        .unwrap_or(acked_cur);
+                    (
+                        OriginQuotaCursorKey { uid }.encode().to_vec(),
+                        encode_origin_quota_cursor_pair(latest_cur, acked_cur),
+                    )
+                })
+                .collect();
             guard.recompute_contiguous_acked();
+            self.watermarks
+                .advance_contiguous_aux_acked(guard.contiguous_acked_index);
             let frontier = guard.contiguous_durable_frontier();
             self.watermarks.advance_aux_outbox_durable(frontier);
-            (deletes, guard.contiguous_acked_index)
+            (deletes, cursor_updates, guard.contiguous_acked_index)
         };
         for key in deletes {
             engine.apply_committed_delete(key, hlc, raft_index);
+        }
+        for (key, val) in cursor_updates {
+            engine.apply_committed_put(key, val, hlc, raft_index);
         }
         acked
     }
@@ -578,6 +634,7 @@ impl ShardAuxOutbox {
         let mut guard = self.inner.write().unwrap();
         guard.tasks.clear();
         guard.last_uid_cursor.clear();
+        guard.acked_uid_cursor.clear();
         guard.contiguous_acked_index = contiguous_acked_index;
         guard.max_observed_raft_index = flushed_raft_index.max(contiguous_acked_index);
         guard.last_durable_seal_index = flushed_raft_index;
@@ -598,6 +655,7 @@ impl ShardAuxOutbox {
                     entry,
                     sealed_at_index: Some(sk.origin_raft_index),
                     durable_spilled: true,
+                    reconstructable_from_log: true,
                 },
             );
         }
@@ -609,13 +667,101 @@ impl ShardAuxOutbox {
         )?;
         for (k_bytes, v_bytes) in cursor_rows {
             let key = OriginQuotaCursorKey::decode(&k_bytes)?;
-            let cursor = decode_origin_quota_cursor(&v_bytes)?;
-            bump_uid_cursor(&mut guard.last_uid_cursor, key.uid, cursor);
+            let (latest, acked) = decode_origin_quota_cursor_pair(&v_bytes)?;
+            let effective_acked = if latest.0 <= contiguous_acked_index {
+                latest
+            } else {
+                acked
+            };
+            if effective_acked != (0, 0) {
+                bump_uid_cursor(&mut guard.acked_uid_cursor, key.uid, effective_acked);
+                bump_uid_cursor(&mut guard.last_uid_cursor, key.uid, effective_acked);
+            }
         }
 
         let frontier = guard.contiguous_durable_frontier();
-        self.watermarks.advance_aux_outbox_durable(frontier);
+        self.watermarks
+            .set_contiguous_aux_acked(guard.contiguous_acked_index);
+        self.watermarks.set_aux_outbox_durable(frontier);
         Ok(())
+    }
+
+    /// Reconstructs unspilled tasks in `(contiguous_acked_index ..= flushed_raft_index]` from `.raftlog`
+    /// after a crash following a size-triggered L0 flush below `spill_threshold`.
+    pub fn recover_unspilled_entry_specs(
+        &self,
+        raft_index: u64,
+        hlc: HlcTimestamp,
+        specs: Vec<AuxIntentSpec>,
+    ) {
+        if specs.is_empty() {
+            return;
+        }
+        let mut guard = self.inner.write().unwrap();
+        if raft_index <= guard.contiguous_acked_index {
+            return;
+        }
+        if guard
+            .tasks
+            .range((raft_index, 0)..=(raft_index, u16::MAX))
+            .next()
+            .is_some()
+        {
+            return;
+        }
+        guard.max_observed_raft_index = guard.max_observed_raft_index.max(raft_index);
+        for (ord_usize, spec) in specs.into_iter().enumerate() {
+            let task_ordinal = ord_usize as u16;
+            let payload = match spec {
+                AuxIntentSpec::QuotaDelta {
+                    uid,
+                    delta_bytes,
+                    delta_inodes,
+                } => {
+                    let prev_uid_cursor = guard
+                        .last_uid_cursor
+                        .insert(uid, (raft_index, task_ordinal))
+                        .unwrap_or((0, 0));
+                    AuxTaskPayload::QuotaDelta {
+                        uid,
+                        delta_bytes,
+                        delta_inodes,
+                        prev_uid_cursor,
+                    }
+                }
+                AuxIntentSpec::IndexUpsert {
+                    fid,
+                    pid,
+                    name,
+                    create_time,
+                } => AuxTaskPayload::IndexUpsert {
+                    fid,
+                    pid,
+                    name,
+                    create_time,
+                },
+                AuxIntentSpec::IndexDelete { fid } => AuxTaskPayload::IndexDelete { fid },
+            };
+            let entry = AuxOutboxEntry {
+                origin_shard_id: self.origin_shard_id,
+                origin_raft_index: raft_index,
+                task_ordinal,
+                hlc,
+                payload,
+            };
+            guard.tasks.insert(
+                (raft_index, task_ordinal),
+                TrackedOutboxTask {
+                    entry,
+                    sealed_at_index: None,
+                    durable_spilled: false,
+                    reconstructable_from_log: true,
+                },
+            );
+        }
+        guard.last_durable_seal_index = guard.contiguous_acked_index;
+        let frontier = guard.contiguous_durable_frontier();
+        self.watermarks.set_aux_outbox_durable(frontier);
     }
 
     /// Returns all currently un-acknowledged entries sorted strictly by `(origin_raft_index, task_ordinal)`.

@@ -118,6 +118,23 @@ message ForwardRouterResponse {
   bytes result = 2;
 }
 
+message Extend2pcLeaseRequest {
+  RequestRoutingHeader header = 1;
+  bytes txn_id_be = 2;
+  uint64 coord_node_id = 3;
+  bool is_primary = 4;
+  uint64 start_hlc = 5;
+  uint64 new_expire_hlc = 6;
+  bool has_rename_fence_token = 7;
+  uint64 rename_fence_token = 8;
+  repeated bytes target_user_keys = 9;
+}
+
+message Extend2pcLeaseResponse {
+  ErrorDetailProto error = 1;
+  uint64 expire_hlc = 2;
+}
+
 service TransactionService {
   rpc Rename(RenameRequest) returns (RenameResponse);
   rpc Prepare2pc(Prepare2pcRequest) returns (Prepare2pcResponse);
@@ -127,4 +144,5 @@ service TransactionService {
   rpc CheckTxnStatus(CheckTxnStatusRequest) returns (CheckTxnStatusResponse);
   rpc ApplyAuxBatch(ApplyAuxBatchRequest) returns (ApplyAuxBatchResponse);
   rpc ForwardRouter(ForwardRouterRequest) returns (ForwardRouterResponse);
+  rpc Extend2pcLease(Extend2pcLeaseRequest) returns (Extend2pcLeaseResponse);
 }
