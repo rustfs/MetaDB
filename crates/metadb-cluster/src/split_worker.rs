@@ -185,6 +185,12 @@ impl RaftShardSplitWorker {
         let left_range =
             CompositeKeyRange::new(parent_route.range.start_key.clone(), split_key.clone())?;
         let right_range = CompositeKeyRange::new(split_key.clone(), old_end_key.clone())?;
+        if parent_group.current_leader() != Some(host.node_id()) {
+            return Err(MetaDbError::NotLeader {
+                shard_id: parent_route.shard_id,
+                leader_hint: parent_group.current_leader(),
+            });
+        }
         // Never publish an epoch older than the one already applied. A stale plan must
         // not rewind `version` and then re-fence a range that a newer split already owns.
         let current_version = parent_group.current_epoch().version;
@@ -534,24 +540,104 @@ impl RaftShardSplitWorker {
             right_range.clone(),
             child_wm.clone(),
         ));
-        let child_group = ShardRaftGroup::start(
-            child_shard_id,
-            host.node_id(),
-            &child_final_dir,
-            host.block_cache().clone(),
-            lsm_config,
-            raft_opts,
-            child_handler.clone(),
-            child_wm,
-            host.clock().clone(),
-            host.router(),
-            host.channel_pool().clone(),
-        )
-        .await?;
-        child_group.initialize_if_needed(peer_addrs.clone()).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        child_handler.set_control_plane_validator(Arc::new(
+            crate::replicated_control::validate_replicated_record,
+        ));
+        let child_group = if let Some(existing) = host.get_group(child_shard_id) {
+            existing
+        } else {
+            let started = ShardRaftGroup::start(
+                child_shard_id,
+                host.node_id(),
+                &child_final_dir,
+                host.block_cache().clone(),
+                lsm_config,
+                raft_opts,
+                child_handler.clone(),
+                child_wm,
+                host.clock().clone(),
+                host.router(),
+                host.channel_pool().clone(),
+            )
+            .await?;
+            host.register_running_group(started.clone());
+            started
+        };
 
-        host.register_running_group(child_group.clone());
+        if peer_addrs.len() <= 1 {
+            child_group.initialize_if_needed(peer_addrs.clone()).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        } else {
+            let local_id = host.node_id();
+            let local_addr = peer_addrs.get(&local_id).cloned().ok_or_else(|| {
+                MetaDbError::ConsensusError(format!(
+                    "local node {local_id} is not a voter in parent shard {}",
+                    parent_route.shard_id
+                ))
+            })?;
+            child_group
+                .initialize_if_needed(BTreeMap::from([(local_id, local_addr)]))
+                .await?;
+            child_group
+                .wait_for_leader(std::time::Duration::from_secs(10))
+                .await?;
+
+            let target_voters: std::collections::BTreeSet<u64> =
+                peer_addrs.keys().copied().collect();
+            let current_voters: std::collections::BTreeSet<u64> = child_group
+                .uniform_voter_addrs()
+                .unwrap_or_default()
+                .into_keys()
+                .collect();
+            if current_voters != target_voters {
+                for (&peer_id, peer_addr) in &peer_addrs {
+                    if peer_id == local_id {
+                        continue;
+                    }
+                    host.channel_pool()
+                        .open_joining_shard(
+                            peer_addr,
+                            metadb_proto::OpenJoiningShardRequest {
+                                cell_id: parent_route.cell_id,
+                                shard_id: child_shard_id,
+                                start_key: right_range.start_key.clone(),
+                                end_key: right_range.end_key.clone(),
+                                initial_epoch: Some(metadb_proto::ShardEpochProto {
+                                    conf_ver: 1,
+                                    version: target_version,
+                                }),
+                                use_jumbo_dedicated_root: false,
+                            },
+                        )
+                        .await?;
+                }
+                let min_matched = child_group.prepare_learner_snapshot().await?;
+                let learners: Vec<(u64, String)> = peer_addrs
+                    .iter()
+                    .filter(|(&nid, _)| nid != local_id && !current_voters.contains(&nid))
+                    .map(|(&nid, addr)| (nid, addr.clone()))
+                    .collect();
+                if !learners.is_empty() {
+                    metadb_raft::ConfChangeOrchestrator::add_learners_and_promote_voters(
+                        child_group.raft(),
+                        &learners,
+                        target_voters,
+                        64,
+                        std::time::Duration::from_secs(20),
+                        min_matched,
+                    )
+                    .await?;
+                } else {
+                    metadb_raft::ConfChangeOrchestrator::change_voters(
+                        child_group.raft(),
+                        target_voters,
+                    )
+                    .await?;
+                }
+                let _ = child_group.wait_uniform_voter_addrs().await?;
+            }
+        }
+
         host.record_registry_state(
             child_shard_id,
             RegistryShardState::Active { peers: peer_addrs },
@@ -573,19 +659,28 @@ impl RaftShardSplitWorker {
 
         let _ = parent_handler;
 
+        let post_split_health = if dual_mode_pid.is_some() {
+            crate::shard::ShardHealthState::Normal
+        } else {
+            parent_route.health_state
+        };
+
         let mut new_parent_route = parent_route.clone();
         new_parent_route.range = left_range;
         new_parent_route.epoch = new_parent_epoch;
+        new_parent_route.health_state = post_split_health;
 
         let child_route = CompositeShardRoute {
             cell_id: parent_route.cell_id,
             shard_id: child_shard_id,
             range: right_range,
             epoch: child_group.current_epoch(),
-            leader_node: parent_route.leader_node,
+            leader_node: child_group
+                .current_leader()
+                .unwrap_or(parent_route.leader_node),
             peers: parent_route.peers.clone(),
             split_mode: parent_route.split_mode,
-            health_state: parent_route.health_state,
+            health_state: post_split_health,
             dual_mode_pid,
         };
 

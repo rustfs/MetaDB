@@ -875,6 +875,25 @@ impl SegmentedRaftLogStore {
             .unwrap_or(0)
     }
 
+    /// Collects retained `EntryPayload::Normal` requests in `[from..=to]` for unspilled outbox recovery.
+    pub fn normal_requests_in_inclusive_range(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Vec<(u64, crate::types::MetaDbRaftRequest)> {
+        if from > to {
+            return Vec::new();
+        }
+        let guard = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        for (&idx, entry) in guard.entries.range(from..=to) {
+            if let openraft::EntryPayload::Normal(req) = &entry.payload {
+                out.push((idx, req.clone()));
+            }
+        }
+        out
+    }
+
     /// Copies `HARD_STATE`, `INITIALIZED`, and segment files while appends are blocked.
     ///
     /// `source` must be the live raft directory opened from the data-directory anchor

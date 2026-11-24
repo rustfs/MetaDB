@@ -11,7 +11,10 @@ use crate::backend::{InMemoryBackend, LsmStorageBackend, StorageBackend};
 use crate::block::BlockEntryValue;
 use crate::bloom::DEFAULT_BLOOM_BITS_PER_KEY;
 use crate::cache::ShardedBlockCache;
-use crate::compaction::{CompactionStats, LocalityCompactor, RangeBucketPrefix};
+use crate::compaction::{
+    CompactionStats, LeveledCompactor, LocalityCompactor, RangeBucketPrefix, DEFAULT_L1_MAX_BYTES,
+    DEFAULT_L2_MAX_BYTES,
+};
 use crate::manifest::DurableShardCheckpoint;
 use crate::mvcc::{
     MemMvccStore, MvccValue, PinnedSnapshotData, PreFlushHook, ReadCut, SnapshotGuard,
@@ -24,6 +27,13 @@ use crate::version_set::{MergedCursor, Version};
 pub enum ScanControl {
     Continue,
     Stop,
+}
+
+/// Per-call bounded scan telemetry returned by [`LifecycleStorageEngine::scan_live_until_with_stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanCursorStats {
+    pub entries_examined: u64,
+    pub tombstones_traversed: u64,
 }
 
 /// Raft identity stamped onto a size-triggered flush checkpoint.
@@ -61,6 +71,10 @@ pub struct LsmEngineConfig {
     pub memtable_size_bytes: usize,
     /// Immutable memtables queued above this cap block writers until one flushes.
     pub max_imm_memtables: usize,
+    /// Cumulative `L1` SSTable byte threshold triggering promotion into `L2`.
+    pub l1_max_bytes: u64,
+    /// Cumulative `L2` SSTable byte threshold triggering promotion into `L3`.
+    pub l2_max_bytes: u64,
 }
 
 impl Default for LsmEngineConfig {
@@ -73,6 +87,8 @@ impl Default for LsmEngineConfig {
             auto_locality_compaction: true,
             memtable_size_bytes: 32 * 1024 * 1024,
             max_imm_memtables: 4,
+            l1_max_bytes: DEFAULT_L1_MAX_BYTES,
+            l2_max_bytes: DEFAULT_L2_MAX_BYTES,
         }
     }
 }
@@ -158,7 +174,10 @@ impl LifecycleStorageEngine {
         lsm: LsmStorageBackend,
         config: LsmEngineConfig,
     ) -> Result<Self> {
-        let lsm = Arc::new(lsm);
+        let lsm = Arc::new(lsm.with_leveled_compactor(LeveledCompactor::new(
+            config.l1_max_bytes,
+            config.l2_max_bytes,
+        )));
         let cp = lsm.current_version().checkpoint.clone();
         let mvcc = Arc::new(MemMvccStore::with_recovered_watermarks(
             config.mvcc_retention_ms,
@@ -183,7 +202,7 @@ impl LifecycleStorageEngine {
             flush_hook: RwLock::new(None),
             flush_identity: RwLock::new(None),
             entries_examined: AtomicU64::new(0),
-            last_aux_frontier: AtomicU64::new(0),
+            last_aux_frontier: AtomicU64::new(cp.contiguous_aux_acked_index),
             command_depth: AtomicU64::new(0),
         })
     }
@@ -196,12 +215,14 @@ impl LifecycleStorageEngine {
     /// Ends a command started by [`Self::begin_command`].
     /// A successful command may seal once; a failed command does not advance the checkpoint.
     pub fn end_command(&self, commit: bool) -> Result<()> {
-        let previous = self.command_depth.fetch_sub(1, Ordering::AcqRel);
-        if previous == 0 {
-            return Err(MetaDbError::StorageIoError(
-                "end_command without begin_command".to_string(),
-            ));
-        }
+        let previous = self
+            .command_depth
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                cur.checked_sub(1)
+            })
+            .map_err(|_| {
+                MetaDbError::StorageIoError("end_command without begin_command".to_string())
+            })?;
         if previous == 1 && commit {
             self.maintain_memtables()?;
         }
@@ -449,12 +470,31 @@ impl LifecycleStorageEngine {
         start_key: &[u8],
         end_key: &[u8],
         snap: &SnapshotGuard,
-        mut visit: impl FnMut(&[u8], &[u8]) -> Result<ScanControl>,
+        visit: impl FnMut(&[u8], &[u8]) -> Result<ScanControl>,
     ) -> Result<()> {
+        self.scan_live_until_with_stats(start_key, end_key, snap, visit)
+            .map(|_| ())
+    }
+
+    pub fn scan_live_until_with_stats(
+        &self,
+        start_key: &[u8],
+        end_key: &[u8],
+        snap: &SnapshotGuard,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<ScanControl>,
+    ) -> Result<ScanCursorStats> {
+        const MVCC_CURSOR_BATCH: usize = 256;
         if start_key >= end_key {
-            return Ok(());
+            return snap.with_step_lease(|_| Ok(ScanCursorStats::default()));
         }
+        let cut = snap.cut();
         let version = snap.with_step_lease(|pinned| Ok(pinned.version.clone()))?;
+        if version.checkpoint.flushed_max_hlc > cut.max_hlc {
+            return Err(MetaDbError::TransactionTimeout {
+                snapshot_hlc: cut.max_hlc.as_u64(),
+                oldest_retained_hlc: version.checkpoint.flushed_max_hlc.as_u64(),
+            });
+        }
         let mut disk = if version.has_sst_files() {
             DiskScan::Sst(version.lazy_merged_cursor(start_key, Some(end_key))?)
         } else {
@@ -463,78 +503,98 @@ impl LifecycleStorageEngine {
             }
         };
         let mut mvcc_from = start_key.to_vec();
-        let cut = snap.cut();
+        let mut mvcc_buf: std::collections::VecDeque<(Vec<u8>, MvccValue)> =
+            std::collections::VecDeque::new();
+        let mut stats = ScanCursorStats::default();
         loop {
             let pulled = snap.with_step_lease(|pinned| {
-                self.pull_next(pinned, cut, &mut disk, &mut mvcc_from, end_key)
+                self.pull_next_buffered(
+                    pinned,
+                    cut,
+                    &mut disk,
+                    &mut mvcc_from,
+                    &mut mvcc_buf,
+                    MVCC_CURSOR_BATCH,
+                    end_key,
+                )
             })?;
             match pulled {
                 Pulled::Done => break,
                 Pulled::MvccTombstone => {
                     self.entries_examined.fetch_add(1, Ordering::Relaxed);
+                    stats.entries_examined += 1;
+                    stats.tombstones_traversed += 1;
                 }
                 Pulled::PhysicalTombstone => {
                     self.entries_examined.fetch_add(1, Ordering::Relaxed);
                     self.backend.record_scanned_tombstones(1);
+                    stats.entries_examined += 1;
+                    stats.tombstones_traversed += 1;
                 }
                 Pulled::Live(key, value) => {
                     self.entries_examined.fetch_add(1, Ordering::Relaxed);
+                    stats.entries_examined += 1;
                     if visit(&key, &value)? == ScanControl::Stop {
                         break;
                     }
                 }
             }
         }
-        Ok(())
+        Ok(stats)
     }
 
-    fn pull_next(
+    #[allow(clippy::too_many_arguments)]
+    fn pull_next_buffered(
         &self,
         pinned: &PinnedSnapshotData,
         cut: ReadCut,
         disk: &mut DiskScan,
         mvcc_from: &mut Vec<u8>,
+        mvcc_buf: &mut std::collections::VecDeque<(Vec<u8>, MvccValue)>,
+        batch_size: usize,
         end_key: &[u8],
     ) -> Result<Pulled> {
-        let mvcc_done = mvcc_from.as_slice() >= end_key;
+        if mvcc_buf.is_empty() && mvcc_from.as_slice() < end_key {
+            let page = self
+                .mvcc
+                .range_page_with_pinned(mvcc_from, end_key, cut, pinned, batch_size);
+            if page.len() < batch_size {
+                *mvcc_from = end_key.to_vec();
+            } else if let Some((last_k, _)) = page.last_key_value() {
+                *mvcc_from = key_successor(last_k);
+            }
+            mvcc_buf.extend(page);
+        }
         let disk_done = disk.is_finished(end_key);
-        if mvcc_done && disk_done {
+        if mvcc_buf.is_empty() && disk_done {
             return Ok(Pulled::Done);
         }
-        let mvcc_item = if mvcc_done {
-            None
-        } else {
-            self.mvcc
-                .range_page_with_pinned(mvcc_from, end_key, cut, pinned, 1)
-                .into_iter()
-                .next()
-        };
         let disk_item = if disk_done {
             None
         } else {
             disk.peek(self, pinned, end_key)?
         };
-        match (mvcc_item, disk_item) {
+        match (mvcc_buf.front(), disk_item) {
             (None, None) => Ok(Pulled::Done),
-            (Some((key, value)), None) => {
-                *mvcc_from = key_successor(&key);
+            (Some(_), None) => {
+                let (key, value) = mvcc_buf.pop_front().unwrap();
                 Ok(pulled_from_mvcc(key, value))
             }
             (None, Some((key, value))) => {
                 disk.advance(&key)?;
                 Ok(pulled_from_disk(key, value))
             }
-            (Some((mvcc_key, mvcc_value)), Some((disk_key, disk_value))) => {
-                if mvcc_key < disk_key {
-                    *mvcc_from = key_successor(&mvcc_key);
-                    Ok(pulled_from_mvcc(mvcc_key, mvcc_value))
-                } else if disk_key < mvcc_key {
+            (Some((mvcc_key, _)), Some((disk_key, disk_value))) => {
+                if mvcc_key.as_slice() < disk_key.as_slice() {
+                    let (key, value) = mvcc_buf.pop_front().unwrap();
+                    Ok(pulled_from_mvcc(key, value))
+                } else if disk_key.as_slice() < mvcc_key.as_slice() {
                     disk.advance(&disk_key)?;
                     Ok(pulled_from_disk(disk_key, disk_value))
                 } else {
-                    *mvcc_from = key_successor(&mvcc_key);
+                    let (key, value) = mvcc_buf.pop_front().unwrap();
                     disk.advance(&disk_key)?;
-                    Ok(pulled_from_mvcc(mvcc_key, mvcc_value))
+                    Ok(pulled_from_mvcc(key, value))
                 }
             }
         }
@@ -633,8 +693,9 @@ impl LifecycleStorageEngine {
             match &item.latest_value {
                 Some(_) => self.compactor.record_live_write(&item.key),
                 None => {
+                    let triggered = self.compactor.record_tombstone(&item.key);
                     if self.auto_locality_compaction {
-                        if let Some(bounds) = self.compactor.record_tombstone(&item.key) {
+                        if let Some(bounds) = triggered {
                             if !ranges_to_compact.contains(&bounds) {
                                 ranges_to_compact.push(bounds);
                             }
@@ -649,7 +710,15 @@ impl LifecycleStorageEngine {
         }
 
         self.raft_log.advance_storage_flushed_lsn(state_flushed_lsn);
-        Ok((state_flushed_lsn, aux_frontier))
+        if aux_frontier > 0 {
+            self.last_aux_frontier
+                .fetch_max(aux_frontier, Ordering::AcqRel);
+        }
+        let effective_aux = self
+            .last_aux_frontier
+            .load(Ordering::Acquire)
+            .max(aux_frontier);
+        Ok((state_flushed_lsn, effective_aux))
     }
 
     /// Convenience synchronous flush without external hook.
@@ -669,10 +738,10 @@ impl LifecycleStorageEngine {
     /// Performs localized bottommost range compaction over `[start_key, end_key)`, updating
     /// `LocalityCompactor` bucket counts strictly when `backend.compact_range` succeeds (`Ok`).
     pub fn try_compact_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<usize> {
-        let (snap_tombs, snap_live) = self.compactor.snapshot_bucket_counts(start_key);
+        let snap_tombs = self.compactor.snapshot_range_tombstones(start_key, end_key);
         let purged = self.backend.compact_range(start_key, end_key)?;
         self.compactor
-            .on_range_compacted(start_key, snap_tombs, snap_live, purged);
+            .on_range_compacted_buckets(&snap_tombs, purged);
         Ok(purged)
     }
 
@@ -686,13 +755,11 @@ impl LifecycleStorageEngine {
         self.backend.create_checkpoint(dest_dir)
     }
 
-    /// Returns the approximate storage byte size of live entries in this shard.
-    pub fn approximate_size_bytes(&self, read_hlc: HlcTimestamp) -> usize {
-        let start = [0x00u8];
-        let end = [0xFFu8];
-        self.scan_range(&start, &end, read_hlc)
-            .map(|rows| rows.iter().map(|(k, v)| k.len() + v.len()).sum())
-            .unwrap_or(0)
+    /// Returns the approximate storage byte size of live entries in this shard in $O(\text{files})$.
+    pub fn approximate_size_bytes(&self, _read_hlc: HlcTimestamp) -> usize {
+        self.backend
+            .approximate_persistent_bytes()
+            .saturating_add(self.mvcc.active_memtable_bytes())
     }
 
     /// Returns a snapshot of storage engine metrics.
@@ -736,7 +803,10 @@ impl LifecycleStorageEngine {
         self.mvcc
             .seal_active_memtable(self.backend.as_ref(), checkpoint, hook)?;
         let flushed = self.flush_queued_imms_with_hook(hook)?;
-        self.last_aux_frontier.store(flushed.1, Ordering::Release);
+        if flushed.1 > 0 {
+            self.last_aux_frontier
+                .fetch_max(flushed.1, Ordering::AcqRel);
+        }
         Ok(flushed)
     }
 

@@ -17,12 +17,10 @@ The default `metadbd` process is **all-in-one**. `be`, `proxy`, `cell-manager`, 
 - データディレクトリは 1 つ
 - セルは 1 つ（`node.cell_id`、既定は `1`）
 - シャードごとの OpenRaft 投票者は 1 つ（このプロセス）
-- `MetadataService`、`TransactionService`、`ControlPlaneService`、`RaftTransportService` を提供する gRPC リスナーは 1 つ
-- 250 ms ごとのバックグラウンドループが、補助アウトボックスの排出、2PC 回復、分割方針の確認、Raft ログのスナップショットを行う
+- `MetadataService`、`TransactionService`、`ControlPlaneService`、`RaftTransportService`、`grpc.health.v1.Health` を提供する gRPC リスナーは 1 つ
+- 250 ms ごとのバックグラウンドループが、補助アウトボックスの排出（セル間 `GrpcRemoteAuxSink` `ApplyAuxBatch` を含む）、2PC 回復、分割方針の確認、Raft ログのスナップショットを行う
 
-`ServerRole` は `be`、`proxy`、`cell-manager`、`global-manager` も解析します。`open_and_serve` starts those roles when that role's configuration is valid. An illegal combination fails before listen. An unknown `--role` returns `unsupported --role` from `metadbd`, not an unimplemented-role `CodecError`.空のデータディレクトリを持つ 2 つ目の `metadbd` が `[cluster] join`（または `--join` / `--cell-manager`）を現在のリーダーに向けると、そのセルの Raft グループに参加します。リーダーは learner として加え、その後 voter に昇格します。すでにセル状態があるディレクトリはローカル Raft を開き直し、再参加しません。`RegisterCell` stores a remote cell after its routes cover the requested range. A later request contained by that cell is forwarded. Join does not create a second cell. `metadb-ctl cell register` without a range still sends `[01, 04)` and exits non-zero against a default cell.未知で非ゼロの `cell_id` に対する `GetRoutes` はエラーを返します。`cell_id = 0` はキャッシュ済みルートをすべて列挙します。
-
-シャード分割、デュアルモードの `(PID, name)` 分割、ジャンボのルートフラグは、その 1 プロセスの中で動きます。投票者を 3 つへ昇格する処理は `DurableCellManager::scale_out_replicas` に実装され、プロセス内の Raft テストで覆われています。これは `metadbd` を 3 プロセス起動する配備ではありません。詳細は [運用](./operations.md) を参照してください。
+シャード分割（1 投票者および 3 投票者）、デュアルモードの `(PID, name)` 分割、`ProbeTransferLeader` による安全なリーダー移譲、`metadbd` 3 プロセスによる投票者フェイルオーバー演習（`three_process_ha_rehearsal`）、および 4 ロール分離クロスセル E2E（`disaggregated_four_role_e2e`）が本ツリーのテストで検証されています。詳細は [運用](./operations.md) を参照してください。
 
 ## 文書の構成
 

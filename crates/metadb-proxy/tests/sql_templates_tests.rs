@@ -279,6 +279,61 @@ async fn test_all_twenty_metadata_sql_templates_and_attr_isolation() {
     };
     assert_eq!(scanned_idx.len(), 1);
 
+    // Explicit `LIMIT 0` on Templates #10, #11, #18, and #20 MUST return 0 rows (never defaulting to 1000/100)!
+    let ProxySqlResult::Entries {
+        entries: zero_meta,
+        next_cursor: zero_cur,
+    } = proxy
+        .execute_sql(
+            "SELECT * FROM MetaTable WHERE pid = 100 AND name > '' ORDER BY name ASC LIMIT 0",
+            &[],
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected Entries");
+    };
+    assert!(zero_meta.is_empty());
+    assert!(zero_cur.is_none());
+
+    let ProxySqlResult::Entries {
+        entries: zero_like, ..
+    } = proxy
+        .execute_sql(
+            "SELECT * FROM MetaTable WHERE pid = 100 AND name LIKE 'r%' ORDER BY name ASC LIMIT 0",
+            &[],
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected LIKE Entries");
+    };
+    assert!(zero_like.is_empty());
+
+    let ProxySqlResult::Quotas(zero_quotas) = proxy
+        .execute_sql(
+            "SELECT * FROM QuotaTable WHERE uid >= 1 ORDER BY uid ASC LIMIT 0",
+            &[],
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected Quotas");
+    };
+    assert!(zero_quotas.is_empty());
+
+    let ProxySqlResult::SecondaryIndices(zero_indices) = proxy
+        .execute_sql(
+            "SELECT * FROM SecondaryIndexTable WHERE fid > 0 ORDER BY fid ASC LIMIT 0",
+            &[],
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected SecondaryIndices");
+    };
+    assert!(zero_indices.is_empty());
+
     // Templates #3 (Unlink) & #4 (Rmdir)
     proxy
         .execute_sql(

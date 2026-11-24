@@ -279,6 +279,90 @@ impl PushdownExecutor {
         Ok(attr)
     }
 
+    /// Single-shard pushdown `setattr` updating `mode`, `uid`, `size_bytes`, `fid`, and/or `modify_time`.
+    pub fn setattr(
+        &self,
+        engine: &LifecycleStorageEngine,
+        pid: InodeId,
+        name: &str,
+        patch: crate::state_machine_impl::SetAttrPatch,
+        hlc: HlcTimestamp,
+    ) -> Result<MetaEntry> {
+        validate_user_entry_name(name)?;
+        if let Some(sz) = patch.size_bytes {
+            validate_file_size(sz)?;
+        }
+        let child_key = MetaKey::child(pid, name);
+        let child_key_bytes = child_key.encode();
+        let Some(raw) = engine.get(&child_key_bytes, hlc)? else {
+            return Err(MetaDbError::NotFound {
+                pid,
+                name: name.to_string(),
+            });
+        };
+        let mut attr = InodeAttr::decode(&raw)?;
+        let old_size = attr.size_bytes;
+        let old_uid = attr.uid;
+        let old_fid = attr.fid;
+
+        if let Some(m) = patch.mode {
+            attr.mode = m;
+        }
+        if let Some(u) = patch.uid {
+            attr.uid = u;
+        }
+        if let Some(sz) = patch.size_bytes {
+            attr.size_bytes = sz;
+        }
+        if let Some(f) = patch.fid {
+            attr.fid = Some(f);
+        }
+        attr.modify_time = patch.modify_time.unwrap_or(hlc);
+
+        let delta_bytes = attr.size_bytes.saturating_sub(old_size);
+        if delta_bytes != 0 {
+            self.validate_parent_delta(engine, pid, 0, delta_bytes, hlc)?;
+        }
+        engine.put(child_key_bytes, attr.encode(), hlc);
+        if delta_bytes != 0 {
+            self.attr_aggregator
+                .record_delta(engine, pid, 0, delta_bytes, hlc);
+        }
+        if attr.uid != old_uid {
+            self.aux_sink.enqueue_quota_delta(
+                engine,
+                old_uid,
+                negate_accounted_size(old_size),
+                -1,
+                hlc,
+            );
+            self.aux_sink
+                .enqueue_quota_delta(engine, attr.uid, attr.size_bytes, 1, hlc);
+        } else if delta_bytes != 0 {
+            self.aux_sink
+                .enqueue_quota_delta(engine, attr.uid, delta_bytes, 0, hlc);
+        }
+        if attr.fid != old_fid {
+            if let Some(prev) = old_fid {
+                self.aux_sink.enqueue_index_delete(engine, prev, hlc);
+            }
+            if let Some(next) = attr.fid {
+                self.aux_sink.enqueue_index_upsert(
+                    engine,
+                    next,
+                    pid,
+                    name.to_string(),
+                    attr.create_time,
+                    hlc,
+                );
+            }
+        }
+        Ok(MetaEntry {
+            key: child_key,
+            attr,
+        })
+    }
+
     /// Authoritative `rmdir` operation (resolving Goldfish Finding F2):
     /// Rather than trusting the asynchronously aggregated `num_children` counter, `rmdir`
     /// scans the target directory's live key range `[dir_id, dir_id + 1)` (excluding `"_attr_"`)

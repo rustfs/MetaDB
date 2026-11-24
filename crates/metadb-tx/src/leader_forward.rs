@@ -3,6 +3,8 @@
 //! `ForwardRouter` runs the operation on the receiving node and does not forward again.
 //! The caller follows a newer `NotLeader` hint, bounded to a few hops.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use metadb_core::codec;
@@ -116,7 +118,7 @@ pub enum ForwardedRouterOp {
 pub enum ForwardedRouterOut {
     Lookup(Option<MetaEntry>),
     DirStat(InodeAttr),
-    ListDir(Vec<MetaEntry>, Option<String>),
+    ListDir(Vec<MetaEntry>, Option<String>, u64, u64),
     GetQuota(Option<QuotaRecord>),
     ListQuotas(Vec<QuotaRecord>),
     GetSecondaryIndex(Option<metadb_core::SecondaryIndexRecord>),
@@ -172,6 +174,11 @@ fn rpc_error(detail: Option<ErrorDetailProto>) -> Option<MetaDbError> {
     })
 }
 
+fn forward_channel_pool() -> &'static tokio::sync::Mutex<HashMap<String, Channel>> {
+    static POOL: OnceLock<tokio::sync::Mutex<HashMap<String, Channel>>> = OnceLock::new();
+    POOL.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
 pub async fn forward_op(
     secret: &str,
     addr: &str,
@@ -189,19 +196,30 @@ pub async fn forward_op(
     let url = security.prepare_url(addr).map_err(|error| {
         MetaDbError::RpcError(format!("invalid leader address {addr}: {error}"))
     })?;
-    let endpoint = Endpoint::from_shared(url.clone())
-        .map_err(|error| MetaDbError::RpcError(format!("invalid leader address {url}: {error}")))?
-        .connect_timeout(remaining.min(Duration::from_secs(3)))
-        .timeout(remaining);
-    let channel: Channel = match tokio::time::timeout(remaining, security.connect(endpoint)).await {
-        Ok(channel) => channel.map_err(|error| {
-            MetaDbError::RpcError(format!("connect to leader {url} failed: {error}"))
-        })?,
-        Err(_) => {
-            return Err(MetaDbError::RpcError(
-                "forwarded read connect timed out".to_string(),
-            ))
-        }
+    let cached = forward_channel_pool().lock().await.get(&url).cloned();
+    let channel: Channel = if let Some(ch) = cached {
+        ch
+    } else {
+        let endpoint = Endpoint::from_shared(url.clone())
+            .map_err(|error| {
+                MetaDbError::RpcError(format!("invalid leader address {url}: {error}"))
+            })?
+            .connect_timeout(remaining.min(Duration::from_secs(3)));
+        let connected = match tokio::time::timeout(remaining, security.connect(endpoint)).await {
+            Ok(channel) => channel.map_err(|error| {
+                MetaDbError::RpcError(format!("connect to leader {url} failed: {error}"))
+            })?,
+            Err(_) => {
+                return Err(MetaDbError::RpcError(
+                    "forwarded read connect timed out".to_string(),
+                ))
+            }
+        };
+        forward_channel_pool()
+            .lock()
+            .await
+            .insert(url.clone(), connected.clone());
+        connected
     };
     let mut client = TransactionServiceClient::with_interceptor(
         channel,
@@ -212,11 +230,31 @@ pub async fn forward_op(
     );
     let payload =
         codec::serialize(op).map_err(|error| MetaDbError::CodecError(error.to_string()))?;
-    let response = client
-        .forward_router(ForwardRouterRequest { op: payload })
-        .await
-        .map_err(|error| MetaDbError::RpcError(format!("forward to leader {url} failed: {error}")))?
-        .into_inner();
+    let rpc_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if rpc_budget.is_zero() {
+        return Err(MetaDbError::RpcError(
+            "forwarded read exceeded the routing deadline".to_string(),
+        ));
+    }
+    let response = match tokio::time::timeout(
+        rpc_budget,
+        client.forward_router(ForwardRouterRequest { op: payload }),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp.into_inner(),
+        Ok(Err(error)) => {
+            forward_channel_pool().lock().await.remove(&url);
+            return Err(MetaDbError::RpcError(format!(
+                "forward to leader {url} failed: {error}"
+            )));
+        }
+        Err(_) => {
+            return Err(MetaDbError::RpcError(
+                "forwarded read timed out".to_string(),
+            ));
+        }
+    };
     if let Some(error) = rpc_error(response.error) {
         return Err(error);
     }

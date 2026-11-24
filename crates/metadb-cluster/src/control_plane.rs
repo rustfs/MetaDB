@@ -40,10 +40,18 @@ impl MetaCache {
     }
 
     pub fn upsert_route(&self, route: ShardRoute) {
-        self.routes_by_start_pid
-            .write()
-            .unwrap()
-            .insert(route.start_pid, route);
+        let mut guard = self.routes_by_start_pid.write().unwrap();
+        let stale: Vec<InodeId> = guard
+            .iter()
+            .filter(|(_, existing)| {
+                existing.start_pid < route.end_pid && route.start_pid < existing.end_pid
+            })
+            .map(|(&k, _)| k)
+            .collect();
+        for k in stale {
+            guard.remove(&k);
+        }
+        guard.insert(route.start_pid, route);
     }
 
     pub fn invalidate_all(&self) {

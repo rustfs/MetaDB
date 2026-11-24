@@ -27,6 +27,8 @@
 | `sharding.bootstrap_table_shards` | `true` | Yes. `true` creates shards 1, 2, and 3. `false` creates shard 1 over `[0x01, 0x04)` |
 | `sharding.shard_split_threshold_bytes` | `4294967296` (4 GiB) | Yes. Split check uses approximate shard size |
 | `sharding.jumbo_dedicated_root` | empty | Yes. A real directory outside the data directory. Empty does not move files. A symlink, or a path inside the data directory, refuses startup. This key stays on this machine. The loopback placement API is not selected here. Handing off the shard that holds the cell-directory snapshot copies that snapshot onto another open local shard before the old directory is removed. An empty engine is not a new directory |
+| `sharding.enable_automatic_leadership_transfer` | `false` | Yes. Opt-in flag enabling automatic leadership transfer after `ProbeTransferLeader` preflight |
+| `cluster.join_timeout_secs` | unset (`45`s) | Yes. Overrides the 45-second join retry budget when set (`> 0`) |
 | `security.shared_secret` | `""` | Yes. Empty does not start a listener. A value with a non-whitespace character requires the same bearer on gRPC and the metrics listener. Whitespace-only is rejected |
 | `security.allow_unauthenticated` | `false` | Yes. Explicit loopback-only development opt-in. It does not allow a non-loopback bind, and it cannot be combined with a usable secret |
 | `security.tls.mode` | `off` | Yes. `off` is plaintext. `tls` and `mtls` are refused before a data directory is created. This process does not terminate TLS |

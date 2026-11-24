@@ -75,3 +75,16 @@ async fn persistent_flush_purge_restart_holds_the_directory_invariant() {
     assert!(report.fault.starts_with("flush-purge-restart"), "{report}");
     assert!(report.acked_mutations > 0, "{report}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_setattr_cross_rename_split_restart_holds_the_directory_invariant() {
+    let spec = ci_workload("metadata_setattr_cross_rename_split_restart")
+        .expect("setattr + cross-rename + split restart workload is in the CI catalog");
+    let dir = tempdir().unwrap();
+    let cfg = persistent_config(dir.path(), 4 * 1024 * 1024 * 1024);
+    let report = run_persistent(spec, 17, &cfg).await;
+    println!("{report}");
+    assert_eq!(report.invariant_violations.len(), 0, "{report}");
+    assert!(report.fault.starts_with("split-flush-restart"), "{report}");
+    assert!(report.acked_mutations > 0, "{report}");
+}

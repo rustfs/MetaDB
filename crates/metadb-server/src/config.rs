@@ -135,21 +135,12 @@ pub struct SecuritySection {
 }
 
 /// `[security.rbac]`. The shared bearer is not one of these credentials.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RbacSection {
     /// Principal this process presents on outbound RPCs.
     pub local_principal: String,
     pub grants: Vec<RbacGrantConfig>,
-}
-
-impl Default for RbacSection {
-    fn default() -> Self {
-        Self {
-            local_principal: String::new(),
-            grants: Vec::new(),
-        }
-    }
 }
 
 impl std::fmt::Debug for RbacSection {
@@ -262,6 +253,8 @@ pub struct ShardingSection {
     /// Directory outside `node.data_dir` for this process's jumbo shard files.
     /// Empty leaves those files in the shared `be/shards` tree.
     pub jumbo_dedicated_root: String,
+    /// Opt-in flag enabling automatic leadership transfer after `ProbeTransferLeader` verification.
+    pub enable_automatic_leadership_transfer: bool,
 }
 
 impl Default for ShardingSection {
@@ -270,6 +263,7 @@ impl Default for ShardingSection {
             bootstrap_table_shards: true,
             shard_split_threshold_bytes: 4 * 1024 * 1024 * 1024,
             jumbo_dedicated_root: String::new(),
+            enable_automatic_leadership_transfer: false,
         }
     }
 }
@@ -299,6 +293,8 @@ pub struct ClusterSection {
     /// `ForwardRouter` are sent here as well. A metadata or transaction request
     /// contained by one registered cell is dialed at that cell instead.
     pub upstream: String,
+    /// Optional join retry budget in seconds (overrides the 45-second default when set).
+    pub join_timeout_secs: Option<u64>,
 }
 
 /// Top-level TOML configuration matching `docs/guides/{en,ja,fr,zh,de}/deployment.md`.
@@ -334,8 +330,17 @@ impl ServerTomlConfig {
             .map_err(|e| MetaDbError::CodecError(format!("invalid TOML config: {e}")))?;
         reject_unsupported_security_keys(&value)?;
         reject_transport_table(&value)?;
-        let parsed = ServerTomlConfig::deserialize(value)
+        let mut parsed = ServerTomlConfig::deserialize(value)
             .map_err(|e| MetaDbError::CodecError(format!("invalid TOML config: {e}")))?;
+        if let Some(secs) = parsed.cluster.join_timeout_secs {
+            if secs == 0 {
+                return Err(MetaDbError::CodecError(
+                    "invalid TOML config: [cluster].join_timeout_secs must be greater than zero"
+                        .to_string(),
+                ));
+            }
+            parsed.join_timeout = Some(Duration::from_secs(secs));
+        }
         // Timer checks only. This does not read or rewrite [security].
         parsed.security.tls.to_spec()?;
         parsed.raft_options.validate()?;
@@ -348,6 +353,19 @@ impl ServerTomlConfig {
     pub fn from_toml_file(path: impl AsRef<Path>) -> Result<Self> {
         let content = fs::read_to_string(path)?;
         Self::from_toml_str(&content)
+    }
+
+    /// Strict TOML parser (`--strict-config`) rejecting unknown top-level or section keys.
+    pub fn from_toml_str_strict(s: &str) -> Result<Self> {
+        let value: toml::Value = toml::from_str(s)
+            .map_err(|e| MetaDbError::CodecError(format!("invalid TOML config: {e}")))?;
+        reject_unknown_config_keys(&value)?;
+        Self::from_toml_str(s)
+    }
+
+    pub fn from_toml_file_strict(path: impl AsRef<Path>) -> Result<Self> {
+        let content = fs::read_to_string(path)?;
+        Self::from_toml_str_strict(&content)
     }
 
     pub fn to_lsm_config(&self) -> Result<LsmEngineConfig> {
@@ -366,6 +384,7 @@ impl ServerTomlConfig {
             auto_locality_compaction: true,
             memtable_size_bytes: self.storage.memtable_size_bytes.max(1),
             max_imm_memtables: self.storage.max_imm_memtables.max(1),
+            ..LsmEngineConfig::default()
         })
     }
 
@@ -780,6 +799,93 @@ fn reject_nested_security_keys(value: &toml::Value) -> Result<()> {
     Ok(())
 }
 
+fn reject_unknown_table_keys(
+    section_name: &str,
+    value: &toml::Value,
+    allowed: &[&str],
+) -> Result<()> {
+    let Some(table) = value.as_table() else {
+        return Err(MetaDbError::CodecError(format!(
+            "invalid TOML config: [{section_name}] must be a table"
+        )));
+    };
+    for key in table.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(MetaDbError::CodecError(format!(
+                "invalid TOML config: unknown key `{key}` in [{section_name}]"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_unknown_config_keys(value: &toml::Value) -> Result<()> {
+    let Some(root) = value.as_table() else {
+        return Err(MetaDbError::CodecError(
+            "TOML config must be a table".to_string(),
+        ));
+    };
+    for (key, child) in root {
+        match key.as_str() {
+            "node" => reject_unknown_table_keys(
+                "node",
+                child,
+                &[
+                    "node_id",
+                    "cell_id",
+                    "role",
+                    "data_dir",
+                    "grpc_listen_addr",
+                    "metrics_listen_addr",
+                ],
+            )?,
+            "clock" => reject_unknown_table_keys("clock", child, &["max_clock_drift_ms"])?,
+            "storage" => reject_unknown_table_keys(
+                "storage",
+                child,
+                &[
+                    "memtable_size_bytes",
+                    "block_cache_bytes",
+                    "mvcc_retention_ms",
+                    "bloom_bits_per_key",
+                    "locality_tombstone_threshold",
+                    "locality_tombstone_ratio",
+                    "max_imm_memtables",
+                ],
+            )?,
+            "sharding" => reject_unknown_table_keys(
+                "sharding",
+                child,
+                &[
+                    "bootstrap_table_shards",
+                    "shard_split_threshold_bytes",
+                    "jumbo_dedicated_root",
+                    "enable_automatic_leadership_transfer",
+                ],
+            )?,
+            "cluster" => reject_unknown_table_keys(
+                "cluster",
+                child,
+                &[
+                    "join",
+                    "cell_start_key",
+                    "cell_end_key",
+                    "global_manager",
+                    "upstream",
+                    "join_timeout_secs",
+                ],
+            )?,
+            "security" | "transport" | "raft" => {}
+            other => {
+                return Err(MetaDbError::CodecError(format!(
+                    "invalid TOML config: unknown top-level section or key `{other}`"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,7 +1194,7 @@ mod tests {
             Some("tcp-grpc")
         );
         assert!(resolution.outcome.allocation().is_empty());
-        assert!(!metadb_transport::RDMA_BACKEND_IMPLEMENTED);
+        const { assert!(!metadb_transport::RDMA_BACKEND_IMPLEMENTED) };
     }
 
     #[test]

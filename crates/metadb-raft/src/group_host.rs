@@ -274,6 +274,22 @@ impl ShardRaftGroup {
         )
         .map_err(|e| MetaDbError::StorageIoError(e.to_string()))?;
 
+        {
+            let engine = state_machine.engine();
+            let cp = engine.durable_checkpoint();
+            if cp.contiguous_aux_acked_index < cp.flushed_raft_index {
+                let retained = log_store.normal_requests_in_inclusive_range(
+                    cp.contiguous_aux_acked_index.saturating_add(1),
+                    cp.flushed_raft_index,
+                );
+                if !retained.is_empty() {
+                    state_machine
+                        .handler()
+                        .recover_unspilled_aux_from_log(&retained, &cp, &engine);
+                }
+            }
+        }
+
         let config = Arc::new(
             Config {
                 cluster_name: format!("metadb-shard-{}", shard_id),
@@ -573,6 +589,16 @@ impl ShardRaftGroup {
 
     pub fn current_epoch(&self) -> ShardEpoch {
         self.state_machine.handler().current_epoch()
+    }
+
+    /// Latest Raft log index applied to the state machine (`0` if none).
+    pub fn last_applied_index(&self) -> u64 {
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .map(|id| id.index)
+            .unwrap_or(0)
     }
 
     /// True when the applied Raft membership lists `node_id` as a voter.
@@ -1136,6 +1162,28 @@ impl ShardGroupHost {
         self.groups.write().unwrap().remove(&shard_id)
     }
 
+    /// Stops `shard_id`, unregisters it from the multiplexed Raft router and `NODE_SHARD_REGISTRY`,
+    /// and deletes its local shard directory so removed voters reclaim disk and stop background tasks.
+    pub async fn remove_and_gc_shard(&self, shard_id: ShardId) -> Result<()> {
+        self.router.remove_local_proposer(shard_id);
+        self.router.remove_group(shard_id);
+        if let Some(group) = self.take_running_group(shard_id) {
+            let _ = group.shutdown().await;
+            drop(group);
+        }
+        {
+            let _shard_set = crate::backup::lock_be_shard_set(&self.data_dir)?;
+            let mut guard = self.registry.write().unwrap();
+            guard.remove(&shard_id);
+            Self::persist_registry(&self.data_dir, &guard)?;
+        }
+        let sdir = self.shard_dir(shard_id);
+        if sdir.exists() {
+            fs::remove_dir_all(&sdir)?;
+        }
+        Ok(())
+    }
+
     pub fn get_group(&self, shard_id: ShardId) -> Option<Arc<ShardRaftGroup>> {
         self.groups.read().unwrap().get(&shard_id).cloned()
     }
@@ -1162,7 +1210,7 @@ impl ShardGroupHost {
         };
         for g in &groups {
             if flush {
-                let _ = g.state_machine().flush_to_lsm();
+                let _ = g.state_machine().flush_for_shutdown();
             }
             let _ = g.shutdown().await;
             self.router.remove_group(g.shard_id());

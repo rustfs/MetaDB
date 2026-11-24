@@ -122,7 +122,8 @@ async fn live_rename_dirsync_failure_does_not_reopen_the_old_directory() {
     let (host, cell) = open_cell(dir.path(), None).await;
     let source = host.shard_dir(1);
     cell.testing_mark_local_jumbo(1, 9).unwrap();
-    metadb_cluster::jumbo_files::testing_fail_next_live_dirsync(2);
+    let published = metadb_cluster::jumbo_files::shard_move_dir(disk.path(), 1);
+    metadb_cluster::jumbo_files::testing_fail_live_dirsync_at(&published, 2);
     let failed = cell
         .relocate_jumbo_shard_files(1, disk.path())
         .await
@@ -137,7 +138,6 @@ async fn live_rename_dirsync_failure_does_not_reopen_the_old_directory() {
         host.get_group(1).is_none(),
         "the old directory must not be reopened"
     );
-    let published = disk.path().join("shards").join(format!("{:020}", 1u64));
     assert!(
         metadb_cluster::jumbo_files::load_live_dir(disk.path(), 1)
             .unwrap()

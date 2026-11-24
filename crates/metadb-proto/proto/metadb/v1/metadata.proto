@@ -140,6 +140,8 @@ message ListDirResponse {
   string next_cursor = 3;
   bool has_more = 4;
   uint64 server_hlc = 5;
+  uint64 entries_examined = 6;
+  uint64 tombstones_traversed = 7;
 }
 
 message SqlParamValue {

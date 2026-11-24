@@ -25,13 +25,20 @@ pub struct ReadToken {
 
 type WaiterSender = oneshot::Sender<Result<u64>>;
 
+#[derive(Default)]
+struct BatcherState {
+    driver_running: bool,
+    pending_waiters: Vec<WaiterSender>,
+}
+
 /// Coalesces concurrent `ensure_linearizable(ReadPolicy::ReadIndex)` requests within `200µs`
-/// so high-QPS `dirstat`/`lookup`/`listdir` calls share a single quorum heartbeat round.
+/// and serializes follow-up waves while a quorum round is in-flight so high-QPS
+/// `dirstat`/`lookup`/`listdir` calls share at most one active quorum heartbeat round per shard.
 pub struct ReadIndexBatcher {
     shard_id: ShardId,
     raft: MetaDbRaft,
     frontier_rx: watch::Receiver<AppliedFrontier>,
-    pending_waiters: Arc<Mutex<Vec<WaiterSender>>>,
+    state: Arc<Mutex<BatcherState>>,
 }
 
 impl ReadIndexBatcher {
@@ -44,7 +51,7 @@ impl ReadIndexBatcher {
             shard_id,
             raft,
             frontier_rx,
-            pending_waiters: Arc::new(Mutex::new(Vec::new())),
+            state: Arc::new(Mutex::new(BatcherState::default())),
         }
     }
 
@@ -98,38 +105,55 @@ impl ReadIndexBatcher {
 
     async fn coalesced_read_index(&self) -> Result<u64> {
         let (tx, rx) = oneshot::channel();
-        let is_driver = {
-            let mut guard = self.pending_waiters.lock().await;
-            let first = guard.is_empty();
-            guard.push(tx);
-            first
+        let spawn_driver = {
+            let mut guard = self.state.lock().await;
+            guard.pending_waiters.push(tx);
+            if guard.driver_running {
+                false
+            } else {
+                guard.driver_running = true;
+                true
+            }
         };
 
-        if is_driver {
+        if spawn_driver {
             // Spawn the batch driver on an independent task so cancelling a single caller's
-            // request future never strands peer waiters in `pending_waiters`.
-            let pending_waiters = self.pending_waiters.clone();
+            // request future never strands peer waiters in `pending_waiters`, and any callers
+            // arriving while `ensure_linearizable` is in-flight coalesce into one follow-up wave.
+            let state = self.state.clone();
             let raft = self.raft.clone();
             let shard_id = self.shard_id;
             tokio::spawn(async move {
-                tokio::task::yield_now().await;
-                if pending_waiters.lock().await.len() > 1 {
-                    tokio::time::sleep(MICRO_BATCH_WINDOW).await;
-                }
+                loop {
+                    tokio::task::yield_now().await;
+                    if state.lock().await.pending_waiters.len() > 1 {
+                        tokio::time::sleep(MICRO_BATCH_WINDOW).await;
+                    }
 
-                let waiters = {
-                    let mut guard = pending_waiters.lock().await;
-                    std::mem::take(&mut *guard)
-                };
+                    let waiters = {
+                        let mut guard = state.lock().await;
+                        if guard.pending_waiters.is_empty() {
+                            guard.driver_running = false;
+                            break;
+                        }
+                        std::mem::take(&mut guard.pending_waiters)
+                    };
 
-                let res = match raft.ensure_linearizable(ReadPolicy::ReadIndex).await {
-                    Ok(read_log_id) => Ok(read_log_id.index()),
-                    Err(error) => Err(crate::error_map::map_linearizable_read_error(
-                        shard_id, error,
-                    )),
-                };
-                for w in waiters {
-                    let _ = w.send(res.clone());
+                    let res = match raft.ensure_linearizable(ReadPolicy::ReadIndex).await {
+                        Ok(read_log_id) => Ok(read_log_id.index()),
+                        Err(error) => Err(crate::error_map::map_linearizable_read_error(
+                            shard_id, error,
+                        )),
+                    };
+                    for w in waiters {
+                        let _ = w.send(res.clone());
+                    }
+
+                    let mut guard = state.lock().await;
+                    if guard.pending_waiters.is_empty() {
+                        guard.driver_running = false;
+                        break;
+                    }
                 }
             });
         }

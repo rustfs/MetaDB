@@ -122,10 +122,13 @@ impl Default for AppliedFrontier {
 
 /// Atomic three-watermark gate clamping physical `.raftlog` prefix purges (`consensus_and_transactions.md` §5.2):
 /// `safe_purge_index = min(state_flushed_index, aux_outbox_durable_index, last_snapshot_index)`.
+/// Also tracks `contiguous_aux_acked_index` separately from `aux_outbox_durable_index` so that
+/// `[0x07]` spills advance `.raftlog` purge without skipping un-acked `[0x07]` tasks on `MANIFEST` recovery.
 #[derive(Debug)]
 pub struct ShardWatermarkTracker {
     state_flushed_index: AtomicU64,
     aux_outbox_durable_index: AtomicU64,
+    contiguous_aux_acked_index: AtomicU64,
     last_snapshot_index: AtomicU64,
 }
 
@@ -140,6 +143,7 @@ impl ShardWatermarkTracker {
         Self {
             state_flushed_index: AtomicU64::new(state_flushed),
             aux_outbox_durable_index: AtomicU64::new(aux_durable),
+            contiguous_aux_acked_index: AtomicU64::new(aux_durable),
             last_snapshot_index: AtomicU64::new(last_snapshot),
         }
     }
@@ -153,11 +157,36 @@ impl ShardWatermarkTracker {
             .fetch_max(idx, Ordering::AcqRel);
     }
 
-    /// Advances `aux_outbox_durable_index` to `idx` if and only if all entries `< idx`
-    /// are already contiguously durable (used for `Blank` / `Membership` entries that emit 0 aux tasks).
+    pub fn set_aux_outbox_durable(&self, idx: u64) {
+        self.aux_outbox_durable_index.store(idx, Ordering::Release);
+    }
+
+    pub fn advance_contiguous_aux_acked(&self, idx: u64) {
+        self.contiguous_aux_acked_index
+            .fetch_max(idx, Ordering::AcqRel);
+    }
+
+    pub fn set_contiguous_aux_acked(&self, idx: u64) {
+        self.contiguous_aux_acked_index
+            .store(idx, Ordering::Release);
+    }
+
+    pub fn contiguous_aux_acked_index(&self) -> u64 {
+        self.contiguous_aux_acked_index.load(Ordering::Acquire)
+    }
+
+    /// Advances `aux_outbox_durable_index` and `contiguous_aux_acked_index` to `idx` if and only if
+    /// all entries `< idx` are already contiguously durable/acked (used for `Blank` / `Membership` /
+    /// rejected entries that emit 0 aux tasks).
     pub fn advance_aux_for_non_aux_entry(&self, idx: u64) {
         let prev = idx.saturating_sub(1);
         let _ = self.aux_outbox_durable_index.compare_exchange(
+            prev,
+            idx,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let _ = self.contiguous_aux_acked_index.compare_exchange(
             prev,
             idx,
             Ordering::AcqRel,

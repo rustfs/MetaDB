@@ -33,13 +33,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use metadb_core::codec;
 use metadb_core::{
-    append_crc32c_le, checksum_crc32c, verify_crc32c_le, MetaDbError, Result, ShardId,
+    append_crc32c_le, checksum_crc32c, verify_crc32c_le, Crc32cHasher, MetaDbError, Result, ShardId,
 };
 use metadb_storage::sstable::{sst_file_name, sync_dir};
 use metadb_storage::{LifecycleStorageEngine, ManifestLog};
 
 use crate::log_store::{read_persisted_purged_index, RaftLogInspection, SegmentedRaftLogStore};
 use crate::state_machine::highest_durable_snapshot_index;
+
+const STREAM_COPY_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Validation callback checking shard coverage against cell control-plane state frames.
+pub type CheckBackupTreeFn = dyn Fn(&[ShardId], &[(String, Vec<u8>)]) -> Result<()>;
 
 fn write_serialized(path: &Path, payload: Vec<u8>) -> Result<()> {
     let mut bytes = payload;
@@ -342,7 +347,7 @@ fn materialize_dir(dir: File) -> Result<File> {
     {
         use std::os::fd::AsRawFd;
         let path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
-        return File::open(path).map_err(Into::into);
+        File::open(path).map_err(Into::into)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -483,6 +488,67 @@ pub(crate) fn read_listed_file(dir: &File, name: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn stream_hash_child_file(dir: &File, name: &str) -> Result<(u64, u32)> {
+    let mut file = open_child(dir, name, false)?;
+    let meta = file.metadata()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(backup_error(format!(
+            "{name} is not a regular file; refusing to copy it"
+        )));
+    }
+    let mut buf = vec![0u8; STREAM_COPY_CHUNK_BYTES];
+    let mut hasher = Crc32cHasher::new();
+    let mut total_len = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total_len = total_len.saturating_add(n as u64);
+    }
+    Ok((total_len, hasher.finalize()))
+}
+
+fn stream_copy_child_file(
+    src_dir: &File,
+    src_name: &str,
+    dst_dir: &File,
+    dst_name: &str,
+) -> Result<(u64, u32)> {
+    let mut src_file = open_child(src_dir, src_name, false)?;
+    let meta = src_file.metadata()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(backup_error(format!(
+            "{src_name} is not a regular file; refusing to copy it"
+        )));
+    }
+    let dst_name = component_name(OsStr::new(dst_name))?;
+    let mut opts = CapOptions::new();
+    opts.write(true)
+        .create(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    let mut dst_file = cap_open(dst_dir, Path::new(&dst_name), &opts)
+        .map_err(|error| map_child_error(&dst_name, error))?;
+
+    let mut buf = vec![0u8; STREAM_COPY_CHUNK_BYTES];
+    let mut hasher = Crc32cHasher::new();
+    let mut total_len = 0u64;
+    loop {
+        let n = src_file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        dst_file.write_all(&buf[..n])?;
+        total_len = total_len.saturating_add(n as u64);
+    }
+    dst_file.sync_data()?;
+    dst_dir.sync_all()?;
+    Ok((total_len, hasher.finalize()))
+}
+
 fn create_child_dir(dir: &File, name: &str) -> Result<File> {
     let name = component_name(OsStr::new(name))?;
     let child = Path::new(&name);
@@ -566,8 +632,7 @@ fn copy_plain_tree(src: &File, dst: &File) -> Result<()> {
                 copy_plain_tree(&child_src, &child_dst)?;
             }
             EntryKind::File => {
-                let bytes = read_listed_file(src, &entry.name)?;
-                write_child_file(dst, &entry.name, &bytes)?;
+                stream_copy_child_file(src, &entry.name, dst, &entry.name)?;
             }
             EntryKind::Other => {
                 return Err(backup_error(format!(
@@ -627,21 +692,22 @@ fn descend_dirs<'a>(root: &File, dirs: impl IntoIterator<Item = &'a str>) -> Res
     Ok(dir)
 }
 
-fn read_relative(root: &File, relative: &Path) -> Result<Vec<u8>> {
+fn stream_hash_relative(root: &File, relative: &Path) -> Result<(u64, u32)> {
     let parts = relative_parts(relative)?;
     let (file_name, dirs) = parts.split_last().expect("relative path has a file name");
     let dir = descend_dirs(root, dirs.iter().map(String::as_str))?;
-    read_listed_file(&dir, file_name)
+    stream_hash_child_file(&dir, file_name)
 }
 
-fn write_relative(root: &File, relative: &Path, bytes: &[u8]) -> Result<()> {
+fn stream_copy_relative(src_root: &File, dst_root: &File, relative: &Path) -> Result<(u64, u32)> {
     let parts = relative_parts(relative)?;
     let (file_name, dirs) = parts.split_last().expect("relative path has a file name");
-    let mut dir = root.try_clone()?;
+    let src_dir = descend_dirs(src_root, dirs.iter().map(String::as_str))?;
+    let mut dst_dir = dst_root.try_clone()?;
     for name in dirs {
-        dir = create_child_dir(&dir, name)?;
+        dst_dir = create_child_dir(&dst_dir, name)?;
     }
-    write_child_file(&dir, file_name, bytes)
+    stream_copy_child_file(&src_dir, file_name, &dst_dir, file_name)
 }
 
 fn relative_string(path: &Path) -> Result<String> {
@@ -706,7 +772,10 @@ pub fn unregister_runtime(data_dir: &Path) {
 fn server_data_dir(start: &Path) -> Option<PathBuf> {
     let mut current = start;
     loop {
-        if current.join("be").join("shards").is_dir() {
+        if current.join("be").join("shards").is_dir()
+            || (current.join("shards").is_dir()
+                && current.file_name().is_none_or(|name| name != "be"))
+        {
             return fs::canonicalize(current).ok();
         }
         current = current.parent()?;
@@ -1009,10 +1078,7 @@ fn read_cell_states(root: &File) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(states)
 }
 
-fn check_anchored_tree(
-    root: &File,
-    check_tree: &dyn Fn(&[ShardId], &[(String, Vec<u8>)]) -> Result<()>,
-) -> Result<()> {
+fn check_anchored_tree(root: &File, check_tree: &CheckBackupTreeFn) -> Result<()> {
     let shard_ids = shard_ids_in_anchor(root)?;
     let cells = read_cell_states(root)?;
     check_tree(&shard_ids, &cells)
@@ -1088,7 +1154,7 @@ pub fn create_online_backup(
     data_dir: &Path,
     destination: &Path,
     shards: &[OnlineShard<'_>],
-    check_tree: &dyn Fn(&[ShardId], &[(String, Vec<u8>)]) -> Result<()>,
+    check_tree: &CheckBackupTreeFn,
 ) -> Result<BackupSummary> {
     let hold = require_active_hold(data_dir)?;
     reject_destination(data_dir, destination)?;
@@ -1128,7 +1194,7 @@ pub fn create_online_backup(
 pub fn create_offline_backup(
     data_dir: &Path,
     destination: &Path,
-    check_tree: &dyn Fn(&[ShardId], &[(String, Vec<u8>)]) -> Result<()>,
+    check_tree: &CheckBackupTreeFn,
 ) -> Result<BackupSummary> {
     if lsm_directory_is_locked(data_dir) {
         return Err(backup_error(
@@ -1170,7 +1236,7 @@ pub fn create_offline_backup(
 pub fn restore_backup(
     artifact: &Path,
     destination: &Path,
-    check_tree: &dyn Fn(&[ShardId], &[(String, Vec<u8>)]) -> Result<()>,
+    check_tree: &CheckBackupTreeFn,
 ) -> Result<BackupSummary> {
     inspect_restore_destination(destination)?;
     let manifest = read_manifest(artifact)?;
@@ -1196,7 +1262,7 @@ pub fn restore_backup(
     walk_plain_dir(&tree, Path::new(""), &mut discovered)?;
     discovered.sort();
     let mut seen = BTreeSet::new();
-    let mut payloads = Vec::with_capacity(manifest.files.len());
+    let mut verified_files = Vec::with_capacity(manifest.files.len());
     for file in &manifest.files {
         if !seen.insert(file.path.clone()) {
             return Err(restore_error(format!(
@@ -1205,15 +1271,15 @@ pub fn restore_backup(
             )));
         }
         let relative = safe_relative(&file.path).map_err(restore_error)?;
-        let bytes = read_relative(&tree, &relative)
+        let (actual_len, actual_crc) = stream_hash_relative(&tree, &relative)
             .map_err(|error| restore_error(format!("missing {}: {error}", file.path)))?;
-        if bytes.len() as u64 != file.len || checksum_crc32c(&bytes) != file.crc32c {
+        if actual_len != file.len || actual_crc != file.crc32c {
             return Err(restore_error(format!(
                 "{} failed length or CRC32C check",
                 file.path
             )));
         }
-        payloads.push((relative, bytes));
+        verified_files.push((file.path.clone(), relative, file.len, file.crc32c));
     }
     let discovered_set = discovered
         .iter()
@@ -1226,8 +1292,14 @@ pub fn restore_backup(
     }
     let mut staging = Staging::create(destination)?;
     let staging_dir = open_plain_dir(&staging.path)?;
-    for (relative, bytes) in &payloads {
-        write_relative(&staging_dir, relative, bytes)?;
+    for (display_path, relative, expected_len, expected_crc) in &verified_files {
+        let (copied_len, copied_crc) = stream_copy_relative(&tree, &staging_dir, relative)
+            .map_err(|error| restore_error(format!("copying {display_path}: {error}")))?;
+        if copied_len != *expected_len || copied_crc != *expected_crc {
+            return Err(restore_error(format!(
+                "{display_path} changed during streaming restore"
+            )));
+        }
     }
     // Open MANIFEST on the writable staging copy. The source artifact stays read-only.
     validate_manifest_tree(&staging_dir, &manifest)?;
@@ -1259,8 +1331,16 @@ pub fn restore_backup(
             sync_dir(&parent)?;
         }
         RestoreDestination::EmptyDir(dir) => {
-            for (relative, bytes) in &payloads {
-                write_relative(&dir, relative, bytes)?;
+            for (display_path, relative, expected_len, expected_crc) in &verified_files {
+                let (copied_len, copied_crc) = stream_copy_relative(&staging_dir, &dir, relative)
+                    .map_err(|error| {
+                    restore_error(format!("copying {display_path}: {error}"))
+                })?;
+                if copied_len != *expected_len || copied_crc != *expected_crc {
+                    return Err(restore_error(format!(
+                        "{display_path} changed during streaming restore"
+                    )));
+                }
             }
             sync_plain_dir(&dir)?;
             staging.disarm();
@@ -1288,7 +1368,9 @@ pub fn claim_backup_job(data_dir: &Path) -> Result<Option<BackupJobRecord>> {
     let source = data_dir.join(BACKUP_JOB_FILE);
     let running = data_dir.join(BACKUP_JOB_RUNNING);
     if running.is_file() {
-        return read_record!(&running).map(Some);
+        let record: BackupJobRecord = read_record!(&running)?;
+        Staging::cleanup_stale(Path::new(&record.output_dir))?;
+        return Ok(Some(record));
     }
     if !source.is_file() {
         return Ok(None);
@@ -1479,7 +1561,7 @@ fn image_from_snapshot(
         )));
     }
     let lsm_rel = format!("be/shards/{shard_id:020}/lsm");
-    if read_relative(tree_dir, Path::new(&format!("{lsm_rel}/CURRENT"))).is_err() {
+    if stream_hash_relative(tree_dir, Path::new(&format!("{lsm_rel}/CURRENT"))).is_err() {
         let lsm = open_under(raft, &format!("snapshots/snap_{index:020}/lsm"))?;
         let lsm_dest = ensure_under(tree_dir, &lsm_rel)?;
         copy_lsm_dir(&lsm, &lsm_dest)?;
@@ -1667,7 +1749,7 @@ fn finish_manifest(
     staging: &Path,
     destination: &Path,
     staging_guard: &mut Staging,
-    check_tree: &dyn Fn(&[ShardId], &[(String, Vec<u8>)]) -> Result<()>,
+    check_tree: &CheckBackupTreeFn,
 ) -> Result<BackupSummary> {
     let current = require_active_hold(data_dir)?;
     if current.hold_id != hold.hold_id {
@@ -2102,7 +2184,7 @@ fn reject_destination(data_dir: &Path, destination: &Path) -> Result<()> {
 
 fn copy_raft_fd(src: &File, dst: &File) -> Result<()> {
     let mut copied_hard_state = false;
-    for entry in list_plain_dir(&src)? {
+    for entry in list_plain_dir(src)? {
         let copy_name = entry.name == "HARD_STATE"
             || entry.name == "INITIALIZED"
             || (entry.name.starts_with("segment_") && entry.name.ends_with(".raftlog"));
@@ -2115,8 +2197,7 @@ fn copy_raft_fd(src: &File, dst: &File) -> Result<()> {
                 entry.name
             )));
         }
-        let bytes = read_listed_file(&src, &entry.name)?;
-        write_child_file(&dst, &entry.name, &bytes)?;
+        stream_copy_child_file(src, &entry.name, dst, &entry.name)?;
         if entry.name == "HARD_STATE" {
             copied_hard_state = true;
         }
@@ -2143,7 +2224,7 @@ fn copy_lsm_files(source: &Path, dest: &Path) -> Result<()> {
 
 fn copy_lsm_dir(src: &File, dst: &File) -> Result<()> {
     let mut saw_current = false;
-    for entry in list_plain_dir(&src)? {
+    for entry in list_plain_dir(src)? {
         if entry.name == "LOCK" || entry.name.ends_with(".tmp") {
             if entry.kind != EntryKind::File {
                 return Err(backup_error(format!(
@@ -2159,8 +2240,7 @@ fn copy_lsm_dir(src: &File, dst: &File) -> Result<()> {
                 entry.name
             )));
         }
-        let bytes = read_listed_file(&src, &entry.name)?;
-        write_child_file(&dst, &entry.name, &bytes)?;
+        stream_copy_child_file(src, &entry.name, dst, &entry.name)?;
         if entry.name == "CURRENT" {
             saw_current = true;
         }
@@ -2268,18 +2348,14 @@ fn record_log_fd(
                 entry.name
             )));
         }
-        let bytes = read_listed_file(dir, &entry.name)?;
-        record_bytes(&format!("{relative_prefix}/{}", entry.name), &bytes, files);
+        let (len, crc32c) = stream_hash_child_file(dir, &entry.name)?;
+        files.push(BackupFileRecord {
+            path: format!("{relative_prefix}/{}", entry.name),
+            len,
+            crc32c,
+        });
     }
     Ok(())
-}
-
-fn record_bytes(relative: &str, bytes: &[u8], files: &mut Vec<BackupFileRecord>) {
-    files.push(BackupFileRecord {
-        path: relative.to_string(),
-        len: bytes.len() as u64,
-        crc32c: checksum_crc32c(bytes),
-    });
 }
 
 fn record_tree_fd(
@@ -2293,8 +2369,12 @@ fn record_tree_fd(
     for path in discovered {
         let suffix = relative_string(&path)?;
         let relative = format!("{}/{}", relative_prefix.trim_end_matches('/'), suffix);
-        let bytes = read_relative(dir, &path)?;
-        record_bytes(&relative, &bytes, files);
+        let (len, crc32c) = stream_hash_relative(dir, &path)?;
+        files.push(BackupFileRecord {
+            path: relative,
+            len,
+            crc32c,
+        });
     }
     Ok(())
 }
@@ -2502,14 +2582,24 @@ struct Staging {
 }
 
 impl Staging {
-    fn create(destination: &Path) -> Result<Self> {
+    fn partial_path(destination: &Path) -> PathBuf {
         let parent = destination_parent(destination);
-        fs::create_dir_all(&parent)?;
         let name = destination
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "backup".to_string());
-        let path = parent.join(format!(".{name}.partial"));
+        parent.join(format!(".{name}.partial"))
+    }
+
+    fn cleanup_stale(destination: &Path) -> Result<()> {
+        let path = Self::partial_path(destination);
+        remove_plain_dir(&path)
+    }
+
+    fn create(destination: &Path) -> Result<Self> {
+        let parent = destination_parent(destination);
+        fs::create_dir_all(&parent)?;
+        let path = Self::partial_path(destination);
         match fs::create_dir(&path) {
             Ok(()) => Ok(Self { path, armed: true }),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -2781,7 +2871,7 @@ mod tests {
         assert!(!dir.path().join(checkpoint_scratch_name(1)).exists());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn crash_checkpoint_scratch_is_removed_without_touching_other_names() {
         let dir = tempfile::tempdir().unwrap();
@@ -2820,7 +2910,7 @@ mod tests {
         assert_eq!(next.output_dir, "/tmp/b");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn external_sentinel(dir: &Path) -> PathBuf {
         let external = dir.join("external");
         fs::create_dir_all(external.join("nested")).unwrap();
@@ -2828,7 +2918,7 @@ mod tests {
         external
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn assert_sentinel_untouched(external: &Path) {
         assert_eq!(fs::read(external.join("SENTINEL")).unwrap(), b"keep-me");
         assert!(external.join("nested").is_dir());
@@ -2846,7 +2936,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn assert_no_sentinel_bytes(root: &Path) {
         if !root.exists() {
             return;
@@ -2869,7 +2959,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn copy_dir_bytes_rejects_a_file_symlink_and_keeps_the_external_sentinel() {
         let dir = tempfile::tempdir().unwrap();
@@ -2888,7 +2978,7 @@ mod tests {
         assert_no_sentinel_bytes(&dest);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn copy_dir_bytes_rejects_a_directory_symlink_and_keeps_the_external_sentinel() {
         let dir = tempfile::tempdir().unwrap();
@@ -2908,7 +2998,7 @@ mod tests {
         assert_no_sentinel_bytes(&dest);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn copy_lsm_files_rejects_a_file_symlink_and_keeps_the_external_sentinel() {
         let dir = tempfile::tempdir().unwrap();
@@ -2927,7 +3017,7 @@ mod tests {
         assert_no_sentinel_bytes(&dest);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn write_min_manifest(artifact: &Path, body: &[u8]) -> Result<()> {
         let tree = artifact.join(BACKUP_TREE_DIR);
         fs::create_dir_all(&tree).unwrap();
@@ -2953,7 +3043,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn restore_rejects_a_symlink_destination_and_keeps_the_external_sentinel() {
         let dir = tempfile::tempdir().unwrap();
@@ -2974,7 +3064,7 @@ mod tests {
             .is_symlink());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn restore_rejects_a_file_symlink_in_the_artifact_and_keeps_the_external_sentinel() {
         let dir = tempfile::tempdir().unwrap();
@@ -2997,7 +3087,7 @@ mod tests {
         assert_no_sentinel_bytes(&dest);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn restore_rejects_a_directory_symlink_in_the_artifact_and_keeps_the_external_sentinel() {
         let dir = tempfile::tempdir().unwrap();
@@ -3017,7 +3107,7 @@ mod tests {
         assert!(!external.join("note").exists());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn live_log_symlink_is_not_copied_and_the_sentinel_stays() {
         let dir = tempfile::tempdir().unwrap();
@@ -3043,7 +3133,7 @@ mod tests {
         assert_no_sentinel_bytes(&dest);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn intermediate_shard_directory_symlink_is_not_followed() {
         let dir = tempfile::tempdir().unwrap();
@@ -3078,7 +3168,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn manifest_tmp_symlink_is_not_truncated() {
         let dir = tempfile::tempdir().unwrap();
@@ -3098,7 +3188,7 @@ mod tests {
             .is_symlink());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn current_escape_is_rejected_before_the_external_file_is_opened() {
         let dir = tempfile::tempdir().unwrap();
@@ -3151,7 +3241,7 @@ mod tests {
         let _ = writer.join();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn cell_state_symlink_is_rejected_before_the_external_file_is_opened() {
         let dir = tempfile::tempdir().unwrap();

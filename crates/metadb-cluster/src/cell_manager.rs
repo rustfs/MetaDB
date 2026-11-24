@@ -199,6 +199,11 @@ pub struct DurableCellManager {
     control_propose_not_leader: AtomicBool,
     /// Times the leadership gate entered its callback. Not an OpenRaft call.
     leadership_transfer_requests: AtomicU64,
+    /// Opt-in flag enabling automatic leadership transfer after `ProbeTransferLeader` verification.
+    /// Defaults to `AUTOMATIC_LEADERSHIP_TRANSFER_ENABLED` (`false`).
+    allow_automatic_transfer: AtomicBool,
+    /// Optional operator-supplied child-name split boundary hints for `DualModeFineGrained` shards.
+    dual_mode_split_hints: Mutex<HashMap<ShardId, String>>,
 }
 
 struct LeadershipGroupFacts {
@@ -380,6 +385,8 @@ impl DurableCellManager {
             stop_before_source_removal: AtomicBool::new(false),
             control_propose_not_leader: AtomicBool::new(false),
             leadership_transfer_requests: AtomicU64::new(0),
+            allow_automatic_transfer: AtomicBool::new(automatic_leadership_transfer_allowed()),
+            dual_mode_split_hints: Mutex::new(HashMap::new()),
         });
 
         if let Err(error) = mgr.boot_local_shards().await {
@@ -505,6 +512,8 @@ impl DurableCellManager {
             stop_before_source_removal: AtomicBool::new(false),
             control_propose_not_leader: AtomicBool::new(false),
             leadership_transfer_requests: AtomicU64::new(0),
+            allow_automatic_transfer: AtomicBool::new(automatic_leadership_transfer_allowed()),
+            dual_mode_split_hints: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -778,6 +787,102 @@ impl DurableCellManager {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         Ok(())
+    }
+
+    /// Starts an uninitialized replica group for a split child shard or spare-voter onboarding
+    /// before the current leader streams a Raft snapshot and promotes this node to voter.
+    pub async fn open_joining_shard(
+        &self,
+        shard_id: ShardId,
+        range: CompositeKeyRange,
+        initial_epoch: ShardEpoch,
+        use_jumbo_dedicated_root: bool,
+    ) -> Result<()> {
+        node_id_in_ha_range(self.host.node_id())?;
+        if handoff_blocks_local_open(&self.state_dir, shard_id)? {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "shard {shard_id} has a recorded remote handoff on node {}; refusing to open a joining replica",
+                self.host.node_id()
+            )));
+        }
+        if self.host.get_group(shard_id).is_some() {
+            return Ok(());
+        }
+        let sdir = if use_jumbo_dedicated_root {
+            if let Some(root) = self.jumbo_dedicated_root.lock().unwrap().clone() {
+                shard_move_dir(&root, shard_id)
+            } else {
+                self.host.shard_dir(shard_id)
+            }
+        } else {
+            self.host.shard_dir(shard_id)
+        };
+        let wm = Arc::new(ShardWatermarkTracker::default());
+        let handler = Arc::new(TxStateMachineHandler::new(
+            shard_id,
+            initial_epoch,
+            range,
+            wm.clone(),
+        ));
+        handler.set_instance_bindings(self.instance_bindings.clone());
+        handler.set_control_plane_validator(Arc::new(validate_replicated_record));
+        let group = ShardRaftGroup::start(
+            shard_id,
+            self.host.node_id(),
+            &sdir,
+            self.host.block_cache().clone(),
+            self.lsm_config.clone(),
+            self.raft_opts.clone(),
+            handler.clone(),
+            wm,
+            self.host.clock().clone(),
+            self.host.router(),
+            self.host.channel_pool().clone(),
+        )
+        .await?;
+        self.host.register_running_group(group);
+        self.host.record_registry_state(
+            shard_id,
+            RegistryShardState::Active {
+                peers: BTreeMap::new(),
+            },
+        )?;
+        self.handlers.write().unwrap().insert(shard_id, handler);
+        Ok(())
+    }
+
+    /// Stops a drained local shard replica (and deletes its shard files when `delete_files == true`),
+    /// refusing if this node is still an applied voter of `shard_id`.
+    pub async fn close_removed_shard(&self, shard_id: ShardId, delete_files: bool) -> Result<()> {
+        let _membership = self.membership_lock.lock().await;
+        if let Some(group) = self.host.get_group(shard_id) {
+            if group
+                .applied_voter_addrs()?
+                .contains_key(&self.host.node_id())
+            {
+                return Err(MetaDbError::ConsensusError(format!(
+                    "refusing to close shard {shard_id}: node {} is still an applied voter",
+                    self.host.node_id()
+                )));
+            }
+        }
+        self.handlers.write().unwrap().remove(&shard_id);
+        if delete_files {
+            self.host.remove_and_gc_shard(shard_id).await?;
+        } else if let Some(group) = self.host.take_running_group(shard_id) {
+            group.shutdown().await?;
+            self.host.router().remove_group(shard_id);
+            self.host.router().remove_local_proposer(shard_id);
+        }
+        Ok(())
+    }
+
+    /// Returns an `Arc<dyn LocalShardControlHook>` backed by a `Weak<DurableCellManager>` for
+    /// in-process multi-voter tests where `ControlPlaneServiceServer` is not mounted.
+    pub fn as_local_control_hook(self: &Arc<Self>) -> Arc<dyn metadb_raft::LocalShardControlHook> {
+        Arc::new(CellLocalControlHook {
+            cell: Arc::downgrade(self),
+        })
     }
 
     /// True when every local shard's applied membership includes `node_id` as a voter.
@@ -1750,12 +1855,158 @@ impl DurableCellManager {
     }
 
     pub fn list_routes(&self) -> Vec<CompositeShardRoute> {
+        let _ = self.reconcile_follower_split_routes();
         let mut routes: Vec<CompositeShardRoute> = {
             let guard = self.state.lock().unwrap();
             guard.routes.values().cloned().collect()
         };
         self.overlay_live_membership(&mut routes);
         routes
+    }
+
+    /// Reconciles split child routes onto followers (or newly elected leaders after split failover)
+    /// from the replicated `CELL_MANAGER_STATE` snapshot or contiguous local handler ranges.
+    fn reconcile_follower_split_routes(&self) -> Result<()> {
+        let has_planned_split = self
+            .state
+            .lock()
+            .unwrap()
+            .split_plans
+            .values()
+            .any(|plan| plan.state == SplitPlanState::Planned);
+        if has_planned_split {
+            return Ok(());
+        }
+
+        if let Ok(Some(record)) = self.replicated_control() {
+            if let Ok(rep_state) = wincode::config::deserialize_exact::<PersistedCellState, _>(
+                &record.manager_body,
+                wincode::config::DefaultConfig::default(),
+            ) {
+                let mut guard = self.state.lock().unwrap();
+                let missing_running_child = rep_state.routes.keys().any(|sid| {
+                    !guard.routes.contains_key(sid) && self.host.get_group(*sid).is_some()
+                });
+                if missing_running_child {
+                    let mut next = guard.clone();
+                    let mut upserts = Vec::new();
+                    for (&sid, rep_route) in &rep_state.routes {
+                        let accept = match next.routes.get(&sid) {
+                            None => self.host.get_group(sid).is_some(),
+                            Some(cur) => rep_route.epoch.version > cur.epoch.version,
+                        };
+                        if accept {
+                            next.routes.insert(sid, rep_route.clone());
+                            upserts.push(rep_route.clone());
+                        }
+                    }
+                    if !upserts.is_empty() {
+                        let _ = self.persist_sync(&next);
+                        *guard = next;
+                        drop(guard);
+                        for r in upserts {
+                            self.meta_cache.upsert_route(r);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // Fallback when the split leader crashed after `UpdateShardRangeOnSplit` committed on Raft
+        // and before `PublishControlPlane` ran: pair narrowed parent handler with running child handler.
+        let orphan_handlers: Vec<(ShardId, Arc<TxStateMachineHandler>)> = {
+            let known: HashSet<ShardId> =
+                self.state.lock().unwrap().routes.keys().copied().collect();
+            let handlers = self.handlers.read().unwrap();
+            handlers
+                .iter()
+                .filter(|(&sid, _)| !known.contains(&sid) && self.host.get_group(sid).is_some())
+                .map(|(&sid, h)| (sid, h.clone()))
+                .collect()
+        };
+        if orphan_handlers.is_empty() {
+            return Ok(());
+        }
+        let parent_routes: Vec<CompositeShardRoute> = self
+            .state
+            .lock()
+            .unwrap()
+            .routes
+            .values()
+            .cloned()
+            .collect();
+        for parent_route in parent_routes {
+            let Ok((p_epoch, p_group, p_handler)) = self.lookup_local_handle(parent_route.shard_id)
+            else {
+                continue;
+            };
+            let p_range = p_handler.key_range();
+            if p_range == parent_route.range
+                || p_range.start_key != parent_route.range.start_key
+                || p_range.end_key >= parent_route.range.end_key
+            {
+                continue;
+            }
+            for &(child_sid, ref c_handler) in &orphan_handlers {
+                let c_range = c_handler.key_range();
+                if c_range.start_key == p_range.end_key
+                    && c_range.end_key == parent_route.range.end_key
+                {
+                    let Some(c_group) = self.host.get_group(child_sid) else {
+                        continue;
+                    };
+                    let mut updated_parent = parent_route.clone();
+                    updated_parent.range = p_range.clone();
+                    updated_parent.epoch = p_epoch;
+                    if let Some(l) = p_group.current_leader() {
+                        updated_parent.leader_node = l;
+                    }
+                    let child_peers = c_group
+                        .applied_voter_addrs()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(nid, addr)| (nid, (addr, true)))
+                        .collect::<BTreeMap<_, _>>();
+                    let child_route = CompositeShardRoute {
+                        cell_id: parent_route.cell_id,
+                        shard_id: child_sid,
+                        range: c_range,
+                        epoch: c_group.current_epoch(),
+                        leader_node: c_group
+                            .current_leader()
+                            .unwrap_or(updated_parent.leader_node),
+                        peers: if child_peers.is_empty() {
+                            parent_route.peers.clone()
+                        } else {
+                            child_peers
+                        },
+                        split_mode: parent_route.split_mode,
+                        health_state: if parent_route.dual_mode_pid.is_some() {
+                            ShardHealthState::Normal
+                        } else {
+                            parent_route.health_state
+                        },
+                        dual_mode_pid: parent_route.dual_mode_pid,
+                    };
+                    if parent_route.dual_mode_pid.is_some() {
+                        updated_parent.health_state = ShardHealthState::Normal;
+                    }
+                    let mut guard = self.state.lock().unwrap();
+                    let mut next = guard.clone();
+                    next.routes
+                        .insert(updated_parent.shard_id, updated_parent.clone());
+                    next.routes.insert(child_sid, child_route.clone());
+                    let _ = self.persist_sync(&next);
+                    *guard = next;
+                    drop(guard);
+                    self.meta_cache
+                        .apply_split_routes(updated_parent, child_route);
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reports the applied Raft membership and epoch. The persisted route cache can
@@ -1923,7 +2174,9 @@ impl DurableCellManager {
             })?
         };
         let (ep, group, handler) = self.lookup_local_handle(shard_id)?;
-        let mut live_route = route;
+        let mut live_routes = [route];
+        self.overlay_live_membership(&mut live_routes);
+        let mut live_route = live_routes.into_iter().next().unwrap();
         live_route.epoch = ep;
 
         if !force {
@@ -1935,8 +2188,37 @@ impl DurableCellManager {
             }
         }
 
-        let Some(candidate) = RaftShardSplitWorker::discover_split_key(&live_route, &group).await?
-        else {
+        let explicit_candidate = if live_route.split_mode == ShardSplitMode::DualModeFineGrained {
+            let dpid = live_route.dual_mode_pid;
+            let hint = self
+                .dual_mode_split_hints
+                .lock()
+                .unwrap()
+                .get(&shard_id)
+                .cloned();
+            match (dpid, hint) {
+                (Some(pid), Some(name)) => {
+                    let key = metadb_core::MetaKey::child(pid, &name).encode();
+                    if key > live_route.range.start_key && key < live_route.range.end_key {
+                        Some(SplitCandidate::SplitAt {
+                            split_key: key,
+                            dual_mode_pid: Some(pid),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let candidate = match explicit_candidate {
+            Some(c) => Some(c),
+            None => RaftShardSplitWorker::discover_split_key(&live_route, &group).await?,
+        };
+        let Some(candidate) = candidate else {
             return Ok(None);
         };
 
@@ -2025,6 +2307,16 @@ impl DurableCellManager {
                     )
                     .await?;
                 self.activate_split(req_uuid, new_parent, new_child, Some(child_handler))?;
+                if dual_mode_pid.is_some() {
+                    self.dual_mode_split_hints.lock().unwrap().remove(&shard_id);
+                    let mut ctrl = self.control.lock().unwrap();
+                    if ctrl.placements.contains_key(&shard_id) {
+                        let mut next_ctrl = ctrl.clone();
+                        next_ctrl.placements.remove(&shard_id);
+                        let _ = self.store_control(&mut ctrl, next_ctrl);
+                    }
+                }
+                let _ = self.publish_manager_snapshot().await;
                 Ok(Some(child_shard_id))
             }
         }
@@ -2032,6 +2324,24 @@ impl DurableCellManager {
 
     /// Switches a Jumbo Shard into `ShardSplitMode::DualModeFineGrained` for `dominant_pid`.
     pub fn enable_dual_mode_split(&self, shard_id: ShardId, dominant_pid: InodeId) -> Result<()> {
+        self.enable_dual_mode_split_with_hint(shard_id, dominant_pid, None)
+    }
+
+    /// Switches a Jumbo Shard into `ShardSplitMode::DualModeFineGrained` for `dominant_pid` with
+    /// an optional explicit child-name split boundary hint.
+    pub fn enable_dual_mode_split_with_hint(
+        &self,
+        shard_id: ShardId,
+        dominant_pid: InodeId,
+        split_name_hint: Option<String>,
+    ) -> Result<()> {
+        let cleaned_hint = match split_name_hint {
+            Some(s) if !s.is_empty() => {
+                metadb_core::schema::validate_user_entry_name(&s)?;
+                Some(s)
+            }
+            _ => None,
+        };
         let mut st = self.state.lock().unwrap();
         if !st.routes.contains_key(&shard_id) {
             return Err(MetaDbError::ShardRoutingError(format!(
@@ -2049,6 +2359,15 @@ impl DurableCellManager {
         let updated = route.clone();
         self.persist_sync(&next)?;
         *st = next;
+        drop(st);
+        if let Some(hint) = cleaned_hint {
+            self.dual_mode_split_hints
+                .lock()
+                .unwrap()
+                .insert(shard_id, hint);
+        } else {
+            self.dual_mode_split_hints.lock().unwrap().remove(&shard_id);
+        }
         self.meta_cache.upsert_route(updated);
         Ok(())
     }
@@ -2569,7 +2888,9 @@ impl DurableCellManager {
         target_version: u64,
     ) -> Result<()> {
         let (_epoch, group, handler) = self.lookup_local_handle(parent_route.shard_id)?;
-        let live_route = parent_route.clone();
+        let mut live_routes = [parent_route.clone()];
+        self.overlay_live_membership(&mut live_routes);
+        let live_route = live_routes.into_iter().next().unwrap();
         let (new_parent, new_child, _child_grp, child_handler) =
             RaftShardSplitWorker::execute_local_split(
                 &self.host,
@@ -2585,7 +2906,9 @@ impl DurableCellManager {
                 None,
             )
             .await?;
-        self.activate_split(request_uuid, new_parent, new_child, Some(child_handler))
+        self.activate_split(request_uuid, new_parent, new_child, Some(child_handler))?;
+        let _ = self.publish_manager_snapshot().await;
+        Ok(())
     }
 
     fn drop_split_plan(&self, request_uuid: u128) -> Result<()> {
@@ -3525,11 +3848,258 @@ impl DurableCellManager {
         *self.jumbo_dedicated_root.lock().unwrap() = root;
     }
 
+    /// Returns `"live"`, `"staged"`, `"error"`, or `""` for `shard_id` on `jumbo_dedicated_root`.
+    pub fn jumbo_move_phase_name(&self, shard_id: ShardId) -> &'static str {
+        let Some(root) = self.jumbo_dedicated_root.lock().unwrap().clone() else {
+            return "";
+        };
+        match visible_move_phase(&shard_move_dir(&root, shard_id), shard_id) {
+            Ok(Some(MOVE_LIVE)) => "live",
+            Ok(Some(MOVE_STAGED)) => "staged",
+            Ok(Some(_)) => "unknown",
+            Ok(None) => "",
+            Err(_) => "error",
+        }
+    }
+
+    /// Count of nodes currently holding a fresh measured `HintLive` heartbeat sample.
+    pub fn live_heartbeat_node_count(&self) -> u64 {
+        let scheduler = self.liveness.lock().unwrap();
+        let now = scheduler.schedule_now();
+        scheduler
+            .decide_all(&now)
+            .into_iter()
+            .filter(|d| matches!(d, LivenessDecision::HintLive { .. }))
+            .count() as u64
+    }
+
     /// How many times the leadership gate entered its callback.
-    ///
-    /// The callback does not call `trigger().transfer_leader`.
     pub fn leadership_transfer_requests(&self) -> u64 {
         self.leadership_transfer_requests.load(Ordering::Relaxed)
+    }
+
+    /// True when automatic leadership transfer is enabled on this cell (`false` by default).
+    pub fn automatic_leadership_transfer_enabled(&self) -> bool {
+        self.allow_automatic_transfer.load(Ordering::Relaxed)
+    }
+
+    /// Enables or disables opt-in automatic leadership transfer on this cell.
+    pub fn set_automatic_leadership_transfer_enabled(&self, enabled: bool) {
+        self.allow_automatic_transfer
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Safely transfers Raft leadership of `shard_id` from this process to `target`:
+    /// 1. Validates all fail-closed gate preconditions (`leadership_transfer_refusal`) and ensures
+    ///    any recorded liveness sample for `target` has not expired.
+    /// 2. Dials `ProbeTransferLeader` on `target` BEFORE touching OpenRaft's leader lease so an
+    ///    offline, lagging, or older peer never disables the current leader's lease.
+    /// 3. Calls `group.raft().trigger().transfer_leader(target)` and polls until `target` is
+    ///    observed as leader over a window covering `election_timeout_max_ms`.
+    pub async fn transfer_shard_leader(
+        &self,
+        shard_id: ShardId,
+        target: NodeId,
+    ) -> Result<LeadershipTransferOutcome> {
+        let _membership = self.membership_lock.lock().await;
+        let facts = self.leadership_group_facts(shard_id);
+        let shard_dir = self.host.shard_dir(shard_id);
+        let shard_existed = shard_dir.exists();
+        let mut live_voters = facts.voters.clone();
+        if matches!(
+            self.liveness_decision(target),
+            LivenessDecision::Refuse {
+                reason: crate::heartbeat_scheduler::LivenessRefusal::ExpiredHeartbeat,
+                ..
+            }
+        ) {
+            live_voters.remove(&target);
+        }
+        let input = LeadershipTransferInput {
+            shard_id,
+            local_node: self.host.node_id(),
+            current_leader: facts.leader,
+            live_voters,
+            intended_voters: facts.voters,
+            target,
+            group_transfer_allowed: true,
+            clock_trusted: self.leadership_clock_trusted(),
+            jumbo_move_in_progress: self.jumbo_move_blocks_transfer(shard_id),
+            remote_handoff: self.remote_handoff_blocks_transfer(shard_id),
+            source_group_open: facts.open,
+            hint_live_only: false,
+        };
+        if let Some(_refusal) = crate::leadership_transfer::leadership_transfer_refusal(&input) {
+            return Ok(run_automatic_leadership_transfer(
+                &input,
+                &shard_dir,
+                |_| TransferObservation {
+                    openraft_called: false,
+                    target_became_leader: false,
+                },
+            ));
+        }
+
+        let Some(group) = self.host.get_group(shard_id) else {
+            return Ok(LeadershipTransferOutcome {
+                transfer_requested: false,
+                openraft_called: false,
+                membership_changed: false,
+                source_directory_deleted: shard_existed && !shard_dir.exists(),
+                invented_leader: false,
+                leader: input.current_leader,
+                refusal: Some(crate::leadership_transfer::TransferRefusal::ClosedSourceGroup),
+                committed: None,
+            });
+        };
+        let voters_before = group.uniform_voter_addrs()?;
+        let Some(target_addr) = voters_before.get(&target).cloned() else {
+            return Ok(LeadershipTransferOutcome {
+                transfer_requested: false,
+                openraft_called: false,
+                membership_changed: false,
+                source_directory_deleted: shard_existed && !shard_dir.exists(),
+                invented_leader: false,
+                leader: input.current_leader,
+                refusal: Some(crate::leadership_transfer::TransferRefusal::TargetNotLiveVoter),
+                committed: None,
+            });
+        };
+
+        let min_matched = group
+            .raft()
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .map(|id| id.index)
+            .unwrap_or(0);
+        self.leadership_transfer_requests
+            .fetch_add(1, Ordering::Relaxed);
+        let probe = self
+            .host
+            .channel_pool()
+            .probe_transfer_leader(&target_addr, shard_id, target, min_matched)
+            .await;
+        match probe {
+            Ok(resp) if resp.eligible => {}
+            Ok(_) | Err(_) => {
+                return Ok(LeadershipTransferOutcome {
+                    transfer_requested: true,
+                    openraft_called: false,
+                    membership_changed: false,
+                    source_directory_deleted: shard_existed && !shard_dir.exists(),
+                    invented_leader: false,
+                    leader: input.current_leader,
+                    refusal: None,
+                    committed: None,
+                });
+            }
+        }
+
+        group
+            .raft()
+            .trigger()
+            .transfer_leader(target)
+            .await
+            .map_err(|error| {
+                MetaDbError::ConsensusError(format!(
+                    "openraft transfer_leader to node {target} on shard {shard_id} failed: {error}"
+                ))
+            })?;
+
+        let poll_ms = self
+            .raft_opts
+            .election_timeout_max_ms
+            .saturating_mul(2)
+            .max(3_000);
+        debug_assert!(crate::jumbo_placement::transfer_poll_covers_election(
+            poll_ms,
+            self.raft_opts.election_timeout_max_ms.max(1)
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(poll_ms);
+        let mut target_became_leader = false;
+        while tokio::time::Instant::now() < deadline {
+            if group.current_leader() == Some(target) {
+                target_became_leader = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let committed = target_became_leader.then_some(CommittedMove::LeadershipTransferred {
+            shard_id,
+            to: target,
+        });
+        if target_became_leader {
+            {
+                let mut st = self.state.lock().unwrap();
+                if st.routes.contains_key(&shard_id) {
+                    let mut next = st.clone();
+                    if let Some(r) = next.routes.get_mut(&shard_id) {
+                        r.leader_node = target;
+                    }
+                    let updated = next.routes.get(&shard_id).cloned();
+                    let _ = self.persist_sync(&next);
+                    *st = next;
+                    if let Some(updated) = updated {
+                        self.meta_cache.upsert_route(updated);
+                    }
+                }
+            }
+            if let Some(mut existing) = self.stored_placement(shard_id) {
+                push_move(
+                    &mut existing.committed_moves,
+                    CommittedMove::LeadershipTransferred {
+                        shard_id,
+                        to: target,
+                    },
+                );
+                existing.last_transfer_attempt_unix_ms = unix_ms();
+                existing.updated_unix_ms = existing.last_transfer_attempt_unix_ms;
+                let _ = self.save_placement(&existing);
+            }
+        }
+
+        let voters_after = group.uniform_voter_addrs().ok();
+        Ok(LeadershipTransferOutcome {
+            transfer_requested: true,
+            openraft_called: true,
+            membership_changed: Some(voters_before) != voters_after,
+            source_directory_deleted: shard_existed && !shard_dir.exists(),
+            invented_leader: false,
+            leader: if target_became_leader {
+                Some(target)
+            } else {
+                group.current_leader().or(input.current_leader)
+            },
+            refusal: None,
+            committed,
+        })
+    }
+
+    /// Async maintenance hook executing safe `ProbeTransferLeader`-verified leadership transfer
+    /// for Jumbo-isolated shards when `automatic_leadership_transfer_enabled()` is opted in.
+    pub async fn consider_automatic_leadership_transfer_async(&self) {
+        if !self.automatic_leadership_transfer_enabled() {
+            self.consider_automatic_leadership_transfer();
+            return;
+        }
+        for group in self.host.all_groups() {
+            let shard_id = group.shard_id();
+            let target = self.jumbo_transfer_target(shard_id);
+            if target == 0 {
+                continue;
+            }
+            if let Some(stored) = self.stored_placement(shard_id) {
+                if stored.last_transfer_attempt_unix_ms != 0
+                    && unix_ms().saturating_sub(stored.last_transfer_attempt_unix_ms)
+                        < PLACEMENT_RETRY_MS
+                {
+                    continue;
+                }
+            }
+            let _ = self.transfer_shard_leader(shard_id, target).await;
+        }
     }
 
     /// Evaluates every local group. A `HintLive` sample is not read.
@@ -4036,10 +4606,31 @@ impl DurableCellManager {
         if let Err(error) = proposed_change {
             return self.finish_replace_after_proposal(group.as_ref(), &proposed, error);
         }
-        match group.wait_uniform_voter_addrs().await {
+        let outcome = match group.wait_uniform_voter_addrs().await {
             Ok(committed) => self.committed_replace(shard_id, group.as_ref(), &proposed, committed),
             Err(error) => self.finish_replace_after_proposal(group.as_ref(), &proposed, error),
+        };
+        if matches!(outcome, ReplaceOutcome::Committed { .. }) {
+            if let Some(removed_addr) = current.get(&remove).cloned() {
+                if !removed_addr.is_empty() && remove != self.host.node_id() {
+                    let pool = self.host.channel_pool().clone();
+                    let cell_id = self.cell_id;
+                    tokio::spawn(async move {
+                        let _ = pool
+                            .close_removed_shard(
+                                &removed_addr,
+                                metadb_proto::CloseRemovedShardRequest {
+                                    cell_id,
+                                    shard_id,
+                                    delete_files: true,
+                                },
+                            )
+                            .await;
+                    });
+                }
+            }
         }
+        outcome
     }
 
     fn finish_replace_after_proposal(
@@ -4571,4 +5162,51 @@ pub fn plan_membership_voters(
         ));
     }
     Ok(final_voters)
+}
+
+struct CellLocalControlHook {
+    cell: std::sync::Weak<DurableCellManager>,
+}
+
+#[tonic::async_trait]
+impl metadb_raft::LocalShardControlHook for CellLocalControlHook {
+    async fn open_joining_shard(&self, req: metadb_proto::OpenJoiningShardRequest) -> Result<()> {
+        let cell = self.cell.upgrade().ok_or_else(|| {
+            MetaDbError::ShardRoutingError("target cell manager has been dropped".to_string())
+        })?;
+        if req.cell_id != 0 && req.cell_id != cell.cell_id() {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "cell id mismatch: request targets {}, local cell is {}",
+                req.cell_id,
+                cell.cell_id()
+            )));
+        }
+        let range = CompositeKeyRange::new(req.start_key, req.end_key)?;
+        let initial_epoch = req
+            .initial_epoch
+            .map(ShardEpoch::from)
+            .unwrap_or_else(ShardEpoch::initial);
+        cell.open_joining_shard(
+            req.shard_id,
+            range,
+            initial_epoch,
+            req.use_jumbo_dedicated_root,
+        )
+        .await
+    }
+
+    async fn close_removed_shard(&self, req: metadb_proto::CloseRemovedShardRequest) -> Result<()> {
+        let cell = self.cell.upgrade().ok_or_else(|| {
+            MetaDbError::ShardRoutingError("target cell manager has been dropped".to_string())
+        })?;
+        if req.cell_id != 0 && req.cell_id != cell.cell_id() {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "cell id mismatch: request targets {}, local cell is {}",
+                req.cell_id,
+                cell.cell_id()
+            )));
+        }
+        cell.close_removed_shard(req.shard_id, req.delete_files)
+            .await
+    }
 }

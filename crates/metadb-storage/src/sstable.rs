@@ -142,29 +142,49 @@ impl SstableBuilder {
         let tmp_path = lsm_dir.join(sst_tmp_file_name(self.file_id));
         let final_path = lsm_dir.join(sst_file_name(self.file_id));
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)?;
+        let write_res = (|| -> Result<SstFileMeta> {
+            let raw_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            let mut file = std::io::BufWriter::with_capacity(64 * 1024, raw_file);
 
-        let mut offset: u64 = 0;
-        let mut block_builder = DataBlockBuilder::new();
-        let mut index_entries: Vec<IndexBlockEntry> = Vec::new();
-        let mut all_key_refs: Vec<&[u8]> = Vec::with_capacity(entries.len());
-        let mut num_tombstones: u64 = 0;
+            let mut offset: u64 = 0;
+            let mut block_builder = DataBlockBuilder::new();
+            let mut index_entries: Vec<IndexBlockEntry> = Vec::new();
+            let mut all_key_refs: Vec<&[u8]> = Vec::with_capacity(entries.len());
+            let mut num_tombstones: u64 = 0;
 
-        for (k, v) in entries {
-            // Both live values AND PhysicalTombstone keys are indexed in the Bloom filter!
-            all_key_refs.push(k.as_slice());
-            if matches!(v, BlockEntryValue::PhysicalTombstone) {
-                num_tombstones += 1;
+            for (k, v) in entries {
+                // Both live values AND PhysicalTombstone keys are indexed in the Bloom filter!
+                all_key_refs.push(k.as_slice());
+                if matches!(v, BlockEntryValue::PhysicalTombstone) {
+                    num_tombstones += 1;
+                }
+                block_builder.add(k, v)?;
+                if block_builder.estimated_size() >= DEFAULT_BLOCK_SIZE_BYTES {
+                    let last_key = block_builder.last_key().to_vec();
+                    let raw_block = std::mem::take(&mut block_builder).finish();
+                    let len = u32::try_from(raw_block.len()).map_err(|_| {
+                        MetaDbError::CodecError("SSTable DataBlock exceeds u32::MAX".to_string())
+                    })?;
+                    file.write_all(&raw_block)?;
+                    index_entries.push(IndexBlockEntry {
+                        last_key,
+                        block_offset: offset,
+                        block_len: len,
+                    });
+                    offset += u64::from(len);
+                }
             }
-            block_builder.add(k, v)?;
-            if block_builder.estimated_size() >= DEFAULT_BLOCK_SIZE_BYTES {
+
+            if !block_builder.is_empty() {
                 let last_key = block_builder.last_key().to_vec();
-                let raw_block = std::mem::take(&mut block_builder).finish();
-                let len = raw_block.len() as u32;
+                let raw_block = block_builder.finish();
+                let len = u32::try_from(raw_block.len()).map_err(|_| {
+                    MetaDbError::CodecError("SSTable DataBlock exceeds u32::MAX".to_string())
+                })?;
                 file.write_all(&raw_block)?;
                 index_entries.push(IndexBlockEntry {
                     last_key,
@@ -173,102 +193,103 @@ impl SstableBuilder {
                 });
                 offset += u64::from(len);
             }
-        }
 
-        if !block_builder.is_empty() {
-            let last_key = block_builder.last_key().to_vec();
-            let raw_block = block_builder.finish();
-            let len = raw_block.len() as u32;
-            file.write_all(&raw_block)?;
-            index_entries.push(IndexBlockEntry {
-                last_key,
-                block_offset: offset,
-                block_len: len,
-            });
-            offset += u64::from(len);
-        }
+            // 1. Filter Block
+            let filter_offset = offset;
+            let filter_raw = BloomFilter::build_encoded(&all_key_refs, self.bloom_bits_per_key);
+            let filter_len = filter_raw.len() as u64;
+            file.write_all(&filter_raw)?;
+            offset += filter_len;
 
-        // 1. Filter Block
-        let filter_offset = offset;
-        let filter_raw = BloomFilter::build_encoded(&all_key_refs, self.bloom_bits_per_key);
-        let filter_len = filter_raw.len() as u64;
-        file.write_all(&filter_raw)?;
-        offset += filter_len;
+            // 2. Index Block: [num_blocks: u32 LE]([last_key_len: u32 LE][last_key][offset: u64 LE][len: u32 LE])*[crc32c: u32 LE]
+            let index_offset = offset;
+            let mut index_raw = Vec::with_capacity(index_entries.len() * 32 + 8);
+            index_raw.extend_from_slice(&(index_entries.len() as u32).to_le_bytes());
+            for ie in &index_entries {
+                index_raw.extend_from_slice(&(ie.last_key.len() as u32).to_le_bytes());
+                index_raw.extend_from_slice(&ie.last_key);
+                index_raw.extend_from_slice(&ie.block_offset.to_le_bytes());
+                index_raw.extend_from_slice(&ie.block_len.to_le_bytes());
+            }
+            append_crc32c_le(&mut index_raw);
+            let index_len = index_raw.len() as u64;
+            file.write_all(&index_raw)?;
+            offset += index_len;
 
-        // 2. Index Block: [num_blocks: u32 LE]([last_key_len: u32 LE][last_key][offset: u64 LE][len: u32 LE])*[crc32c: u32 LE]
-        let index_offset = offset;
-        let mut index_raw = Vec::with_capacity(index_entries.len() * 32 + 8);
-        index_raw.extend_from_slice(&(index_entries.len() as u32).to_le_bytes());
-        for ie in &index_entries {
-            index_raw.extend_from_slice(&(ie.last_key.len() as u32).to_le_bytes());
-            index_raw.extend_from_slice(&ie.last_key);
-            index_raw.extend_from_slice(&ie.block_offset.to_le_bytes());
-            index_raw.extend_from_slice(&ie.block_len.to_le_bytes());
-        }
-        append_crc32c_le(&mut index_raw);
-        let index_len = index_raw.len() as u64;
-        file.write_all(&index_raw)?;
-        offset += index_len;
+            // 3. Meta Block
+            let min_key = entries.first().unwrap().0.clone();
+            let max_key = entries.last().unwrap().0.clone();
+            let num_entries = entries.len() as u64;
 
-        // 3. Meta Block
-        let min_key = entries.first().unwrap().0.clone();
-        let max_key = entries.last().unwrap().0.clone();
-        let num_entries = entries.len() as u64;
+            let meta_offset = offset;
+            let mut meta_raw = Vec::with_capacity(min_key.len() + max_key.len() + 64);
+            meta_raw.extend_from_slice(&(min_key.len() as u32).to_le_bytes());
+            meta_raw.extend_from_slice(&min_key);
+            meta_raw.extend_from_slice(&(max_key.len() as u32).to_le_bytes());
+            meta_raw.extend_from_slice(&max_key);
+            meta_raw.extend_from_slice(&num_entries.to_le_bytes());
+            meta_raw.extend_from_slice(&num_tombstones.to_le_bytes());
+            meta_raw.push(self.level);
+            meta_raw.extend_from_slice(&self.flush_generation.to_le_bytes());
+            meta_raw.extend_from_slice(&self.max_raft_index.to_le_bytes());
+            meta_raw.extend_from_slice(&self.max_hlc.0.to_le_bytes());
+            append_crc32c_le(&mut meta_raw);
+            let meta_len = meta_raw.len() as u64;
+            file.write_all(&meta_raw)?;
+            offset += meta_len;
 
-        let meta_offset = offset;
-        let mut meta_raw = Vec::with_capacity(min_key.len() + max_key.len() + 64);
-        meta_raw.extend_from_slice(&(min_key.len() as u32).to_le_bytes());
-        meta_raw.extend_from_slice(&min_key);
-        meta_raw.extend_from_slice(&(max_key.len() as u32).to_le_bytes());
-        meta_raw.extend_from_slice(&max_key);
-        meta_raw.extend_from_slice(&num_entries.to_le_bytes());
-        meta_raw.extend_from_slice(&num_tombstones.to_le_bytes());
-        meta_raw.push(self.level);
-        meta_raw.extend_from_slice(&self.flush_generation.to_le_bytes());
-        meta_raw.extend_from_slice(&self.max_raft_index.to_le_bytes());
-        meta_raw.extend_from_slice(&self.max_hlc.0.to_le_bytes());
-        append_crc32c_le(&mut meta_raw);
-        let meta_len = meta_raw.len() as u64;
-        file.write_all(&meta_raw)?;
-        offset += meta_len;
+            // 4. Fixed 64-Byte Footer
+            let mut footer = [0u8; SSTABLE_FOOTER_LEN];
+            footer[0..8].copy_from_slice(&filter_offset.to_le_bytes());
+            footer[8..16].copy_from_slice(&filter_len.to_le_bytes());
+            footer[16..24].copy_from_slice(&index_offset.to_le_bytes());
+            footer[24..32].copy_from_slice(&index_len.to_le_bytes());
+            footer[32..40].copy_from_slice(&meta_offset.to_le_bytes());
+            footer[40..48].copy_from_slice(&meta_len.to_le_bytes());
+            footer[48..52].copy_from_slice(&SSTABLE_FORMAT_VERSION.to_le_bytes());
+            footer[56..64].copy_from_slice(&SSTABLE_MAGIC.to_le_bytes());
 
-        // 4. Fixed 64-Byte Footer
-        let mut footer = [0u8; SSTABLE_FOOTER_LEN];
-        footer[0..8].copy_from_slice(&filter_offset.to_le_bytes());
-        footer[8..16].copy_from_slice(&filter_len.to_le_bytes());
-        footer[16..24].copy_from_slice(&index_offset.to_le_bytes());
-        footer[24..32].copy_from_slice(&index_len.to_le_bytes());
-        footer[32..40].copy_from_slice(&meta_offset.to_le_bytes());
-        footer[40..48].copy_from_slice(&meta_len.to_le_bytes());
-        footer[48..52].copy_from_slice(&SSTABLE_FORMAT_VERSION.to_le_bytes());
-        footer[56..64].copy_from_slice(&SSTABLE_MAGIC.to_le_bytes());
+            let mut crc_input = Vec::with_capacity(60);
+            crc_input.extend_from_slice(&footer[0..52]);
+            crc_input.extend_from_slice(&footer[56..64]);
+            let footer_crc = checksum_crc32c(&crc_input);
+            footer[52..56].copy_from_slice(&footer_crc.to_le_bytes());
 
-        let mut crc_input = Vec::with_capacity(60);
-        crc_input.extend_from_slice(&footer[0..52]);
-        crc_input.extend_from_slice(&footer[56..64]);
-        let footer_crc = checksum_crc32c(&crc_input);
-        footer[52..56].copy_from_slice(&footer_crc.to_le_bytes());
+            file.write_all(&footer)?;
+            file.flush()?;
+            let raw_file = file
+                .into_inner()
+                .map_err(|e| MetaDbError::StorageIoError(e.error().to_string()))?;
+            raw_file.sync_data()?;
+            drop(raw_file);
 
-        file.write_all(&footer)?;
-        file.sync_data()?;
-        drop(file);
+            let file_size = offset + SSTABLE_FOOTER_LEN as u64;
+            Ok(SstFileMeta {
+                level: self.level,
+                file_id: self.file_id,
+                flush_generation: self.flush_generation,
+                file_size,
+                min_key,
+                max_key,
+                num_entries,
+                num_tombstones,
+                max_raft_index: self.max_raft_index,
+                max_hlc: self.max_hlc,
+            })
+        })();
 
-        let file_size = offset + SSTABLE_FOOTER_LEN as u64;
+        let meta = match write_res {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+        };
+
         fs::rename(&tmp_path, &final_path)?;
         sync_dir(lsm_dir)?;
 
-        Ok(SstFileMeta {
-            level: self.level,
-            file_id: self.file_id,
-            flush_generation: self.flush_generation,
-            file_size,
-            min_key,
-            max_key,
-            num_entries,
-            num_tombstones,
-            max_raft_index: self.max_raft_index,
-            max_hlc: self.max_hlc,
-        })
+        Ok(meta)
     }
 }
 

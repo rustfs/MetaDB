@@ -38,8 +38,23 @@ impl CompositeMetaCache {
         Self::default()
     }
 
+    fn evict_overlapping(
+        guard: &mut BTreeMap<Vec<u8>, CompositeShardRoute>,
+        range: &CompositeKeyRange,
+    ) {
+        let stale_keys: Vec<Vec<u8>> = guard
+            .iter()
+            .filter(|(_, existing)| existing.range.overlaps(&range.start_key, &range.end_key))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale_keys {
+            guard.remove(&k);
+        }
+    }
+
     pub fn upsert_route(&self, route: CompositeShardRoute) {
         let mut guard = self.routes_by_start_key.write().unwrap();
+        Self::evict_overlapping(&mut guard, &route.range);
         guard.insert(route.range.start_key.clone(), route);
     }
 
@@ -50,6 +65,8 @@ impl CompositeMetaCache {
         child_route: CompositeShardRoute,
     ) {
         let mut guard = self.routes_by_start_key.write().unwrap();
+        Self::evict_overlapping(&mut guard, &parent_route.range);
+        Self::evict_overlapping(&mut guard, &child_route.range);
         guard.insert(parent_route.range.start_key.clone(), parent_route);
         guard.insert(child_route.range.start_key.clone(), child_route);
     }

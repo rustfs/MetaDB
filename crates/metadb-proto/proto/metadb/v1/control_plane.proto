@@ -81,6 +81,9 @@ message PlacementRecordProto {
   uint64 last_transfer_attempt_unix_ms = 9;
   uint64 last_replace_attempt_unix_ms = 10;
   uint64 updated_unix_ms = 11;
+  string jumbo_move_phase = 12;
+  bool jumbo_remote_handoff = 13;
+  bool jumbo_spare_drained = 14;
 }
 
 message GetRoutesResponse {
@@ -200,6 +203,61 @@ message RegisterCellResponse {
   ErrorDetailProto error = 1;
 }
 
+message ExtendDirRenameLeaseRequest {
+  uint64 rename_fence_token = 1;
+  uint64 ttl_ms = 2;
+}
+
+message ExtendDirRenameLeaseResponse {
+  ErrorDetailProto error = 1;
+  uint64 rename_fence_token = 2;
+  uint64 expire_hlc = 3;
+}
+
+message TransferShardLeaderRequest {
+  uint64 shard_id = 1;
+  uint64 target_node_id = 2;
+}
+
+message TransferShardLeaderResponse {
+  ErrorDetailProto error = 1;
+  bool transferred = 2;
+  uint64 leader_node_id = 3;
+}
+
+message RemoveShardVoterRequest {
+  uint64 cell_id = 1;
+  uint64 remove_node_id = 2;
+}
+
+message RemoveShardVoterResponse {
+  ErrorDetailProto error = 1;
+  uint32 updated_shards = 2;
+}
+
+message OpenJoiningShardRequest {
+  uint64 cell_id = 1;
+  uint64 shard_id = 2;
+  bytes start_key = 3;
+  bytes end_key = 4;
+  ShardEpochProto initial_epoch = 5;
+  bool use_jumbo_dedicated_root = 6;
+}
+
+message OpenJoiningShardResponse {
+  ErrorDetailProto error = 1;
+}
+
+message CloseRemovedShardRequest {
+  uint64 cell_id = 1;
+  uint64 shard_id = 2;
+  bool delete_files = 3;
+}
+
+message CloseRemovedShardResponse {
+  ErrorDetailProto error = 1;
+}
+
 service ControlPlaneService {
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc StoreHeartbeat(StoreHeartbeatRequest) returns (StoreHeartbeatResponse);
@@ -208,9 +266,14 @@ service ControlPlaneService {
   rpc AllocSplitPlan(AllocSplitPlanRequest) returns (AllocSplitPlanResponse);
   rpc ActivateSplit(ActivateSplitRequest) returns (ActivateSplitResponse);
   rpc AcquireDirRenameLease(AcquireDirRenameLeaseRequest) returns (AcquireDirRenameLeaseResponse);
+  rpc ExtendDirRenameLease(ExtendDirRenameLeaseRequest) returns (ExtendDirRenameLeaseResponse);
   rpc ReleaseDirRenameLease(ReleaseDirRenameLeaseRequest) returns (ReleaseDirRenameLeaseResponse);
   rpc TriggerShardSplit(TriggerShardSplitRequest) returns (TriggerShardSplitResponse);
   rpc EnableDualModeSplit(EnableDualModeSplitRequest) returns (EnableDualModeSplitResponse);
   rpc ScaleShardReplicas(ScaleShardReplicasRequest) returns (ScaleShardReplicasResponse);
   rpc RegisterCell(RegisterCellRequest) returns (RegisterCellResponse);
+  rpc TransferShardLeader(TransferShardLeaderRequest) returns (TransferShardLeaderResponse);
+  rpc RemoveShardVoter(RemoveShardVoterRequest) returns (RemoveShardVoterResponse);
+  rpc OpenJoiningShard(OpenJoiningShardRequest) returns (OpenJoiningShardResponse);
+  rpc CloseRemovedShard(CloseRemovedShardRequest) returns (CloseRemovedShardResponse);
 }

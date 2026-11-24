@@ -59,7 +59,11 @@ done
   for sidecar in metadb-*.tar.gz.sha256; do
     cat "$sidecar" >> SHA256SUMS
   done
-  sha256sum -c SHA256SUMS
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c SHA256SUMS
+  else
+    shasum -a 256 -c SHA256SUMS
+  fi
 )
 
 notes=$(mktemp)

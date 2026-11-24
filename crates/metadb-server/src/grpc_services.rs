@@ -114,7 +114,7 @@ pub fn composite_route_from_proto(
     route_conv::from_proto_route(descriptor)
 }
 
-fn placement_to_proto(cell_id: u64, record: &StoredPlacement) -> PlacementRecordProto {
+fn placement_to_proto(cell: &DurableCellManager, record: &StoredPlacement) -> PlacementRecordProto {
     let committed_moves = record
         .committed_moves
         .iter()
@@ -137,8 +137,16 @@ fn placement_to_proto(cell_id: u64, record: &StoredPlacement) -> PlacementRecord
             },
         })
         .collect();
+    let jumbo_remote_handoff = cell
+        .stored_remote_handoffs()
+        .map(|v| v.iter().any(|h| h.shard_id == record.shard_id))
+        .unwrap_or(false);
+    let jumbo_spare_drained = cell
+        .stored_spare_drains()
+        .map(|v| v.iter().any(|d| d.jumbo_shard_id == record.shard_id))
+        .unwrap_or(false);
     PlacementRecordProto {
-        cell_id,
+        cell_id: cell.cell_id(),
         shard_id: record.shard_id,
         dominant_pid: record.dominant_pid,
         dedicated_node: record.dedicated_node,
@@ -149,6 +157,9 @@ fn placement_to_proto(cell_id: u64, record: &StoredPlacement) -> PlacementRecord
         last_transfer_attempt_unix_ms: record.last_transfer_attempt_unix_ms,
         last_replace_attempt_unix_ms: record.last_replace_attempt_unix_ms,
         updated_unix_ms: record.updated_unix_ms,
+        jumbo_move_phase: cell.jumbo_move_phase_name(record.shard_id).to_string(),
+        jumbo_remote_handoff,
+        jumbo_spare_drained,
     }
 }
 
@@ -156,7 +167,7 @@ fn local_placement_records(cells: &[Arc<DurableCellManager>]) -> Vec<PlacementRe
     let mut records = Vec::new();
     for cell in cells {
         for record in cell.stored_placements() {
-            records.push(placement_to_proto(cell.cell_id(), &record));
+            records.push(placement_to_proto(cell.as_ref(), &record));
         }
     }
     records
@@ -167,13 +178,14 @@ fn routes_response(
     shards: Vec<ShardDescriptorProto>,
     cluster_id: Vec<u8>,
     placements: Vec<PlacementRecordProto>,
+    auto_transfer_enabled: bool,
 ) -> GetRoutesResponse {
     GetRoutesResponse {
         error,
         shards,
         cluster_id,
         placements,
-        automatic_leadership_transfer_enabled: automatic_leadership_transfer_allowed(),
+        automatic_leadership_transfer_enabled: auto_transfer_enabled,
     }
 }
 
@@ -1295,6 +1307,8 @@ impl MetadataService for MetaDbGrpcService {
                         next_cursor: String::new(),
                         has_more: false,
                         server_hlc: self.server_hlc(),
+                        entries_examined: 0,
+                        tombstones_traversed: 0,
                     }));
                 }
             }
@@ -1308,6 +1322,8 @@ impl MetadataService for MetaDbGrpcService {
                     next_cursor: String::new(),
                     has_more: false,
                     server_hlc: self.server_hlc(),
+                    entries_examined: 0,
+                    tombstones_traversed: 0,
                 }));
             }
         } {
@@ -1320,17 +1336,20 @@ impl MetadataService for MetaDbGrpcService {
         let req = request.into_inner();
         let after = (!req.after_name.is_empty()).then_some(req.after_name.as_str());
         let pfx = (!req.name_prefix.is_empty()).then_some(req.name_prefix.as_str());
+        let limit_opt = (req.limit > 0).then_some(req.limit as usize);
         match self
             .tx_router
-            .listdir_paginated(req.pid, after, pfx, req.limit as usize)
+            .listdir_with_stats(req.pid, after, pfx, limit_opt)
             .await
         {
-            Ok((entries, next_cursor)) => Ok(Response::new(ListDirResponse {
+            Ok(page) => Ok(Response::new(ListDirResponse {
                 error: None,
-                entries: entries.iter().map(MetaEntryProto::from).collect(),
-                has_more: next_cursor.is_some(),
-                next_cursor: next_cursor.unwrap_or_default(),
+                entries: page.entries.iter().map(MetaEntryProto::from).collect(),
+                has_more: page.next_cursor.is_some(),
+                next_cursor: page.next_cursor.unwrap_or_default(),
                 server_hlc: self.server_hlc(),
+                entries_examined: page.entries_examined,
+                tombstones_traversed: page.tombstones_traversed,
             })),
             Err(e) => Ok(Response::new(ListDirResponse {
                 error: Some(ErrorDetailProto::from(&e)),
@@ -1338,6 +1357,8 @@ impl MetadataService for MetaDbGrpcService {
                 next_cursor: String::new(),
                 has_more: false,
                 server_hlc: self.server_hlc(),
+                entries_examined: 0,
+                tombstones_traversed: 0,
             })),
         }
     }
@@ -2188,6 +2209,10 @@ impl TransactionService for MetaDbGrpcService {
             }
         }
 
+        let leader_forwarded = request
+            .metadata()
+            .get("x-metadb-leader-forwarded")
+            .is_some();
         let req = request.into_inner();
         let (_, grp, _) = match self.global_manager.route_user_key(&req.primary_key) {
             Ok(t) => t,
@@ -2203,6 +2228,33 @@ impl TransactionService for MetaDbGrpcService {
         let epoch = grp.current_epoch();
         let (_, snap) = match grp.linearizable_read(epoch).await {
             Ok(read) => read,
+            Err(MetaDbError::NotLeader {
+                leader_hint: Some(leader_id),
+                ..
+            }) if !leader_forwarded && leader_id != grp.node_id() => {
+                if let Some(leader_addr) = grp.peer_addr(leader_id) {
+                    let mut client = self.transaction_client_for(&[leader_addr]).await?;
+                    let mut fwd = Request::new(req);
+                    fwd.metadata_mut().insert(
+                        "x-metadb-leader-forwarded",
+                        tonic::metadata::MetadataValue::from_static("1"),
+                    );
+                    fwd.metadata_mut().insert(
+                        CELL_FORWARDED,
+                        tonic::metadata::MetadataValue::from_static("1"),
+                    );
+                    return client.check_txn_status(fwd).await;
+                }
+                let error = MetaDbError::NotLeader {
+                    shard_id: grp.shard_id(),
+                    leader_hint: Some(leader_id),
+                };
+                return Ok(Response::new(CheckTxnStatusResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                    txn_state: 0,
+                    commit_hlc: 0,
+                }));
+            }
             Err(error) => {
                 return Ok(Response::new(CheckTxnStatusResponse {
                     error: Some(ErrorDetailProto::from(&error)),
@@ -2315,13 +2367,75 @@ impl TransactionService for MetaDbGrpcService {
         let Some(hdr) = req.header else {
             return Err(Status::invalid_argument("missing header"));
         };
-        let ep: ShardEpoch = hdr.expected_epoch.unwrap_or_default().into();
         let mut entries = Vec::with_capacity(req.encoded_outbox_entries.len());
         for raw in &req.encoded_outbox_entries {
             entries.push(
                 AuxOutboxEntry::decode(raw).map_err(|e| Status::invalid_argument(e.to_string()))?,
             );
         }
+        if hdr.shard_id == 0 {
+            let mut by_shard: BTreeMap<
+                u64,
+                (
+                    ShardEpoch,
+                    Arc<metadb_raft::ShardRaftGroup>,
+                    Vec<AuxOutboxEntry>,
+                ),
+            > = BTreeMap::new();
+            for entry in entries {
+                let target_key = match &entry.payload {
+                    metadb_core::AuxTaskPayload::QuotaDelta { uid, .. } => {
+                        QuotaKey { uid: *uid }.encode()
+                    }
+                    metadb_core::AuxTaskPayload::IndexUpsert { fid, .. }
+                    | metadb_core::AuxTaskPayload::IndexDelete { fid } => {
+                        SecondaryIndexKey { fid: *fid }.encode()
+                    }
+                };
+                match self.global_manager.route_user_key(&target_key) {
+                    Ok((ep, grp, _)) => {
+                        by_shard
+                            .entry(grp.shard_id())
+                            .or_insert_with(|| (ep, grp, Vec::new()))
+                            .2
+                            .push(entry);
+                    }
+                    Err(e) => {
+                        return Ok(Response::new(ApplyAuxBatchResponse {
+                            error: Some(ErrorDetailProto::from(&e)),
+                            applied_count: 0,
+                        }));
+                    }
+                }
+            }
+            let mut total_applied = 0u32;
+            for (_, (ep, grp, batch)) in by_shard {
+                let cmd = TxRaftCmd::ApplyAuxBatch { entries: batch };
+                let payload = metadb_tx::command_payload(&cmd)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                match grp.propose(ep, self.tx_router.clock().now(), payload).await {
+                    Ok(resp) => {
+                        let out: TxRaftOutput =
+                            codec::deserialize(&resp.result.unwrap_or_default())
+                                .unwrap_or(TxRaftOutput::AppliedCount(0));
+                        if let TxRaftOutput::AppliedCount(c) = out {
+                            total_applied = total_applied.saturating_add(c as u32);
+                        }
+                    }
+                    Err(e) => {
+                        return Ok(Response::new(ApplyAuxBatchResponse {
+                            error: Some(ErrorDetailProto::from(&e)),
+                            applied_count: total_applied,
+                        }));
+                    }
+                }
+            }
+            return Ok(Response::new(ApplyAuxBatchResponse {
+                error: None,
+                applied_count: total_applied,
+            }));
+        }
+        let ep: ShardEpoch = hdr.expected_epoch.unwrap_or_default().into();
         let find_res = self
             .global_manager
             .all_cells()
@@ -2377,6 +2491,89 @@ impl TransactionService for MetaDbGrpcService {
             Err(error) => Ok(Response::new(ForwardRouterResponse {
                 error: Some(ErrorDetailProto::from(&error)),
                 result: Vec::new(),
+            })),
+        }
+    }
+
+    async fn extend2pc_lease(
+        &self,
+        request: Request<Extend2pcLeaseRequest>,
+    ) -> Result<Response<Extend2pcLeaseResponse>, Status> {
+        if let Some(plan) = self.proxy_plan_keys(&request, &request.get_ref().target_user_keys) {
+            match plan {
+                Ok(endpoints) => {
+                    let mut client = self.transaction_client_for(&endpoints).await?;
+                    return client
+                        .extend2pc_lease(self.cell_forward_request(request.into_inner()))
+                        .await;
+                }
+                Err(error) => {
+                    return Ok(Response::new(Extend2pcLeaseResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        expire_hlc: 0,
+                    }));
+                }
+            }
+        }
+        if let Some(endpoints) = match self.forward_shard_rpc(
+            &request,
+            request
+                .get_ref()
+                .header
+                .as_ref()
+                .map(|header| header.shard_id),
+            request.get_ref().target_user_keys.clone(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Ok(Response::new(Extend2pcLeaseResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                    expire_hlc: 0,
+                }));
+            }
+        } {
+            let mut client = self.transaction_client_for(&endpoints).await?;
+            return client
+                .extend2pc_lease(self.cell_forward_request(request.into_inner()))
+                .await;
+        }
+
+        let req = request.into_inner();
+        let Some(hdr) = req.header else {
+            return Err(Status::invalid_argument("missing routing header"));
+        };
+        let ep: ShardEpoch = hdr.expected_epoch.unwrap_or_default().into();
+        let txn_id = decode_req_txn_id(&req.txn_id_be)?;
+        let find_res = self
+            .global_manager
+            .all_cells()
+            .into_iter()
+            .find_map(|c| c.lookup_local_handle(hdr.shard_id).ok());
+        let Some((_, grp, _)) = find_res else {
+            let e = MetaDbError::ShardRoutingError(format!("unknown shard {}", hdr.shard_id));
+            return Ok(Response::new(Extend2pcLeaseResponse {
+                error: Some(ErrorDetailProto::from(&e)),
+                expire_hlc: 0,
+            }));
+        };
+        let cmd = TxRaftCmd::Extend2pcLease {
+            txn_id,
+            coord_node_id: req.coord_node_id,
+            expire_hlc: HlcTimestamp(req.new_expire_hlc),
+            start_hlc: HlcTimestamp(req.start_hlc),
+            rename_fence_token: req.has_rename_fence_token.then_some(req.rename_fence_token),
+            target_user_keys: req.target_user_keys,
+        };
+        let payload =
+            metadb_tx::command_payload(&cmd).map_err(|e| Status::internal(e.to_string()))?;
+        match grp.propose(ep, self.tx_router.clock().now(), payload).await {
+            Ok(_) => Ok(Response::new(Extend2pcLeaseResponse {
+                error: None,
+                expire_hlc: req.new_expire_hlc,
+            })),
+            Err(e) => Ok(Response::new(Extend2pcLeaseResponse {
+                error: Some(ErrorDetailProto::from(&e)),
+                expire_hlc: 0,
             })),
         }
     }
@@ -2491,6 +2688,7 @@ impl ControlPlaneService for MetaDbGrpcService {
             return client.get_routes(request.into_inner()).await;
         }
 
+        let auto_transfer = self.automatic_transfer_enabled();
         let req = request.into_inner();
         let (routes, cluster_id, placements) = if req.cell_id == 0 {
             let cells = self.global_manager.all_cells();
@@ -2515,6 +2713,7 @@ impl ControlPlaneService for MetaDbGrpcService {
                             Vec::new(),
                             Vec::new(),
                             Vec::new(),
+                            auto_transfer,
                         )));
                     }
                 }
@@ -2539,6 +2738,7 @@ impl ControlPlaneService for MetaDbGrpcService {
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
+                        auto_transfer,
                     )));
                 }
             }
@@ -2549,6 +2749,7 @@ impl ControlPlaneService for MetaDbGrpcService {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                auto_transfer,
             )));
         };
         let cluster_id = if cluster_id == 0 {
@@ -2561,6 +2762,7 @@ impl ControlPlaneService for MetaDbGrpcService {
             routes.iter().map(route_conv::to_proto_route).collect(),
             cluster_id,
             placements,
+            auto_transfer,
         )))
     }
 
@@ -2613,16 +2815,20 @@ impl ControlPlaneService for MetaDbGrpcService {
         }
 
         if let Some(allocator) = &self.shared_allocator {
-            let cell_id = match request.metadata().get(ALLOC_CELL) {
-                None => 0,
-                Some(value) => {
-                    let text = value
-                        .to_str()
-                        .map_err(|_| Status::invalid_argument("alloc cell header is not ascii"))?;
-                    text.parse::<u64>().map_err(|_| {
-                        Status::invalid_argument("alloc cell header is not a cell id")
-                    })?
+            let cell_id = if forwarded {
+                match request.metadata().get(ALLOC_CELL) {
+                    None => 0,
+                    Some(value) => {
+                        let text = value.to_str().map_err(|_| {
+                            Status::invalid_argument("alloc cell header is not ascii")
+                        })?;
+                        text.parse::<u64>().map_err(|_| {
+                            Status::invalid_argument("alloc cell header is not a cell id")
+                        })?
+                    }
                 }
+            } else {
+                0
             };
             let req = request.into_inner();
             let kind = match req.id_kind {
@@ -2903,13 +3109,18 @@ impl ControlPlaneService for MetaDbGrpcService {
         }
 
         let req = request.into_inner();
+        let hint = (!req.split_name.is_empty()).then_some(req.split_name);
         for cell in self.global_manager.all_cells() {
             if cell
                 .list_routes()
                 .iter()
                 .any(|r| r.shard_id == req.shard_id)
             {
-                return match cell.enable_dual_mode_split(req.shard_id, req.dominant_pid) {
+                return match cell.enable_dual_mode_split_with_hint(
+                    req.shard_id,
+                    req.dominant_pid,
+                    hint,
+                ) {
                     Ok(()) => Ok(Response::new(EnableDualModeSplitResponse { error: None })),
                     Err(e) => Ok(Response::new(EnableDualModeSplitResponse {
                         error: Some(ErrorDetailProto::from(&e)),
@@ -3071,9 +3282,241 @@ impl ControlPlaneService for MetaDbGrpcService {
             })),
         }
     }
+
+    async fn extend_dir_rename_lease(
+        &self,
+        request: Request<ExtendDirRenameLeaseRequest>,
+    ) -> Result<Response<ExtendDirRenameLeaseResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(ExtendDirRenameLeaseResponse {
+                error: Some(error),
+                rename_fence_token: 0,
+                expire_hlc: 0,
+            }));
+        }
+        if self.directory_only {
+            let error = Self::directory_lease_error();
+            return Ok(Response::new(ExtendDirRenameLeaseResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+                rename_fence_token: 0,
+                expire_hlc: 0,
+            }));
+        }
+        if self.shard_host_only {
+            let error = Self::shard_host_error();
+            return Ok(Response::new(ExtendDirRenameLeaseResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+                rename_fence_token: 0,
+                expire_hlc: 0,
+            }));
+        }
+        let req = request.into_inner();
+        let now_hlc = self.tx_router.clock().now();
+        match self.global_manager.id_allocator().extend_dir_rename_lease(
+            req.rename_fence_token,
+            now_hlc,
+            req.ttl_ms,
+        ) {
+            Ok(expire_hlc) => Ok(Response::new(ExtendDirRenameLeaseResponse {
+                error: None,
+                rename_fence_token: req.rename_fence_token,
+                expire_hlc: expire_hlc.0,
+            })),
+            Err(error) => Ok(Response::new(ExtendDirRenameLeaseResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+                rename_fence_token: 0,
+                expire_hlc: 0,
+            })),
+        }
+    }
+
+    async fn transfer_shard_leader(
+        &self,
+        request: Request<TransferShardLeaderRequest>,
+    ) -> Result<Response<TransferShardLeaderResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(TransferShardLeaderResponse {
+                error: Some(error),
+                transferred: false,
+                leader_node_id: 0,
+            }));
+        }
+        let req = request.into_inner();
+        for cell in self.global_manager.all_cells() {
+            if cell
+                .list_routes()
+                .iter()
+                .any(|r| r.shard_id == req.shard_id)
+                || cell.lookup_local_handle(req.shard_id).is_ok()
+            {
+                return match cell
+                    .transfer_shard_leader(req.shard_id, req.target_node_id)
+                    .await
+                {
+                    Ok(outcome) => {
+                        if let Some(refusal) = outcome.refusal {
+                            let err = MetaDbError::ShardRoutingError(format!(
+                                "leadership transfer refused for shard {}: {:?}",
+                                req.shard_id, refusal
+                            ));
+                            Ok(Response::new(TransferShardLeaderResponse {
+                                error: Some(ErrorDetailProto::from(&err)),
+                                transferred: false,
+                                leader_node_id: outcome.leader.unwrap_or(0),
+                            }))
+                        } else if outcome.committed.is_some() {
+                            Ok(Response::new(TransferShardLeaderResponse {
+                                error: None,
+                                transferred: true,
+                                leader_node_id: outcome.leader.unwrap_or(req.target_node_id),
+                            }))
+                        } else {
+                            let err = MetaDbError::ConsensusError(format!(
+                                "leadership transfer on shard {} did not observe target {} as leader",
+                                req.shard_id, req.target_node_id
+                            ));
+                            Ok(Response::new(TransferShardLeaderResponse {
+                                error: Some(ErrorDetailProto::from(&err)),
+                                transferred: false,
+                                leader_node_id: outcome.leader.unwrap_or(0),
+                            }))
+                        }
+                    }
+                    Err(error) => Ok(Response::new(TransferShardLeaderResponse {
+                        error: Some(ErrorDetailProto::from(&error)),
+                        transferred: false,
+                        leader_node_id: 0,
+                    })),
+                };
+            }
+        }
+        let err = MetaDbError::ShardRoutingError(format!("unknown shard {}", req.shard_id));
+        Ok(Response::new(TransferShardLeaderResponse {
+            error: Some(ErrorDetailProto::from(&err)),
+            transferred: false,
+            leader_node_id: 0,
+        }))
+    }
+
+    async fn remove_shard_voter(
+        &self,
+        request: Request<RemoveShardVoterRequest>,
+    ) -> Result<Response<RemoveShardVoterResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(RemoveShardVoterResponse {
+                error: Some(error),
+                updated_shards: 0,
+            }));
+        }
+        let req = request.into_inner();
+        let Some(cell) = self.global_manager.get_cell(req.cell_id) else {
+            let err = MetaDbError::ShardRoutingError(format!("unknown cell {}", req.cell_id));
+            return Ok(Response::new(RemoveShardVoterResponse {
+                error: Some(ErrorDetailProto::from(&err)),
+                updated_shards: 0,
+            }));
+        };
+        match cell.remove_voter(req.remove_node_id).await {
+            Ok(updated) => Ok(Response::new(RemoveShardVoterResponse {
+                error: None,
+                updated_shards: updated as u32,
+            })),
+            Err(error) => Ok(Response::new(RemoveShardVoterResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+                updated_shards: 0,
+            })),
+        }
+    }
+
+    async fn open_joining_shard(
+        &self,
+        request: Request<OpenJoiningShardRequest>,
+    ) -> Result<Response<OpenJoiningShardResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(OpenJoiningShardResponse {
+                error: Some(error),
+            }));
+        }
+        let req = request.into_inner();
+        let cell = if req.cell_id == 0 {
+            self.global_manager.all_cells().into_iter().next()
+        } else {
+            self.global_manager.get_cell(req.cell_id)
+        };
+        let Some(cell) = cell else {
+            let err = MetaDbError::ShardRoutingError(format!("unknown cell {}", req.cell_id));
+            return Ok(Response::new(OpenJoiningShardResponse {
+                error: Some(ErrorDetailProto::from(&err)),
+            }));
+        };
+        let range = match CompositeKeyRange::new(req.start_key, req.end_key) {
+            Ok(r) => r,
+            Err(error) => {
+                return Ok(Response::new(OpenJoiningShardResponse {
+                    error: Some(ErrorDetailProto::from(&error)),
+                }));
+            }
+        };
+        let epoch: ShardEpoch = req.initial_epoch.unwrap_or_default().into();
+        match cell
+            .open_joining_shard(req.shard_id, range, epoch, req.use_jumbo_dedicated_root)
+            .await
+        {
+            Ok(()) => Ok(Response::new(OpenJoiningShardResponse { error: None })),
+            Err(error) => Ok(Response::new(OpenJoiningShardResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+            })),
+        }
+    }
+
+    async fn close_removed_shard(
+        &self,
+        request: Request<CloseRemovedShardRequest>,
+    ) -> Result<Response<CloseRemovedShardResponse>, Status> {
+        if self.upstream.is_some() {
+            let error = ErrorDetailProto::from(&Self::proxy_control_error());
+            return Ok(Response::new(CloseRemovedShardResponse {
+                error: Some(error),
+            }));
+        }
+        let req = request.into_inner();
+        let cell = if req.cell_id == 0 {
+            self.global_manager.all_cells().into_iter().next()
+        } else {
+            self.global_manager.get_cell(req.cell_id)
+        };
+        let Some(cell) = cell else {
+            let err = MetaDbError::ShardRoutingError(format!("unknown cell {}", req.cell_id));
+            return Ok(Response::new(CloseRemovedShardResponse {
+                error: Some(ErrorDetailProto::from(&err)),
+            }));
+        };
+        match cell
+            .close_removed_shard(req.shard_id, req.delete_files)
+            .await
+        {
+            Ok(()) => Ok(Response::new(CloseRemovedShardResponse { error: None })),
+            Err(error) => Ok(Response::new(CloseRemovedShardResponse {
+                error: Some(ErrorDetailProto::from(&error)),
+            })),
+        }
+    }
 }
 
 impl MetaDbGrpcService {
+    fn automatic_transfer_enabled(&self) -> bool {
+        automatic_leadership_transfer_allowed()
+            || self
+                .global_manager
+                .all_cells()
+                .iter()
+                .any(|cell| cell.automatic_leadership_transfer_enabled())
+    }
+
     fn split_response(
         &self,
         error: Option<ErrorDetailProto>,
@@ -3086,14 +3529,14 @@ impl MetaDbGrpcService {
             split_executed,
             child_shard_id,
             placement: self.placement_for_shard(shard_id),
-            automatic_leadership_transfer_enabled: automatic_leadership_transfer_allowed(),
+            automatic_leadership_transfer_enabled: self.automatic_transfer_enabled(),
         }
     }
 
     fn placement_for_shard(&self, shard_id: u64) -> Option<PlacementRecordProto> {
         for cell in self.global_manager.all_cells() {
             if let Some(record) = cell.stored_placement(shard_id) {
-                return Some(placement_to_proto(cell.cell_id(), &record));
+                return Some(placement_to_proto(cell.as_ref(), &record));
             }
         }
         None

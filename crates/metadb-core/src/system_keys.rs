@@ -27,6 +27,7 @@ use crate::schema::{
 };
 
 const SYSTEM_CODEC_V1: u8 = 1;
+const SYSTEM_CODEC_V2: u8 = 2;
 
 /// Key of `DirShardDelta` (`[0x04][pid: 8B BE]`).
 #[derive(
@@ -573,17 +574,49 @@ pub fn encode_origin_quota_cursor(raft_index: u64, task_ordinal: u16) -> Vec<u8>
     buf
 }
 
+/// Encodes `(latest_cursor, acked_cursor)` in `[0x08][uid]` (`V2`) so unspilled `.raftlog`
+/// reconstruction preserves the durable acknowledged predecessor even after L0 folding.
+pub fn encode_origin_quota_cursor_pair(latest: (u64, u16), acked: (u64, u16)) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 8 + 2 + 8 + 2 + 4);
+    buf.push(SYSTEM_CODEC_V2);
+    buf.extend_from_slice(&latest.0.to_be_bytes());
+    buf.extend_from_slice(&latest.1.to_be_bytes());
+    buf.extend_from_slice(&acked.0.to_be_bytes());
+    buf.extend_from_slice(&acked.1.to_be_bytes());
+    append_crc32c_be(&mut buf);
+    buf
+}
+
 pub fn decode_origin_quota_cursor(bytes: &[u8]) -> Result<(u64, u16)> {
+    let (latest, _) = decode_origin_quota_cursor_pair(bytes)?;
+    Ok(latest)
+}
+
+pub fn decode_origin_quota_cursor_pair(bytes: &[u8]) -> Result<((u64, u16), (u64, u16))> {
     let body = verify_crc32c_be(bytes, "OriginQuotaCursor")?;
-    if body.len() != 11 || body[0] != SYSTEM_CODEC_V1 {
-        return Err(MetaDbError::CodecError(
+    match body.first().copied() {
+        Some(SYSTEM_CODEC_V1) if body.len() == 11 => {
+            let cur = (
+                u64::from_be_bytes(body[1..9].try_into().unwrap()),
+                u16::from_be_bytes(body[9..11].try_into().unwrap()),
+            );
+            Ok((cur, cur))
+        }
+        Some(SYSTEM_CODEC_V2) if body.len() == 21 => {
+            let latest = (
+                u64::from_be_bytes(body[1..9].try_into().unwrap()),
+                u16::from_be_bytes(body[9..11].try_into().unwrap()),
+            );
+            let acked = (
+                u64::from_be_bytes(body[11..19].try_into().unwrap()),
+                u16::from_be_bytes(body[19..21].try_into().unwrap()),
+            );
+            Ok((latest, acked))
+        }
+        _ => Err(MetaDbError::CodecError(
             "invalid OriginQuotaCursor".to_string(),
-        ));
+        )),
     }
-    Ok((
-        u64::from_be_bytes(body[1..9].try_into().unwrap()),
-        u16::from_be_bytes(body[9..11].try_into().unwrap()),
-    ))
 }
 
 /// Persisted auxiliary outbox entry stored in `[0x07]` or dispatched via `ApplyAuxBatchRpc`.
@@ -655,7 +688,7 @@ pub fn lease_preimage_prefix_end(txn_id: u128) -> Vec<u8> {
 }
 
 fn split_lease_preimage_key(storage_key: &[u8]) -> Option<(u128, Vec<u8>)> {
-    if storage_key.len() < 17 || storage_key[0] != SYSTEM_PREFIX_LEASE_PREIMAGE {
+    if storage_key.len() <= 17 || storage_key[0] != SYSTEM_PREFIX_LEASE_PREIMAGE {
         return None;
     }
     let mut id = [0u8; 16];

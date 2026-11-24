@@ -82,6 +82,16 @@ pub trait ShardApplyHandler: Send + Sync + 'static {
         checkpoint: &DurableShardCheckpoint,
         engine: &LifecycleStorageEngine,
     );
+
+    /// Reconstructs any unspilled in-RAM auxiliary outbox tasks in `(contiguous_aux_acked_index ..= flushed_raft_index]`
+    /// from retained `.raftlog` entries on crash recovery when a size-triggered L0 flush occurred below `spill_threshold`.
+    fn recover_unspilled_aux_from_log(
+        &self,
+        _entries: &[(u64, MetaDbRaftRequest)],
+        _checkpoint: &DurableShardCheckpoint,
+        _engine: &LifecycleStorageEngine,
+    ) {
+    }
 }
 
 /// Built-in KV handler for standalone `metadb-raft` consensus & crash-recovery verification.
@@ -128,6 +138,7 @@ impl ShardApplyHandler for BasicKvApplyHandler {
         }
         // BasicKvApplyHandler has no remote outbox, so aux_outbox_durable_index tracks applied index.
         self.watermarks.advance_aux_outbox_durable(raft_index);
+        self.watermarks.advance_contiguous_aux_acked(raft_index);
         Ok(Vec::new())
     }
 
@@ -143,6 +154,8 @@ impl ShardApplyHandler for BasicKvApplyHandler {
         }
         self.watermarks
             .advance_aux_outbox_durable(checkpoint.flushed_raft_index);
+        self.watermarks
+            .advance_contiguous_aux_acked(checkpoint.flushed_raft_index);
     }
 }
 
@@ -265,6 +278,18 @@ impl StateMachineShared {
         self.flush_to_lsm_locked()
     }
 
+    fn flush_for_shutdown(&self) -> Result<(u64, DurableShardCheckpoint)> {
+        let _operation = self.operation_lock.lock().unwrap();
+        let current_idx = self
+            .last_applied_log_id
+            .read()
+            .unwrap()
+            .map(|id| id.index)
+            .unwrap_or(0);
+        self.handler.prepare_for_snapshot(current_idx);
+        self.flush_to_lsm_locked()
+    }
+
     fn flush_to_lsm_locked(&self) -> Result<(u64, DurableShardCheckpoint)> {
         let engine = self.current_engine();
         let last_log = *self.last_applied_log_id.read().unwrap();
@@ -286,7 +311,7 @@ impl StateMachineShared {
             flushed_raft_leader: leader_node,
             flushed_raft_index: index,
             flushed_max_hlc: last_hlc,
-            contiguous_aux_acked_index: self.watermarks.snapshot_values().1,
+            contiguous_aux_acked_index: self.watermarks.contiguous_aux_acked_index(),
             membership_bytes,
             descriptor_bytes: self.handler.encode_descriptor_bytes(),
         };
@@ -337,49 +362,62 @@ impl StateMachineShared {
     }
 
     fn build_snapshot_sync(&self) -> io::Result<SnapshotOf<MetaDbTypeConfig, SnapshotArchive>> {
-        let _operation = self.operation_lock.lock().unwrap();
-        let current_idx = self
-            .last_applied_log_id
-            .read()
-            .unwrap()
-            .map(|id| id.index)
-            .unwrap_or(0);
-        self.handler.prepare_for_snapshot(current_idx);
-
-        let (_, _) = self
-            .flush_to_lsm_locked()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        let engine = self.current_engine();
         let snaps_root = self.shard_dir.join("raft/snapshots");
         fs::create_dir_all(&snaps_root)?;
 
-        // Strict `snapshot_index == checkpoint.flushed_raft_index` alignment (`Resolution B6`).
-        let ckpt_preview = engine.durable_checkpoint();
-        let snap_index = ckpt_preview.flushed_raft_index;
-        let tmp_dir = snaps_root.join(format!("snap_{:020}.tmp", snap_index));
-        if tmp_dir.exists() {
-            fs::remove_dir_all(&tmp_dir)?;
-        }
+        let (snap_index, tmp_dir, ckpt_lsm_dir, checkpoint, last_log_id, last_membership) = {
+            let _operation = self.operation_lock.lock().unwrap();
+            let current_idx = self
+                .last_applied_log_id
+                .read()
+                .unwrap()
+                .map(|id| id.index)
+                .unwrap_or(0);
+            self.handler.prepare_for_snapshot(current_idx);
 
-        // Do not delete `snap_<index>` before this temporary directory is complete.
-        // A reader that opens the live directory during that gap sees ENOENT and
-        // OpenRaft turns that into a fatal `Read Snapshot` error.
-        let ckpt_lsm_dir = tmp_dir.join("lsm");
-        let checkpoint = engine
-            .create_checkpoint(&ckpt_lsm_dir)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+            let (_, _) = self
+                .flush_to_lsm_locked()
+                .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let last_log_id = checkpoint_log_id(&checkpoint);
+            let engine = self.current_engine();
 
-        let last_membership: StoredMembershipOf<MetaDbTypeConfig> =
-            if checkpoint.membership_bytes.is_empty() {
-                StoredMembership::default()
-            } else {
-                codec::deserialize_serde(&checkpoint.membership_bytes)
-                    .unwrap_or_else(|_| self.last_membership.read().unwrap().clone())
-            };
+            // Strict `snapshot_index == checkpoint.flushed_raft_index` alignment (`Resolution B6`).
+            let ckpt_preview = engine.durable_checkpoint();
+            let snap_index = ckpt_preview.flushed_raft_index;
+            let tmp_dir = snaps_root.join(format!("snap_{:020}.tmp", snap_index));
+            if tmp_dir.exists() {
+                fs::remove_dir_all(&tmp_dir)?;
+            }
 
+            // Do not delete `snap_<index>` before this temporary directory is complete.
+            // A reader that opens the live directory during that gap sees ENOENT and
+            // OpenRaft turns that into a fatal `Read Snapshot` error.
+            let ckpt_lsm_dir = tmp_dir.join("lsm");
+            let checkpoint = engine
+                .create_checkpoint(&ckpt_lsm_dir)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+
+            let last_log_id = checkpoint_log_id(&checkpoint);
+
+            let last_membership: StoredMembershipOf<MetaDbTypeConfig> =
+                if checkpoint.membership_bytes.is_empty() {
+                    StoredMembership::default()
+                } else {
+                    codec::deserialize_serde(&checkpoint.membership_bytes)
+                        .unwrap_or_else(|_| self.last_membership.read().unwrap().clone())
+                };
+            (
+                snap_index,
+                tmp_dir,
+                ckpt_lsm_dir,
+                checkpoint,
+                last_log_id,
+                last_membership,
+            )
+        };
+
+        // Read hard-linked immutable SSTable files and compute CRC32Cs outside `operation_lock`
+        // so live `apply` and `acquire_snapshot` traffic is never blocked by disk I/O!
         let mut files: Vec<SnapshotFileEntry> = Vec::new();
         for d in fs::read_dir(&ckpt_lsm_dir)? {
             let d = d?;
@@ -428,23 +466,28 @@ impl StateMachineShared {
 
         // Persist SNAPSHOT_META's directory entry before publishing the snapshot.
         sync_dir(&tmp_dir).map_err(|e| io::Error::other(e.to_string()))?;
-        let purged = crate::log_store::read_persisted_purged_index(&self.shard_dir.join("raft"))
-            .unwrap_or(0);
-        let required = purged.max(self.watermarks.snapshot_values().2);
-        if snap_index < required {
-            let _ = fs::remove_dir_all(&tmp_dir);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "refusing to publish snapshot index {snap_index}; it does not cover required index {required}"
-                ),
-            ));
-        }
-        publish_snapshot_dir(&snaps_root, snap_index, &tmp_dir)?;
-        *self.snapshot_cache.lock().unwrap() = None;
 
-        self.watermarks
-            .advance_last_snapshot(checkpoint.flushed_raft_index);
+        {
+            let _publish_op = self.operation_lock.lock().unwrap();
+            let purged =
+                crate::log_store::read_persisted_purged_index(&self.shard_dir.join("raft"))
+                    .unwrap_or(0);
+            let required = purged.max(self.watermarks.snapshot_values().2);
+            if snap_index < required {
+                let _ = fs::remove_dir_all(&tmp_dir);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "refusing to publish snapshot index {snap_index}; it does not cover required index {required}"
+                    ),
+                ));
+            }
+            publish_snapshot_dir(&snaps_root, snap_index, &tmp_dir)?;
+            *self.snapshot_cache.lock().unwrap() = None;
+
+            self.watermarks
+                .advance_last_snapshot(checkpoint.flushed_raft_index);
+        }
 
         Ok(Snapshot {
             meta,
@@ -838,7 +881,10 @@ impl RaftSnapshotBuilder<MetaDbTypeConfig> for ShardSnapshotBuilder {
     async fn build_snapshot(
         &mut self,
     ) -> std::result::Result<SnapshotOf<MetaDbTypeConfig, Self::SnapshotData>, io::Error> {
-        self.shared.build_snapshot_sync()
+        let shared = self.shared.clone();
+        tokio::task::spawn_blocking(move || shared.build_snapshot_sync())
+            .await
+            .map_err(|e| io::Error::other(format!("snapshot builder task panicked: {e}")))?
     }
 }
 
@@ -914,6 +960,7 @@ impl ShardStateMachine {
             };
 
         watermarks.advance_state_flushed(cp.flushed_raft_index);
+        watermarks.set_contiguous_aux_acked(cp.contiguous_aux_acked_index);
         watermarks.advance_aux_outbox_durable(cp.contiguous_aux_acked_index);
         // The MANIFEST flushed index is the local durability floor. Without this,
         // `last_snapshot_index` stays 0 across process restarts and the 3-watermark
@@ -984,6 +1031,10 @@ impl ShardStateMachine {
 
     pub fn flush_to_lsm(&self) -> Result<(u64, DurableShardCheckpoint)> {
         self.shared.flush_to_lsm()
+    }
+
+    pub fn flush_for_shutdown(&self) -> Result<(u64, DurableShardCheckpoint)> {
+        self.shared.flush_for_shutdown()
     }
 
     /// Pin a read cut only between complete state-machine commands and validate
@@ -1111,8 +1162,16 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
                                 .advance_aux_for_non_aux_entry(log_id.index);
                             Ok(prior)
                         }
-                        Err(error) => Err(error),
+                        Err(error) => {
+                            self.shared
+                                .watermarks
+                                .advance_aux_for_non_aux_entry(log_id.index);
+                            Err(error)
+                        }
                         Ok(None) if req.expected_epoch != cur_epoch => {
+                            self.shared
+                                .watermarks
+                                .advance_aux_for_non_aux_entry(log_id.index);
                             Err(MetaDbError::EpochMismatch {
                                 shard_id: self.shared.shard_id,
                                 expected: req.expected_epoch,
@@ -1126,7 +1185,7 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
                                 leader: log_id.committed_leader_id().node_id,
                                 membership: codec::serialize_serde(&membership).unwrap_or_default(),
                                 descriptor: self.shared.handler.encode_descriptor_bytes(),
-                                aux_index: self.shared.watermarks.snapshot_values().1,
+                                aux_index: self.shared.watermarks.contiguous_aux_acked_index(),
                             });
                             // Seal only after every key and side effect of this command is in the memtable.
                             engine.begin_command();
@@ -1143,6 +1202,9 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
                                 Ok(bytes) => command.commit().map(|()| bytes),
                                 Err(error) => {
                                     drop(command);
+                                    self.shared
+                                        .watermarks
+                                        .advance_aux_for_non_aux_entry(log_id.index);
                                     Err(error)
                                 }
                             }
@@ -1378,14 +1440,17 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
         *self.shared.last_applied_hlc.write().unwrap() = snapshot.checkpoint.flushed_max_hlc;
         *self.shared.last_membership.write().unwrap() = meta.last_membership.clone();
 
-        self.shared
-            .handler
-            .on_snapshot_installed(&snapshot.checkpoint, &reopened);
         self.shared.watermarks.advance_state_flushed(snap_idx);
+        self.shared
+            .watermarks
+            .set_contiguous_aux_acked(snapshot.checkpoint.contiguous_aux_acked_index);
         self.shared
             .watermarks
             .advance_aux_outbox_durable(snapshot.checkpoint.contiguous_aux_acked_index);
         self.shared.watermarks.advance_last_snapshot(snap_idx);
+        self.shared
+            .handler
+            .on_snapshot_installed(&snapshot.checkpoint, &reopened);
 
         // Persist in `raft/snapshots/snap_<S>` so `get_current_snapshot` returns it on restart!
         let snaps_root = self.shared.shard_dir.join("raft/snapshots");

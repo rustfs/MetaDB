@@ -7,6 +7,12 @@ pub const RESTART_INTERVAL: usize = 16;
 
 pub const ENTRY_TAG_VALUE: u8 = 0x01;
 pub const ENTRY_TAG_TOMBSTONE: u8 = 0x02;
+/// Extended tags carrying an explicit `u32 LE` unshared key length when `unshared > u16::MAX`
+/// (up to `MAX_BLOCK_KEY_BYTES`, covering `[0x0D][txn_id: 16B][MetaKey]` lease pre-image keys).
+pub const ENTRY_TAG_EXT_VALUE: u8 = 0x03;
+pub const ENTRY_TAG_EXT_TOMBSTONE: u8 = 0x04;
+/// Maximum permitted total/unshared key length in an SSTable `DataBlock` (`u16::MAX + 17` bytes).
+pub const MAX_BLOCK_KEY_BYTES: usize = (u16::MAX as usize) + 17;
 
 /// Decoded entry yielded from an SSTable `DataBlock`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,12 +61,15 @@ impl DataBlockBuilder {
         &self.last_key
     }
 
-    /// Appends a sorted `(key, value)` entry to the block, rejecting keys whose unshared suffix exceeds `u16::MAX`.
+    /// Appends a sorted `(key, value)` entry to the block.
+    /// Keys with `unshared <= u16::MAX` use canonical v1 `0x01`/`0x02` tags; keys with
+    /// `unshared > u16::MAX` (up to `u32::MAX`) use extended `0x03`/`0x04` tags.
     pub fn add(&mut self, key: &[u8], value: &BlockEntryValue) -> Result<()> {
-        debug_assert!(
-            self.entries_count == 0 || key > self.last_key.as_slice(),
-            "DataBlock keys must be strictly ascending"
-        );
+        if self.entries_count > 0 && key <= self.last_key.as_slice() {
+            return Err(MetaDbError::CodecError(
+                "DataBlock keys must be strictly ascending".to_string(),
+            ));
+        }
 
         let mut shared = 0usize;
         if self.counter < RESTART_INTERVAL {
@@ -69,30 +78,66 @@ impl DataBlockBuilder {
                 shared += 1;
             }
         } else {
-            self.restarts.push(self.buf.len() as u32);
+            let restart_off = u32::try_from(self.buf.len()).map_err(|_| {
+                MetaDbError::CodecError("DataBlock buffer exceeds u32::MAX".to_string())
+            })?;
+            self.restarts.push(restart_off);
             self.counter = 0;
         }
 
+        if key.len() > MAX_BLOCK_KEY_BYTES {
+            return Err(MetaDbError::CodecError(format!(
+                "DataBlock key length {} exceeds MAX_BLOCK_KEY_BYTES ({})",
+                key.len(),
+                MAX_BLOCK_KEY_BYTES
+            )));
+        }
         let unshared = key.len() - shared;
-        let unshared_u16 = u16::try_from(unshared).map_err(|_| {
+        let unshared_u32 = u32::try_from(unshared).map_err(|_| {
             MetaDbError::CodecError(format!(
-                "DataBlock unshared key suffix length {} exceeds u16::MAX",
+                "DataBlock unshared key suffix length {} exceeds u32::MAX",
                 unshared
             ))
         })?;
+
         self.buf.extend_from_slice(&(shared as u16).to_le_bytes());
-        self.buf.extend_from_slice(&unshared_u16.to_le_bytes());
-        match value {
-            BlockEntryValue::Value(v) => {
-                self.buf.push(ENTRY_TAG_VALUE);
-                self.buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                self.buf.extend_from_slice(&key[shared..]);
-                self.buf.extend_from_slice(v);
+        if let Ok(unshared_u16) = u16::try_from(unshared) {
+            self.buf.extend_from_slice(&unshared_u16.to_le_bytes());
+            match value {
+                BlockEntryValue::Value(v) => {
+                    let val_len = u32::try_from(v.len()).map_err(|_| {
+                        MetaDbError::CodecError("DataBlock value length exceeds u32::MAX".into())
+                    })?;
+                    self.buf.push(ENTRY_TAG_VALUE);
+                    self.buf.extend_from_slice(&val_len.to_le_bytes());
+                    self.buf.extend_from_slice(&key[shared..]);
+                    self.buf.extend_from_slice(v);
+                }
+                BlockEntryValue::PhysicalTombstone => {
+                    self.buf.push(ENTRY_TAG_TOMBSTONE);
+                    self.buf.extend_from_slice(&0u32.to_le_bytes());
+                    self.buf.extend_from_slice(&key[shared..]);
+                }
             }
-            BlockEntryValue::PhysicalTombstone => {
-                self.buf.push(ENTRY_TAG_TOMBSTONE);
-                self.buf.extend_from_slice(&0u32.to_le_bytes());
-                self.buf.extend_from_slice(&key[shared..]);
+        } else {
+            self.buf.extend_from_slice(&u16::MAX.to_le_bytes());
+            match value {
+                BlockEntryValue::Value(v) => {
+                    let val_len = u32::try_from(v.len()).map_err(|_| {
+                        MetaDbError::CodecError("DataBlock value length exceeds u32::MAX".into())
+                    })?;
+                    self.buf.push(ENTRY_TAG_EXT_VALUE);
+                    self.buf.extend_from_slice(&val_len.to_le_bytes());
+                    self.buf.extend_from_slice(&unshared_u32.to_le_bytes());
+                    self.buf.extend_from_slice(&key[shared..]);
+                    self.buf.extend_from_slice(v);
+                }
+                BlockEntryValue::PhysicalTombstone => {
+                    self.buf.push(ENTRY_TAG_EXT_TOMBSTONE);
+                    self.buf.extend_from_slice(&0u32.to_le_bytes());
+                    self.buf.extend_from_slice(&unshared_u32.to_le_bytes());
+                    self.buf.extend_from_slice(&key[shared..]);
+                }
             }
         }
 
@@ -124,7 +169,7 @@ pub struct DataBlock {
 }
 
 impl DataBlock {
-    /// Parses a raw on-disk block and validates its trailing CRC32C checksum.
+    /// Parses a raw on-disk block and validates its trailing CRC32C checksum and restart table invariants.
     pub fn from_raw_checked(raw: &[u8]) -> Result<Self> {
         let body = verify_crc32c_le(raw, "SSTable DataBlock")?;
         if body.len() < 4 {
@@ -143,15 +188,34 @@ impl DataBlock {
             ));
         }
         let entries_end = body.len() - restarts_bytes;
+        if entries_end == 0 {
+            return Err(MetaDbError::CodecError(
+                "DataBlock has zero entry bytes".to_string(),
+            ));
+        }
         let mut restarts = Vec::with_capacity(num_restarts);
+        let mut prev_restart: Option<u32> = None;
         for i in 0..num_restarts {
             let off = entries_end + i * 4;
             let r = u32::from_le_bytes(body[off..off + 4].try_into().unwrap());
-            if (r as usize) > entries_end {
+            if i == 0 && r != 0 {
+                return Err(MetaDbError::CodecError(
+                    "DataBlock first restart offset must be 0".to_string(),
+                ));
+            }
+            if (r as usize) >= entries_end {
                 return Err(MetaDbError::CodecError(
                     "DataBlock restart offset out of range".to_string(),
                 ));
             }
+            if let Some(prev) = prev_restart {
+                if r <= prev {
+                    return Err(MetaDbError::CodecError(
+                        "DataBlock restart offsets must be strictly ascending".to_string(),
+                    ));
+                }
+            }
+            prev_restart = Some(r);
             restarts.push(r);
         }
         Ok(Self {
@@ -166,22 +230,9 @@ impl DataBlock {
         self.data.len() + self.restarts.len() * 4
     }
 
-    /// Decodes all `(key, BlockEntryValue)` pairs in ascending order or starting from a restart point.
+    /// Point lookup using $O(\log R)$ zero-allocation restart-key binary search.
     pub fn get(&self, target_key: &[u8]) -> Result<Option<BlockEntryValue>> {
-        // Binary search restart points (each restart point has shared_prefix_len == 0).
-        let mut left = 0usize;
-        let mut right = self.restarts.len();
-        while left + 1 < right {
-            let mid = left + (right - left) / 2;
-            let restart_key = self.decode_restart_key(self.restarts[mid] as usize)?;
-            if restart_key.as_slice() <= target_key {
-                left = mid;
-            } else {
-                right = mid;
-            }
-        }
-
-        let mut offset = self.restarts[left] as usize;
+        let mut offset = self.restart_offset_for(target_key)?;
         let mut current_key = Vec::new();
         while offset < self.entries_end {
             let val = self.decode_next_entry(&mut offset, &mut current_key)?;
@@ -202,19 +253,7 @@ impl DataBlock {
         end_key: &[u8],
         out: &mut Vec<(Vec<u8>, BlockEntryValue)>,
     ) -> Result<()> {
-        let mut left = 0usize;
-        let mut right = self.restarts.len();
-        while left + 1 < right {
-            let mid = left + (right - left) / 2;
-            let restart_key = self.decode_restart_key(self.restarts[mid] as usize)?;
-            if restart_key.as_slice() <= start_key {
-                left = mid;
-            } else {
-                right = mid;
-            }
-        }
-
-        let mut offset = self.restarts[left] as usize;
+        let mut offset = self.restart_offset_for(start_key)?;
         let mut current_key = Vec::new();
         while offset < self.entries_end {
             let val = self.decode_next_entry(&mut offset, &mut current_key)?;
@@ -239,8 +278,8 @@ impl DataBlock {
         let mut right = self.restarts.len();
         while left + 1 < right {
             let mid = left + (right - left) / 2;
-            let restart_key = self.decode_restart_key(self.restarts[mid] as usize)?;
-            if restart_key.as_slice() <= start_key {
+            let restart_key = self.decode_restart_key_slice(self.restarts[mid] as usize)?;
+            if restart_key <= start_key {
                 left = mid;
             } else {
                 right = mid;
@@ -275,21 +314,47 @@ impl DataBlock {
         Ok(out)
     }
 
-    fn decode_restart_key(&self, offset: usize) -> Result<Vec<u8>> {
+    fn decode_restart_key_slice(&self, offset: usize) -> Result<&[u8]> {
         if offset + 9 > self.entries_end {
             return Err(MetaDbError::CodecError(
                 "truncated DataBlock restart header".to_string(),
             ));
         }
         let shared = u16::from_le_bytes(self.data[offset..offset + 2].try_into().unwrap()) as usize;
-        let unshared =
-            u16::from_le_bytes(self.data[offset + 2..offset + 4].try_into().unwrap()) as usize;
-        if shared != 0 || offset + 9 + unshared > self.entries_end {
+        let tag = self.data[offset + 4];
+        let (hdr_len, unshared) = match tag {
+            ENTRY_TAG_VALUE | ENTRY_TAG_TOMBSTONE => {
+                let u = u16::from_le_bytes(self.data[offset + 2..offset + 4].try_into().unwrap())
+                    as usize;
+                (9usize, u)
+            }
+            ENTRY_TAG_EXT_VALUE | ENTRY_TAG_EXT_TOMBSTONE => {
+                if offset + 13 > self.entries_end {
+                    return Err(MetaDbError::CodecError(
+                        "truncated extended DataBlock restart header".to_string(),
+                    ));
+                }
+                let u = u32::from_le_bytes(self.data[offset + 9..offset + 13].try_into().unwrap())
+                    as usize;
+                (13usize, u)
+            }
+            other => {
+                return Err(MetaDbError::CodecError(format!(
+                    "unknown DataBlock entry tag 0x{:02x}",
+                    other
+                )))
+            }
+        };
+        let key_end = offset
+            .checked_add(hdr_len)
+            .and_then(|p| p.checked_add(unshared))
+            .ok_or_else(|| MetaDbError::CodecError("DataBlock restart key overflow".to_string()))?;
+        if shared != 0 || key_end > self.entries_end {
             return Err(MetaDbError::CodecError(
                 "corrupted DataBlock restart key".to_string(),
             ));
         }
-        Ok(self.data[offset + 9..offset + 9 + unshared].to_vec())
+        Ok(&self.data[offset + hdr_len..key_end])
     }
 
     fn decode_next_entry(
@@ -304,14 +369,44 @@ impl DataBlock {
             ));
         }
         let shared = u16::from_le_bytes(self.data[pos..pos + 2].try_into().unwrap()) as usize;
-        let unshared = u16::from_le_bytes(self.data[pos + 2..pos + 4].try_into().unwrap()) as usize;
+        let raw_unshared_u16 =
+            u16::from_le_bytes(self.data[pos + 2..pos + 4].try_into().unwrap()) as usize;
         let tag = self.data[pos + 4];
         let val_len = u32::from_le_bytes(self.data[pos + 5..pos + 9].try_into().unwrap()) as usize;
 
-        let end = pos
-            .checked_add(9)
-            .and_then(|p| p.checked_add(unshared))
-            .and_then(|p| p.checked_add(val_len))
+        let (hdr_len, unshared, is_tombstone) = match tag {
+            ENTRY_TAG_VALUE => (9usize, raw_unshared_u16, false),
+            ENTRY_TAG_TOMBSTONE => (9usize, raw_unshared_u16, true),
+            ENTRY_TAG_EXT_VALUE | ENTRY_TAG_EXT_TOMBSTONE => {
+                if pos + 13 > self.entries_end {
+                    return Err(MetaDbError::CodecError(
+                        "truncated extended DataBlock entry header".to_string(),
+                    ));
+                }
+                let ext_unshared =
+                    u32::from_le_bytes(self.data[pos + 9..pos + 13].try_into().unwrap()) as usize;
+                (13usize, ext_unshared, tag == ENTRY_TAG_EXT_TOMBSTONE)
+            }
+            other => {
+                return Err(MetaDbError::CodecError(format!(
+                    "unknown DataBlock entry tag 0x{:02x}",
+                    other
+                )))
+            }
+        };
+
+        if is_tombstone && val_len != 0 {
+            return Err(MetaDbError::CodecError(
+                "corrupted DataBlock tombstone entry with non-zero value length".to_string(),
+            ));
+        }
+
+        let key_start = pos + hdr_len;
+        let val_start = key_start
+            .checked_add(unshared)
+            .ok_or_else(|| MetaDbError::CodecError("DataBlock key overflow".to_string()))?;
+        let end = val_start
+            .checked_add(val_len)
             .ok_or_else(|| MetaDbError::CodecError("DataBlock entry overflow".to_string()))?;
         if shared > current_key.len() || end > self.entries_end {
             return Err(MetaDbError::CodecError(
@@ -320,17 +415,14 @@ impl DataBlock {
         }
 
         current_key.truncate(shared);
-        current_key.extend_from_slice(&self.data[pos + 9..pos + 9 + unshared]);
-        let val_slice = &self.data[pos + 9 + unshared..end];
+        current_key.extend_from_slice(&self.data[key_start..val_start]);
+        let val_slice = &self.data[val_start..end];
         *offset = end;
 
-        match tag {
-            ENTRY_TAG_VALUE => Ok(BlockEntryValue::Value(val_slice.to_vec())),
-            ENTRY_TAG_TOMBSTONE => Ok(BlockEntryValue::PhysicalTombstone),
-            other => Err(MetaDbError::CodecError(format!(
-                "unknown DataBlock entry tag 0x{:02x}",
-                other
-            ))),
+        if is_tombstone {
+            Ok(BlockEntryValue::PhysicalTombstone)
+        } else {
+            Ok(BlockEntryValue::Value(val_slice.to_vec()))
         }
     }
 }

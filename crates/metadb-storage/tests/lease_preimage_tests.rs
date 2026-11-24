@@ -42,7 +42,7 @@ fn leased_point_read_keeps_the_first_capture_after_a_newer_collapse() {
         42,
         start,
         Instant::now() + Duration::from_secs(30),
-        &[key.clone()],
+        std::slice::from_ref(&key),
         &[(key.clone(), start, MvccValue::Value(b"v0".to_vec()))],
     );
     engine.apply_committed_put(key.clone(), b"v1".to_vec(), later, 2);
@@ -63,7 +63,7 @@ fn leased_point_read_keeps_the_first_capture_after_a_newer_collapse() {
         42,
         start,
         Instant::now() + Duration::from_secs(30),
-        &[key.clone()],
+        std::slice::from_ref(&key),
         &[(key.clone(), start, MvccValue::Value(b"v1".to_vec()))],
     );
     assert_eq!(
@@ -210,14 +210,14 @@ fn releasing_one_holder_keeps_the_other_capture_and_checkpoint_keeps_live_rows()
         1,
         start_a,
         until,
-        &[key.clone()],
+        std::slice::from_ref(&key),
         &[(key.clone(), start_a, MvccValue::Value(b"a".to_vec()))],
     );
     engine.mvcc().snapshot_registry().renew_lease_hold(
         2,
         start_b,
         until,
-        &[key.clone()],
+        std::slice::from_ref(&key),
         &[(key.clone(), start_b, MvccValue::Value(b"b".to_vec()))],
     );
     engine.apply_committed_put(key.clone(), b"c".to_vec(), HlcTimestamp::new(3_000, 0), 3);
@@ -327,7 +327,7 @@ fn releasing_the_hold_stops_serving_the_capture() {
         3,
         start,
         Instant::now() + Duration::from_secs(30),
-        &[key.clone()],
+        std::slice::from_ref(&key),
         &[(key.clone(), start, MvccValue::Value(b"v0".to_vec()))],
     );
     engine.apply_committed_put(key.clone(), b"v1".to_vec(), HlcTimestamp::new(2_000, 0), 2);
@@ -351,7 +351,7 @@ fn flush_keeps_the_start_capture_when_the_same_prefix_has_a_newer_body() {
         11,
         start,
         Instant::now() + Duration::from_secs(30),
-        &[key.clone()],
+        std::slice::from_ref(&key),
         &[(key.clone(), start, MvccValue::Value(b"v0".to_vec()))],
     );
     let storage_key = lease_preimage_key(11, &key);
@@ -397,7 +397,7 @@ fn pinned_generation_compaction_keeps_the_cut_and_the_open_lease_capture() {
         12,
         start,
         Instant::now() + Duration::from_secs(30),
-        &[key.clone()],
+        std::slice::from_ref(&key),
         &[(key.clone(), start, MvccValue::Value(b"v0".to_vec()))],
     );
     flush(&engine, 1, flushed);

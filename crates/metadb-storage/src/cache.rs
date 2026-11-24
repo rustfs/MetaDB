@@ -1,6 +1,6 @@
-//! 16-shard bounded LRU `BlockCache` for parsed SSTable `DataBlock`s.
+//! 16-shard $O(1)$ bounded LRU `BlockCache` for parsed SSTable `DataBlock`s.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
@@ -23,11 +23,23 @@ struct ScopedCacheKey {
     block: BlockCacheKey,
 }
 
+struct LruNode {
+    key: ScopedCacheKey,
+    block: Option<Arc<DataBlock>>,
+    bytes: usize,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+/// $O(1)$ slab-backed doubly-linked list LRU shard.
 struct LruShard {
     capacity_bytes: usize,
     used_bytes: usize,
-    order: VecDeque<ScopedCacheKey>,
-    entries: HashMap<ScopedCacheKey, Arc<DataBlock>>,
+    nodes: Vec<LruNode>,
+    free_list: Vec<usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    index: HashMap<ScopedCacheKey, usize>,
 }
 
 impl LruShard {
@@ -35,16 +47,55 @@ impl LruShard {
         Self {
             capacity_bytes: capacity_bytes.max(4096),
             used_bytes: 0,
-            order: VecDeque::new(),
-            entries: HashMap::new(),
+            nodes: Vec::new(),
+            free_list: Vec::new(),
+            head: None,
+            tail: None,
+            index: HashMap::new(),
         }
     }
 
+    fn detach(&mut self, idx: usize) {
+        let prev = self.nodes[idx].prev.take();
+        let next = self.nodes[idx].next.take();
+        if let Some(p) = prev {
+            self.nodes[p].next = next;
+        } else {
+            self.head = next;
+        }
+        if let Some(n) = next {
+            self.nodes[n].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+    }
+
+    fn push_back(&mut self, idx: usize) {
+        self.nodes[idx].prev = self.tail;
+        self.nodes[idx].next = None;
+        if let Some(t) = self.tail {
+            self.nodes[t].next = Some(idx);
+        } else {
+            self.head = Some(idx);
+        }
+        self.tail = Some(idx);
+    }
+
+    fn remove_idx(&mut self, idx: usize) {
+        self.detach(idx);
+        let key = self.nodes[idx].key;
+        self.index.remove(&key);
+        self.used_bytes = self.used_bytes.saturating_sub(self.nodes[idx].bytes);
+        self.nodes[idx].block = None;
+        self.free_list.push(idx);
+    }
+
     fn get(&mut self, key: &ScopedCacheKey) -> Option<Arc<DataBlock>> {
-        let block = self.entries.get(key)?.clone();
-        if self.order.back() != Some(key) {
-            self.order.retain(|k| k != key);
-            self.order.push_back(*key);
+        let &idx = self.index.get(key)?;
+        let block = self.nodes[idx].block.as_ref()?.clone();
+        if self.tail != Some(idx) {
+            self.detach(idx);
+            self.push_back(idx);
         }
         Some(block)
     }
@@ -54,21 +105,38 @@ impl LruShard {
         if block_bytes > self.capacity_bytes {
             return;
         }
-        if let Some(old) = self.entries.remove(&key) {
-            self.used_bytes = self.used_bytes.saturating_sub(old.byte_size().max(64));
-            self.order.retain(|k| k != &key);
+        if let Some(&existing_idx) = self.index.get(&key) {
+            self.remove_idx(existing_idx);
         }
         while self.used_bytes + block_bytes > self.capacity_bytes {
-            let Some(evict_key) = self.order.pop_front() else {
+            let Some(evict_idx) = self.head else {
                 break;
             };
-            if let Some(evicted) = self.entries.remove(&evict_key) {
-                self.used_bytes = self.used_bytes.saturating_sub(evicted.byte_size().max(64));
-            }
+            self.remove_idx(evict_idx);
         }
+        let idx = if let Some(reused) = self.free_list.pop() {
+            self.nodes[reused] = LruNode {
+                key,
+                block: Some(block),
+                bytes: block_bytes,
+                prev: None,
+                next: None,
+            };
+            reused
+        } else {
+            let idx = self.nodes.len();
+            self.nodes.push(LruNode {
+                key,
+                block: Some(block),
+                bytes: block_bytes,
+                prev: None,
+                next: None,
+            });
+            idx
+        };
         self.used_bytes += block_bytes;
-        self.order.push_back(key);
-        self.entries.insert(key, block);
+        self.push_back(idx);
+        self.index.insert(key, idx);
     }
 }
 

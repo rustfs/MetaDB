@@ -27,27 +27,50 @@ impl JumboIsolationPlanner {
             };
         }
 
-        let mut load_by_node: BTreeMap<NodeId, (usize, usize)> = available_nodes
+        let mut load_by_node: BTreeMap<NodeId, (usize, usize, usize)> = available_nodes
             .iter()
-            .map(|&n| (n, (0usize, 0usize)))
+            .map(|&n| (n, (0usize, 0usize, 0usize)))
             .collect();
 
         for r in all_routes {
             if r.shard_id == jumbo_shard_id {
                 continue;
             }
-            if let Some(entry) = load_by_node.get_mut(&r.leader_node) {
-                if matches!(r.health_state, ShardHealthState::JumboIsolated { .. }) {
-                    entry.0 += 1;
-                } else {
-                    entry.1 += 1;
+            let is_jumbo = matches!(r.health_state, ShardHealthState::JumboIsolated { .. });
+            let mut counted_voter = false;
+            for (&nid, &(_, is_voter)) in &r.peers {
+                if !is_voter {
+                    continue;
+                }
+                counted_voter = true;
+                if let Some(entry) = load_by_node.get_mut(&nid) {
+                    if is_jumbo {
+                        entry.0 += 1;
+                    } else {
+                        entry.1 += 1;
+                    }
+                    if nid == r.leader_node {
+                        entry.2 += 1;
+                    }
+                }
+            }
+            if !counted_voter {
+                if let Some(entry) = load_by_node.get_mut(&r.leader_node) {
+                    if is_jumbo {
+                        entry.0 += 1;
+                    } else {
+                        entry.1 += 1;
+                    }
+                    entry.2 += 1;
                 }
             }
         }
 
         let dedicated_node = load_by_node
             .into_iter()
-            .min_by_key(|&(_, (jumbo_cnt, normal_cnt))| (jumbo_cnt, normal_cnt))
+            .min_by_key(|&(_, (jumbo_cnt, voter_cnt, leader_cnt))| {
+                (jumbo_cnt, voter_cnt, leader_cnt)
+            })
             .map(|(nid, _)| nid)
             .unwrap_or(current_leader);
 
