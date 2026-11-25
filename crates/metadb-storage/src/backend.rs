@@ -176,12 +176,27 @@ impl LsmStorageBackend {
             .create(true)
             .truncate(false)
             .open(&lock_path)?;
-        lock_file.try_lock().map_err(|e| {
-            MetaDbError::StorageIoError(format!(
+        let mut lock_err = None;
+        for attempt in 0..30 {
+            match lock_file.try_lock() {
+                Ok(()) => {
+                    lock_err = None;
+                    break;
+                }
+                Err(e) => {
+                    lock_err = Some(e);
+                    if attempt < 29 {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        if let Some(e) = lock_err {
+            return Err(MetaDbError::StorageIoError(format!(
                 "failed to acquire exclusive lock on {:?}: {}",
                 lock_path, e
-            ))
-        })?;
+            )));
+        }
         let (manifest, recovered) = if recover {
             ManifestLog::open_or_create(&lsm_dir)?
         } else {
@@ -275,6 +290,7 @@ impl LsmStorageBackend {
             let level_bytes: u64 = v.levels[src_level].iter().map(|r| r.meta().file_size).sum();
             if level_bytes > max_bytes && !v.levels[src_level].is_empty() {
                 self.promote_level(src_level, src_level + 1)?;
+                metadb_core::code_probe("probe.storage.leveled_compaction_ran");
             }
         }
         Ok(())
@@ -305,18 +321,38 @@ impl LsmStorageBackend {
             .clone();
         let mut union_min = seed.meta().min_key.clone();
         let mut union_max = seed.meta().max_key.clone();
+        let mut src_inputs: Vec<Arc<SstableReader>> = vec![seed];
         let mut dst_inputs: Vec<Arc<SstableReader>> = Vec::new();
-        for sst in &base_version.levels[dst_level] {
-            if sst.meta().max_key >= union_min && sst.meta().min_key <= union_max {
-                union_min = union_min.min(sst.meta().min_key.clone());
-                union_max = union_max.max(sst.meta().max_key.clone());
-                dst_inputs.push(sst.clone());
+        // Expand `[union_min, union_max]` across `src_level` and `dst_level` until fixed point so
+        // rewriting merged runs into `dst_level` never overlaps an untouched `dst_level` SSTable.
+        loop {
+            let mut added_any = false;
+            let dst_ids: HashSet<u64> = dst_inputs.iter().map(|r| r.meta().file_id).collect();
+            for sst in &base_version.levels[dst_level] {
+                if !dst_ids.contains(&sst.meta().file_id)
+                    && sst.meta().max_key >= union_min
+                    && sst.meta().min_key <= union_max
+                {
+                    union_min = union_min.min(sst.meta().min_key.clone());
+                    union_max = union_max.max(sst.meta().max_key.clone());
+                    dst_inputs.push(sst.clone());
+                    added_any = true;
+                }
             }
-        }
-        let mut src_inputs: Vec<Arc<SstableReader>> = Vec::new();
-        for sst in &base_version.levels[src_level] {
-            if sst.meta().max_key >= union_min && sst.meta().min_key <= union_max {
-                src_inputs.push(sst.clone());
+            let src_ids: HashSet<u64> = src_inputs.iter().map(|r| r.meta().file_id).collect();
+            for sst in &base_version.levels[src_level] {
+                if !src_ids.contains(&sst.meta().file_id)
+                    && sst.meta().max_key >= union_min
+                    && sst.meta().min_key <= union_max
+                {
+                    union_min = union_min.min(sst.meta().min_key.clone());
+                    union_max = union_max.max(sst.meta().max_key.clone());
+                    src_inputs.push(sst.clone());
+                    added_any = true;
+                }
+            }
+            if !added_any {
+                break;
             }
         }
         src_inputs.sort_by(|a, b| a.meta().min_key.cmp(&b.meta().min_key));

@@ -126,7 +126,9 @@ impl ReadIndexBatcher {
             tokio::spawn(async move {
                 loop {
                     tokio::task::yield_now().await;
-                    if state.lock().await.pending_waiters.len() > 1 {
+                    if state.lock().await.pending_waiters.len() > 1
+                        || metadb_core::buggify("raft.read_index_coalesce_yield")
+                    {
                         tokio::time::sleep(MICRO_BATCH_WINDOW).await;
                     }
 
@@ -138,6 +140,9 @@ impl ReadIndexBatcher {
                         }
                         std::mem::take(&mut guard.pending_waiters)
                     };
+                    if waiters.len() > 1 {
+                        metadb_core::code_probe("probe.raft.read_index_coalesced");
+                    }
 
                     let res = match raft.ensure_linearizable(ReadPolicy::ReadIndex).await {
                         Ok(read_log_id) => Ok(read_log_id.index()),

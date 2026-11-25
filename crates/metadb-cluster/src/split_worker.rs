@@ -274,6 +274,34 @@ impl RaftShardSplitWorker {
             conf_ver: parent_group.current_epoch().conf_ver,
             version: target_version.max(parent_group.current_epoch().version),
         };
+        let peer_addrs: BTreeMap<u64, String> = parent_route
+            .peers
+            .iter()
+            .filter(|(_, (_, is_voter))| *is_voter)
+            .map(|(&nid, (addr, _))| (nid, addr.clone()))
+            .collect();
+
+        // Pre-flight voter reachability check BEFORE fencing `S_parent`: a multi-voter child
+        // shard must onboard all parent voters (`add_learners_and_promote_voters`), so deferring
+        // cleanly while any voter is partitioned avoids fencing `S_parent` or churning epochs!
+        if !already_fenced && peer_addrs.len() > 1 {
+            let local_id = host.node_id();
+            for (&peer_id, peer_addr) in &peer_addrs {
+                if peer_id == local_id {
+                    continue;
+                }
+                if host
+                    .channel_pool()
+                    .probe_transfer_leader(peer_addr, parent_route.shard_id, peer_id, 0)
+                    .await
+                    .is_err()
+                {
+                    return Err(MetaDbError::SplitDeferred(format!(
+                        "peer voter {peer_id} ({peer_addr}) unreachable for online split"
+                    )));
+                }
+            }
+        }
 
         // Atomically fence `S_parent` to `left_range` + `new_parent_epoch` BEFORE flushing & scanning
         // so zero concurrent writes or `AttrDelta`s can land in `right_range` on `S_parent` during split!
@@ -298,12 +326,6 @@ impl RaftShardSplitWorker {
         Self::bail_crash(crash_at, SplitCrashPoint::AfterFlush)?;
 
         // Stage B.1: Record `PendingChildBoot` in `NODE_SHARD_REGISTRY` (`Resolution B15`).
-        let peer_addrs: BTreeMap<u64, String> = parent_route
-            .peers
-            .iter()
-            .filter(|(_, (_, is_voter))| *is_voter)
-            .map(|(&nid, (addr, _))| (nid, addr.clone()))
-            .collect();
         host.record_registry_state(
             child_shard_id,
             RegistryShardState::PendingChildBoot {
@@ -529,23 +551,35 @@ impl RaftShardSplitWorker {
         Self::bail_crash(crash_at, SplitCrashPoint::AfterChildDirRename)?;
 
         // Boot `S_child` OpenRaft group and transition `NODE_SHARD_REGISTRY` -> `Active`.
+        // When resuming an interrupted split whose `S_child` group is already running in `host`,
+        // reuse the exact `Arc<TxStateMachineHandler>` bound to `existing.state_machine()` so
+        // `ReplicatedAttrAggregator` and `ShardAuxOutbox` remain unified across retries!
         let child_epoch = ShardEpoch {
             conf_ver: 1,
             version: target_version,
         };
-        let child_wm = Arc::new(ShardWatermarkTracker::default());
-        let child_handler = Arc::new(TxStateMachineHandler::new(
-            child_shard_id,
-            child_epoch,
-            right_range.clone(),
-            child_wm.clone(),
-        ));
-        child_handler.set_control_plane_validator(Arc::new(
-            crate::replicated_control::validate_replicated_record,
-        ));
-        let child_group = if let Some(existing) = host.get_group(child_shard_id) {
-            existing
+        let (child_group, child_handler) = if let Some(existing) = host.get_group(child_shard_id) {
+            let any_handler: Arc<dyn std::any::Any + Send + Sync> =
+                existing.state_machine().handler().clone();
+            let reused = any_handler
+                .downcast::<TxStateMachineHandler>()
+                .map_err(|_| {
+                    MetaDbError::ShardRoutingError(format!(
+                        "existing child shard {child_shard_id} has non-tx state machine handler"
+                    ))
+                })?;
+            (existing, reused)
         } else {
+            let child_wm = Arc::new(ShardWatermarkTracker::default());
+            let fresh_handler = Arc::new(TxStateMachineHandler::new(
+                child_shard_id,
+                child_epoch,
+                right_range.clone(),
+                child_wm.clone(),
+            ));
+            fresh_handler.set_control_plane_validator(Arc::new(
+                crate::replicated_control::validate_replicated_record,
+            ));
             let started = ShardRaftGroup::start(
                 child_shard_id,
                 host.node_id(),
@@ -553,7 +587,7 @@ impl RaftShardSplitWorker {
                 host.block_cache().clone(),
                 lsm_config,
                 raft_opts,
-                child_handler.clone(),
+                fresh_handler.clone(),
                 child_wm,
                 host.clock().clone(),
                 host.router(),
@@ -561,7 +595,7 @@ impl RaftShardSplitWorker {
             )
             .await?;
             host.register_running_group(started.clone());
-            started
+            (started, fresh_handler)
         };
 
         if peer_addrs.len() <= 1 {
@@ -655,6 +689,7 @@ impl RaftShardSplitWorker {
         parent_group
             .propose(parent_group.current_epoch(), host.clock().now(), payload)
             .await?;
+        metadb_core::code_probe("probe.cluster.online_split_completed");
         Self::bail_crash(crash_at, SplitCrashPoint::AfterParentKeyDelete)?;
 
         let _ = parent_handler;

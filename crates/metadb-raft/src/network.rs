@@ -1,9 +1,10 @@
 //! Multiplexed `tonic` gRPC transport (`RaftTransportService`) for Multi-Raft shard groups.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use openraft::async_runtime::watch::WatchReceiver;
@@ -120,6 +121,46 @@ pub trait LocalShardControlHook: Send + Sync {
     ) -> std::result::Result<(), MetaDbError>;
 }
 
+/// Classification of outbound wire RPCs observed by [`NetworkChaosHook`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcWireKind {
+    AppendEntries,
+    Vote,
+    InstallSnapshot,
+    TransferLeader,
+    ClientWrite,
+    ControlPlane,
+}
+
+/// Fault-injection decision returned before sending an outbound RPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireAction {
+    Allow,
+    Delay(Duration),
+    DropBeforeSend(&'static str),
+}
+
+/// Deterministic or seeded network fault-injection hook for multi-node simulation/chaos tests.
+pub trait NetworkChaosHook: Send + Sync {
+    fn before_rpc(
+        &self,
+        from_addr: &str,
+        to_addr: &str,
+        shard_id: ShardId,
+        kind: RpcWireKind,
+    ) -> WireAction;
+
+    fn after_rpc(
+        &self,
+        _from_addr: &str,
+        _to_addr: &str,
+        _shard_id: ShardId,
+        _kind: RpcWireKind,
+    ) -> bool {
+        false
+    }
+}
+
 /// Shared gRPC channel pool across Multi-Raft instances on the same host.
 #[derive(Clone, Default)]
 pub struct ChannelPool {
@@ -128,9 +169,78 @@ pub struct ChannelPool {
     security: Arc<RwLock<TransportSecurity>>,
     role: Arc<RwLock<Option<metadb_security::RolePresentation>>>,
     local_control_hooks: Arc<RwLock<HashMap<String, Arc<dyn LocalShardControlHook>>>>,
+    local_addr: Arc<RwLock<String>>,
+    has_chaos_hook: Arc<AtomicBool>,
+    chaos_hook: Arc<RwLock<Option<Arc<dyn NetworkChaosHook>>>>,
 }
 
 impl ChannelPool {
+    /// Installs a simulation/chaos network fault hook and binds `local_addr` as the sender identity.
+    pub fn set_network_chaos_hook(
+        &self,
+        local_addr: impl Into<String>,
+        hook: Option<Arc<dyn NetworkChaosHook>>,
+    ) {
+        *self.local_addr.write().unwrap() = local_addr.into();
+        let active = hook.is_some();
+        *self.chaos_hook.write().unwrap() = hook;
+        self.has_chaos_hook.store(active, Ordering::Release);
+    }
+
+    pub(crate) async fn gate_before_rpc(
+        &self,
+        to_addr: &str,
+        shard_id: ShardId,
+        kind: RpcWireKind,
+    ) -> Result<(), io::Error> {
+        if !self.has_chaos_hook.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let hook = self.chaos_hook.read().unwrap().clone();
+        let Some(hook) = hook else {
+            return Ok(());
+        };
+        let from_addr = self.local_addr.read().unwrap().clone();
+        match hook.before_rpc(&from_addr, to_addr, shard_id, kind) {
+            WireAction::Allow => Ok(()),
+            WireAction::Delay(d) => {
+                metadb_core::code_probe("probe.raft.network_packet_delayed");
+                if !d.is_zero() {
+                    tokio::time::sleep(d).await;
+                }
+                Ok(())
+            }
+            WireAction::DropBeforeSend(reason) => {
+                metadb_core::code_probe("probe.raft.network_link_clogged");
+                Err(io::Error::new(io::ErrorKind::ConnectionRefused, reason))
+            }
+        }
+    }
+
+    pub(crate) fn gate_after_rpc(
+        &self,
+        to_addr: &str,
+        shard_id: ShardId,
+        kind: RpcWireKind,
+    ) -> Result<(), io::Error> {
+        if !self.has_chaos_hook.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let hook = self.chaos_hook.read().unwrap().clone();
+        let Some(hook) = hook else {
+            return Ok(());
+        };
+        let from_addr = self.local_addr.read().unwrap().clone();
+        if hook.after_rpc(&from_addr, to_addr, shard_id, kind) {
+            metadb_core::code_probe("probe.raft.network_reply_dropped");
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "simulated post-apply reply drop",
+            ));
+        }
+        Ok(())
+    }
+
     /// Registers an in-process control-plane hook for `addr` (used by in-process multi-voter tests).
     pub fn register_local_control_hook(&self, addr: String, hook: Arc<dyn LocalShardControlHook>) {
         self.local_control_hooks.write().unwrap().insert(addr, hook);
@@ -199,6 +309,11 @@ impl ChannelPool {
         shard_id: ShardId,
         request: &MetaDbRaftRequest,
     ) -> std::result::Result<MetaDbRaftResponse, MetaDbError> {
+        self.gate_before_rpc(addr, shard_id, RpcWireKind::ClientWrite)
+            .await
+            .map_err(|error| {
+                MetaDbError::RpcError(format!("client_write to leader {addr} blocked: {error}"))
+            })?;
         let channel = self.connect(addr).await.map_err(|error| {
             MetaDbError::RpcError(format!("connect to leader {addr} failed: {error}"))
         })?;
@@ -218,6 +333,12 @@ impl ChannelPool {
                 MetaDbError::RpcError(format!("client_write to leader {addr} failed: {error}"))
             })?
             .into_inner();
+        self.gate_after_rpc(addr, shard_id, RpcWireKind::ClientWrite)
+            .map_err(|error| {
+                MetaDbError::RpcError(format!(
+                    "client_write reply from leader {addr} dropped: {error}"
+                ))
+            })?;
         if !reply.error_message.is_empty() && reply.bincode_payload.is_empty() {
             return Err(MetaDbError::RpcError(reply.error_message));
         }
@@ -234,6 +355,11 @@ impl ChannelPool {
         target_node_id: u64,
         min_matched_index: u64,
     ) -> std::result::Result<ProbeTransferLeaderResponse, MetaDbError> {
+        self.gate_before_rpc(addr, shard_id, RpcWireKind::ControlPlane)
+            .await
+            .map_err(|error| {
+                MetaDbError::RpcError(format!("probe_transfer_leader to {addr} blocked: {error}"))
+            })?;
         let channel = self.connect(addr).await.map_err(|error| {
             MetaDbError::RpcError(format!("connect to transfer target {addr} failed: {error}"))
         })?;
@@ -252,6 +378,12 @@ impl ChannelPool {
                 MetaDbError::RpcError(format!("probe_transfer_leader to {addr} failed: {error}"))
             })?
             .into_inner();
+        self.gate_after_rpc(addr, shard_id, RpcWireKind::ControlPlane)
+            .map_err(|error| {
+                MetaDbError::RpcError(format!(
+                    "probe_transfer_leader reply from {addr} dropped: {error}"
+                ))
+            })?;
         Ok(reply)
     }
 
@@ -262,6 +394,11 @@ impl ChannelPool {
         addr: &str,
         req: OpenJoiningShardRequest,
     ) -> std::result::Result<(), MetaDbError> {
+        self.gate_before_rpc(addr, req.shard_id, RpcWireKind::ControlPlane)
+            .await
+            .map_err(|error| {
+                MetaDbError::RpcError(format!("open_joining_shard to {addr} blocked: {error}"))
+            })?;
         let local_hook = self.local_control_hooks.read().unwrap().get(addr).cloned();
         if let Some(hook) = local_hook {
             return hook.open_joining_shard(req).await;
@@ -370,6 +507,10 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
         let prev_log_id = rpc.prev_log_id;
         let last_log_id = rpc.entries.last().map(|e| e.log_id()).or(prev_log_id);
 
+        self.pool
+            .gate_before_rpc(&self.target_addr, self.shard_id, RpcWireKind::AppendEntries)
+            .await
+            .map_err(Self::unreachable)?;
         let ch = self
             .pool
             .connect(&self.target_addr)
@@ -390,6 +531,9 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
             .await
             .map_err(Self::unreachable)?
             .into_inner();
+        self.pool
+            .gate_after_rpc(&self.target_addr, self.shard_id, RpcWireKind::AppendEntries)
+            .map_err(Self::unreachable)?;
 
         if !reply.error_message.is_empty() {
             return Err(Self::unreachable(reply.error_message));
@@ -405,6 +549,10 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
         rpc: VoteRequest<MetaDbTypeConfig>,
         _option: RPCOption,
     ) -> Result<VoteResponse<MetaDbTypeConfig>, RPCError<MetaDbTypeConfig>> {
+        self.pool
+            .gate_before_rpc(&self.target_addr, self.shard_id, RpcWireKind::Vote)
+            .await
+            .map_err(Self::unreachable)?;
         let ch = self
             .pool
             .connect(&self.target_addr)
@@ -425,6 +573,9 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
             .await
             .map_err(Self::unreachable)?
             .into_inner();
+        self.pool
+            .gate_after_rpc(&self.target_addr, self.shard_id, RpcWireKind::Vote)
+            .map_err(Self::unreachable)?;
 
         if !reply.error_message.is_empty() {
             return Err(Self::unreachable(reply.error_message));
@@ -437,6 +588,14 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
         rpc: TransferLeaderRequest<MetaDbTypeConfig>,
         _option: RPCOption,
     ) -> Result<TransferLeaderResponse<MetaDbTypeConfig>, RPCError<MetaDbTypeConfig>> {
+        self.pool
+            .gate_before_rpc(
+                &self.target_addr,
+                self.shard_id,
+                RpcWireKind::TransferLeader,
+            )
+            .await
+            .map_err(Self::unreachable)?;
         let channel = self
             .pool
             .connect(&self.target_addr)
@@ -456,6 +615,13 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
             .await
             .map_err(Self::unreachable)?
             .into_inner();
+        self.pool
+            .gate_after_rpc(
+                &self.target_addr,
+                self.shard_id,
+                RpcWireKind::TransferLeader,
+            )
+            .map_err(Self::unreachable)?;
         if !reply.error_message.is_empty() {
             return Err(Self::unreachable(reply.error_message));
         }
@@ -469,6 +635,14 @@ impl RaftNetworkV2<MetaDbTypeConfig> for TonicRaftNetworkClient {
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<MetaDbTypeConfig>, StreamingError<MetaDbTypeConfig>> {
+        self.pool
+            .gate_before_rpc(
+                &self.target_addr,
+                self.shard_id,
+                RpcWireKind::InstallSnapshot,
+            )
+            .await
+            .map_err(Self::streaming_unreachable)?;
         let ch = self
             .pool
             .connect(&self.target_addr)
@@ -821,5 +995,239 @@ impl RaftTransportService for MultiRaftTransportServer {
             last_applied_index,
             reason: "ready".to_string(),
         }))
+    }
+}
+
+/// Deterministic schedule for FoundationDB's `Swizzle-Clog` network fault pattern:
+/// clogs a subset of directed `(from, to)` links in permutation `clog_order`, then heals
+/// those exact links in an independent permutation `unclog_order`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwizzleClogPlan {
+    pub clog_order: Vec<(String, String)>,
+    pub unclog_order: Vec<(String, String)>,
+}
+
+/// Seeded multi-node network fault controller supporting:
+/// - Symmetric & asymmetric directed link partitions (`clog_link` / `unclog_link`),
+/// - Full node isolation (`isolate_node`),
+/// - FoundationDB `Swizzle-Clog` schedules (`plan_swizzle_clog`),
+/// - Bounded per-RPC random micro-jitter (`set_max_jitter_ms`),
+/// - Post-apply reply drops (`set_drop_reply_permille`) testing idempotent proposal-receipt deduplication.
+pub struct SwizzleClogController {
+    rng_state: Mutex<u64>,
+    clogged_links: RwLock<HashSet<(String, String)>>,
+    isolated_nodes: RwLock<HashSet<String>>,
+    max_jitter_ms: AtomicU64,
+    drop_reply_permille: AtomicU64,
+    dropped_before_send: AtomicU64,
+    delayed_packets: AtomicU64,
+    dropped_replies: AtomicU64,
+}
+
+impl SwizzleClogController {
+    pub fn new(seed: u64) -> Arc<Self> {
+        Arc::new(Self {
+            rng_state: Mutex::new(seed ^ 0x9E37_79B9_7F4A_7C15),
+            clogged_links: RwLock::new(HashSet::new()),
+            isolated_nodes: RwLock::new(HashSet::new()),
+            max_jitter_ms: AtomicU64::new(0),
+            drop_reply_permille: AtomicU64::new(0),
+            dropped_before_send: AtomicU64::new(0),
+            delayed_packets: AtomicU64::new(0),
+            dropped_replies: AtomicU64::new(0),
+        })
+    }
+
+    fn next_rand(&self) -> u64 {
+        let mut guard = self.rng_state.lock().unwrap();
+        *guard = metadb_core::buggify::splitmix64(*guard);
+        *guard
+    }
+
+    pub fn set_max_jitter_ms(&self, max_ms: u64) {
+        self.max_jitter_ms.store(max_ms, Ordering::Release);
+    }
+
+    pub fn set_drop_reply_permille(&self, permille: u64) {
+        self.drop_reply_permille
+            .store(permille.min(1000), Ordering::Release);
+    }
+
+    pub fn clog_link(&self, from_addr: impl Into<String>, to_addr: impl Into<String>) {
+        self.clogged_links
+            .write()
+            .unwrap()
+            .insert((from_addr.into(), to_addr.into()));
+    }
+
+    pub fn unclog_link(&self, from_addr: &str, to_addr: &str) {
+        self.clogged_links
+            .write()
+            .unwrap()
+            .remove(&(from_addr.to_string(), to_addr.to_string()));
+    }
+
+    pub fn isolate_node(&self, addr: impl Into<String>) {
+        self.isolated_nodes.write().unwrap().insert(addr.into());
+    }
+
+    pub fn heal_node(&self, addr: &str) {
+        self.isolated_nodes.write().unwrap().remove(addr);
+    }
+
+    pub fn heal_all(&self) {
+        self.clogged_links.write().unwrap().clear();
+        self.isolated_nodes.write().unwrap().clear();
+        self.max_jitter_ms.store(0, Ordering::Release);
+        self.drop_reply_permille.store(0, Ordering::Release);
+    }
+
+    pub fn stats(&self) -> (u64, u64, u64) {
+        (
+            self.dropped_before_send.load(Ordering::Acquire),
+            self.delayed_packets.load(Ordering::Acquire),
+            self.dropped_replies.load(Ordering::Acquire),
+        )
+    }
+
+    /// Generates a pure deterministic FoundationDB `Swizzle-Clog` schedule over `addrs`.
+    pub fn plan_swizzle_clog(addrs: &[String], seed: u64, max_links: usize) -> SwizzleClogPlan {
+        let mut all_links = Vec::new();
+        for a in addrs {
+            for b in addrs {
+                if a != b {
+                    all_links.push((a.clone(), b.clone()));
+                }
+            }
+        }
+        if all_links.is_empty() || max_links == 0 {
+            return SwizzleClogPlan {
+                clog_order: Vec::new(),
+                unclog_order: Vec::new(),
+            };
+        }
+        let mut state = seed ^ 0xA5A5_5A5A_F0F0_0F0F;
+        // Fisher-Yates shuffle for `clog_order`.
+        for i in (1..all_links.len()).rev() {
+            state = metadb_core::buggify::splitmix64(state);
+            let j = (state as usize) % (i + 1);
+            all_links.swap(i, j);
+        }
+        let count = max_links.min(all_links.len());
+        let clog_order: Vec<(String, String)> = all_links.into_iter().take(count).collect();
+        let mut unclog_order = clog_order.clone();
+        // Independent Fisher-Yates shuffle for `unclog_order` ("swizzle").
+        for i in (1..unclog_order.len()).rev() {
+            state = metadb_core::buggify::splitmix64(state ^ 0x1234_5678_9ABC_DEF0);
+            let j = (state as usize) % (i + 1);
+            unclog_order.swap(i, j);
+        }
+        SwizzleClogPlan {
+            clog_order,
+            unclog_order,
+        }
+    }
+}
+
+impl NetworkChaosHook for SwizzleClogController {
+    fn before_rpc(
+        &self,
+        from_addr: &str,
+        to_addr: &str,
+        _shard_id: ShardId,
+        _kind: RpcWireKind,
+    ) -> WireAction {
+        if !from_addr.is_empty() && from_addr != to_addr {
+            let isolated = {
+                let g = self.isolated_nodes.read().unwrap();
+                g.contains(from_addr) || g.contains(to_addr)
+            };
+            if isolated {
+                self.dropped_before_send.fetch_add(1, Ordering::Relaxed);
+                return WireAction::DropBeforeSend("simulated node isolation");
+            }
+            let clogged = self
+                .clogged_links
+                .read()
+                .unwrap()
+                .contains(&(from_addr.to_string(), to_addr.to_string()));
+            if clogged {
+                self.dropped_before_send.fetch_add(1, Ordering::Relaxed);
+                return WireAction::DropBeforeSend("simulated swizzle-clogged link");
+            }
+        }
+        let max_jitter = self.max_jitter_ms.load(Ordering::Relaxed);
+        if max_jitter > 0 {
+            let roll = self.next_rand() % (max_jitter + 1);
+            if roll > 0 {
+                self.delayed_packets.fetch_add(1, Ordering::Relaxed);
+                return WireAction::Delay(Duration::from_millis(roll));
+            }
+        }
+        WireAction::Allow
+    }
+
+    fn after_rpc(
+        &self,
+        from_addr: &str,
+        to_addr: &str,
+        _shard_id: ShardId,
+        kind: RpcWireKind,
+    ) -> bool {
+        if from_addr == to_addr {
+            return false;
+        }
+        if !matches!(kind, RpcWireKind::ClientWrite | RpcWireKind::AppendEntries) {
+            return false;
+        }
+        let permille = self.drop_reply_permille.load(Ordering::Relaxed);
+        if permille == 0 {
+            return false;
+        }
+        let drop_it = (self.next_rand() % 1000) < permille;
+        if drop_it {
+            self.dropped_replies.fetch_add(1, Ordering::Relaxed);
+        }
+        drop_it
+    }
+}
+
+#[cfg(test)]
+mod chaos_tests {
+    use super::*;
+
+    #[test]
+    fn swizzle_clog_plan_is_deterministic_and_preserves_link_set() {
+        let addrs = vec![
+            "127.0.0.1:7001".to_string(),
+            "127.0.0.1:7002".to_string(),
+            "127.0.0.1:7003".to_string(),
+        ];
+        let p1 = SwizzleClogController::plan_swizzle_clog(&addrs, 42, 4);
+        let p2 = SwizzleClogController::plan_swizzle_clog(&addrs, 42, 4);
+        assert_eq!(p1, p2);
+        assert_eq!(p1.clog_order.len(), 4);
+        let s1: HashSet<_> = p1.clog_order.iter().cloned().collect();
+        let s2: HashSet<_> = p1.unclog_order.iter().cloned().collect();
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn asymmetric_clog_blocks_one_direction_and_heal_restores() {
+        let ctrl = SwizzleClogController::new(99);
+        ctrl.clog_link("n1", "n2");
+        assert!(matches!(
+            ctrl.before_rpc("n1", "n2", 1, RpcWireKind::AppendEntries),
+            WireAction::DropBeforeSend(_)
+        ));
+        assert_eq!(
+            ctrl.before_rpc("n2", "n1", 1, RpcWireKind::AppendEntries),
+            WireAction::Allow
+        );
+        ctrl.heal_all();
+        assert_eq!(
+            ctrl.before_rpc("n1", "n2", 1, RpcWireKind::AppendEntries),
+            WireAction::Allow
+        );
     }
 }

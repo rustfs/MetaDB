@@ -21,7 +21,8 @@ pub use group_host::{
 pub use log_store::SegmentedRaftLogStore;
 pub use network::{
     ChannelPool, LocalShardControlHook, MetaDbRaft, MultiRaftRouter, MultiRaftTransportServer,
-    TonicRaftNetworkFactory,
+    NetworkChaosHook, RpcWireKind, SwizzleClogController, SwizzleClogPlan, TonicRaftNetworkFactory,
+    WireAction,
 };
 pub use read_index::{ReadIndexBatcher, ReadToken};
 pub use state_machine::{BasicKvApplyHandler, ShardApplyHandler, ShardStateMachine};

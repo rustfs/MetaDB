@@ -301,6 +301,14 @@ impl PushdownExecutor {
             });
         };
         let mut attr = InodeAttr::decode(&raw)?;
+        if attr.entry_type == EntryType::Directory
+            && (patch.size_bytes.is_some() || patch.fid.is_some())
+        {
+            return Err(MetaDbError::InvalidEntryType {
+                expected: "File".to_string(),
+                actual: "Directory".to_string(),
+            });
+        }
         let old_size = attr.size_bytes;
         let old_uid = attr.uid;
         let old_fid = attr.fid;
@@ -319,7 +327,19 @@ impl PushdownExecutor {
         }
         attr.modify_time = patch.modify_time.unwrap_or(hlc);
 
-        let delta_bytes = attr.size_bytes.saturating_sub(old_size);
+        if attr.entry_type == EntryType::Directory {
+            let dir_attr_key = MetaKey::dir_attr(attr.inode_id).encode();
+            if let Some(dir_raw) = engine.get(&dir_attr_key, hlc)? {
+                let mut dir_self = InodeAttr::decode(&dir_raw)?;
+                dir_self.mode = attr.mode;
+                dir_self.uid = attr.uid;
+                dir_self.modify_time = attr.modify_time;
+                engine.put(dir_attr_key, dir_self.encode(), hlc);
+            }
+        }
+
+        let delta_bytes =
+            metadb_core::saturating_add_i64(attr.size_bytes, negate_accounted_size(old_size));
         if delta_bytes != 0 {
             self.validate_parent_delta(engine, pid, 0, delta_bytes, hlc)?;
         }

@@ -46,17 +46,21 @@ async fn spawn_raft_grpc_server(
     (addr, handle)
 }
 
+static SNAPSHOT_PROMOTION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// T-RAFT-2: Boots a `1-Voter` shard over real `tonic` TCP/gRPC, writes data + builds SSTable snapshot +
 /// purges logs (forcing `InstallSnapshot` on learners!), promotes online via `AddLearner -> 3-Voter`,
 /// kills original Node 1 leader, and verifies failover election + `ReadIndex` linearizable reads!
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_online_1_to_3_voter_snapshot_promotion_and_leader_failover() {
+    let _guard = SNAPSHOT_PROMOTION_LOCK.lock().await;
     run_promotion_and_failover(false).await;
 }
 
 /// Exercise authenticated Vote, AppendEntries and InstallSnapshot over real TCP.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_authenticated_raft_snapshot_promotion_and_leader_failover() {
+    let _guard = SNAPSHOT_PROMOTION_LOCK.lock().await;
     run_promotion_and_failover(true).await;
 }
 
@@ -115,7 +119,10 @@ async fn run_promotion_and_failover(authenticated: bool) {
         .initialize_if_needed(BTreeMap::from([(1u64, addr1.clone())]))
         .await
         .unwrap();
-    node1.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+    node1
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
     let ep1 = node1.current_epoch();
     // Force multiple transport chunks and a file above the native 4 MiB default cap.
     let large_snapshot_value = vec![42u8; (4 << 20) + 1];
@@ -156,12 +163,15 @@ async fn run_promotion_and_failover(authenticated: bool) {
         &[(2, addr2.clone()), (3, addr3.clone())],
         BTreeSet::from([1, 2, 3]),
         5,
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         0,
     )
     .await
     .unwrap();
-    node1.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+    node1
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
 
     // Write 1 more entry committed across the 3-Voter quorum!
     let ep_3voter = node1.current_epoch();

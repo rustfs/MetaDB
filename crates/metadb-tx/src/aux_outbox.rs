@@ -517,8 +517,16 @@ impl ShardAuxOutbox {
             }
         }
 
-        if !force && !has_non_reconstructable && unspilled_count < self.spill_threshold {
+        let buggify_spill = unspilled_count > 0 && metadb_core::buggify("tx.outbox_force_spill");
+        if !force
+            && !buggify_spill
+            && !has_non_reconstructable
+            && unspilled_count < self.spill_threshold
+        {
             return Vec::new();
+        }
+        if unspilled_count > 0 {
+            metadb_core::code_probe("probe.tx.outbox_spilled_to_0x07");
         }
 
         let mut out = Vec::with_capacity(unspilled_count);
@@ -762,6 +770,7 @@ impl ShardAuxOutbox {
         guard.last_durable_seal_index = guard.contiguous_acked_index;
         let frontier = guard.contiguous_durable_frontier();
         self.watermarks.set_aux_outbox_durable(frontier);
+        metadb_core::code_probe("probe.tx.outbox_reconstructed_from_raftlog");
     }
 
     /// Returns all currently un-acknowledged entries sorted strictly by `(origin_raft_index, task_ordinal)`.

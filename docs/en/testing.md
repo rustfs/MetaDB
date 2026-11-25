@@ -34,6 +34,8 @@ cargo test -p metadb-storage --test locality_compaction_tests
 cargo test -p metadb-server --test auth_fail_closed
 cargo test -p metadb-server --test prefix_load
 cargo test -p metadb-server --test stress_harness
+cargo test -p metadb-server --test fdb_chaos_ensemble_tests
+cargo run -p metadb-server --bin metadb-ctl -- sim --workload all --seed 0x1 --seeds 10 --steps 32
 ```
 
 ## What each suite actually exercises

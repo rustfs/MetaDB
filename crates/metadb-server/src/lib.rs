@@ -7,6 +7,7 @@
 //!   Jumbo Shard dedicated-node isolation, and multi-Cell federation under `GlobalManager`.
 
 pub mod config;
+pub mod fdb_chaos;
 pub mod grpc_services;
 pub mod metrics;
 pub mod simulation;
@@ -533,15 +534,15 @@ impl MetaDbEngine {
         let mut all_engines: Vec<Arc<LifecycleStorageEngine>> = Vec::new();
         for cell in self.global_manager.cells() {
             for engine in cell.all_engines() {
-                self.pushdown
-                    .attr_aggregator()
-                    .flush_aggregated_deltas(&engine, hlc)?;
                 all_engines.push(engine);
             }
         }
 
         let engine_refs: Vec<&LifecycleStorageEngine> =
             all_engines.iter().map(|e| e.as_ref()).collect();
+        self.pushdown
+            .attr_aggregator()
+            .flush_aggregated_deltas_across(&engine_refs, hlc)?;
         self.pushdown.aux_sink().drain_and_apply(&engine_refs);
 
         for engine in &all_engines {
@@ -1416,6 +1417,10 @@ impl PersistentMetaDbCluster {
         &self.id_buffer
     }
 
+    pub fn host(&self) -> Option<&Arc<ShardGroupHost>> {
+        self.host.as_ref()
+    }
+
     /// Creates a file under `pid` automatically allocating bit-63 `InodeId` and backing `FileId`.
     pub async fn create_file_auto_id(
         &self,
@@ -1479,6 +1484,7 @@ impl PersistentMetaDbCluster {
             role: self.roles().map(|r| r.local().clone()),
         };
         for cell in self.global_manager.all_cells() {
+            let _ = cell.list_routes();
             for (_, grp, handler) in cell.local_shard_handles() {
                 let _ = AuxDispatcher::drain_shard_outbox_with_remote_sink(
                     &grp,

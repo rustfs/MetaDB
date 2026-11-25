@@ -126,6 +126,24 @@ enum Command {
         #[arg(long)]
         seed: Option<u64>,
     },
+    /// Run FoundationDB-style deterministic simulation, Buggify, and Swizzle-Clog chaos ensembles.
+    Sim {
+        /// Workload: `in-memory` | `persistent-cascade` | `swizzle-clog` | `all`.
+        #[arg(long, default_value = "in-memory")]
+        workload: String,
+        /// Starting seed (accepts decimal or `0x...` hex).
+        #[arg(long, default_value = "0x1")]
+        seed: String,
+        /// Number of consecutive seeds to run per workload.
+        #[arg(long, default_value_t = 1)]
+        seeds: u32,
+        /// Steps per seed.
+        #[arg(long, default_value_t = 32)]
+        steps: u32,
+        /// Parallel worker count for thread-isolated in-memory ensembles.
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -642,6 +660,60 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
+    if let Command::Sim {
+        workload,
+        seed,
+        seeds,
+        steps,
+        concurrency,
+    } = cli.command
+    {
+        let trimmed = seed.trim();
+        let start_seed = if let Some(hex) = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+        {
+            u64::from_str_radix(hex, 16).map_err(|e| format!("invalid hex --seed '{seed}': {e}"))?
+        } else {
+            trimmed
+                .parse::<u64>()
+                .map_err(|e| format!("invalid --seed '{seed}': {e}"))?
+        };
+        let kinds = if workload == "all" {
+            vec![
+                metadb_server::fdb_chaos::ChaosWorkloadKind::InMemoryFullStackBuggify,
+                metadb_server::fdb_chaos::ChaosWorkloadKind::PersistentMultiFaultCascade,
+                metadb_server::fdb_chaos::ChaosWorkloadKind::ThreeVoterSwizzleClogChaos,
+            ]
+        } else {
+            let Some(k) = metadb_server::fdb_chaos::ChaosWorkloadKind::parse(&workload) else {
+                return Err(format!(
+                    "unsupported --workload '{workload}' (expected in-memory, persistent-cascade, swizzle-clog, or all)"
+                )
+                .into());
+            };
+            vec![k]
+        };
+        for kind in kinds {
+            let report =
+                metadb_server::fdb_chaos::run_ensemble(&metadb_server::fdb_chaos::EnsembleConfig {
+                    workload: kind,
+                    start_seed,
+                    seed_count: seeds.max(1),
+                    steps_per_seed: steps.max(4),
+                    concurrency: concurrency.max(1),
+                    required_probes: Vec::new(),
+                })
+                .await;
+            println!("{report}");
+            if !report.is_ok() {
+                return Err(
+                    format!("simulation ensemble failed on workload {}", kind.as_str()).into(),
+                );
+            }
+        }
+        return Ok(());
+    }
     let security = client_security(&cli)?;
     let url = security.prepare_url(&cli.endpoint)?;
     let auth = bearer_client(&cli)?;
@@ -904,6 +976,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .await?;
             }
         }
+        Command::Sim { .. } => unreachable!("handled before client_security"),
     }
 
     Ok(())

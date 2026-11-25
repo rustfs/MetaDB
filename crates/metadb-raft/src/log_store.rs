@@ -115,6 +115,10 @@ struct LogStoreInner {
     segments: Vec<SegmentFile>,
     active_file: Option<File>,
     max_segment_bytes: u64,
+    /// Highest log index that OpenRaft's `RaftCore` has explicitly requested `purge()` up to.
+    /// `try_purge_to_safe_watermark` must never delete entries above this bound behind OpenRaft's
+    /// back while an active `ReplicationStream` still expects those entries in the log.
+    max_openraft_purge_requested: u64,
     /// Test hook: the next `n` append fsyncs fail after the bytes are written.
     fail_syncs: u32,
 }
@@ -305,6 +309,7 @@ impl LogStoreInner {
             None
         };
 
+        let max_openraft_purge_requested = purged_idx_opt.unwrap_or(0);
         Ok(Self {
             raft_dir: raft_dir.to_path_buf(),
             hard_state,
@@ -312,6 +317,7 @@ impl LogStoreInner {
             segments,
             active_file,
             max_segment_bytes,
+            max_openraft_purge_requested,
             fail_syncs: 0,
         })
     }
@@ -976,10 +982,11 @@ impl SegmentedRaftLogStore {
     /// if OpenRaft has already requested a purge or if called after advancing watermarks.
     pub fn try_purge_to_safe_watermark(&self) -> io::Result<usize> {
         let mut guard = self.inner.lock().unwrap();
+        let requested_cap = guard.max_openraft_purge_requested;
         let safe_idx = purge_limit(
             &guard.raft_dir,
             self.watermarks.safe_purge_index(),
-            u64::MAX,
+            requested_cap,
         );
         if safe_idx == 0 {
             return Ok(0);
@@ -1152,7 +1159,9 @@ impl RaftLogStorage<MetaDbTypeConfig> for SegmentedRaftLogStore {
         // Re-read the backup hold after the lock is taken so a hold that became
         // visible after the first check still blocks this deletion.
         let safe_idx = {
-            let guard = self.inner.lock().unwrap();
+            let mut guard = self.inner.lock().unwrap();
+            guard.max_openraft_purge_requested =
+                guard.max_openraft_purge_requested.max(log_id.index);
             purge_limit(
                 &guard.raft_dir,
                 self.watermarks.safe_purge_index(),

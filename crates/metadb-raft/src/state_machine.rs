@@ -37,7 +37,7 @@ use crate::types::{
 /// Pluggable application command handler executed deterministically inside `RaftStateMachine::apply`.
 ///
 /// Implemented by `BasicKvApplyHandler` in Phase 3 tests and by `TxStateMachineHandler` in `metadb-tx` (Phase 4).
-pub trait ShardApplyHandler: Send + Sync + 'static {
+pub trait ShardApplyHandler: std::any::Any + Send + Sync + 'static {
     fn current_epoch(&self) -> ShardEpoch;
 
     fn on_membership_changed(&self, new_epoch: ShardEpoch);
