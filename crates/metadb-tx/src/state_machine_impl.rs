@@ -524,11 +524,16 @@ pub fn node_instance_key(node_id: u64) -> Vec<u8> {
     key
 }
 
+/// Replicated marker recording that `FenceShardRangeForSplit` narrowed this shard's active range
+/// while right-half keys still reside in the parent engine (cleared atomically by
+/// `UpdateShardRangeOnSplit` or `RestoreShardRange`). Prefix `0x0E` is outside the split copy
+/// range `[0x01, 0x08)` and is not a user-table key.
+const SPLIT_FENCE_RESTORABLE_KEY: &[u8] = &[0x0E, b'F'];
+
 /// Key of the replicated cell-directory and cell-manager snapshot.
 ///
 /// Prefix `0x0F` is outside the split copy range `[0x01, 0x08)` and is not a
-/// user-table key. `0x0E` is not used. The snapshot stays on the shard that
-/// committed it.
+/// user-table key. The snapshot stays on the shard that committed it.
 pub const CONTROL_PLANE_STATE_KEY: &[u8] = &[0x0F];
 
 /// One committed publication of `GLOBAL_CELL_DIRECTORY` and `CELL_MANAGER_STATE`.
@@ -644,6 +649,16 @@ impl TxStateMachineHandler {
 
     pub fn key_range(&self) -> CompositeKeyRange {
         self.meta.read().unwrap().range.clone()
+    }
+
+    /// True iff `FenceShardRangeForSplit` has narrowed this shard's range and neither
+    /// `UpdateShardRangeOnSplit` (which deletes right-half keys) nor `RestoreShardRange`
+    /// has committed yet.
+    pub fn has_restorable_split_fence(&self, engine: &LifecycleStorageEngine) -> bool {
+        Self::read_latest_in_apply(engine, SPLIT_FENCE_RESTORABLE_KEY)
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     pub fn attr_aggregator(&self) -> &Arc<ReplicatedAttrAggregator> {
@@ -1395,6 +1410,14 @@ impl TxStateMachineHandler {
                     return Err(MetaDbError::NotFound { pid, name });
                 };
                 let mut attr = InodeAttr::decode(&raw)?;
+                if attr.entry_type == EntryType::Directory
+                    && (patch.size_bytes.is_some() || patch.fid.is_some())
+                {
+                    return Err(MetaDbError::InvalidEntryType {
+                        expected: "File".to_string(),
+                        actual: "Directory".to_string(),
+                    });
+                }
                 let old_uid = attr.uid;
                 let old_size = attr.size_bytes;
                 let old_fid = attr.fid;
@@ -2239,6 +2262,7 @@ impl TxStateMachineHandler {
                     false,
                 );
                 self.release_lease_hold(engine, txn_id, raft_index, final_commit_hlc);
+                metadb_core::code_probe("probe.tx.cross_shard_2pc_committed");
                 Ok(TxRaftOutput::Committed {
                     commit_hlc: final_commit_hlc,
                     already_applied: false,
@@ -2421,6 +2445,12 @@ impl TxStateMachineHandler {
                             .into(),
                     ));
                 }
+                engine.apply_committed_put(
+                    SPLIT_FENCE_RESTORABLE_KEY.to_vec(),
+                    vec![1],
+                    commit_hlc,
+                    raft_index,
+                );
                 {
                     let mut m = self.meta.write().unwrap();
                     m.range = new_range;
@@ -2500,6 +2530,11 @@ impl TxStateMachineHandler {
                     let dk = DirShardDeltaKey { pid: sub.inode_id }.encode().to_vec();
                     engine.apply_committed_put(dk, sub.encode(), commit_hlc, raft_index);
                 }
+                engine.apply_committed_delete(
+                    SPLIT_FENCE_RESTORABLE_KEY.to_vec(),
+                    commit_hlc,
+                    raft_index,
+                );
                 {
                     let mut m = self.meta.write().unwrap();
                     m.range = new_range;
@@ -2513,6 +2548,11 @@ impl TxStateMachineHandler {
                 restored_range,
                 new_epoch,
             } => {
+                engine.apply_committed_delete(
+                    SPLIT_FENCE_RESTORABLE_KEY.to_vec(),
+                    commit_hlc,
+                    raft_index,
+                );
                 {
                     let mut m = self.meta.write().unwrap();
                     m.range = restored_range;
@@ -3376,6 +3416,7 @@ impl ShardApplyHandler for TxStateMachineHandler {
         maintain_proposal_receipts(engine, commit_hlc, raft_index)?;
         let (proposal_id, cmd) = decode_proposed_command(&request.payload)?;
         if let Some(prior) = committed_proposal_result(engine, proposal_id, commit_hlc)? {
+            metadb_core::code_probe("probe.tx.proposal_receipt_dedup_hit");
             return Ok(prior);
         }
         let out = self.apply_tx_cmd(raft_index, commit_hlc, cmd, engine)?;

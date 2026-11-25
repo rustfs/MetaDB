@@ -999,23 +999,39 @@ impl ShardRaftGroup {
             .await
             .map_err(|e| MetaDbError::ConsensusError(e.to_string()))?;
 
-        // Give OpenRaft's async snapshot task a moment to complete and invoke `purge`.
-        for _ in 0..40 {
-            if self.watermarks.snapshot_values().2 >= flushed_idx {
+        // Wait until BOTH `ShardStateMachine::build_snapshot` AND `RaftCore`'s own
+        // `RaftMetrics.snapshot` have observed `flushed_idx`; otherwise `purge_log` can
+        // arrive at `RaftCore` before the async snapshot result and get clamped to the old snapshot.
+        for _ in 0..500 {
+            let core_snap_idx = self
+                .raft
+                .metrics()
+                .borrow_watched()
+                .snapshot
+                .map(|id| id.index)
+                .unwrap_or(0);
+            if self.watermarks.snapshot_values().2 >= flushed_idx && core_snap_idx >= flushed_idx {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let safe_idx = self.watermarks.safe_purge_index();
-        let _ = self.raft.trigger().purge_log(safe_idx).await;
-        // A hold can make that purge a no-op. OpenRaft may not ask again for the same
-        // index after the hold is released, so apply the storage clamp directly.
-        let _ = self.log_store.try_purge_to_safe_watermark();
-        for _ in 0..40 {
-            if self.log_store.retained_entry_count() == 0 {
-                break;
+        if safe_idx > 0 {
+            let _ = self.raft.trigger().purge_log(safe_idx).await;
+            // Wait for `RaftCore` to invoke `RaftLogStorage::purge` (recording
+            // `max_openraft_purge_requested`), re-triggering periodically if `RaftCore` was busy.
+            for tick in 0..500 {
+                if tick > 0 && tick % 5 == 0 {
+                    let _ = self.raft.trigger().purge_log(safe_idx).await;
+                }
+                let _ = self.log_store.try_purge_to_safe_watermark();
+                if self.log_store.retained_entry_count() == 0
+                    || self.log_store.last_purged_index() >= safe_idx
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         Ok(safe_idx)
     }

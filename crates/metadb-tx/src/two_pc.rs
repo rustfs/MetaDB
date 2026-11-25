@@ -803,6 +803,7 @@ impl DistributedTxRouter {
                     primary_key,
                     expire_hlc: _,
                 }) if attempt < 11 => {
+                    metadb_core::code_probe("probe.tx.write_intent_conflict_resolved");
                     // A committed or already-aborted transaction can be finished
                     // now. An expired pending transaction is aborted only when
                     // expiry is proved. Neither waits for the next recovery tick,
@@ -1320,6 +1321,9 @@ impl DistributedTxRouter {
                 name: src_name.to_string(),
             });
         };
+        if src_pid == dst_pid && src_name == dst_name {
+            return Ok(src_entry);
+        }
 
         let (_, g_src, h_src) = self.route_user_key(&src_bytes).await?;
         let (_, g_dst, _) = self.route_user_key(&dst_bytes).await?;
@@ -1457,15 +1461,11 @@ impl DistributedTxRouter {
         intents.push((
             src_bytes.clone(),
             IntentOp::Delete {
-                attr_deltas: if src_pid != dst_pid {
-                    vec![AttrDeltaSpec {
-                        pid: src_pid,
-                        delta_children: -1,
-                        delta_bytes: negate_accounted_size(src_accounted),
-                    }]
-                } else {
-                    vec![]
-                },
+                attr_deltas: vec![AttrDeltaSpec {
+                    pid: src_pid,
+                    delta_children: -1,
+                    delta_bytes: negate_accounted_size(src_accounted),
+                }],
                 aux_specs: vec![],
             },
         ));
@@ -1473,22 +1473,11 @@ impl DistributedTxRouter {
             dst_bytes,
             IntentOp::Put {
                 value: moved_attr.encode(),
-                attr_deltas: if src_pid != dst_pid {
-                    vec![AttrDeltaSpec {
-                        pid: dst_pid,
-                        delta_children: dst_delta_children,
-                        delta_bytes: dst_delta_bytes,
-                    }]
-                } else {
-                    vec![AttrDeltaSpec {
-                        pid: dst_pid,
-                        delta_children: dst_delta_children - 1,
-                        delta_bytes: saturating_add_i64(
-                            dst_delta_bytes,
-                            negate_accounted_size(src_accounted),
-                        ),
-                    }]
-                },
+                attr_deltas: vec![AttrDeltaSpec {
+                    pid: dst_pid,
+                    delta_children: dst_delta_children,
+                    delta_bytes: dst_delta_bytes,
+                }],
                 aux_specs: dst_aux_specs,
             },
         ));
@@ -1876,6 +1865,9 @@ impl DistributedTxRouter {
             ));
         }
 
+        if metadb_core::buggify("tx.two_pc_post_prepare_yield") {
+            tokio::task::yield_now().await;
+        }
         if let Some(gate) = &self.post_prepare_gate {
             gate.prepared.notify_one();
             gate.release.notified().await;
@@ -2326,14 +2318,15 @@ impl DistributedTxRouter {
                 let intent = WriteIntentRecord::decode(&raw_intent)?;
                 if !intent.op.is_dir_exists_fence() && intent.start_hlc <= snap.read_hlc() {
                     drop(snap);
-                    let st = TxnRecoveryWorker::resolve_single_txn(
+                    let cleared = TxnRecoveryWorker::resolve_blocking_read_intent(
                         self.directory.as_ref(),
                         &self.clock,
-                        intent.txn_id,
-                        &intent.primary_key,
+                        &group,
+                        &intent,
+                        &attr_key,
                     )
                     .await?;
-                    if matches!(st, TxnState::Pending) {
+                    if !cleared {
                         tokio::time::sleep(Duration::from_millis(15)).await;
                     }
                     continue;
@@ -2428,24 +2421,26 @@ impl DistributedTxRouter {
             let (_, snap) = group.linearizable_read(epoch).await?;
             Self::validate_read_epoch(&group, epoch)?;
             let intents = eng.scan_with_snapshot(&i_start, &i_end, &snap)?;
-            let mut blocking: Option<WriteIntentRecord> = None;
-            for (_, raw_i) in &intents {
+            let mut blocking: Option<(Vec<u8>, WriteIntentRecord)> = None;
+            for (ik_bytes, raw_i) in &intents {
                 let irec = WriteIntentRecord::decode(raw_i)?;
                 if !irec.op.is_dir_exists_fence() && irec.start_hlc <= snap.read_hlc() {
-                    blocking = Some(irec);
+                    let uk = WriteIntentKey::decode(ik_bytes)?.target_user_key;
+                    blocking = Some((uk, irec));
                     break;
                 }
             }
-            if let Some(irec) = blocking {
+            if let Some((uk, irec)) = blocking {
                 drop(snap);
-                let st = TxnRecoveryWorker::resolve_single_txn(
+                let cleared = TxnRecoveryWorker::resolve_blocking_read_intent(
                     self.directory.as_ref(),
                     &self.clock,
-                    irec.txn_id,
-                    &irec.primary_key,
+                    &group,
+                    &irec,
+                    &uk,
                 )
                 .await?;
-                if matches!(st, TxnState::Pending) {
+                if !cleared {
                     if attempt == 7 {
                         return Err(MetaDbError::WriteIntentConflict {
                             conflicting_txn_id: irec.txn_id,
@@ -2580,14 +2575,15 @@ impl DistributedTxRouter {
                 let intent = WriteIntentRecord::decode(&raw_intent)?;
                 if !intent.op.is_dir_exists_fence() && intent.start_hlc <= snap.read_hlc() {
                     drop(snap);
-                    let st = TxnRecoveryWorker::resolve_single_txn(
+                    let cleared = TxnRecoveryWorker::resolve_blocking_read_intent(
                         self.directory.as_ref(),
                         &self.clock,
-                        intent.txn_id,
-                        &intent.primary_key,
+                        &group,
+                        &intent,
+                        &key_bytes,
                     )
                     .await?;
-                    if matches!(st, TxnState::Pending) {
+                    if !cleared {
                         if attempt == 15 {
                             return Err(MetaDbError::WriteIntentConflict {
                                 conflicting_txn_id: intent.txn_id,
@@ -2628,14 +2624,15 @@ impl DistributedTxRouter {
                 let intent = WriteIntentRecord::decode(&raw)?;
                 if !intent.op.is_dir_exists_fence() {
                     drop(snap);
-                    let st = TxnRecoveryWorker::resolve_single_txn(
+                    let cleared = TxnRecoveryWorker::resolve_blocking_read_intent(
                         self.directory.as_ref(),
                         &self.clock,
-                        intent.txn_id,
-                        &intent.primary_key,
+                        &group,
+                        &intent,
+                        key,
                     )
                     .await?;
-                    if matches!(st, TxnState::Pending) {
+                    if !cleared {
                         if attempt == 15 {
                             return Err(MetaDbError::WriteIntentConflict {
                                 conflicting_txn_id: intent.txn_id,
@@ -2868,14 +2865,15 @@ impl DistributedTxRouter {
                     let intent = WriteIntentRecord::decode(&raw_intent)?;
                     if !intent.op.is_dir_exists_fence() && intent.start_hlc <= snap.read_hlc() {
                         drop(snap);
-                        let st = TxnRecoveryWorker::resolve_single_txn(
+                        let cleared = TxnRecoveryWorker::resolve_blocking_read_intent(
                             self.directory.as_ref(),
                             &self.clock,
-                            intent.txn_id,
-                            &intent.primary_key,
+                            group,
+                            &intent,
+                            &attr_key,
                         )
                         .await?;
-                        if matches!(st, TxnState::Pending) {
+                        if !cleared {
                             tokio::time::sleep(Duration::from_millis(15)).await;
                         }
                         continue;
@@ -3202,24 +3200,26 @@ impl DistributedTxRouter {
                 Self::validate_read_epoch(&group, epoch)?;
 
                 let intents = eng.scan_with_snapshot(&i_start, &i_end, &snap)?;
-                let mut blocking: Option<WriteIntentRecord> = None;
-                for (_, raw_i) in &intents {
+                let mut blocking: Option<(Vec<u8>, WriteIntentRecord)> = None;
+                for (ik_bytes, raw_i) in &intents {
                     let irec = WriteIntentRecord::decode(raw_i)?;
                     if !irec.op.is_dir_exists_fence() && irec.start_hlc <= snap.read_hlc() {
-                        blocking = Some(irec);
+                        let uk = WriteIntentKey::decode(ik_bytes)?.target_user_key;
+                        blocking = Some((uk, irec));
                         break;
                     }
                 }
-                if let Some(irec) = blocking {
+                if let Some((uk, irec)) = blocking {
                     drop(snap);
-                    let st = TxnRecoveryWorker::resolve_single_txn(
+                    let cleared = TxnRecoveryWorker::resolve_blocking_read_intent(
                         self.directory.as_ref(),
                         &self.clock,
-                        irec.txn_id,
-                        &irec.primary_key,
+                        &group,
+                        &irec,
+                        &uk,
                     )
                     .await?;
-                    if matches!(st, TxnState::Pending) {
+                    if !cleared {
                         if attempt == 7 {
                             return Err(MetaDbError::WriteIntentConflict {
                                 conflicting_txn_id: irec.txn_id,

@@ -779,12 +779,17 @@ impl LifecycleStorageEngine {
     }
 
     fn maintain_memtables(&self) -> Result<()> {
-        if self.mvcc.active_memtable_bytes() < self.memtable_size_bytes {
+        let active_bytes = self.mvcc.active_memtable_bytes();
+        let early_seal = active_bytes > 0 && metadb_core::buggify("storage.early_memtable_seal");
+        if !early_seal && active_bytes < self.memtable_size_bytes {
             return Ok(());
         }
         let _budget = self.budget_mu.lock().unwrap();
-        if self.mvcc.active_memtable_bytes() < self.memtable_size_bytes {
+        if !early_seal && self.mvcc.active_memtable_bytes() < self.memtable_size_bytes {
             return Ok(());
+        }
+        if early_seal {
+            metadb_core::code_probe("probe.storage.early_memtable_seal");
         }
         let (lsn, hlc, _, _) = self.mvcc.latest_watermarks();
         let checkpoint = self.checkpoint_for_flush(lsn, hlc);

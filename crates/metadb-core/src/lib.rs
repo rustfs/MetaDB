@@ -5,6 +5,7 @@
 //! *"MetaDB: Putting File-System Structure Back into Distributed Databases"*
 //! (arXiv:2610.32247v1).
 
+pub mod buggify;
 pub mod checksum;
 pub mod codec;
 pub mod epoch;
@@ -13,6 +14,9 @@ pub mod hlc;
 pub mod schema;
 pub mod system_keys;
 
+pub use buggify::{
+    buggify, code_probe, BuggifyConfig, CodeProbeSnapshot, GlobalBuggifyGuard, ThreadBuggifyGuard,
+};
 pub use checksum::{
     append_crc32c_be, append_crc32c_le, checksum_crc32c, verify_crc32c_be, verify_crc32c_le,
     Crc32cHasher,

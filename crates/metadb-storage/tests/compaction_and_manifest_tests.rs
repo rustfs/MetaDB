@@ -278,3 +278,84 @@ fn scan_stats_report_tombstones_and_corrupted_sstable_block_fails_crc() {
         "expected ChecksumMismatch on corrupted SSTable DataBlock during open/read"
     );
 }
+
+#[test]
+fn leveled_promotion_fixed_point_expansion_preserves_non_overlapping_runs() {
+    let dir = tempdir().unwrap();
+    let lsm_dir = dir.path().join("shard_1/lsm");
+    let cache = Arc::new(ShardedBlockCache::new(16 * 1024 * 1024));
+    let cfg = LsmEngineConfig {
+        auto_locality_compaction: false,
+        l1_max_bytes: 512,
+        l2_max_bytes: 1024,
+        ..Default::default()
+    };
+    let engine = LifecycleStorageEngine::open_lsm(1, &lsm_dir, cache.clone(), cfg.clone()).unwrap();
+
+    // Interleave wide and narrow key spans across 12 flushes so L0->L1 and L1->L2->L3 promotions
+    // expand transitively across adjacent runs without ever creating overlapping SSTables in L1..L3.
+    let mut lsn = 0u64;
+    for round in 0..12u64 {
+        let hlc = HlcTimestamp::new(10_000 + round * 10, 0);
+        for k in (round % 3)..30u64 {
+            lsn += 1;
+            let key = MetaKey::child(2 + (k / 10), format!("entry_{k:03}.bin")).encode();
+            if round % 4 == 3 && k % 5 == 0 {
+                engine.apply_committed_delete(key, hlc, lsn);
+            } else {
+                let val = format!("r{round:02}_k{k:03}_{}", "x".repeat(48)).into_bytes();
+                engine.apply_committed_put(key, val, hlc, lsn);
+            }
+        }
+        engine
+            .seal_and_flush_with_hook(
+                DurableShardCheckpoint {
+                    flushed_raft_index: lsn,
+                    flushed_max_hlc: hlc,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+    }
+
+    let ver = engine.backend().current_version();
+    for (lvl_idx, lvl) in ver.levels.iter().enumerate().skip(1) {
+        for pair in lvl.windows(2) {
+            assert!(
+                pair[0].meta().max_key < pair[1].meta().min_key,
+                "level L{lvl_idx} has overlapping SSTables: {:?} vs {:?}",
+                pair[0].meta().max_key,
+                pair[1].meta().min_key
+            );
+        }
+    }
+
+    let read_hlc = HlcTimestamp::new(50_000, 0);
+    for k in 0..30u64 {
+        let key = MetaKey::child(2 + (k / 10), format!("entry_{k:03}.bin")).encode();
+        let got = engine.get(&key, read_hlc).unwrap();
+        // Round 11 (`11 % 3 == 2`, `11 % 4 == 3`) touched `k >= 2` and deleted `k % 5 == 0` (`5,10,15,20,25`).
+        // `k == 0` was last touched in round 9 (`put`); `k == 1` was last touched in round 10 (`put`).
+        if k >= 2 && k % 5 == 0 {
+            assert!(
+                got.is_none(),
+                "expected k={k} deleted at round 11, got {got:?}"
+            );
+        } else {
+            let expected_round = if k == 0 {
+                9
+            } else if k == 1 {
+                10
+            } else {
+                11
+            };
+            let expected = format!("r{expected_round:02}_k{k:03}_{}", "x".repeat(48)).into_bytes();
+            assert_eq!(
+                got.as_deref(),
+                Some(expected.as_slice()),
+                "mismatch on k={k}"
+            );
+        }
+    }
+}

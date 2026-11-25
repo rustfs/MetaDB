@@ -1884,16 +1884,28 @@ impl DurableCellManager {
                 wincode::config::DefaultConfig::default(),
             ) {
                 let mut guard = self.state.lock().unwrap();
-                let missing_running_child = rep_state.routes.keys().any(|sid| {
-                    !guard.routes.contains_key(sid) && self.host.get_group(*sid).is_some()
+                let route_is_newer =
+                    |cur: &CompositeShardRoute, rep_route: &CompositeShardRoute| -> bool {
+                        rep_route.epoch.version > cur.epoch.version
+                            || (rep_route.epoch.version == cur.epoch.version
+                                && rep_route.range == cur.range
+                                && cur.split_mode == ShardSplitMode::DirectoryColocated
+                                && rep_route.split_mode == ShardSplitMode::DualModeFineGrained)
+                    };
+                let needs_route_sync = rep_state.routes.iter().any(|(sid, rep_route)| match guard
+                    .routes
+                    .get(sid)
+                {
+                    None => self.host.get_group(*sid).is_some(),
+                    Some(cur) => route_is_newer(cur, rep_route),
                 });
-                if missing_running_child {
+                if needs_route_sync {
                     let mut next = guard.clone();
                     let mut upserts = Vec::new();
                     for (&sid, rep_route) in &rep_state.routes {
                         let accept = match next.routes.get(&sid) {
                             None => self.host.get_group(sid).is_some(),
-                            Some(cur) => rep_route.epoch.version > cur.epoch.version,
+                            Some(cur) => route_is_newer(cur, rep_route),
                         };
                         if accept {
                             next.routes.insert(sid, rep_route.clone());
@@ -1956,15 +1968,22 @@ impl DurableCellManager {
                     let Some(c_group) = self.host.get_group(child_sid) else {
                         continue;
                     };
+                    if c_group.current_epoch().version != p_epoch.version {
+                        continue;
+                    }
+                    let Ok(applied_voters) = c_group.applied_voter_addrs() else {
+                        continue;
+                    };
+                    if applied_voters.is_empty() {
+                        continue;
+                    }
                     let mut updated_parent = parent_route.clone();
                     updated_parent.range = p_range.clone();
                     updated_parent.epoch = p_epoch;
                     if let Some(l) = p_group.current_leader() {
                         updated_parent.leader_node = l;
                     }
-                    let child_peers = c_group
-                        .applied_voter_addrs()
-                        .unwrap_or_default()
+                    let child_peers = applied_voters
                         .into_iter()
                         .map(|(nid, addr)| (nid, (addr, true)))
                         .collect::<BTreeMap<_, _>>();
@@ -1976,11 +1995,7 @@ impl DurableCellManager {
                         leader_node: c_group
                             .current_leader()
                             .unwrap_or(updated_parent.leader_node),
-                        peers: if child_peers.is_empty() {
-                            parent_route.peers.clone()
-                        } else {
-                            child_peers
-                        },
+                        peers: child_peers,
                         split_mode: parent_route.split_mode,
                         health_state: if parent_route.dual_mode_pid.is_some() {
                             ShardHealthState::Normal
@@ -2291,21 +2306,31 @@ impl DurableCellManager {
                     (plan.split_key, plan.dual_mode_pid, plan.target_version)
                 };
                 let crash_at = *self.crash_point.lock().unwrap();
-                let (new_parent, new_child, _child_grp, child_handler) =
-                    RaftShardSplitWorker::execute_local_split(
-                        &self.host,
-                        &live_route,
-                        &group,
-                        &handler,
-                        child_shard_id,
-                        split_key,
-                        dual_mode_pid,
-                        self.lsm_config.clone(),
-                        self.raft_opts.clone(),
-                        target_version,
-                        crash_at,
-                    )
-                    .await?;
+                let split_res = RaftShardSplitWorker::execute_local_split(
+                    &self.host,
+                    &live_route,
+                    &group,
+                    &handler,
+                    child_shard_id,
+                    split_key,
+                    dual_mode_pid,
+                    self.lsm_config.clone(),
+                    self.raft_opts.clone(),
+                    target_version,
+                    crash_at,
+                )
+                .await;
+                let (new_parent, new_child, _child_grp, child_handler) = match split_res {
+                    Ok(ok) => ok,
+                    Err(err) => {
+                        if crash_at.is_none() && group.current_epoch().version < target_version {
+                            let _ = self
+                                .abort_unpublished_split_plan(req_uuid, child_shard_id)
+                                .await;
+                        }
+                        return Err(err);
+                    }
+                };
                 self.activate_split(req_uuid, new_parent, new_child, Some(child_handler))?;
                 if dual_mode_pid.is_some() {
                     self.dual_mode_split_hints.lock().unwrap().remove(&shard_id);
@@ -2566,6 +2591,7 @@ impl DurableCellManager {
     /// child routes, adopts orphan child directories, and restores a parent range when a fence
     /// cannot be completed.
     async fn recover_incomplete_splits(&self) -> Result<()> {
+        let _ = self.reconcile_follower_split_routes();
         self.discard_incomplete_splitting_dirs()?;
 
         let plans: Vec<(u128, SplitPlanRecord)> = {
@@ -2593,8 +2619,60 @@ impl DurableCellManager {
         }
 
         self.resume_registry_pending(&resumed_children).await?;
+        self.gc_superseded_joining_shards().await?;
         self.adopt_orphan_shard_dirs().await?;
         self.restore_unpublished_fences().await?;
+        Ok(())
+    }
+
+    async fn gc_superseded_joining_shards(&self) -> Result<()> {
+        let (known_routes, planned_children, parent_routes) = {
+            let st = self.state.lock().unwrap();
+            let known: HashSet<ShardId> = st.routes.keys().copied().collect();
+            let planned: HashSet<ShardId> = st
+                .split_plans
+                .values()
+                .filter(|p| p.state == SplitPlanState::Planned)
+                .map(|p| p.child_shard_id)
+                .collect();
+            let parents: Vec<CompositeShardRoute> = st.routes.values().cloned().collect();
+            (known, planned, parents)
+        };
+        let unpublished: Vec<(ShardId, Arc<TxStateMachineHandler>)> = {
+            let handlers = self.handlers.read().unwrap();
+            handlers
+                .iter()
+                .filter(|(&sid, _)| {
+                    !known_routes.contains(&sid) && !planned_children.contains(&sid)
+                })
+                .map(|(&sid, h)| (sid, h.clone()))
+                .collect()
+        };
+        for (sid, c_handler) in unpublished {
+            let Some(c_group) = self.host.get_group(sid) else {
+                continue;
+            };
+            // Never garbage-collect an initialized Multi-Raft voter group; only uninitialized
+            // pre-promotion joining replicas (`applied_voter_addrs().is_err()`) from an aborted
+            // split epoch are eligible!
+            if c_group.applied_voter_addrs().is_ok() {
+                continue;
+            }
+            let c_ver = c_group.current_epoch().version;
+            let c_range = c_handler.key_range();
+            let superseded = parent_routes.iter().any(|pr| {
+                pr.range.start_key <= c_range.start_key
+                    && c_range.end_key <= pr.range.end_key
+                    && self
+                        .host
+                        .get_group(pr.shard_id)
+                        .is_some_and(|pg| pg.current_epoch().version > c_ver)
+            });
+            if superseded {
+                self.handlers.write().unwrap().remove(&sid);
+                let _ = self.host.remove_and_gc_shard(sid).await;
+            }
+        }
         Ok(())
     }
 
@@ -2635,7 +2713,8 @@ impl DurableCellManager {
         let interior = plan.split_key.as_slice() > parent_route.range.start_key.as_slice()
             && plan.split_key.as_slice() < parent_route.range.end_key.as_slice();
         if !interior {
-            self.drop_split_plan(request_uuid)?;
+            self.abort_unpublished_split_plan(request_uuid, plan.child_shard_id)
+                .await?;
             return Ok(());
         }
         let current = self
@@ -2644,8 +2723,21 @@ impl DurableCellManager {
             .map(|g| g.current_epoch().version)
             .unwrap_or(0);
         if current > plan.target_version {
-            self.drop_split_plan(request_uuid)?;
+            self.abort_unpublished_split_plan(request_uuid, plan.child_shard_id)
+                .await?;
             return Ok(());
+        }
+        // If `current == plan.target_version` yet the parent handler range is still the full
+        // unfenced `parent_route.range` (or does not match `plan.split_key`), a peer leader
+        // already superseded or restored this fence; discard any stale unpublished child shard!
+        if current == plan.target_version {
+            if let Ok((_, _, p_handler)) = self.lookup_local_handle(plan.parent_shard_id) {
+                if p_handler.key_range().end_key != plan.split_key {
+                    self.abort_unpublished_split_plan(request_uuid, plan.child_shard_id)
+                        .await?;
+                    return Ok(());
+                }
+            }
         }
         self.finish_split(
             request_uuid,
@@ -2656,6 +2748,24 @@ impl DurableCellManager {
             plan.target_version,
         )
         .await
+    }
+
+    async fn abort_unpublished_split_plan(
+        &self,
+        request_uuid: u128,
+        child_shard_id: ShardId,
+    ) -> Result<()> {
+        let published = self
+            .state
+            .lock()
+            .unwrap()
+            .routes
+            .contains_key(&child_shard_id);
+        if !published {
+            self.handlers.write().unwrap().remove(&child_shard_id);
+            let _ = self.host.remove_and_gc_shard(child_shard_id).await;
+        }
+        self.drop_split_plan(request_uuid)
     }
 
     async fn resume_registry_pending(&self, already: &HashSet<ShardId>) -> Result<()> {
@@ -2681,7 +2791,7 @@ impl DurableCellManager {
             };
             if self.state.lock().unwrap().routes.contains_key(&child_id) {
                 continue;
-            }
+            };
             let Some(parent_route) = ({
                 let st = self.state.lock().unwrap();
                 st.routes.get(&parent_shard_id).cloned()
@@ -2697,6 +2807,7 @@ impl DurableCellManager {
             if split_key.as_slice() <= parent_route.range.start_key.as_slice()
                 || split_key.as_slice() >= parent_route.range.end_key.as_slice()
             {
+                let _ = self.host.remove_and_gc_shard(child_id).await;
                 continue;
             }
             let current = self
@@ -2705,6 +2816,7 @@ impl DurableCellManager {
                 .map(|g| g.current_epoch().version)
                 .unwrap_or(0);
             if current > target_version {
+                let _ = self.host.remove_and_gc_shard(child_id).await;
                 continue;
             }
             let req_uuid = (child_id as u128) << 64 | target_version as u128;
@@ -2772,15 +2884,25 @@ impl DurableCellManager {
             if fenced.end_key.as_slice() >= parent_route.range.end_key.as_slice() {
                 continue;
             }
+            let target_version = self
+                .host
+                .get_group(parent_route.shard_id)
+                .map(|g| g.current_epoch().version)
+                .unwrap_or(parent_route.epoch.version);
             let reg = self.host.registry_entries();
             let child_id = reg
                 .iter()
                 .find_map(|(cid, st)| {
                     if let RegistryShardState::PendingChildBoot {
-                        parent_shard_id, ..
+                        parent_shard_id,
+                        target_version: reg_ver,
+                        ..
                     } = st
                     {
-                        if *parent_shard_id == parent_route.shard_id && orphans.contains(cid) {
+                        if *parent_shard_id == parent_route.shard_id
+                            && (*reg_ver == 0 || *reg_ver == target_version)
+                            && orphans.contains(cid)
+                        {
                             return Some(*cid);
                         }
                     }
@@ -2788,7 +2910,12 @@ impl DurableCellManager {
                 })
                 .or_else(|| {
                     if orphans.len() == 1 {
-                        Some(orphans[0])
+                        let candidate = orphans[0];
+                        let epoch_matches = self
+                            .host
+                            .get_group(candidate)
+                            .is_none_or(|g| g.current_epoch().version == target_version);
+                        epoch_matches.then_some(candidate)
                     } else {
                         None
                     }
@@ -2800,11 +2927,6 @@ impl DurableCellManager {
                 continue;
             }
             let req_uuid = (child_id as u128) << 64;
-            let target_version = self
-                .host
-                .get_group(parent_route.shard_id)
-                .map(|g| g.current_epoch().version)
-                .unwrap_or(parent_route.epoch.version);
             self.finish_split(
                 req_uuid,
                 &parent_route,
@@ -2842,9 +2964,17 @@ impl DurableCellManager {
             if handler.key_range() == route.range {
                 continue;
             }
+            if group.current_leader() != Some(self.host.node_id()) {
+                continue;
+            }
+            // Only restore when `FenceShardRangeForSplit` is still open and right-half keys
+            // have NOT been deleted by `UpdateShardRangeOnSplit`!
+            if !handler.has_restorable_split_fence(group.engine().as_ref()) {
+                continue;
+            }
             let cmd = metadb_tx::TxRaftCmd::RestoreShardRange {
                 restored_range: route.range.clone(),
-                new_epoch: epoch,
+                new_epoch: epoch.bump_version(),
             };
             let payload = metadb_tx::command_payload(&cmd)?;
             group
@@ -2871,6 +3001,16 @@ impl DurableCellManager {
             }
             if let Ok(id) = name.parse::<ShardId>() {
                 if !known.contains(&id) && ent.path().join("lsm").exists() {
+                    // An uninitialized joining replica (`open_joining_shard` before voter
+                    // promotion) holds no authoritative split data and must not block a new
+                    // parent leader from restoring an interrupted pre-delete split fence!
+                    if self
+                        .host
+                        .get_group(id)
+                        .is_some_and(|g| g.applied_voter_addrs().is_err())
+                    {
+                        continue;
+                    }
                     return true;
                 }
             }
@@ -3975,24 +4115,41 @@ impl DurableCellManager {
             .unwrap_or(0);
         self.leadership_transfer_requests
             .fetch_add(1, Ordering::Relaxed);
-        let probe = self
-            .host
-            .channel_pool()
-            .probe_transfer_leader(&target_addr, shard_id, target, min_matched)
-            .await;
-        match probe {
-            Ok(resp) if resp.eligible => {}
-            Ok(_) | Err(_) => {
-                return Ok(LeadershipTransferOutcome {
-                    transfer_requested: true,
-                    openraft_called: false,
-                    membership_changed: false,
-                    source_directory_deleted: shard_existed && !shard_dir.exists(),
-                    invented_leader: false,
-                    leader: input.current_leader,
-                    refusal: None,
-                    committed: None,
-                });
+        // When a write just committed on the leader, a healthy voter already appended the entry
+        // (`matched >= min_matched`) but only learns `leader_commit = min_matched` on the next
+        // heartbeat. Retry `probe_transfer_leader` briefly ONLY when the target responds online
+        // with `reason == "follower_lagging"`; unreachable or non-voter targets still fail closed
+        // immediately without ever touching OpenRaft's leader lease.
+        let probe_catchup_deadline = tokio::time::Instant::now()
+            + Duration::from_millis(
+                (self.raft_opts.heartbeat_interval_ms.saturating_mul(4)).max(500),
+            );
+        loop {
+            let probe = self
+                .host
+                .channel_pool()
+                .probe_transfer_leader(&target_addr, shard_id, target, min_matched)
+                .await;
+            match probe {
+                Ok(resp) if resp.eligible => break,
+                Ok(resp)
+                    if resp.reason == "follower_lagging"
+                        && tokio::time::Instant::now() < probe_catchup_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok(_) | Err(_) => {
+                    return Ok(LeadershipTransferOutcome {
+                        transfer_requested: true,
+                        openraft_called: false,
+                        membership_changed: false,
+                        source_directory_deleted: shard_existed && !shard_dir.exists(),
+                        invented_leader: false,
+                        leader: input.current_leader,
+                        refusal: None,
+                        committed: None,
+                    });
+                }
             }
         }
 

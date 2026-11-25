@@ -129,6 +129,17 @@ impl AsyncAttrAggregator {
         engine: &LifecycleStorageEngine,
         flush_hlc: HlcTimestamp,
     ) -> Result<usize> {
+        self.flush_aggregated_deltas_across(&[engine], flush_hlc)
+    }
+
+    /// Folds pending deltas across a multi-shard set of engines, writing each `pid`'s
+    /// aggregated delta strictly to the shard holding `(pid, "_attr_")` and dropping
+    /// queues only when `(pid, "_attr_")` is absent across ALL provided shards (i.e. deleted via `rmdir`).
+    pub fn flush_aggregated_deltas_across(
+        &self,
+        engines: &[&LifecycleStorageEngine],
+        flush_hlc: HlcTimestamp,
+    ) -> Result<usize> {
         let mut guard = self.pending_by_pid.write().unwrap();
         let mut flushed_dirs = 0usize;
 
@@ -142,33 +153,41 @@ impl AsyncAttrAggregator {
             }
 
             let attr_key = MetaKey::dir_attr(pid).encode();
-            if let Some(raw_bytes) = engine.get(&attr_key, flush_hlc)? {
-                let mut attr = InodeAttr::decode(&raw_bytes)?;
-                for item in queue.iter() {
-                    if item.seq > attr.applied_lsn {
-                        attr.num_children =
-                            saturating_add_i64(attr.num_children, item.delta_children).max(0);
-                        attr.size_bytes =
-                            saturating_add_i64(attr.size_bytes, item.delta_bytes).max(0);
-                        if item.modify_time > attr.modify_time {
-                            attr.modify_time = item.modify_time;
+            let mut found_on_any_shard = false;
+            for engine in engines {
+                if let Some(raw_bytes) = engine.get(&attr_key, flush_hlc)? {
+                    let mut attr = InodeAttr::decode(&raw_bytes)?;
+                    for item in queue.iter() {
+                        if item.seq > attr.applied_lsn {
+                            attr.num_children =
+                                saturating_add_i64(attr.num_children, item.delta_children).max(0);
+                            attr.size_bytes =
+                                saturating_add_i64(attr.size_bytes, item.delta_bytes).max(0);
+                            if item.modify_time > attr.modify_time {
+                                attr.modify_time = item.modify_time;
+                            }
+                            attr.applied_lsn = item.seq;
                         }
-                        attr.applied_lsn = item.seq;
                     }
+                    engine.put(attr_key, attr.encode(), flush_hlc);
+                    flushed_dirs += 1;
+                    queue.clear();
+                    found_on_any_shard = true;
+                    break;
                 }
-                engine.put(attr_key, attr.encode(), flush_hlc);
-                flushed_dirs += 1;
-                queue.clear();
-            } else {
+            }
+            if !found_on_any_shard {
                 queue.clear();
             }
         }
 
         guard.retain(|_, q| !q.is_empty());
         if guard.is_empty() {
-            engine
-                .raft_log()
-                .advance_attr_aggregated_lsn(engine.raft_log().last_lsn());
+            for engine in engines {
+                engine
+                    .raft_log()
+                    .advance_attr_aggregated_lsn(engine.raft_log().last_lsn());
+            }
         }
         Ok(flushed_dirs)
     }

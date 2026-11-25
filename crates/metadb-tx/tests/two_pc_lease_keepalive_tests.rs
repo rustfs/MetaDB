@@ -154,7 +154,10 @@ impl MultiShardTestCluster {
     }
 }
 
+static CLUSTER_CONCURRENCY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
+
 struct Cluster {
+    _permit: tokio::sync::SemaphorePermit<'static>,
     directory: Arc<MultiShardTestCluster>,
     shard1: Arc<ShardRaftGroup>,
     shard2: Arc<ShardRaftGroup>,
@@ -219,6 +222,7 @@ async fn boot_group(
 }
 
 async fn boot_cluster(dir: &std::path::Path) -> Cluster {
+    let permit = CLUSTER_CONCURRENCY.acquire().await.unwrap();
     let cache = Arc::new(ShardedBlockCache::new(8 * 1024 * 1024));
     let clock = Arc::new(HybridLogicalClock::new());
     let router = MultiRaftRouter::new();
@@ -264,6 +268,7 @@ async fn boot_cluster(dir: &std::path::Path) -> Cluster {
     let shard2 = s2.1.clone();
     let handler2 = s2.2.clone();
     Cluster {
+        _permit: permit,
         directory: Arc::new(MultiShardTestCluster {
             shards: vec![s1, s2, s3, s4],
             clock: clock.clone(),
@@ -279,6 +284,7 @@ async fn boot_cluster(dir: &std::path::Path) -> Cluster {
 }
 
 async fn reopen_cluster(dir: &std::path::Path) -> Cluster {
+    let permit = CLUSTER_CONCURRENCY.acquire().await.unwrap();
     let clock = Arc::new(HybridLogicalClock::new());
     let cache = Arc::new(ShardedBlockCache::new(8 * 1024 * 1024));
     let router = MultiRaftRouter::new();
@@ -320,6 +326,7 @@ async fn reopen_cluster(dir: &std::path::Path) -> Cluster {
     .await;
     tokio::time::sleep(Duration::from_millis(80)).await;
     Cluster {
+        _permit: permit,
         shard1: s1.1.clone(),
         handler1: s1.2.clone(),
         shard2: s2.1.clone(),
@@ -652,7 +659,7 @@ async fn committed_primary_rolls_forward_after_expire() {
     let dir = tempdir().unwrap();
     let cluster = boot_cluster(dir.path()).await;
     let tx = DistributedTxRouter::new(1, cluster.clock.clone(), cluster.directory.clone())
-        .with_ttl_ms(200);
+        .with_ttl_ms(600);
     seed_dirs(&tx).await;
     tx.create_file(100, "committed.txt", 1003, 8003, 10, 0o644, 8)
         .await
@@ -671,7 +678,7 @@ async fn committed_primary_rolls_forward_after_expire() {
     assert!(matches!(error, MetaDbError::RpcError(_)));
     let records = txn_records(&cluster.shard1).await;
     assert!(matches!(records[0].state, TxnState::Committed { .. }));
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
     assert!(cluster.clock.now() > records[0].expire_hlc);
 
     let landed = tx.lookup(600, "landed.txt").await.unwrap().unwrap();
@@ -712,8 +719,8 @@ async fn work_past_the_hard_cap_is_aborted_and_recovered() {
     let gate = Arc::new(TwoPcPrepareGate::new());
     let rename = {
         let tx = DistributedTxRouter::new(1, cluster.clock.clone(), cluster.directory.clone())
-            .with_ttl_ms(200)
-            .with_max_lease_lifetime_ms(700)
+            .with_ttl_ms(400)
+            .with_max_lease_lifetime_ms(1_400)
             .with_post_prepare_gate(gate.clone());
         tokio::spawn(async move {
             tx.rename(100, "capped.txt", 600, "capped-dst.txt", false)
@@ -721,7 +728,7 @@ async fn work_past_the_hard_cap_is_aborted_and_recovered() {
         })
     };
     gate.wait_prepared().await;
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    tokio::time::sleep(Duration::from_millis(650)).await;
     recover(&cluster).await;
     let mid = txn_records(&cluster.shard1).await;
     assert!(
@@ -730,7 +737,7 @@ async fn work_past_the_hard_cap_is_aborted_and_recovered() {
     );
     assert!(mid[0].expire_hlc > cluster.clock.now());
 
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
     recover(&cluster).await;
     gate.release();
     let error = rename.await.unwrap().unwrap_err();
@@ -858,7 +865,7 @@ async fn extended_expire_hlc_survives_restart_after_flush_and_purge() {
     let dir = tempdir().unwrap();
     let cluster = boot_cluster(dir.path()).await;
     let tx = DistributedTxRouter::new(1, cluster.clock.clone(), cluster.directory.clone())
-        .with_ttl_ms(300);
+        .with_ttl_ms(600);
     seed_dirs(&tx).await;
     tx.create_file(100, "durable.txt", 1007, 8007, 10, 0o644, 4)
         .await
@@ -925,59 +932,7 @@ async fn extended_expire_hlc_survives_restart_after_flush_and_purge() {
     drop(tx);
     drop(cluster);
 
-    let clock = Arc::new(HybridLogicalClock::new());
-    let cache = Arc::new(ShardedBlockCache::new(8 * 1024 * 1024));
-    let router = MultiRaftRouter::new();
-    let s1 = boot_group(
-        dir.path(),
-        1,
-        CompositeKeyRange::meta_pid_range(0, 500).unwrap(),
-        cache.clone(),
-        clock.clone(),
-        router.clone(),
-    )
-    .await;
-    let s2 = boot_group(
-        dir.path(),
-        2,
-        CompositeKeyRange::meta_pid_range(500, u64::MAX).unwrap(),
-        cache.clone(),
-        clock.clone(),
-        router.clone(),
-    )
-    .await;
-    let s3 = boot_group(
-        dir.path(),
-        3,
-        CompositeKeyRange::quota_table_root(),
-        cache.clone(),
-        clock.clone(),
-        router.clone(),
-    )
-    .await;
-    let s4 = boot_group(
-        dir.path(),
-        4,
-        CompositeKeyRange::secondary_index_table_root(),
-        cache,
-        clock.clone(),
-        router,
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    let restarted = Cluster {
-        shard1: s1.1.clone(),
-        handler1: s1.2.clone(),
-        shard2: s2.1.clone(),
-        handler2: s2.2.clone(),
-        directory: Arc::new(MultiShardTestCluster {
-            shards: vec![s1, s2, s3, s4],
-            clock: clock.clone(),
-            next_token: AtomicU64::new(1),
-            rename_lease: Mutex::new(None),
-        }),
-        clock: clock.clone(),
-    };
+    let restarted = reopen_cluster(dir.path()).await;
     let restored = txn_records(&restarted.shard1).await;
     assert_eq!(restored.len(), 1, "TxnRecord must survive purge");
     assert_eq!(restored[0].expire_hlc.physical_ms(), extended.physical_ms());
@@ -1006,7 +961,7 @@ async fn extended_expire_hlc_survives_restart_after_flush_and_purge() {
         Some(fence_bytes.as_slice()),
         "directory attr pre-image must survive flush, purge, and restart"
     );
-    let resumed = DistributedTxRouter::new(1, clock.clone(), restarted.directory.clone())
+    let resumed = DistributedTxRouter::new(1, restarted.clock.clone(), restarted.directory.clone())
         .resume_pending_lease(&restored[0].primary_key, restored[0].txn_id)
         .await
         .unwrap();
@@ -1113,7 +1068,7 @@ async fn expired_lease_is_not_rehydrated_and_recovery_does_not_commit_it() {
     let dir = tempdir().unwrap();
     let cluster = boot_cluster(dir.path()).await;
     let tx = DistributedTxRouter::new(1, cluster.clock.clone(), cluster.directory.clone())
-        .with_ttl_ms(200);
+        .with_ttl_ms(600);
     seed_dirs(&tx).await;
     tx.create_file(100, "expired.txt", 1009, 8009, 10, 0o644, 4)
         .await
@@ -1132,7 +1087,8 @@ async fn expired_lease_is_not_rehydrated_and_recovery_does_not_commit_it() {
     assert!(matches!(error, MetaDbError::RpcError(_)));
     let pending = txn_records(&cluster.shard1).await.remove(0);
     let start_hlc = pending.start_hlc;
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    assert!(cluster.clock.now() > pending.expire_hlc);
     cluster.shard1.flush_snapshot_and_purge().await.unwrap();
     cluster.shard2.flush_snapshot_and_purge().await.unwrap();
     cluster.directory.shutdown_groups().await;

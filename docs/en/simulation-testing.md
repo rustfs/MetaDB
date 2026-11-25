@@ -95,3 +95,12 @@ Library tests in `simulation::tests` check that the schedule is pure, that the o
 - the official million-operation load
 
 Those entries exist so a reviewer can see the boundary. They are not tests, they do not fail the suite, and they do not pass the suite.
+
+## Full-stack `Buggify`, `CodeProbe`, and 3-Voter `Swizzle-Clog` ensemble (`metadb_server::fdb_chaos`)
+
+In addition to `metadb_server::simulation`, `crates/metadb-server/src/fdb_chaos.rs` and `crates/metadb-server/tests/fdb_chaos_ensemble_tests.rs` implement FoundationDB-inspired full-stack fault-injection and multi-seed ensemble verification:
+
+- **Two-stage `Buggify` & monotonic `CodeProbe` (`metadb_core::buggify`)**: zero-cost in normal execution (`AtomicUsize == 0` fast path); under `ThreadBuggifyGuard` or `GlobalBuggifyGuard`, deterministically enables a seeded subset of subsystem fault sites (`storage.early_memtable_seal`, `tx.outbox_force_spill`, `tx.two_pc_post_prepare_yield`, `raft.read_index_coalesce_yield`) and records rare-path coverage deltas via `CodeProbeSnapshot`.
+- **`SwizzleClogController` (`metadb_raft::SwizzleClogController`)**: intercepts outbound Raft and control-plane RPCs on `ChannelPool` to inject deterministic FoundationDB `Swizzle-Clog` directed-link partitions (clogging in permutation $P_1$ and healing in independent permutation $P_2$), full node isolation, bounded per-RPC jitter, and post-apply reply drops.
+- **Six-dimensional full-stack invariant oracle**: audits (1) prime-paged `listdir` & `lookup` exactness, (2) `dirstat` conservation across `DirectoryColocated` and `DualModeFineGrained` shards, (3) multi-UID `QuotaTable` inode & byte conservation, (4) `SecondaryIndexTable` live bijection and zero zombie deleted/overwritten FIDs, (5) zero leaked `[0x05]`/`[0x06]`/`[0x07]`/`[0x0D]` system keys, and (6) byte-for-byte 3-voter replica convergence and contiguous `[0x01, 0x04)` routing.
+- **CLI ensemble runner (`metadb-ctl sim`)**: run large-scale campaigns or reproduce any hexadecimal seed directly via `metadb-ctl sim --workload <in-memory|persistent-cascade|swizzle-clog|all> --seed 0x1 --seeds 1000 --steps 48 --concurrency 8`.
