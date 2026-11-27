@@ -3121,19 +3121,32 @@ impl DistributedTxRouter {
         }
 
         let shards = self.directory.route_user_range(&scan_start, &scan_end)?;
+        if shards.is_empty() {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "no shards cover listdir range for pid={pid}"
+            )));
+        }
         let mut collected: Vec<MetaEntry> = Vec::new();
         let mut entries_examined = 0u64;
         let mut tombstones_traversed = 0u64;
+        let mut covered_until: Vec<u8> = scan_start.clone();
 
         for (epoch, group, handler) in shards {
             if collected.len() >= effective_limit {
                 break;
             }
+            // Validate epoch & contiguous range coverage BEFORE checking `sub_start >= sub_end`
+            // so a stale route cache after an online shard split never silently returns an empty
+            // or truncated directory listing!
+            Self::validate_read_epoch(&group, epoch)?;
             let r = handler.key_range();
             let sub_start = scan_start.as_slice().max(r.start_key.as_slice());
             let sub_end = scan_end.as_slice().min(r.end_key.as_slice());
-            if sub_start >= sub_end {
-                continue;
+            if sub_start >= sub_end || sub_start > covered_until.as_slice() {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "stale or gapped shard range during listdir on shard {} for pid={pid}",
+                    group.shard_id()
+                )));
             }
 
             let eng = group.engine();
@@ -3236,6 +3249,9 @@ impl DistributedTxRouter {
             }
 
             if forwarded_done {
+                if sub_end > covered_until.as_slice() {
+                    covered_until = sub_end.to_vec();
+                }
                 continue;
             }
 
@@ -3294,8 +3310,18 @@ impl DistributedTxRouter {
                         tombstones_traversed,
                     });
                 }
-                ListDirStop::Continue => {}
+                ListDirStop::Continue => {
+                    if sub_end > covered_until.as_slice() {
+                        covered_until = sub_end.to_vec();
+                    }
+                }
             }
+        }
+
+        if covered_until.as_slice() < scan_end.as_slice() {
+            return Err(MetaDbError::ShardRoutingError(format!(
+                "incomplete shard range coverage during listdir for pid={pid}"
+            )));
         }
 
         Ok(ListDirPage {
@@ -3393,16 +3419,26 @@ impl DistributedTxRouter {
         let start = QuotaKey { uid: start_uid }.encode();
         let end = vec![TABLE_PREFIX_SECONDARY_INDEX];
         let shards = self.directory.route_user_range(&start, &end)?;
+        if shards.is_empty() {
+            return Err(MetaDbError::ShardRoutingError(
+                "no shards cover quota scan range".to_string(),
+            ));
+        }
         let mut out = Vec::new();
+        let mut covered_until = start.clone();
         for (epoch, group, handler) in shards {
             if out.len() >= lim {
                 break;
             }
+            Self::validate_read_epoch(&group, epoch)?;
             let r = handler.key_range();
             let s = start.as_slice().max(r.start_key.as_slice());
             let e = end.as_slice().min(r.end_key.as_slice());
-            if s >= e {
-                continue;
+            if s >= e || s > covered_until.as_slice() {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "stale or gapped shard range during list_quotas on shard {}",
+                    group.shard_id()
+                )));
             }
             let (_, snap) = match group.linearizable_read(epoch).await {
                 Ok(pair) => pair,
@@ -3431,6 +3467,9 @@ impl DistributedTxRouter {
                     if out.len() >= lim {
                         return Ok(out);
                     }
+                    if e > covered_until.as_slice() {
+                        covered_until = e.to_vec();
+                    }
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -3447,6 +3486,14 @@ impl DistributedTxRouter {
             if out.len() >= lim {
                 return Ok(out);
             }
+            if e > covered_until.as_slice() {
+                covered_until = e.to_vec();
+            }
+        }
+        if covered_until.as_slice() < end.as_slice() {
+            return Err(MetaDbError::ShardRoutingError(
+                "incomplete shard range coverage during list_quotas".to_string(),
+            ));
         }
         Ok(out)
     }
@@ -3516,16 +3563,26 @@ impl DistributedTxRouter {
         let start = SecondaryIndexKey { fid: next_fid }.encode();
         let end = vec![TABLE_PREFIX_SECONDARY_INDEX + 1];
         let shards = self.directory.route_user_range(&start, &end)?;
+        if shards.is_empty() {
+            return Err(MetaDbError::ShardRoutingError(
+                "no shards cover secondary index scan range".to_string(),
+            ));
+        }
         let mut out = Vec::new();
+        let mut covered_until = start.clone();
         for (epoch, group, handler) in shards {
             if out.len() >= lim {
                 break;
             }
+            Self::validate_read_epoch(&group, epoch)?;
             let r = handler.key_range();
             let s = start.as_slice().max(r.start_key.as_slice());
             let e = end.as_slice().min(r.end_key.as_slice());
-            if s >= e {
-                continue;
+            if s >= e || s > covered_until.as_slice() {
+                return Err(MetaDbError::ShardRoutingError(format!(
+                    "stale or gapped shard range during scan_secondary_index on shard {}",
+                    group.shard_id()
+                )));
             }
             let (_, snap) = match group.linearizable_read(epoch).await {
                 Ok(pair) => pair,
@@ -3554,6 +3611,9 @@ impl DistributedTxRouter {
                     if out.len() >= lim {
                         return Ok(out);
                     }
+                    if e > covered_until.as_slice() {
+                        covered_until = e.to_vec();
+                    }
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -3573,6 +3633,14 @@ impl DistributedTxRouter {
             if out.len() >= lim {
                 return Ok(out);
             }
+            if e > covered_until.as_slice() {
+                covered_until = e.to_vec();
+            }
+        }
+        if covered_until.as_slice() < end.as_slice() {
+            return Err(MetaDbError::ShardRoutingError(
+                "incomplete shard range coverage during scan_secondary_index".to_string(),
+            ));
         }
         Ok(out)
     }

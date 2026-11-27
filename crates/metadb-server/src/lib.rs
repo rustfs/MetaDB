@@ -7,8 +7,10 @@
 //!   Jumbo Shard dedicated-node isolation, and multi-Cell federation under `GlobalManager`.
 
 pub mod config;
+pub mod dst;
 pub mod fdb_chaos;
 pub mod grpc_services;
+pub mod jepsen;
 pub mod metrics;
 pub mod simulation;
 pub mod stress;

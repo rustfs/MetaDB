@@ -181,6 +181,11 @@ impl PushdownExecutor {
         hlc: HlcTimestamp,
     ) -> Result<MetaEntry> {
         let _gate = self.mkdir_gate.lock().unwrap();
+        // Advance `hlc` past any concurrent writer that won `mkdir_gate` with a higher HLC so
+        // existence checks inside the critical section never read behind an already-claimed inode.
+        let hlc = hlc
+            .max(parent_engine.mvcc().latest_watermarks().1)
+            .max(new_dir_engine.mvcc().latest_watermarks().1);
         validate_user_entry_name(name)?;
         validate_dir_inode_id(new_dir_id)?;
 

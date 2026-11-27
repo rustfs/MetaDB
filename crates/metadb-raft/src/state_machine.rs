@@ -382,9 +382,14 @@ impl StateMachineShared {
             let engine = self.current_engine();
 
             // Strict `snapshot_index == checkpoint.flushed_raft_index` alignment (`Resolution B6`).
+            // Use a monotonic per-attempt staging suffix so two concurrent snapshot builds for
+            // the same `snap_index` can never collide on `tmp_dir` or `lsm.ckpt.tmp` (`ENOTEMPTY`).
+            static SNAP_TMP_SEQ: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
             let ckpt_preview = engine.durable_checkpoint();
             let snap_index = ckpt_preview.flushed_raft_index;
-            let tmp_dir = snaps_root.join(format!("snap_{:020}.tmp", snap_index));
+            let seq = SNAP_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp_dir = snaps_root.join(format!("snap_{:020}.{seq}.tmp", snap_index));
             if tmp_dir.exists() {
                 fs::remove_dir_all(&tmp_dir)?;
             }
@@ -522,9 +527,25 @@ impl StateMachineShared {
         let meta_path = self
             .shard_dir
             .join(format!("raft/snapshots/snap_{index:020}/SNAPSHOT_META"));
-        let Ok(info) = fs::metadata(&meta_path) else {
-            *self.snapshot_cache.lock().unwrap() = None;
-            return true;
+        let info = match fs::metadata(&meta_path) {
+            Ok(i) => i,
+            Err(_) => {
+                // Re-check under `operation_lock` so a microsecond swap window inside
+                // `publish_snapshot_dir` (`final_dir -> bak_dir`, `tmp_dir -> final_dir`)
+                // never triggers a spurious concurrent snapshot rebuild.
+                let _op = self.operation_lock.lock().unwrap();
+                let current_index = self.watermarks.snapshot_values().2;
+                let current_meta = self.shard_dir.join(format!(
+                    "raft/snapshots/snap_{current_index:020}/SNAPSHOT_META"
+                ));
+                match fs::metadata(&current_meta) {
+                    Ok(i) => i,
+                    Err(_) => {
+                        *self.snapshot_cache.lock().unwrap() = None;
+                        return true;
+                    }
+                }
+            }
         };
         if !info.is_file() || info.len() <= 4 {
             *self.snapshot_cache.lock().unwrap() = None;
@@ -1453,9 +1474,12 @@ impl RaftStateMachine<MetaDbTypeConfig> for ShardStateMachine {
             .on_snapshot_installed(&snapshot.checkpoint, &reopened);
 
         // Persist in `raft/snapshots/snap_<S>` so `get_current_snapshot` returns it on restart!
+        static INSTALL_SNAP_TMP_SEQ: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
         let snaps_root = self.shared.shard_dir.join("raft/snapshots");
         fs::create_dir_all(&snaps_root)?;
-        let saved_tmp = snaps_root.join(format!("snap_{:020}.tmp", snap_idx));
+        let iseq = INSTALL_SNAP_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let saved_tmp = snaps_root.join(format!("snap_{:020}.inst{iseq}.tmp", snap_idx));
         if saved_tmp.exists() {
             fs::remove_dir_all(&saved_tmp)?;
         }

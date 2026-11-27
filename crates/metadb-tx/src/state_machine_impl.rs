@@ -2276,6 +2276,10 @@ impl TxStateMachineHandler {
                 for key in &target_user_keys {
                     self.ensure_user_key_in_range(key)?;
                 }
+                // Match `CommitPrimary2pc`: clamp the materialized MVCC HLC to at least the
+                // secondary shard's replicated Raft `commit_hlc` so under inter-shard clock skew
+                // `WriteIntent` tombstones and materialized values never sort behind `Prepare2pc`.
+                let final_commit_hlc = tx_commit_hlc.max(commit_hlc);
                 let mut any_applied = false;
                 let mut aux_specs = Vec::new();
                 for uk in &target_user_keys {
@@ -2284,7 +2288,7 @@ impl TxStateMachineHandler {
                         txn_id,
                         uk,
                         raft_index,
-                        tx_commit_hlc,
+                        final_commit_hlc,
                         &mut aux_specs,
                     )? {
                         any_applied = true;
@@ -2295,15 +2299,15 @@ impl TxStateMachineHandler {
                 }
                 self.outbox.record_entry_specs_with_reconstructability(
                     raft_index,
-                    tx_commit_hlc,
+                    final_commit_hlc,
                     aux_specs,
                     false,
                 );
                 if !self.shard_still_has_txn_intent(engine, txn_id)? {
-                    self.release_lease_hold(engine, txn_id, raft_index, commit_hlc);
+                    self.release_lease_hold(engine, txn_id, raft_index, final_commit_hlc);
                 }
                 Ok(TxRaftOutput::Committed {
-                    commit_hlc: tx_commit_hlc,
+                    commit_hlc: final_commit_hlc,
                     already_applied: !any_applied,
                 })
             }

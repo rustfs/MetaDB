@@ -419,3 +419,157 @@ fn fence_rechecks_intents_at_the_serialized_apply_boundary() {
     assert_eq!(handler.key_range(), before);
     assert!(read(&engine, &WriteIntentKey::new(key).encode()).is_some());
 }
+
+#[test]
+fn commit_secondary_2pc_with_skewed_primary_hlc_clears_intent_regardless_of_memtable_flush() {
+    // Regression test discovered by MetaDB DST (`seed=0x2015`):
+    // When `Prepare2pc` ran on a secondary shard at a higher local HLC (`10_100`) than the
+    // primary shard's `tx_commit_hlc` (`10_050`, bounded inter-shard NTP skew), `CommitSecondary2pc`
+    // must clamp its MVCC write/delete HLC to `tx_commit_hlc.max(raft_commit_hlc)` so the
+    // `WriteIntent` tombstone never sorts behind `Prepare2pc` in memory, guaranteeing identical
+    // replica state regardless of whether a memtable flushed between `Prepare2pc` and `CommitSecondary2pc`.
+    let (_dir_a, engine_unflushed, handler_a) = fixture();
+    let (_dir_b, engine_flushed, handler_b) = fixture();
+
+    let key = MetaKey::child(1, "skewed_token").encode();
+    let attr = InodeAttr {
+        inode_id: 9001,
+        parent_pid: 1,
+        entry_type: metadb_core::EntryType::File,
+        fid: Some(9001),
+        uid: 1,
+        mode: 0o644,
+        link_count: 1,
+        size_bytes: 64,
+        num_children: 0,
+        create_time: HlcTimestamp::new(10_000, 0),
+        modify_time: HlcTimestamp::new(10_000, 0),
+        applied_lsn: 0,
+    };
+    let prep_cmd = TxRaftCmd::Prepare2pc {
+        txn_id: 77,
+        is_primary: false,
+        primary_key: MetaKey::child(2, "skewed_token").encode(),
+        participant_keys: vec![key.clone()],
+        start_hlc: HlcTimestamp::new(10_040, 0),
+        expire_hlc: HlcTimestamp::new(12_000, 0),
+        rename_fence_token: None,
+        intents: vec![(
+            key.clone(),
+            IntentOp::Put {
+                value: attr.encode(),
+                attr_deltas: vec![AttrDeltaSpec {
+                    pid: 1,
+                    delta_children: 1,
+                    delta_bytes: 64,
+                }],
+                aux_specs: vec![],
+            },
+        )],
+    };
+    let commit_cmd = TxRaftCmd::CommitSecondary2pc {
+        txn_id: 77,
+        // Primary shard clock lags behind secondary shard's Prepare HLC (10_100).
+        commit_hlc: HlcTimestamp::new(10_050, 0),
+        target_user_keys: vec![key.clone()],
+    };
+    let follow_up_prep = TxRaftCmd::Prepare2pc {
+        txn_id: 78,
+        is_primary: false,
+        primary_key: MetaKey::child(2, "skewed_token").encode(),
+        participant_keys: vec![key.clone()],
+        start_hlc: HlcTimestamp::new(10_120, 0),
+        expire_hlc: HlcTimestamp::new(12_120, 0),
+        rename_fence_token: None,
+        intents: vec![(
+            key.clone(),
+            IntentOp::Delete {
+                attr_deltas: vec![AttrDeltaSpec {
+                    pid: 1,
+                    delta_children: -1,
+                    delta_bytes: -64,
+                }],
+                aux_specs: vec![],
+            },
+        )],
+    };
+
+    let apply_at = |h: &TxStateMachineHandler,
+                    e: &LifecycleStorageEngine,
+                    idx: u64,
+                    hlc: HlcTimestamp,
+                    cmd: &TxRaftCmd| {
+        e.begin_command();
+        let req = MetaDbRaftRequest {
+            expected_epoch: h.current_epoch(),
+            hlc,
+            payload: codec::serialize(cmd).unwrap(),
+        };
+        let res = h.apply_command(idx, hlc, &req, e);
+        e.end_command(res.is_ok()).unwrap();
+        res
+    };
+
+    // Replica A (no flush between idx=2 and idx=3) vs Replica B (flushes right after idx=2).
+    apply_at(
+        &handler_a,
+        &engine_unflushed,
+        2,
+        HlcTimestamp::new(10_100, 0),
+        &prep_cmd,
+    )
+    .unwrap();
+    apply_at(
+        &handler_b,
+        &engine_flushed,
+        2,
+        HlcTimestamp::new(10_100, 0),
+        &prep_cmd,
+    )
+    .unwrap();
+    engine_flushed.flush_mvcc_to_persistent();
+
+    apply_at(
+        &handler_a,
+        &engine_unflushed,
+        3,
+        HlcTimestamp::new(10_101, 0),
+        &commit_cmd,
+    )
+    .unwrap();
+    apply_at(
+        &handler_b,
+        &engine_flushed,
+        3,
+        HlcTimestamp::new(10_101, 0),
+        &commit_cmd,
+    )
+    .unwrap();
+
+    // Both replicas MUST have cleared `0x05 WriteIntent` and MUST accept follow-up txn 78!
+    let intent_key = WriteIntentKey::new(key.clone()).encode();
+    let read_hlc = HlcTimestamp::new(20_000, 0);
+    assert!(engine_unflushed
+        .get(&intent_key, read_hlc)
+        .unwrap()
+        .is_none());
+    assert!(engine_flushed.get(&intent_key, read_hlc).unwrap().is_none());
+    assert!(engine_unflushed.get(&key, read_hlc).unwrap().is_some());
+    assert!(engine_flushed.get(&key, read_hlc).unwrap().is_some());
+    apply_at(
+        &handler_a,
+        &engine_unflushed,
+        4,
+        HlcTimestamp::new(10_120, 0),
+        &follow_up_prep,
+    )
+    .unwrap();
+    apply_at(
+        &handler_b,
+        &engine_flushed,
+        4,
+        HlcTimestamp::new(10_120, 0),
+        &follow_up_prep,
+    )
+    .unwrap();
+}
