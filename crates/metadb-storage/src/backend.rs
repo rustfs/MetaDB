@@ -834,9 +834,11 @@ impl StorageBackend for LsmStorageBackend {
             (st.next_file_id, st.next_flush_generation)
         };
 
+        static CKPT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let parent = dest_dir.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
-        let tmp_dir = dest_dir.with_extension("ckpt.tmp");
+        let cseq = CKPT_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_dir = dest_dir.with_extension(format!("ckpt.{cseq}.tmp"));
         if tmp_dir.exists() {
             fs::remove_dir_all(&tmp_dir)?;
         }

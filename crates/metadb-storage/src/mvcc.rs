@@ -576,12 +576,15 @@ pub enum VisibleAt {
 }
 
 fn memory_value_leq(guard: &MemMvccInner, key: &[u8], read_hlc: HlcTimestamp) -> Option<MvccValue> {
-    let mut best: Option<((HlcTimestamp, LogSequenceNumber), MvccValue)> = None;
+    let mut best: Option<((LogSequenceNumber, HlcTimestamp), MvccValue)> = None;
     let consider =
         |chain: &[MvccVersion],
-         best: &mut Option<((HlcTimestamp, LogSequenceNumber), MvccValue)>| {
+         best: &mut Option<((LogSequenceNumber, HlcTimestamp), MvccValue)>| {
             for version in chain {
-                let ord = (version.hlc, version.lsn);
+                // Order by Raft apply sequence `(lsn, hlc)` to match `range_page_with_pinned`
+                // (`chain.iter().rev()`) and `flush_eligible_imms` (`chain.last()`), guaranteeing
+                // identical visibility regardless of when memtables flush to SSTables.
+                let ord = (version.lsn, version.hlc);
                 if version.hlc <= read_hlc
                     && best.as_ref().map(|(cur, _)| ord >= *cur).unwrap_or(true)
                 {

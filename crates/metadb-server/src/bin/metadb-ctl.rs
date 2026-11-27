@@ -144,6 +144,48 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         concurrency: usize,
     },
+    /// Run single-threaded virtual-clock Deterministic Simulation Testing (DST) ensembles.
+    Dst {
+        /// Scenario: `raft-linearizability` | `two-pc-crash-skew` | `split-aux-convergence` | `disk-fault-recovery` | `all`.
+        #[arg(long, default_value = "all")]
+        scenario: String,
+        /// Starting seed (accepts decimal or `0x...` hex).
+        #[arg(long, default_value = "0x1")]
+        seed: String,
+        /// Number of consecutive seeds per scenario.
+        #[arg(long, default_value_t = 10)]
+        seeds: u32,
+        /// Workload operations per seed.
+        #[arg(long, default_value_t = 36)]
+        ops: u32,
+        /// Parallel worker threads (each seed runs single-threaded & bit-identical).
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+    },
+    /// Run Jepsen (`https://jepsen.io/`) linearizability, Elle, set-full, and bank tests.
+    Jepsen {
+        /// Workload: `register` | `set` | `rename-elle` | `bank` | `all`.
+        #[arg(long, default_value = "register")]
+        workload: String,
+        /// Nemesis: `none` | `kill` | `pause` | `split` | `partition` | `combo`.
+        #[arg(long, default_value = "partition")]
+        nemesis: String,
+        /// Seed (decimal or `0x...` hex).
+        #[arg(long, default_value = "0x4a455053454e")]
+        seed: String,
+        /// Concurrent client workers.
+        #[arg(long, default_value_t = 4)]
+        clients: usize,
+        /// Fault-injection duration in seconds.
+        #[arg(long, default_value_t = 5)]
+        duration_secs: u64,
+        /// Optional path to export Clojure Jepsen EDN history (`history.edn`).
+        #[arg(long)]
+        edn_out: Option<std::path::PathBuf>,
+        /// Optional explicit path to `metadbd` binary for OS-process nemeses.
+        #[arg(long)]
+        metadbd_bin: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -714,6 +756,110 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         return Ok(());
     }
+    if let Command::Dst {
+        scenario,
+        seed,
+        seeds,
+        ops,
+        concurrency,
+    } = cli.command
+    {
+        let start_seed = if let Some(hex) =
+            seed.strip_prefix("0x").or_else(|| seed.strip_prefix("0X"))
+        {
+            u64::from_str_radix(hex, 16).map_err(|e| format!("invalid hex --seed '{seed}': {e}"))?
+        } else {
+            seed.parse::<u64>()
+                .map_err(|e| format!("invalid --seed '{seed}': {e}"))?
+        };
+        let scenarios = if scenario == "all" {
+            metadb_server::dst::DstScenario::all().to_vec()
+        } else {
+            let Some(s) = metadb_server::dst::DstScenario::parse(&scenario) else {
+                return Err(format!(
+                    "unsupported --scenario '{scenario}' (expected raft-linearizability, two-pc-crash-skew, split-aux-convergence, disk-fault-recovery, or all)"
+                )
+                .into());
+            };
+            vec![s]
+        };
+        for sc in scenarios {
+            let report = metadb_server::dst::run_dst_ensemble(
+                sc,
+                start_seed,
+                seeds.max(1),
+                ops.max(12),
+                concurrency.max(1),
+            );
+            println!("{report}");
+            if !report.is_ok() {
+                return Err(format!("DST ensemble failed on scenario {}", sc.as_str()).into());
+            }
+        }
+        return Ok(());
+    }
+    if let Command::Jepsen {
+        workload,
+        nemesis,
+        seed,
+        clients,
+        duration_secs,
+        edn_out,
+        metadbd_bin,
+    } = cli.command
+    {
+        let parsed_seed = if let Some(hex) =
+            seed.strip_prefix("0x").or_else(|| seed.strip_prefix("0X"))
+        {
+            u64::from_str_radix(hex, 16).map_err(|e| format!("invalid hex --seed '{seed}': {e}"))?
+        } else {
+            seed.parse::<u64>()
+                .map_err(|e| format!("invalid --seed '{seed}': {e}"))?
+        };
+        let Some(nem) = metadb_server::jepsen::JepsenNemesisKind::parse(&nemesis) else {
+            return Err(format!(
+                "unsupported --nemesis '{nemesis}' (expected none, kill, pause, split, partition, or combo)"
+            )
+            .into());
+        };
+        let workloads = if workload == "all" {
+            vec![
+                metadb_server::jepsen::JepsenWorkload::Register,
+                metadb_server::jepsen::JepsenWorkload::Set,
+                metadb_server::jepsen::JepsenWorkload::RenameElle,
+                metadb_server::jepsen::JepsenWorkload::Bank,
+            ]
+        } else {
+            let Some(w) = metadb_server::jepsen::JepsenWorkload::parse(&workload) else {
+                return Err(format!(
+                    "unsupported --workload '{workload}' (expected register, set, rename-elle, bank, or all)"
+                )
+                .into());
+            };
+            vec![w]
+        };
+        for (idx, w) in workloads.into_iter().enumerate() {
+            let cfg = metadb_server::jepsen::JepsenConfig {
+                workload: w,
+                nemesis: nem,
+                seed: parsed_seed.wrapping_add(idx as u64),
+                clients: clients.max(2),
+                duration_secs: duration_secs.max(3),
+                edn_output_path: edn_out.clone(),
+                metadbd_bin: metadbd_bin.clone(),
+            };
+            let report = if nem == metadb_server::jepsen::JepsenNemesisKind::PartitionSwizzleClog {
+                metadb_server::jepsen::run_partition_jepsen(&cfg).await
+            } else {
+                metadb_server::jepsen::run_os_cluster_jepsen(&cfg).await
+            };
+            println!("{report}");
+            if !report.is_ok() {
+                return Err(format!("Jepsen run failed on workload {}", w.as_str()).into());
+            }
+        }
+        return Ok(());
+    }
     let security = client_security(&cli)?;
     let url = security.prepare_url(&cli.endpoint)?;
     let auth = bearer_client(&cli)?;
@@ -976,7 +1122,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .await?;
             }
         }
-        Command::Sim { .. } => unreachable!("handled before client_security"),
+        Command::Sim { .. } | Command::Dst { .. } | Command::Jepsen { .. } => {
+            unreachable!("handled before client_security")
+        }
     }
 
     Ok(())

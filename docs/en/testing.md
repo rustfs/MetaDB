@@ -35,8 +35,14 @@ cargo test -p metadb-server --test auth_fail_closed
 cargo test -p metadb-server --test prefix_load
 cargo test -p metadb-server --test stress_harness
 cargo test -p metadb-server --test fdb_chaos_ensemble_tests
+cargo test -p metadb-server --test dst_tests
+cargo test -p metadb-server --test jepsen_tests
 cargo run -p metadb-server --bin metadb-ctl -- sim --workload all --seed 0x1 --seeds 10 --steps 32
+cargo run -p metadb-server --bin metadb-ctl -- dst --scenario all --seed 0x1 --seeds 20 --ops 36
+cargo run -p metadb-server --bin metadb-ctl -- jepsen --workload register --nemesis partition --clients 4 --duration-secs 5
 ```
+
+See also [DST and Jepsen testing](./dst-and-jepsen-testing.md) and [tests/jepsen/README.md](../../tests/jepsen/README.md) for the single-threaded virtual-clock DST runtime, WGL/Elle/set-full/bank Jepsen checkers, real 3-process `metadbd` OS nemeses, and the official 5-node Clojure/Docker Jepsen harness.
 
 ## What each suite actually exercises
 

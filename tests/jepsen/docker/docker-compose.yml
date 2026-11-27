@@ -1,0 +1,90 @@
+services:
+  control:
+    build:
+      context: ../../..
+      dockerfile: tests/jepsen/docker/Dockerfile
+      target: control
+    hostname: control
+    container_name: metadb-jepsen-control
+    networks:
+      - jepsen-net
+    depends_on:
+      - n1
+      - n2
+      - n3
+      - n4
+      - n5
+
+  n1:
+    build:
+      context: ../../..
+      dockerfile: tests/jepsen/docker/Dockerfile
+      target: db-node
+    hostname: n1
+    container_name: metadb-jepsen-n1
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_TIME
+    networks:
+      - jepsen-net
+
+  n2:
+    build:
+      context: ../../..
+      dockerfile: tests/jepsen/docker/Dockerfile
+      target: db-node
+    hostname: n2
+    container_name: metadb-jepsen-n2
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_TIME
+    networks:
+      - jepsen-net
+
+  n3:
+    build:
+      context: ../../..
+      dockerfile: tests/jepsen/docker/Dockerfile
+      target: db-node
+    hostname: n3
+    container_name: metadb-jepsen-n3
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_TIME
+    networks:
+      - jepsen-net
+
+  n4:
+    build:
+      context: ../../..
+      dockerfile: tests/jepsen/docker/Dockerfile
+      target: db-node
+    hostname: n4
+    container_name: metadb-jepsen-n4
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_TIME
+    networks:
+      - jepsen-net
+
+  n5:
+    build:
+      context: ../../..
+      dockerfile: tests/jepsen/docker/Dockerfile
+      target: db-node
+    hostname: n5
+    container_name: metadb-jepsen-n5
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_TIME
+    networks:
+      - jepsen-net
+
+networks:
+  jepsen-net:
+    driver: bridge
